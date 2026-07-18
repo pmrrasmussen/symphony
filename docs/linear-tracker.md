@@ -13,6 +13,7 @@
 | `assignee` | optional | Unset permits all assignees. A non-empty ID permits only that assignee. `me` resolves the current Linear viewer ID for each read. |
 | `handoff_state` | optional | Enables the tightly scoped Codex `linear_graphql` compatibility tool. The name must be a non-active workflow state in the active issue's Linear team. |
 | `handoff_comment_template` | optional | A repository-owned Go template for the comment made by the tool's `handoff` operation. It requires `handoff_state` and receives only `issue`. |
+| `agent_transitions` | optional | A non-empty mapping of exact source state names to destination state names for the bounded Codex `transition` operation. Terminal and same-state edges are rejected. |
 
 Invalid provider values produce `invalid_tracker_config`; a missing or empty key
 produces `missing_tracker_secret`. `api_key_file` loading errors are reported by
@@ -65,12 +66,12 @@ error text or logs.
 
 ## Optional Codex handoff capability
 
-When `handoff_state` is absent, Symphony does not advertise a client-side
-Linear tool and all such requests remain unsupported. When it is configured,
-the service validates the active issue's project and team, resolves the named
-state in that team, and freezes those values for the Codex session before the
-child process starts. A workflow reload affects later sessions only; an invalid
-reload retains the last valid policy.
+When both `handoff_state` and `agent_transitions` are absent, Symphony does not
+advertise a client-side Linear tool and all such requests remain unsupported.
+When either is configured, the service validates the active issue's project and
+team and freezes the policy for the Codex session before the child process
+starts. A workflow reload affects later sessions only; an invalid reload retains
+the last valid policy.
 
 Before every handoff transition or comment mutation, Symphony re-reads the
 bound issue and rejects the action if its project, team, or state changed, or
@@ -89,7 +90,7 @@ idempotent without storing an agent-supplied key or exposing a broader Linear
 write API.
 
 The compatibility name is `linear_graphql`, but it is not a GraphQL proxy. Its
-only typed operations are `read`, `handoff`, and `comment`. They are bound to
+only typed operations are `read`, `handoff`, `comment`, and `transition`. They are bound to
 the active issue and configured project; callers cannot supply a query, issue
 ID, project, endpoint, credential, or state. `handoff` may only use the
 configured state and the optional fixed comment template. `comment` can only
@@ -97,3 +98,14 @@ write a bounded comment to the active issue. Tool failures return generic
 responses and never reveal the Linear credential or provider payload.
 Handoff logs contain only the outcome and bound issue ID/identifier; comment
 bodies, credentials, and full agent arguments are not logged.
+
+`transition` accepts only a destination state name. On every call Symphony
+refreshes the active issue, resolves its current team states, and permits the
+mutation only when the refreshed source and requested destination match one
+configured `agent_transitions` edge. It refreshes once more immediately before
+the mutation and again afterwards, adopting the confirmed resulting state in
+the session snapshot. A call already at a configured destination is idempotent;
+reversed, terminal, stale, cross-project, cross-team, and unconfigured edges
+are rejected. Transition calls are serialized per session. Linear cannot make
+the worker's worktree and its own mutation one atomic transaction, so a race or
+ambiguous provider result is reconciled by the next scoped call.

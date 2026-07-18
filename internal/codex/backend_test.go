@@ -648,6 +648,31 @@ func TestGitHubToolHasNoCallerControlledScopeOrCredentialFields(t *testing.T) {
 	}
 }
 
+func TestLinearTransitionToolHasOnlyBoundDestinationInput(t *testing.T) {
+	definition := linearGraphQLToolDefinition()
+	schema, ok := definition["inputSchema"].(map[string]any)
+	if !ok || schema["type"] != "object" || schema["additionalProperties"] != false {
+		t.Fatalf("schema=%#v", definition["inputSchema"])
+	}
+	properties, ok := schema["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("properties=%#v", schema["properties"])
+	}
+	for _, forbidden := range []string{"issue", "project", "team", "endpoint", "credential", "token", "state_id"} {
+		if _, exists := properties[forbidden]; exists {
+			t.Fatalf("linear tool exposed caller-controlled %q: %#v", forbidden, properties)
+		}
+	}
+	operation, ok := properties["operation"].(map[string]any)
+	if !ok {
+		t.Fatalf("operation schema=%#v", properties["operation"])
+	}
+	encoded, _ := json.Marshal(operation["enum"])
+	if !strings.Contains(string(encoded), "transition") {
+		t.Fatalf("transition operation is not advertised: %s", encoded)
+	}
+}
+
 func TestStartGrantsLinkedWorktreeMetadataOnlyToWorkspaceWriteTurns(t *testing.T) {
 	dir := t.TempDir()
 	gitMetadata := filepath.Join(t.TempDir(), "git-common")

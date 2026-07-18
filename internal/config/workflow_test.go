@@ -502,6 +502,39 @@ func TestHandoffPolicyIsOptInAndInvalidReloadRetainsLastKnownGood(t *testing.T) 
 	}
 }
 
+func TestAgentTransitionPolicyIsExactAndReloadSafe(t *testing.T) {
+	d := t.TempDir()
+	p := filepath.Join(d, "WORKFLOW.md")
+	good := "---\ntracker: {kind: linear, provider: {agent_transitions: {Todo: \"In Progress\", Merging: \"In Review\"}}, active_states: [Todo, In Progress], terminal_states: [Done]}\n---\nprompt"
+	if err := os.WriteFile(p, []byte(good), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := NewStore(p, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy := s.Current().Config.Tracker.AgentTransitions
+	if len(policy) != 2 || policy["Todo"] != "In Progress" || policy["Merging"] != "In Review" {
+		t.Fatalf("agent transition policy=%#v", policy)
+	}
+	for _, invalid := range []string{
+		"tracker: {kind: linear, provider: {agent_transitions: []}, active_states: [Todo], terminal_states: [Done]}",
+		"tracker: {kind: linear, provider: {agent_transitions: {Todo: Todo}}, active_states: [Todo], terminal_states: [Done]}",
+		"tracker: {kind: linear, provider: {agent_transitions: {Done: \"In Review\"}}, active_states: [Todo], terminal_states: [Done]}",
+		"tracker: {kind: linear, provider: {agent_transitions: {Todo: Done}}, active_states: [Todo], terminal_states: [Done]}",
+	} {
+		if err := os.WriteFile(p, []byte("---\n"+invalid+"\n---\nprompt"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Reload(); err == nil {
+			t.Fatalf("invalid agent transition policy reloaded: %s", invalid)
+		}
+		if got := s.Current().Config.Tracker.AgentTransitions["Todo"]; got != "In Progress" {
+			t.Fatalf("invalid reload replaced agent transition policy: %#v", s.Current().Config.Tracker.AgentTransitions)
+		}
+	}
+}
+
 func TestGitHubConfigurationIsOptionalScopedAndSecretBacked(t *testing.T) {
 	d := t.TempDir()
 	secret := filepath.Join(d, "github-token")

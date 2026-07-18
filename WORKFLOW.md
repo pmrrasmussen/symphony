@@ -6,6 +6,11 @@ tracker:
     project_slug_id: 6e13e4a9f215
     # Set this to an absolute path for a mode-600 file outside the repository.
     api_key_file: $SYMPHONY_LINEAR_API_KEY_FILE
+    # Exact state edges a bound Codex session may request. These are not a
+    # general destination allowlist.
+    agent_transitions:
+      Todo: In Progress
+      Merging: In Review
   active_states: [Todo, In Progress]
   terminal_states: [Done, Canceled]
 polling:

@@ -33,6 +33,12 @@ type handoffFixture struct {
 	commentIssue        string
 	commentProject      string
 	commentTeam         string
+	readAttempts        int
+	changeOnRead        int
+	changedStateID      string
+	changedStateName    string
+	postTransitionID    string
+	postTransitionName  string
 }
 
 func newHandoffFixture(t *testing.T) *handoffFixture {
@@ -74,13 +80,17 @@ func (f *handoffFixture) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	variables := request["variables"].(map[string]any)
 	switch {
 	case strings.Contains(query, "SymphonyLinearHandoffIssue"):
+		f.readAttempts++
+		if f.changeOnRead == f.readAttempts {
+			f.stateID, f.stateName = f.changedStateID, f.changedStateName
+		}
 		writeJSON(f.t, w, map[string]any{"data": map[string]any{"issue": map[string]any{
 			"id": "active", "identifier": "PMR-18", "title": "Handoff", "description": "private agent payload", "url": "https://linear.app/issue/PMR-18",
 			"project": map[string]string{"slugId": f.project}, "team": map[string]string{"id": f.team}, "state": map[string]string{"id": f.stateID, "name": f.stateName},
 		}}})
 	case strings.Contains(query, "SymphonyLinearHandoffStates"):
 		writeJSON(f.t, w, map[string]any{"data": map[string]any{"team": map[string]any{"id": "team-1", "states": map[string]any{"nodes": []any{
-			map[string]string{"id": "todo", "name": "Todo"}, map[string]string{"id": "review", "name": "In Review"}, map[string]string{"id": "done", "name": "Done"},
+			map[string]string{"id": "todo", "name": "Todo"}, map[string]string{"id": "in-progress", "name": "In Progress"}, map[string]string{"id": "merging", "name": "Merging"}, map[string]string{"id": "review", "name": "In Review"}, map[string]string{"id": "done", "name": "Done"},
 		}}}}})
 	case strings.Contains(query, "SymphonyLinearHandoffComments"):
 		nodes := make([]any, 0, len(f.comments))
@@ -124,7 +134,7 @@ func (f *handoffFixture) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		if got := variables["issueID"]; got != "active" {
 			f.t.Errorf("transition issueID=%v", got)
 		}
-		if got := variables["stateID"]; got != "review" && got != "done" {
+		if got := variables["stateID"]; got != "review" && got != "done" && got != "in-progress" {
 			f.t.Errorf("transition stateID=%v", got)
 		}
 		if f.failTransition {
@@ -134,8 +144,13 @@ func (f *handoffFixture) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		if variables["stateID"] == "done" {
 			f.stateID, f.stateName = "done", "Done"
+		} else if variables["stateID"] == "in-progress" {
+			f.stateID, f.stateName = "in-progress", "In Progress"
 		} else {
 			f.stateID, f.stateName = "review", "In Review"
+		}
+		if f.postTransitionID != "" {
+			f.stateID, f.stateName = f.postTransitionID, f.postTransitionName
 		}
 		if f.ambiguousTransition {
 			f.ambiguousTransition = false
@@ -152,6 +167,170 @@ func (f *handoffFixture) serveHTTP(w http.ResponseWriter, r *http.Request) {
 func callHandoff(session *HandoffSession) error {
 	_, err := session.Call(context.Background(), json.RawMessage(`{"operation":"handoff"}`))
 	return err
+}
+
+func callTransition(session *HandoffSession, destination string) (ToolResult, error) {
+	arguments, err := json.Marshal(map[string]string{"operation": "transition", "destination": destination})
+	if err != nil {
+		return ToolResult{}, err
+	}
+	return session.Call(context.Background(), arguments)
+}
+
+func TestAgentTransitionsAreExactScopedAndIdempotent(t *testing.T) {
+	f := newHandoffFixture(t)
+	settings := f.settings()
+	settings.Tracker.AgentTransitions = map[string]string{"Todo": "In Progress", "Merging": "In Review"}
+	session, err := NewHandoff(func() config.Settings { return settings }).Prepare(context.Background(), domain.Issue{ID: "active"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := callTransition(session, "In Progress")
+	if err != nil || !result.Success || f.stateName != "In Progress" || f.transitionAttempts != 1 {
+		t.Fatalf("result=%+v err=%v state=%s transitions=%d", result, err, f.stateName, f.transitionAttempts)
+	}
+	if _, err := callTransition(session, "In Progress"); err != nil {
+		t.Fatalf("duplicate transition: %v", err)
+	}
+	if f.transitionAttempts != 1 {
+		t.Fatalf("duplicate mutation count=%d", f.transitionAttempts)
+	}
+	for _, destination := range []string{"Todo", "In Review"} {
+		if _, err := callTransition(session, destination); err == nil {
+			t.Fatalf("accepted unconfigured/reversed destination %q", destination)
+		}
+	}
+	if _, err := session.Call(context.Background(), json.RawMessage(`{"operation":"transition","destination":"In Progress","issue":"other"}`)); err == nil {
+		t.Fatal("transition accepted caller-controlled scope")
+	}
+}
+
+func TestAgentTransitionPermitsConfiguredMergingToReviewEdge(t *testing.T) {
+	f := newHandoffFixture(t)
+	f.stateID, f.stateName = "merging", "Merging"
+	settings := f.settings()
+	settings.Tracker.HandoffState = ""
+	settings.Tracker.AgentTransitions = map[string]string{"Merging": "In Review"}
+	session, err := NewHandoff(func() config.Settings { return settings }).Prepare(context.Background(), domain.Issue{ID: "active"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := callTransition(session, "In Review"); err != nil {
+		t.Fatal(err)
+	}
+	if f.stateName != "In Review" || f.transitionAttempts != 1 {
+		t.Fatalf("state=%s transitions=%d", f.stateName, f.transitionAttempts)
+	}
+}
+
+func TestAgentTransitionsRejectTerminalStaleAndCrossScopeStates(t *testing.T) {
+	for name, mutate := range map[string]func(*handoffFixture){
+		"terminal": func(f *handoffFixture) { f.stateID, f.stateName = "done", "Done" },
+		"stale":    func(f *handoffFixture) { f.stateID, f.stateName = "old-todo", "Todo" },
+		"project":  func(f *handoffFixture) { f.project = "other-project" },
+		"team":     func(f *handoffFixture) { f.team = "other-team" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newHandoffFixture(t)
+			settings := f.settings()
+			settings.Tracker.HandoffState = ""
+			settings.Tracker.AgentTransitions = map[string]string{"Todo": "In Progress"}
+			session, err := NewHandoff(func() config.Settings { return settings }).Prepare(context.Background(), domain.Issue{ID: "active"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			mutate(f)
+			if _, err := callTransition(session, "In Progress"); err == nil {
+				t.Fatal("transition accepted invalid refreshed issue")
+			}
+			if f.transitionAttempts != 0 {
+				t.Fatalf("mutation attempts=%d", f.transitionAttempts)
+			}
+		})
+	}
+}
+
+func TestAgentTransitionsSerializeConcurrentCalls(t *testing.T) {
+	f := newHandoffFixture(t)
+	settings := f.settings()
+	settings.Tracker.AgentTransitions = map[string]string{"Todo": "In Progress"}
+	session, err := NewHandoff(func() config.Settings { return settings }).Prepare(context.Background(), domain.Issue{ID: "active"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	errs := make(chan error, 8)
+	var calls sync.WaitGroup
+	for range 8 {
+		calls.Add(1)
+		go func() {
+			defer calls.Done()
+			_, err := callTransition(session, "In Progress")
+			errs <- err
+		}()
+	}
+	calls.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if f.transitionAttempts != 1 || f.stateName != "In Progress" {
+		t.Fatalf("transitions=%d state=%s", f.transitionAttempts, f.stateName)
+	}
+}
+
+func TestAgentTransitionRespectsHumanChangesBeforeAndAfterMutation(t *testing.T) {
+	t.Run("before mutation", func(t *testing.T) {
+		f := newHandoffFixture(t)
+		f.changeOnRead, f.changedStateID, f.changedStateName = 3, "merging", "Merging"
+		settings := f.settings()
+		settings.Tracker.HandoffState = ""
+		settings.Tracker.AgentTransitions = map[string]string{"Todo": "In Progress"}
+		session, err := NewHandoff(func() config.Settings { return settings }).Prepare(context.Background(), domain.Issue{ID: "active"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := callTransition(session, "In Progress"); err == nil {
+			t.Fatal("transition succeeded after human state change")
+		}
+		if f.transitionAttempts != 0 {
+			t.Fatalf("mutation attempts=%d", f.transitionAttempts)
+		}
+	})
+	t.Run("after mutation", func(t *testing.T) {
+		f := newHandoffFixture(t)
+		f.postTransitionID, f.postTransitionName = "merging", "Merging"
+		settings := f.settings()
+		settings.Tracker.HandoffState = ""
+		settings.Tracker.AgentTransitions = map[string]string{"Todo": "In Progress"}
+		session, err := NewHandoff(func() config.Settings { return settings }).Prepare(context.Background(), domain.Issue{ID: "active"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := callTransition(session, "In Progress"); err == nil {
+			t.Fatal("transition accepted a mismatched post-mutation state")
+		}
+		if f.transitionAttempts != 1 || f.stateName != "Merging" {
+			t.Fatalf("transitions=%d state=%s", f.transitionAttempts, f.stateName)
+		}
+	})
+}
+
+func TestAgentTransitionPolicyIsFrozenForSession(t *testing.T) {
+	f := newHandoffFixture(t)
+	settings := f.settings()
+	settings.Tracker.HandoffState = ""
+	settings.Tracker.AgentTransitions = map[string]string{"Todo": "In Progress"}
+	handoff := NewHandoff(func() config.Settings { return settings })
+	session, err := handoff.Prepare(context.Background(), domain.Issue{ID: "active"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	settings.Tracker.AgentTransitions = map[string]string{"Todo": "Merging"}
+	if _, err := callTransition(session, "In Progress"); err != nil {
+		t.Fatalf("frozen policy rejected original edge: %v", err)
+	}
 }
 
 func TestHandoffSuccessAndDuplicateDeliveryAreIdempotent(t *testing.T) {
