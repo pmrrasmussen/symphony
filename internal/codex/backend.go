@@ -71,7 +71,7 @@ func (b *Backend) Start(ctx context.Context, r domain.AgentRequest) (domain.Agen
 	}
 	var handoff *linear.HandoffSession
 	var err error
-	if b.handoff != nil && strings.TrimSpace(settings.Tracker.HandoffState) != "" {
+	if b.handoff != nil && (strings.TrimSpace(settings.Tracker.HandoffState) != "" || len(settings.Tracker.AgentTransitions) > 0) {
 		handoff, err = b.handoff.PrepareWithSettings(ctx, settings, r.Issue)
 		if err != nil {
 			return domain.AgentSession{}, nil, fmt.Errorf("prepare Linear handoff: %w", err)
@@ -571,12 +571,13 @@ func (c *client) handle(x rpc) {
 func linearGraphQLToolDefinition() map[string]any {
 	return map[string]any{
 		"type": "function", "name": "linear_graphql",
-		"description": "Read the active Linear issue, move only it to the workflow-configured handoff state, or add a bounded comment only to it.",
+		"description": "Read the active Linear issue, move only it to a workflow-configured state through an exact directed edge, hand it off to review, or add a bounded comment only to it.",
 		"inputSchema": map[string]any{
 			"type": "object", "additionalProperties": false,
 			"properties": map[string]any{
-				"operation": map[string]any{"type": "string", "enum": []string{"read", "handoff", "comment"}},
-				"body":      map[string]any{"type": "string", "maxLength": 8192},
+				"operation":   map[string]any{"type": "string", "enum": []string{"read", "handoff", "comment", "transition"}},
+				"body":        map[string]any{"type": "string", "maxLength": 8192},
+				"destination": map[string]any{"type": "string", "maxLength": 256},
 			},
 			"required": []string{"operation"},
 		},

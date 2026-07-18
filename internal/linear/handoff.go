@@ -32,7 +32,8 @@ func NewHandoff(settings func() config.Settings) *Handoff {
 }
 
 func (h *Handoff) Enabled() bool {
-	return strings.TrimSpace(h.settings().Tracker.HandoffState) != ""
+	settings := h.settings()
+	return strings.TrimSpace(settings.Tracker.HandoffState) != "" || len(settings.Tracker.AgentTransitions) > 0
 }
 
 // Prepare verifies that the issue is still in the configured project, finds
@@ -45,7 +46,7 @@ func (h *Handoff) Prepare(ctx context.Context, issue domain.Issue) (*HandoffSess
 // PrepareWithSettings binds a single repository settings snapshot to the
 // session. The Codex backend calls this once before it launches the child.
 func (h *Handoff) PrepareWithSettings(ctx context.Context, s config.Settings, issue domain.Issue) (*HandoffSession, error) {
-	if strings.TrimSpace(s.Tracker.HandoffState) == "" {
+	if strings.TrimSpace(s.Tracker.HandoffState) == "" && len(s.Tracker.AgentTransitions) == 0 {
 		return nil, nil
 	}
 	if err := validateProvider(s.Tracker.Provider); err != nil {
@@ -65,39 +66,43 @@ func (h *Handoff) PrepareWithSettings(ctx context.Context, s config.Settings, is
 	if active.ID != issue.ID || active.ProjectSlug() != projectSlug || active.TeamID() == "" {
 		return nil, trackerError("handoff_scope", "active issue is outside the configured Linear project")
 	}
-	if !stateAllowed(active.State.Name, s.Tracker.ActiveStates) {
+	if strings.TrimSpace(s.Tracker.HandoffState) != "" && !stateAllowed(active.State.Name, s.Tracker.ActiveStates) && len(s.Tracker.AgentTransitions) == 0 {
 		return nil, trackerError("handoff_scope", "active issue is not in a workflow active state")
 	}
-	stateID, err := h.resolveState(ctx, s, active.TeamID(), s.Tracker.HandoffState)
-	if err != nil {
-		return nil, err
-	}
-	comment, err := s.RenderHandoffComment(active.toDomain())
-	if err != nil {
-		return nil, trackerError("invalid_handoff_config", "could not render configured handoff comment")
-	}
-	comment = strings.TrimSpace(comment)
-	if strings.TrimSpace(s.Tracker.HandoffCommentTemplate) != "" {
-		if err := validateComment(comment); err != nil {
-			return nil, trackerError("invalid_handoff_config", "rendered handoff comment is invalid")
+	stateID, comment := "", ""
+	if strings.TrimSpace(s.Tracker.HandoffState) != "" {
+		stateID, err = h.resolveState(ctx, s, active.TeamID(), s.Tracker.HandoffState)
+		if err != nil {
+			return nil, err
+		}
+		comment, err = s.RenderHandoffComment(active.toDomain())
+		if err != nil {
+			return nil, trackerError("invalid_handoff_config", "could not render configured handoff comment")
+		}
+		comment = strings.TrimSpace(comment)
+		if strings.TrimSpace(s.Tracker.HandoffCommentTemplate) != "" {
+			if err := validateComment(comment); err != nil {
+				return nil, trackerError("invalid_handoff_config", "rendered handoff comment is invalid")
+			}
 		}
 	}
 	return &HandoffSession{
 		client: h.client, settings: s, issue: active, targetStateID: stateID,
-		handoffComment: comment, logger: h.logger,
+		handoffComment: comment, agentTransitions: copyTransitions(s.Tracker.AgentTransitions), logger: h.logger,
 	}, nil
 }
 
 // HandoffSession is the fixed authority granted to one app-server session.
 // It has no method that accepts an issue, project, endpoint, or credential.
 type HandoffSession struct {
-	client         *http.Client
-	settings       config.Settings
-	issue          handoffIssue
-	targetStateID  string
-	handoffComment string
-	logger         *slog.Logger
-	handoffMu      sync.Mutex
+	client           *http.Client
+	settings         config.Settings
+	issue            handoffIssue
+	targetStateID    string
+	handoffComment   string
+	agentTransitions map[string]string
+	logger           *slog.Logger
+	handoffMu        sync.Mutex
 }
 
 // MatchesSecret lets the Codex launcher remove inherited values containing the
@@ -113,7 +118,18 @@ type ToolResult struct {
 	Data    any
 }
 
-// Call accepts only the three typed tool operations. json.RawMessage exists so
+func copyTransitions(source map[string]string) map[string]string {
+	if source == nil {
+		return nil
+	}
+	copy := make(map[string]string, len(source))
+	for from, to := range source {
+		copy[strings.ToLower(strings.TrimSpace(from))] = strings.TrimSpace(to)
+	}
+	return copy
+}
+
+// Call accepts only the four typed tool operations. json.RawMessage exists so
 // Codex protocol decoding stays in its adapter; this function never accepts a
 // GraphQL document or arbitrary target identifiers.
 func (s *HandoffSession) Call(ctx context.Context, arguments json.RawMessage) (ToolResult, error) {
@@ -122,13 +138,14 @@ func (s *HandoffSession) Call(ctx context.Context, arguments json.RawMessage) (T
 		return ToolResult{}, trackerError("handoff_request", "tool arguments must be a JSON object")
 	}
 	for key := range raw {
-		if key != "operation" && key != "body" {
+		if key != "operation" && key != "body" && key != "destination" {
 			return ToolResult{}, trackerError("handoff_request", "tool arguments contain an unsupported field")
 		}
 	}
 	var input struct {
-		Operation string `json:"operation"`
-		Body      string `json:"body"`
+		Operation   string `json:"operation"`
+		Body        string `json:"body"`
+		Destination string `json:"destination"`
 	}
 	if err := json.Unmarshal(arguments, &input); err != nil || strings.TrimSpace(input.Operation) == "" {
 		return ToolResult{}, trackerError("handoff_request", "tool arguments have invalid field types")
@@ -136,13 +153,13 @@ func (s *HandoffSession) Call(ctx context.Context, arguments json.RawMessage) (T
 	operation := strings.TrimSpace(input.Operation)
 	switch operation {
 	case "read":
-		if strings.TrimSpace(input.Body) != "" {
-			return ToolResult{}, trackerError("handoff_request", "read does not accept body")
+		if strings.TrimSpace(input.Body) != "" || strings.TrimSpace(input.Destination) != "" {
+			return ToolResult{}, trackerError("handoff_request", "read does not accept input")
 		}
 		return ToolResult{Success: true, Data: s.issue.metadata()}, nil
 	case "handoff":
-		if strings.TrimSpace(input.Body) != "" {
-			return ToolResult{}, trackerError("handoff_request", "handoff does not accept body")
+		if strings.TrimSpace(input.Body) != "" || strings.TrimSpace(input.Destination) != "" {
+			return ToolResult{}, trackerError("handoff_request", "handoff does not accept input")
 		}
 		if err := s.handoff(ctx); err != nil {
 			s.log("handoff_failed")
@@ -151,6 +168,9 @@ func (s *HandoffSession) Call(ctx context.Context, arguments json.RawMessage) (T
 		s.log("handoff_complete")
 		return ToolResult{Success: true, Data: map[string]any{"issue": s.issue.metadata(), "handoff_state": s.settings.Tracker.HandoffState}}, nil
 	case "comment":
+		if strings.TrimSpace(input.Destination) != "" {
+			return ToolResult{}, trackerError("handoff_request", "comment does not accept destination")
+		}
 		body := strings.TrimSpace(input.Body)
 		if err := validateComment(body); err != nil {
 			return ToolResult{}, err
@@ -162,9 +182,145 @@ func (s *HandoffSession) Call(ctx context.Context, arguments json.RawMessage) (T
 			return ToolResult{}, err
 		}
 		return ToolResult{Success: true, Data: map[string]any{"issue": s.issue.metadata(), "commented": true}}, nil
+	case "transition":
+		if strings.TrimSpace(input.Body) != "" {
+			return ToolResult{}, trackerError("handoff_request", "transition does not accept body")
+		}
+		destination := strings.TrimSpace(input.Destination)
+		if destination == "" {
+			return ToolResult{}, trackerError("handoff_request", "transition destination is required")
+		}
+		issue, err := s.agentTransition(ctx, destination)
+		if err != nil {
+			return ToolResult{}, err
+		}
+		return ToolResult{Success: true, Data: map[string]any{"issue": issue.metadata(), "transition_state": issue.State.Name}}, nil
 	default:
 		return ToolResult{}, trackerError("handoff_request", "unsupported linear handoff operation")
 	}
+}
+
+// agentTransition performs one configured exact edge. It deliberately has no
+// issue, project, team, endpoint, or credential input: the session owns all
+// of those values and refreshes the bound issue before and after the mutation.
+// Linear has no cross-system transaction with the worker, so an ambiguous
+// result is reconciled by the next bounded call.
+func (s *HandoffSession) agentTransition(ctx context.Context, destination string) (handoffIssue, error) {
+	s.handoffMu.Lock()
+	defer s.handoffMu.Unlock()
+	current, err := s.readScopedIssue(ctx)
+	if err != nil {
+		return handoffIssue{}, err
+	}
+	if s.isTransitionDestination(current, destination) {
+		s.issue = current
+		return current, nil
+	}
+	if _, err := s.validateTransition(ctx, current, destination); err != nil {
+		return handoffIssue{}, err
+	}
+
+	// The second read closes the human-change window as far as Linear's API
+	// permits. It cannot be atomic with the mutation, which is why successful
+	// writes are always followed by another scoped read below.
+	current, err = s.readScopedIssue(ctx)
+	if err != nil {
+		return handoffIssue{}, err
+	}
+	if s.isTransitionDestination(current, destination) {
+		s.issue = current
+		return current, nil
+	}
+	targetID, err := s.validateTransition(ctx, current, destination)
+	if err != nil {
+		return handoffIssue{}, err
+	}
+	if err := s.transitionTo(ctx, targetID); err != nil {
+		return handoffIssue{}, err
+	}
+	updated, err := s.readScopedIssue(ctx)
+	if err != nil {
+		return handoffIssue{}, err
+	}
+	if !s.isState(updated, targetID, destination) {
+		return handoffIssue{}, trackerError("handoff_response", "Linear did not apply the configured transition")
+	}
+	s.issue = updated
+	s.log("agent_transition_complete")
+	return updated, nil
+}
+
+func (s *HandoffSession) isTransitionDestination(issue handoffIssue, destination string) bool {
+	if !strings.EqualFold(strings.TrimSpace(issue.State.Name), strings.TrimSpace(destination)) {
+		return false
+	}
+	for _, configured := range s.agentTransitions {
+		if strings.EqualFold(strings.TrimSpace(configured), strings.TrimSpace(destination)) {
+			return true
+		}
+	}
+	return false
+}
+
+// validateTransition resolves both current and target states in the active
+// issue's team on every call. Matching names alone is insufficient because a
+// stale or cross-team state ID must never be sent to Linear.
+func (s *HandoffSession) validateTransition(ctx context.Context, current handoffIssue, destination string) (string, error) {
+	if stateAllowed(current.State.Name, s.settings.Tracker.TerminalStates) {
+		return "", trackerError("handoff_scope", "active issue is in a terminal state")
+	}
+	target, ok := s.agentTransitions[strings.ToLower(strings.TrimSpace(current.State.Name))]
+	if !ok || !strings.EqualFold(target, destination) {
+		return "", trackerError("handoff_scope", "requested Linear transition is not configured for the active issue state")
+	}
+	if stateAllowed(target, s.settings.Tracker.TerminalStates) {
+		return "", trackerError("handoff_scope", "configured Linear transition targets a terminal state")
+	}
+	states, err := s.resolveTeamStates(ctx, current.TeamID())
+	if err != nil {
+		return "", err
+	}
+	sourceID, sourceOK := states[strings.ToLower(strings.TrimSpace(current.State.Name))]
+	targetID, targetOK := states[strings.ToLower(strings.TrimSpace(target))]
+	if !sourceOK || sourceID != current.StateID() || !targetOK {
+		return "", trackerError("handoff_scope", "configured Linear transition is stale or outside the active issue team")
+	}
+	return targetID, nil
+}
+
+func (s *HandoffSession) resolveTeamStates(ctx context.Context, teamID string) (map[string]string, error) {
+	response, err := requestWithSettings(ctx, s.client, s.settings, handoffStatesQuery, map[string]any{"teamID": teamID})
+	if err != nil {
+		return nil, err
+	}
+	var payload struct {
+		Data struct {
+			Team *struct {
+				ID     string `json:"id"`
+				States struct {
+					Nodes []struct {
+						ID   string `json:"id"`
+						Name string `json:"name"`
+					} `json:"nodes"`
+				} `json:"states"`
+			} `json:"team"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(response, &payload); err != nil || payload.Data.Team == nil || strings.TrimSpace(payload.Data.Team.ID) != strings.TrimSpace(teamID) {
+		return nil, trackerError("handoff_scope", "Linear did not return the active issue team")
+	}
+	states := make(map[string]string, len(payload.Data.Team.States.Nodes))
+	for _, state := range payload.Data.Team.States.Nodes {
+		name, id := strings.ToLower(strings.TrimSpace(state.Name)), strings.TrimSpace(state.ID)
+		if name == "" || id == "" {
+			return nil, trackerError("handoff_scope", "Linear returned an invalid active issue team state")
+		}
+		if _, exists := states[name]; exists {
+			return nil, trackerError("handoff_scope", "Linear returned ambiguous active issue team states")
+		}
+		states[name] = id
+	}
+	return states, nil
 }
 
 // handoff coordinates the repository-owned completion comment and transition.
@@ -348,6 +504,10 @@ func (s *HandoffSession) isInitialState(issue handoffIssue) bool {
 
 func (s *HandoffSession) isTargetState(issue handoffIssue) bool {
 	return issue.StateID() == s.targetStateID && strings.EqualFold(strings.TrimSpace(issue.State.Name), strings.TrimSpace(s.settings.Tracker.HandoffState))
+}
+
+func (s *HandoffSession) isState(issue handoffIssue, stateID, stateName string) bool {
+	return issue.StateID() == strings.TrimSpace(stateID) && strings.EqualFold(strings.TrimSpace(issue.State.Name), strings.TrimSpace(stateName))
 }
 
 func stateAllowed(state string, allowed []string) bool {

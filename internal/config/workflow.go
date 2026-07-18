@@ -60,6 +60,7 @@ type Tracker struct {
 	Provider                                     map[string]any
 	RequiredLabels, ActiveStates, TerminalStates []string
 	HandoffState, HandoffCommentTemplate         string
+	AgentTransitions                             map[string]string
 }
 
 type Polling struct{ Interval time.Duration }
@@ -208,6 +209,10 @@ func decode(raw map[string]any, base, path, logRoot string, sources *sourceSnaps
 	if err != nil {
 		return Settings{}, err
 	}
+	agentTransitions, err := agentTransitionPolicy(resolvedProvider, terminalStates)
+	if err != nil {
+		return Settings{}, err
+	}
 
 	pollInterval, err := durationMS(polling, "interval_ms", 30_000)
 	if err != nil {
@@ -297,6 +302,7 @@ func decode(raw map[string]any, base, path, logRoot string, sources *sourceSnaps
 			TerminalStates:         terminalStates,
 			HandoffState:           handoffState,
 			HandoffCommentTemplate: handoffCommentTemplate,
+			AgentTransitions:       agentTransitions,
 		},
 		Polling:   Polling{Interval: pollInterval},
 		Workspace: Workspace{Root: workspaceRoot, SourceRoot: sourceRoot},
@@ -509,6 +515,52 @@ func handoffPolicy(provider map[string]any, activeStates, terminalStates []strin
 	return state, comment, nil
 }
 
+// agentTransitionPolicy parses the repository-owned exact state edges exposed
+// to a Codex session. A mapping deliberately expresses one destination per
+// source; it is not a destination allowlist that could permit reverse edges.
+func agentTransitionPolicy(provider map[string]any, terminalStates []string) (map[string]string, error) {
+	value, exists := provider["agent_transitions"]
+	if !exists {
+		return nil, nil
+	}
+	edges, ok := value.(map[string]any)
+	if !ok || len(edges) == 0 {
+		return nil, errors.New("invalid configuration: tracker.provider.agent_transitions must be a non-empty object")
+	}
+	result := make(map[string]string, len(edges))
+	seen := make(map[string]struct{}, len(edges))
+	for sourceValue, targetValue := range edges {
+		source := strings.TrimSpace(sourceValue)
+		target, ok := targetValue.(string)
+		target = strings.TrimSpace(target)
+		if source == "" || !ok || target == "" {
+			return nil, errors.New("invalid configuration: tracker.provider.agent_transitions entries must map non-empty state names to non-empty state names")
+		}
+		key := strings.ToLower(source)
+		if _, duplicate := seen[key]; duplicate {
+			return nil, errors.New("invalid configuration: tracker.provider.agent_transitions has duplicate source states")
+		}
+		seen[key] = struct{}{}
+		if strings.EqualFold(source, target) {
+			return nil, errors.New("invalid configuration: tracker.provider.agent_transitions must not contain same-state edges")
+		}
+		if stateInList(source, terminalStates) || stateInList(target, terminalStates) {
+			return nil, errors.New("invalid configuration: tracker.provider.agent_transitions must not contain terminal states")
+		}
+		result[source] = target
+	}
+	return result, nil
+}
+
+func stateInList(state string, states []string) bool {
+	for _, candidate := range states {
+		if strings.EqualFold(strings.TrimSpace(state), strings.TrimSpace(candidate)) {
+			return true
+		}
+	}
+	return false
+}
+
 // Render renders a prompt for one run. The first run has a nil attempt;
 // retries and continuations receive the spec's 1-based attempt number.
 func (s Settings) Render(issue any, attempt int) (string, error) {
@@ -664,6 +716,7 @@ func cloneWorkflow(w Workflow) Workflow {
 	w.Config.Tracker.RequiredLabels = append([]string(nil), w.Config.Tracker.RequiredLabels...)
 	w.Config.Tracker.ActiveStates = append([]string(nil), w.Config.Tracker.ActiveStates...)
 	w.Config.Tracker.TerminalStates = append([]string(nil), w.Config.Tracker.TerminalStates...)
+	w.Config.Tracker.AgentTransitions = cloneStringMap(w.Config.Tracker.AgentTransitions)
 	w.Config.HostSecretEnvNames = append([]string(nil), w.Config.HostSecretEnvNames...)
 	w.Config.HostSecretValues = append([]string(nil), w.Config.HostSecretValues...)
 	w.Config.Warnings = append([]string(nil), w.Config.Warnings...)
@@ -674,6 +727,17 @@ func cloneWorkflow(w Workflow) Workflow {
 	}
 	w.Config.Codex.TurnSandboxPolicy = cloneValue(w.Config.Codex.TurnSandboxPolicy)
 	return w
+}
+
+func cloneStringMap(source map[string]string) map[string]string {
+	if source == nil {
+		return nil
+	}
+	copy := make(map[string]string, len(source))
+	for key, value := range source {
+		copy[key] = value
+	}
+	return copy
 }
 
 func cloneMap(source map[string]any) map[string]any {
