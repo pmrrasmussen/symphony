@@ -38,6 +38,7 @@ type Settings struct {
 	Codex              Codex
 	GitHub             GitHub
 	HostSecretEnvNames []string
+	HostSecretValues   []string
 	WorkflowPath       string
 	LogRoot            string
 	Prompt             string
@@ -307,6 +308,7 @@ func decode(raw map[string]any, base, path, logRoot string, sources *sourceSnaps
 		// credentials. The Codex launcher uses this metadata to prevent those
 		// variables from crossing the child-process boundary.
 		HostSecretEnvNames: hostSecretEnvNames(provider, github),
+		HostSecretValues:   hostSecretValues(resolvedProvider, github, base, sources),
 		Warnings:           providerWarnings,
 	}
 	if s.Tracker.Kind != "linear" {
@@ -411,6 +413,44 @@ func hostSecretEnvNames(provider, github map[string]any) []string {
 	out := make([]string, 0, len(names))
 	for name := range names {
 		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// hostSecretValues keeps the resolved credentials needed to remove inherited
+// values from the Codex environment. It deliberately includes an optional
+// GitHub token even when the GitHub integration is disabled: configuration
+// validity must not decide whether a host credential crosses the boundary.
+func hostSecretValues(provider, github map[string]any, base string, sources *sourceSnapshot) []string {
+	values := map[string]struct{}{}
+	add := func(value string) {
+		if value = strings.TrimSpace(value); value != "" {
+			values[value] = struct{}{}
+		}
+	}
+	if value, ok := provider["api_key"].(string); ok {
+		add(value)
+	}
+	if github != nil {
+		if file, ok := github["token_file"].(string); ok {
+			if expanded, err := sources.expand(file, "github.token_file"); err == nil && strings.TrimSpace(expanded) != "" {
+				if content, err := sources.readFile(normalizePath(expanded, base)); err == nil {
+					add(string(content))
+				}
+			}
+		} else if token, ok := github["token"].(string); ok && strings.HasPrefix(token, "$") {
+			if expanded, err := sources.expand(token, "github.token"); err == nil {
+				add(expanded)
+			}
+		}
+	}
+	if len(values) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(values))
+	for value := range values {
+		out = append(out, value)
 	}
 	sort.Strings(out)
 	return out
@@ -625,6 +665,7 @@ func cloneWorkflow(w Workflow) Workflow {
 	w.Config.Tracker.ActiveStates = append([]string(nil), w.Config.Tracker.ActiveStates...)
 	w.Config.Tracker.TerminalStates = append([]string(nil), w.Config.Tracker.TerminalStates...)
 	w.Config.HostSecretEnvNames = append([]string(nil), w.Config.HostSecretEnvNames...)
+	w.Config.HostSecretValues = append([]string(nil), w.Config.HostSecretValues...)
 	w.Config.Warnings = append([]string(nil), w.Config.Warnings...)
 	byState := w.Config.Agent.ByState
 	w.Config.Agent.ByState = make(map[string]int, len(byState))

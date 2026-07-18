@@ -28,12 +28,22 @@ type Backend struct {
 	mu          sync.Mutex
 	sessions    map[string]*client
 	secretNames []string
+	settings    func() config.Settings
 	handoff     *linear.Handoff
 	github      *githubhost.Manager
 }
 
+var reservedSecretEnvNames = []string{
+	"LINEAR_API_KEY",
+	"SYMPHONY_LINEAR_API_KEY_FILE",
+	"GITHUB_TOKEN",
+	"SYMPHONY_GITHUB_TOKEN",
+	"SYMPHONY_GITHUB_TOKEN_FILE",
+}
+
 func New(secretNames ...string) *Backend {
-	return &Backend{sessions: map[string]*client{}, secretNames: secretNames}
+	names := append(append([]string(nil), reservedSecretEnvNames...), secretNames...)
+	return &Backend{sessions: map[string]*client{}, secretNames: uniquePaths(names)}
 }
 
 // NewWithLinearHandoff enables the sole supported client-side tool. The
@@ -41,6 +51,7 @@ func New(secretNames ...string) *Backend {
 // session-bound capability once the policy has been validated.
 func NewWithLinearHandoff(settings func() config.Settings, secretNames ...string) *Backend {
 	b := New(secretNames...)
+	b.settings = settings
 	b.handoff = linear.NewHandoff(settings)
 	return b
 }
@@ -54,10 +65,14 @@ func NewWithIntegrations(settings func() config.Settings, logger *slog.Logger, s
 	return b, manager
 }
 func (b *Backend) Start(ctx context.Context, r domain.AgentRequest) (domain.AgentSession, <-chan domain.Event, error) {
+	settings := config.Settings{}
+	if b.settings != nil {
+		settings = b.settings()
+	}
 	var handoff *linear.HandoffSession
 	var err error
-	if b.handoff != nil && b.handoff.Enabled() {
-		handoff, err = b.handoff.Prepare(ctx, r.Issue)
+	if b.handoff != nil && strings.TrimSpace(settings.Tracker.HandoffState) != "" {
+		handoff, err = b.handoff.PrepareWithSettings(ctx, settings, r.Issue)
 		if err != nil {
 			return domain.AgentSession{}, nil, fmt.Errorf("prepare Linear handoff: %w", err)
 		}
@@ -65,7 +80,7 @@ func (b *Backend) Start(ctx context.Context, r domain.AgentRequest) (domain.Agen
 	var secretMatcher func(string) bool
 	var githubSession *githubhost.Session
 	if b.github != nil {
-		githubSession = b.github.Prepare(r.Issue, r.Workspace, handoff)
+		githubSession = b.github.PrepareWithSettings(settings.GitHub, r.Issue, r.Workspace, handoff)
 	}
 	if handoff != nil || b.github != nil {
 		secretMatcher = func(candidate string) bool {
@@ -73,7 +88,9 @@ func (b *Backend) Start(ctx context.Context, r domain.AgentRequest) (domain.Agen
 		}
 	}
 	r.TurnSandboxPolicy = localCommitSandbox(r)
-	c, err := start(ctx, r, b.secretNames, secretMatcher, handoff, githubSession)
+	secretNames := append(append([]string(nil), b.secretNames...), settings.HostSecretEnvNames...)
+	secretMatcher = withSecretValues(secretMatcher, settings.HostSecretValues)
+	c, err := start(ctx, r, secretNames, secretMatcher, handoff, githubSession)
 	if err != nil {
 		return domain.AgentSession{}, nil, err
 	}
@@ -197,7 +214,7 @@ func start(ctx context.Context, r domain.AgentRequest, secrets []string, secretM
 	if command == "" {
 		command = "codex app-server"
 	}
-	cmd := exec.CommandContext(ctx, "sh", "-lc", "exec "+command)
+	cmd := exec.CommandContext(ctx, "bash", "-lc", command)
 	cmd.Dir = r.Workspace
 	cmd.Env = filteredEnv(secrets, secretMatcher)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -326,6 +343,23 @@ func filteredEnv(names []string, secretMatcher func(string) bool) []string {
 		}
 	}
 	return out
+}
+
+func withSecretValues(matcher func(string) bool, values []string) func(string) bool {
+	if len(values) == 0 {
+		return matcher
+	}
+	return func(candidate string) bool {
+		if matcher != nil && matcher(candidate) {
+			return true
+		}
+		for _, value := range values {
+			if value != "" && strings.Contains(candidate, value) {
+				return true
+			}
+		}
+		return false
+	}
 }
 func (c *client) call(ctx context.Context, method string, params any) (map[string]any, error) {
 	if c.readTimeout > 0 {
@@ -574,9 +608,7 @@ func (c *client) handleToolCall(x rpc) {
 		}
 		result, err := c.github.Publish(c.ctx)
 		if err != nil {
-			if c.sendServerResponse(x.ID, map[string]any{"success": false, "contentItems": []any{map[string]any{"type": "inputText", "text": "GitHub pull request publication was rejected."}}}) {
-				c.emit(domain.Event{Kind: domain.EventBlocked, At: time.Now(), Message: "Codex GitHub publication request was rejected"})
-			}
+			c.toolFailure(x.ID, "GitHub pull request publication was rejected.")
 			return
 		}
 		content, _ := json.Marshal(map[string]any{"branch": result.Branch, "pull_request": result.URL, "number": result.Number})
@@ -592,10 +624,7 @@ func (c *client) handleToolCall(x rpc) {
 		// Do not return provider errors, issue data, or any credential-derived
 		// value to the child. The generic response is enough for the model to
 		// choose another path, while the normalized event informs the scheduler.
-		if !c.sendServerResponse(x.ID, map[string]any{"success": false, "contentItems": []any{map[string]any{"type": "inputText", "text": "Linear handoff request was rejected."}}}) {
-			return
-		}
-		c.emit(domain.Event{Kind: domain.EventBlocked, At: time.Now(), Message: "Codex Linear handoff request was rejected"})
+		c.toolFailure(x.ID, "Linear handoff request was rejected.")
 		return
 	}
 	text, err := json.Marshal(result.Data)
@@ -607,10 +636,14 @@ func (c *client) handleToolCall(x rpc) {
 }
 
 func (c *client) unsupportedTool(id any) {
-	if !c.sendServerResponse(id, map[string]any{"success": false, "contentItems": []any{map[string]any{"type": "inputText", "text": "Unsupported client-side tool."}}}) {
-		return
-	}
-	c.emit(domain.Event{Kind: domain.EventBlocked, At: time.Now(), Message: "Codex requested an unsupported client-side tool"})
+	c.toolFailure(id, "Unsupported client-side tool.")
+}
+
+// Tool failures are normal app-server responses: the model can inspect the
+// structured rejection and keep working in the same turn. EventBlocked is
+// reserved for interactive approval or user-input requests.
+func (c *client) toolFailure(id any, message string) {
+	c.sendServerResponse(id, map[string]any{"success": false, "contentItems": []any{map[string]any{"type": "inputText", "text": message}}})
 }
 func (c *client) sendServerResponse(id, result any) bool {
 	if err := c.send(map[string]any{"jsonrpc": "2.0", "id": id, "result": result}); err != nil {

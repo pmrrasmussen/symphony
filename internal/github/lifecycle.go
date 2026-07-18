@@ -89,7 +89,12 @@ func (m *Manager) MatchesSecret(candidate string) bool {
 
 // Prepare freezes all authority for one active issue and worktree.
 func (m *Manager) Prepare(issue domain.Issue, workspace string, handoff *linear.HandoffSession) *Session {
-	s := m.settings().GitHub
+	return m.PrepareWithSettings(m.settings().GitHub, issue, workspace, handoff)
+}
+
+// PrepareWithSettings freezes the host capability to the same configuration
+// snapshot that selected the other Codex session capabilities.
+func (m *Manager) PrepareWithSettings(s config.GitHub, issue domain.Issue, workspace string, handoff *linear.HandoffSession) *Session {
 	if !s.Enabled || handoff == nil || strings.TrimSpace(issue.ID) == "" || strings.TrimSpace(issue.Identifier) == "" || strings.TrimSpace(workspace) == "" {
 		return nil
 	}
