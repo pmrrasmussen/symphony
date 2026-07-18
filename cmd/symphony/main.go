@@ -49,8 +49,11 @@ func main() {
 	defer f.Close()
 	log := observability.New(slog.NewJSONHandler(f, &slog.HandlerOptions{Level: slog.LevelInfo}), os.Stderr)
 	settings := func() config.Settings {
-		if err := store.Reload(); err != nil {
+		changed, err := store.ReloadIfChanged()
+		if err != nil {
 			log.Error("workflow reload rejected; retaining last valid configuration", "error", err)
+		} else if changed {
+			log.Info("workflow configuration reloaded")
 		}
 		return store.Current().Config
 	}

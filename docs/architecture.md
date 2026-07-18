@@ -15,11 +15,23 @@ the host process and are removed from Codex's environment.
 The loader validates the supported core front-matter fields but preserves
 unknown extension keys for forward compatibility. It applies documented
 defaults, resolves explicit `$VARNAME` references only for documented secret
-and path fields, and normalizes paths relative to the workflow file. Valid
-changes take effect for future work without a restart; invalid reloads retain
-the last known good configuration. Prompts render strictly per run with
-lowercase `issue` and nullable `attempt` variables, so template failures do
-not prevent polling or configuration reload.
+and path fields, rejects ambiguous expansion syntax, and normalizes paths
+relative to the workflow file. A candidate snapshots environment values and
+reads each referenced file once before it is validated and atomically
+published. The reload fingerprint includes those dependencies; an environment
+or secret-file correction therefore retries a rejected workflow without an
+unrelated file edit. Readers receive defensive copies of the last complete
+snapshot, and invalid reloads retain that snapshot. Prompts render strictly per
+run with lowercase `issue` and nullable `attempt` variables, so template
+failures do not prevent polling or configuration reload.
+
+Successful reloads affect settings reads which begin after publication. Future
+polls and run launches therefore use the new states, intervals, limits, hooks,
+paths, and Codex settings. A Codex process already launched keeps its captured
+command, sandbox, and timeout values; concurrency changes do not evict it, but
+subsequent reconciliation still applies the current state and stall policy.
+The process log destination is selected by `--logs-root` at startup rather than
+by reloadable workflow policy.
 
 Authoritative durable state is Linear plus the workspace tree under the
 configured root.  In-memory claims are rebuilt after restart; startup cleans
