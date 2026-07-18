@@ -1,13 +1,19 @@
 package codex
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -53,6 +59,311 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"
 	}
 	if started.SessionID != session.ID || started.ThreadID != session.ThreadID || started.TurnID != session.TurnID || started.PID <= 0 {
 		t.Fatalf("session-start event=%+v session=%+v", started, session)
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		b.mu.Lock()
+		_, retained := b.sessions[session.ID]
+		b.mu.Unlock()
+		if !retained {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("exited app-server session was retained")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestStartDrainsStderrBeforeProcessFinalization(t *testing.T) {
+	dir := t.TempDir()
+	script := writeAppServer(t, dir, `
+printf '%s\n' 'token=do-not-log-this' >&2
+`)
+	c, err := start(context.Background(), request(dir, script), nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-c.done
+	c.mu.Lock()
+	diagnostics := append([]domain.Event(nil), c.diagnostics...)
+	c.mu.Unlock()
+	seenDiagnostic := false
+	for _, event := range diagnostics {
+		seenDiagnostic = seenDiagnostic || redactedDiagnostic(event)
+	}
+	if !seenDiagnostic {
+		t.Fatalf("retained diagnostics=%+v", diagnostics)
+	}
+}
+
+func TestReadRoutesServerRequestBeforeCollidingResponseID(t *testing.T) {
+	responses := make(chan callResult, 1)
+	events := make(chan domain.Event, 32)
+	c := &client{pending: map[int]chan callResult{1: responses}, active: events, activeReady: true, done: make(chan struct{})}
+	input := strings.NewReader("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"account/rateLimits/updated\",\"params\":{\"remaining\":9}}\n" +
+		"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\n")
+	if err := c.read(input); err != nil {
+		t.Fatal(err)
+	}
+	result := <-responses
+	if result.err != nil || !bytes.Contains(result.rpc.Result, []byte(`"ok":true`)) {
+		t.Fatalf("response=%+v", result)
+	}
+	select {
+	case event := <-events:
+		if event.Kind != domain.EventRateLimit {
+			t.Fatalf("event=%+v", event)
+		}
+	default:
+		t.Fatal("colliding server request was consumed as a response")
+	}
+}
+
+func TestCallRemovesPendingRequestOnTimeoutAndWriteFailure(t *testing.T) {
+	t.Run("timeout", func(t *testing.T) {
+		c := bareClient(nopWriteCloser{Writer: io.Discard})
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		defer cancel()
+		_, err := c.call(ctx, "initialize", map[string]any{})
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("error=%v", err)
+		}
+		if got := pendingCount(c); got != 0 {
+			t.Fatalf("pending=%d want 0", got)
+		}
+	})
+	t.Run("write failure fails all", func(t *testing.T) {
+		c := bareClient(failingWriteCloser{})
+		other := make(chan callResult, 1)
+		c.pending[99] = other
+		_, err := c.call(context.Background(), "initialize", map[string]any{})
+		if err == nil || !strings.Contains(err.Error(), "write failed") {
+			t.Fatalf("error=%v", err)
+		}
+		if got := pendingCount(c); got != 0 {
+			t.Fatalf("pending=%d want 0", got)
+		}
+		if result := <-other; result.err == nil {
+			t.Fatal("concurrent pending request was not failed")
+		}
+	})
+}
+
+func TestReadClassifiesMalformedAndOversizedStdout(t *testing.T) {
+	c := bareClient(nopWriteCloser{Writer: io.Discard})
+	if err := c.read(strings.NewReader("not-json\n")); err == nil || !strings.Contains(err.Error(), "malformed app-server message") {
+		t.Fatalf("malformed error=%v", err)
+	}
+	oversized := strings.NewReader(strings.Repeat("x", (1<<20)+1))
+	if err := c.read(oversized); err == nil || !strings.Contains(err.Error(), "stdout scanner failed") {
+		t.Fatalf("scanner error=%v", err)
+	}
+}
+
+func TestMalformedResponseFailsPendingRequest(t *testing.T) {
+	response := make(chan callResult, 1)
+	c := bareClient(nopWriteCloser{Writer: io.Discard})
+	c.pending[1] = response
+	err := c.read(strings.NewReader("{\"jsonrpc\":\"2.0\",\"id\":1}\n"))
+	if err == nil || !strings.Contains(err.Error(), "missing result and error") {
+		t.Fatalf("read error=%v", err)
+	}
+	if result := <-response; result.err == nil || !strings.Contains(result.err.Error(), "missing result and error") {
+		t.Fatalf("pending result=%+v", result)
+	}
+}
+
+func TestMalformedResultFailsAllPendingRequests(t *testing.T) {
+	c := bareClient(nopWriteCloser{Writer: io.Discard})
+	other := make(chan callResult, 1)
+	c.pending[99] = other
+	callDone := make(chan error, 1)
+	go func() {
+		_, err := c.call(context.Background(), "initialize", map[string]any{})
+		callDone <- err
+	}()
+	deadline := time.Now().Add(time.Second)
+	var response chan callResult
+	for response == nil {
+		c.mu.Lock()
+		response = c.pending[1]
+		if response != nil {
+			delete(c.pending, 1)
+		}
+		c.mu.Unlock()
+		if response == nil {
+			if time.Now().After(deadline) {
+				t.Fatal("request was not registered")
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+	response <- callResult{rpc: rpc{Result: json.RawMessage(`[]`)}}
+	if err := <-callDone; err == nil || !strings.Contains(err.Error(), "malformed initialize response") {
+		t.Fatalf("call error=%v", err)
+	}
+	if result := <-other; result.err == nil {
+		t.Fatal("other pending request was not failed")
+	}
+}
+
+func TestFinishFailsPendingAndDeliversTerminalIntoFullBuffer(t *testing.T) {
+	c := bareClient(nopWriteCloser{Writer: io.Discard})
+	events := make(chan domain.Event, 32)
+	c.active = events
+	c.activeDone = make(chan struct{})
+	c.activeReady = true
+	pending := make(chan callResult, 1)
+	c.pending[1] = pending
+	for i := 0; i < 100; i++ {
+		c.emit(domain.Event{Kind: domain.EventProgress, Message: fmt.Sprintf("progress-%d", i)})
+	}
+	c.finish(errors.New("codex test process exit"))
+	if result := <-pending; result.err == nil {
+		t.Fatal("pending request was not failed")
+	}
+	var last domain.Event
+	count := 0
+	for event := range events {
+		last = event
+		count++
+	}
+	if count != 32 || last.Kind != domain.EventFailed || !strings.Contains(last.Message, "process exit") {
+		t.Fatalf("event count=%d last=%+v", count, last)
+	}
+}
+
+func TestFinishDefersTerminalUntilTurnActivation(t *testing.T) {
+	c := bareClient(nopWriteCloser{Writer: io.Discard})
+	events := make(chan domain.Event, 32)
+	c.active = events
+	c.activeDone = make(chan struct{})
+	c.finish(errors.New("codex process exited immediately after turn start"))
+	select {
+	case _, ok := <-events:
+		if !ok {
+			t.Fatal("pre-ready event stream closed before session activation")
+		}
+		t.Fatal("pre-ready event stream emitted before session activation")
+	default:
+	}
+	session := domain.AgentSession{ID: "thread-turn", ThreadID: "thread", TurnID: "turn"}
+	c.activate(events, session, 123)
+	var kinds []domain.EventKind
+	for event := range events {
+		kinds = append(kinds, event.Kind)
+	}
+	if len(kinds) != 2 || kinds[0] != domain.EventSessionStarted || kinds[1] != domain.EventFailed {
+		t.Fatalf("events=%v", kinds)
+	}
+}
+
+func TestDrainContinuesAfterOversizedDiagnostic(t *testing.T) {
+	var messages []string
+	err := drain(strings.NewReader(strings.Repeat("x", observability.MaxDiagnosticBytes*3)+"\ntoken=secret-value\n"), func(message string) {
+		messages = append(messages, observability.Text(message))
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(messages) != 2 || messages[0] != "stderr diagnostic exceeded limit" || !strings.Contains(messages[1], "[REDACTED]") || strings.Contains(messages[1], "secret-value") {
+		t.Fatalf("messages=%q", messages)
+	}
+}
+
+func TestStartFailsPromptlyWhenProcessExitsWithPendingRequest(t *testing.T) {
+	dir := t.TempDir()
+	script := writeAppServer(t, dir, `
+IFS= read -r line
+exit 7
+`)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, _, err := New().Start(ctx, request(dir, script))
+	if err == nil || !strings.Contains(err.Error(), "process exited") {
+		t.Fatalf("error=%v", err)
+	}
+}
+
+func TestProcessExitAndTurnTimeoutDeliverTerminalFailure(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		afterStart  string
+		turnTimeout time.Duration
+		want        string
+	}{
+		{name: "process exit", afterStart: "exit 9", turnTimeout: time.Minute, want: "process exited"},
+		{name: "turn timeout", afterStart: "sleep 30", turnTimeout: 30 * time.Millisecond, want: "turn timeout"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			script := writeAppServer(t, dir, `
+IFS= read -r line
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'
+IFS= read -r line
+IFS= read -r line
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thread-1"}}}'
+IFS= read -r line
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn-1"}}}'
+`+test.afterStart+"\n")
+			req := request(dir, script)
+			req.TurnTimeout = test.turnTimeout
+			_, events, err := New().Start(context.Background(), req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var terminal domain.Event
+			for event := range events {
+				if event.Kind == domain.EventFailed {
+					terminal = event
+				}
+			}
+			if terminal.Kind != domain.EventFailed || !strings.Contains(strings.ToLower(terminal.Message), test.want) {
+				t.Fatalf("terminal=%+v", terminal)
+			}
+		})
+	}
+}
+
+func TestCancelTerminatesAppServerProcessGroup(t *testing.T) {
+	dir := t.TempDir()
+	childPIDPath := filepath.Join(dir, "child.pid")
+	script := writeAppServer(t, dir, `
+IFS= read -r line
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'
+IFS= read -r line
+IFS= read -r line
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thread-1"}}}'
+IFS= read -r line
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn-1"}}}'
+sleep 30 &
+printf '%s' "$!" > child.pid
+wait
+`)
+	b := New()
+	session, _, err := b.Start(context.Background(), request(dir, script))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.mu.Lock()
+	c := b.sessions[session.ID]
+	b.mu.Unlock()
+	childPID := waitForPID(t, childPIDPath)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := b.Cancel(ctx, session); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for syscall.Kill(childPID, 0) == nil && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := syscall.Kill(childPID, 0); !errors.Is(err, syscall.ESRCH) {
+		t.Fatalf("child process %d survived cancellation: %v", childPID, err)
+	}
+	if got := pendingCount(c); got != 0 {
+		t.Fatalf("pending requests after cancellation=%d", got)
 	}
 }
 
@@ -171,4 +482,66 @@ func TestFilteredEnvRemovesConfiguredSecretByNameAndValue(t *testing.T) {
 			t.Fatalf("child environment retained embedded Linear secret: %q", value)
 		}
 	}
+}
+
+type nopWriteCloser struct{ io.Writer }
+
+func (nopWriteCloser) Close() error { return nil }
+
+type failingWriteCloser struct{}
+
+func (failingWriteCloser) Write([]byte) (int, error) { return 0, errors.New("broken pipe") }
+func (failingWriteCloser) Close() error              { return nil }
+
+func bareClient(in io.WriteCloser) *client {
+	return &client{in: in, pending: map[int]chan callResult{}, done: make(chan struct{})}
+}
+
+func pendingCount(c *client) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.pending)
+}
+
+func request(dir, script string) domain.AgentRequest {
+	return domain.AgentRequest{
+		Workspace: dir, Prompt: "work", Command: "sh " + script,
+		ApprovalPolicy: "never", ThreadSandbox: "workspace-write",
+		TurnTimeout: time.Minute, ReadTimeout: time.Second,
+	}
+}
+
+func writeAppServer(t *testing.T, dir, body string) string {
+	t.Helper()
+	script := filepath.Join(dir, "fake-app-server.sh")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\n"+body), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return script
+}
+
+func waitForPID(t *testing.T, path string) int {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		text, err := os.ReadFile(path)
+		if err == nil {
+			pid, err := strconv.Atoi(string(text))
+			if err != nil {
+				t.Fatal(err)
+			}
+			return pid
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			t.Fatal(err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("child pid was not written to %s", path)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func redactedDiagnostic(event domain.Event) bool {
+	return event.Kind == domain.EventDiagnostic && strings.Contains(event.Message, "[REDACTED]") && !strings.Contains(event.Message, "do-not-log-this")
 }
