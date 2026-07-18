@@ -342,23 +342,7 @@ func (c *client) turn(ctx context.Context, thread, prompt string, r domain.Agent
 	if c.cmd.Process != nil {
 		pid = c.cmd.Process.Pid
 	}
-	c.mu.Lock()
-	c.activeReady = true
-	pending := c.pendingEvents
-	c.pendingEvents = nil
-	pendingTerminal := c.pendingTerminal
-	c.pendingTerminal = nil
-	events <- domain.Event{Kind: domain.EventSessionStarted, At: time.Now(), SessionID: s.ID, ThreadID: thread, TurnID: turn, PID: pid}
-	for _, event := range pending {
-		if len(events) < cap(events)-1 {
-			events <- event
-		}
-	}
-	if pendingTerminal != nil {
-		events <- *pendingTerminal
-		c.detachActiveLocked()
-	}
-	c.mu.Unlock()
+	c.activate(events, s, pid)
 	if r.TurnTimeout > 0 {
 		go func() {
 			timer := time.NewTimer(r.TurnTimeout)
@@ -372,6 +356,25 @@ func (c *client) turn(ctx context.Context, thread, prompt string, r domain.Agent
 		}()
 	}
 	return s, events, nil
+}
+func (c *client) activate(events chan domain.Event, s domain.AgentSession, pid int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.activeReady = true
+	pending := c.pendingEvents
+	c.pendingEvents = nil
+	pendingTerminal := c.pendingTerminal
+	c.pendingTerminal = nil
+	events <- domain.Event{Kind: domain.EventSessionStarted, At: time.Now(), SessionID: s.ID, ThreadID: s.ThreadID, TurnID: s.TurnID, PID: pid}
+	for _, event := range pending {
+		if len(events) < cap(events)-1 {
+			events <- event
+		}
+	}
+	if pendingTerminal != nil {
+		events <- *pendingTerminal
+		c.detachActiveLocked()
+	}
 }
 func (c *client) read(r io.Reader) error {
 	scan := bufio.NewScanner(r)
@@ -566,7 +569,6 @@ func (c *client) finish(err error) {
 		}
 		c.failPending(err)
 		c.emit(domain.Event{Kind: domain.EventFailed, At: time.Now(), Message: observability.Text(err.Error())})
-		c.closeActive()
 		_ = c.in.Close()
 		close(c.done)
 	})

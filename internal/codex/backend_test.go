@@ -234,6 +234,31 @@ func TestFinishFailsPendingAndDeliversTerminalIntoFullBuffer(t *testing.T) {
 	}
 }
 
+func TestFinishDefersTerminalUntilTurnActivation(t *testing.T) {
+	c := bareClient(nopWriteCloser{Writer: io.Discard})
+	events := make(chan domain.Event, 32)
+	c.active = events
+	c.activeDone = make(chan struct{})
+	c.finish(errors.New("codex process exited immediately after turn start"))
+	select {
+	case _, ok := <-events:
+		if !ok {
+			t.Fatal("pre-ready event stream closed before session activation")
+		}
+		t.Fatal("pre-ready event stream emitted before session activation")
+	default:
+	}
+	session := domain.AgentSession{ID: "thread-turn", ThreadID: "thread", TurnID: "turn"}
+	c.activate(events, session, 123)
+	var kinds []domain.EventKind
+	for event := range events {
+		kinds = append(kinds, event.Kind)
+	}
+	if len(kinds) != 2 || kinds[0] != domain.EventSessionStarted || kinds[1] != domain.EventFailed {
+		t.Fatalf("events=%v", kinds)
+	}
+}
+
 func TestDrainContinuesAfterOversizedDiagnostic(t *testing.T) {
 	var messages []string
 	err := drain(strings.NewReader(strings.Repeat("x", observability.MaxDiagnosticBytes*3)+"\ntoken=secret-value\n"), func(message string) {
