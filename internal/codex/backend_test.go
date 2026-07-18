@@ -392,7 +392,7 @@ func TestEnabledLinearHandoffIsAdvertisedAndUsesOnlyBoundIssue(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
 		case strings.Contains(query, "SymphonyLinearHandoffIssue"):
-			_, _ = w.Write([]byte(`{"data":{"issue":{"id":"active","identifier":"PMR-5","title":"Handoff","description":"safe","url":"https://linear.app/issue/PMR-5","project":{"slugId":"project-1"},"team":{"id":"team-1"},"state":{"name":"Todo"}}}}`))
+			_, _ = w.Write([]byte(`{"data":{"issue":{"id":"active","identifier":"PMR-5","title":"Handoff","description":"safe","url":"https://linear.app/issue/PMR-5","project":{"slugId":"project-1"},"team":{"id":"team-1"},"state":{"id":"todo","name":"Todo"}}}}`))
 		case strings.Contains(query, "SymphonyLinearHandoffStates"):
 			_, _ = w.Write([]byte(`{"data":{"team":{"id":"team-1","states":{"nodes":[{"id":"review","name":"In Review"}]}}}}`))
 		default:
