@@ -177,6 +177,9 @@ func hooks(h config.Hooks) error {
 func errorsf(format string, args ...any) error { return fmt.Errorf(format, args...) }
 
 func lifecycle(ctx context.Context, settings config.Settings) error {
+	// One turn is sufficient to exercise every dry-run boundary without making
+	// preflight wait through the configured continuation lifecycle.
+	settings.Agent.MaxTurns = 1
 	issue := domain.Issue{ID: "preflight", Identifier: "PREFLIGHT-1", Title: "Synthetic preflight", State: settings.Tracker.ActiveStates[0], Labels: append([]string(nil), settings.Tracker.RequiredLabels...), Dispatchable: true}
 	if _, err := settings.Render(issue, 0); err != nil {
 		return err
@@ -286,7 +289,7 @@ func (f *fakeBoundaries) Cancel(context.Context, domain.AgentSession) error {
 func (f *fakeBoundaries) verify() error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.lists != 1 || f.gets != 1 || f.shouldRun != 2 || f.prepares != 1 || f.before != 1 || f.starts != 1 || f.after != 1 || f.marks != 1 || f.cancels != 1 {
+	if f.lists != 1 || f.gets != 2 || f.shouldRun != 2 || f.prepares != 1 || f.before != 1 || f.starts != 1 || f.after != 1 || f.marks != 1 || f.cancels != 1 {
 		return errorsf("unexpected synthetic boundary counts: list=%d get=%d should_run=%d prepare=%d before=%d start=%d after=%d mark=%d cancel=%d", f.lists, f.gets, f.shouldRun, f.prepares, f.before, f.starts, f.after, f.marks, f.cancels)
 	}
 	return nil

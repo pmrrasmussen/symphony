@@ -54,7 +54,7 @@ const (
 
 type Run struct {
 	IssueID, IssueIdentifier, WorkspacePath, SessionID string
-	Attempt                                            int
+	Attempt, TurnCount                                 int
 	StartedAt                                          time.Time
 	Status                                             RunStatus
 	Error                                              string
