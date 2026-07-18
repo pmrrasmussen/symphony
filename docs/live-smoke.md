@@ -24,7 +24,8 @@ Codex capacity or changing an issue by accident.
   issues. Never use a production project, team, workspace, or customer data.
 - Create a least-privilege Linear credential for that dedicated project and
   export it as `LINEAR_API_KEY` only in the shell or CI environment that runs
-  the smoke test.
+  the smoke test. Long-running local operation should instead set
+  `SYMPHONY_LINEAR_API_KEY_FILE` to an absolute mode-600 credential file path.
 - For a future non-dry Codex exercise, authenticate the Codex CLI with its
   normal supported mechanism. In GitHub Actions, store that credential as the
   `OPENAI_API_KEY` secret; do not print it, place it in a workflow file, or

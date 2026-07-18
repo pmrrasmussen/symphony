@@ -53,10 +53,37 @@ func TestRunReportsIndependentBoundaryFailures(t *testing.T) {
 	}
 }
 
+func TestRunReportsSafeLegacyProjectMigrationWarning(t *testing.T) {
+	dir := t.TempDir()
+	workflow := filepath.Join(dir, "WORKFLOW.md")
+	content := "---\n" +
+		"tracker:\n  kind: linear\n  provider: {project_slug: private-project, api_key: not-a-live-key}\n  active_states: [Todo]\n  terminal_states: [Done]\n" +
+		"workspace: {root: " + filepath.Join(dir, "workspaces") + ", source_root: " + dir + "}\n" +
+		"codex: {command: go}\n" +
+		"---\nWork on {{.issue.identifier}}"
+	if err := os.WriteFile(workflow, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	result := Run(context.Background(), workflow, filepath.Join(dir, "logs"))
+	found := false
+	for _, check := range result.Checks {
+		if check.Name == "workflow_migration" && check.Status == StatusWarning {
+			found = true
+			if strings.Contains(check.Message, "private-project") {
+				t.Fatalf("migration warning exposed project value: %+v", check)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("missing migration warning: %+v", result)
+	}
+}
+
 func writeWorkflow(t *testing.T, path, workspaceRoot, command, beforeRun string) {
 	t.Helper()
 	content := "---\n" +
-		"tracker:\n  kind: linear\n  provider: {project_slug: preflight, api_key: not-a-live-key}\n  active_states: [Todo]\n  terminal_states: [Done]\n" +
+		"tracker:\n  kind: linear\n  provider: {project_slug_id: preflight, api_key: not-a-live-key}\n  active_states: [Todo]\n  terminal_states: [Done]\n" +
 		"workspace: {root: " + workspaceRoot + ", source_root: " + filepath.Dir(path) + "}\n" +
 		"hooks:\n  before_run: \"" + beforeRun + "\"\n" +
 		"codex:\n  command: \"" + command + "\"\n" +

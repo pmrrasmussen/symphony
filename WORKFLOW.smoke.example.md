@@ -3,7 +3,7 @@ tracker:
   kind: linear
   provider:
     # Replace only in a local copy or the manually dispatched CI workflow.
-    project_slug: __LINEAR_SMOKE_PROJECT_SLUG__
+    project_slug_id: __LINEAR_SMOKE_PROJECT_SLUG__
     api_key: $LINEAR_API_KEY
   active_states: [Todo, In Progress]
   terminal_states: [Done, Canceled]

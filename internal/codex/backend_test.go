@@ -438,7 +438,7 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{}}'
 		t.Fatal(err)
 	}
 	settings := config.Settings{Tracker: config.Tracker{
-		Provider:     map[string]any{"api_key": "test-token", "project_slug": "project-1", "endpoint": server.URL},
+		Provider:     map[string]any{"api_key": "test-token", "project_slug_id": "project-1", "endpoint": server.URL},
 		ActiveStates: []string{"todo"}, HandoffState: "In Review",
 	}}
 	b := NewWithLinearHandoff(func() config.Settings { return settings }, "LINEAR_API_KEY")

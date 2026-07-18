@@ -54,6 +54,9 @@ func Run(ctx context.Context, workflowPath, logRoot string) Result {
 	}
 	settings := store.Current().Config
 	result.add("workflow", StatusPassed, "workflow parsed and normalized")
+	for _, warning := range settings.Warnings {
+		result.add("workflow_migration", StatusWarning, warning)
+	}
 
 	tracker := linear.New(func() config.Settings { return settings })
 	if err := tracker.Validate(); err != nil {

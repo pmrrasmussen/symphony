@@ -2,9 +2,11 @@
 tracker:
   kind: linear
   provider:
-    project_slug: example-project
-    # Environment expansion accepts the exact $VARNAME form only.
-    api_key: $LINEAR_API_KEY
+    project_slug_id: example-project
+    # Recommended: point this variable at a mode-600 file outside the repo.
+    api_key_file: $SYMPHONY_LINEAR_API_KEY_FILE
+    # Alternatively, inject the credential value directly from the environment:
+    # api_key: $LINEAR_API_KEY
     # Optional: only dispatch issues assigned to this Linear user ID, or `me`.
     # assignee: me
     # Optional, opt-in Codex client tool. It can only read/comment on the
