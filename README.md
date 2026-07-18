@@ -8,6 +8,24 @@ deterministic local workspace.
 go run ./cmd/symphony --workflow ./WORKFLOW.md
 ```
 
+## Working with Symphony
+
+1. Create one focused Linear issue, move it to **In Progress**, and work from
+   an isolated Git worktree—not the primary checkout.
+2. Keep the workflow policy in the repository. Configure
+   `workspace.source_root` for the source repository; Symphony creates a
+   separate agent workspace for each eligible issue.
+3. Validate the narrow change first, then run broader checks when shared
+   behavior changes. Review the generated workspace before keeping its work.
+4. Open a PR with **Why**, **What was changed**, and **On Call**; merge only
+   after required checks and review, then move the Linear issue to **Done**.
+5. Use `--dry-run` before any live run. Live smoke tests are manual and must
+   use dedicated Symphony test artifacts, never Dagligvare-app.
+
+For the delivery sequence, see [HOW_WE_WORK.md](HOW_WE_WORK.md). For runtime
+configuration and operational details, use [WORKFLOW.example.md](WORKFLOW.example.md)
+and [docs/architecture.md](docs/architecture.md).
+
 Run with `--dry-run` to validate configuration and scheduling without starting
 Codex. A live smoke test is opt-in: set `LINEAR_API_KEY`, configure a dedicated
 Symphony test project in `WORKFLOW.md`, and use `--dry-run` first. Never run a
