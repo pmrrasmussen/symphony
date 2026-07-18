@@ -8,10 +8,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/exec"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/pmrrasmussen/symphony/internal/config"
@@ -60,7 +62,10 @@ func (b *Backend) Start(ctx context.Context, r domain.AgentRequest) (domain.Agen
 		c.kill()
 		return domain.AgentSession{}, nil, err
 	}
-	c.notify("initialized", map[string]any{})
+	if err := c.notify("initialized", map[string]any{}); err != nil {
+		c.kill()
+		return domain.AgentSession{}, nil, err
+	}
 	threadParams := map[string]any{"cwd": r.Workspace, "approvalPolicy": r.ApprovalPolicy, "sandbox": r.ThreadSandbox}
 	if handoff != nil {
 		threadParams["dynamicTools"] = []map[string]any{linearGraphQLToolDefinition()}
@@ -83,6 +88,14 @@ func (b *Backend) Start(ctx context.Context, r domain.AgentRequest) (domain.Agen
 	b.mu.Lock()
 	b.sessions[s.ID] = c
 	b.mu.Unlock()
+	go func() {
+		<-c.exited
+		b.mu.Lock()
+		if b.sessions[s.ID] == c {
+			delete(b.sessions, s.ID)
+		}
+		b.mu.Unlock()
+	}()
 	return s, events, nil
 }
 func (b *Backend) Continue(ctx context.Context, s domain.AgentSession, prompt string) (<-chan domain.Event, error) {
@@ -95,7 +108,7 @@ func (b *Backend) Continue(ctx context.Context, s domain.AgentSession, prompt st
 	_, events, err := c.turn(ctx, s.ThreadID, prompt, domain.AgentRequest{Workspace: c.workspace, ApprovalPolicy: c.approval, TurnSandboxPolicy: c.policy, TurnTimeout: c.turnTimeout, ReadTimeout: c.readTimeout})
 	return events, err
 }
-func (b *Backend) Cancel(_ context.Context, s domain.AgentSession) error {
+func (b *Backend) Cancel(ctx context.Context, s domain.AgentSession) error {
 	b.mu.Lock()
 	c := b.sessions[s.ID]
 	delete(b.sessions, s.ID)
@@ -104,7 +117,12 @@ func (b *Backend) Cancel(_ context.Context, s domain.AgentSession) error {
 		return nil
 	}
 	c.kill()
-	return nil
+	select {
+	case <-c.exited:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 type client struct {
@@ -117,16 +135,26 @@ type client struct {
 	ctx                 context.Context
 	handoff             *linear.HandoffSession
 	mu                  sync.Mutex
+	writeMu             sync.Mutex
 	next                int
-	pending             map[int]chan rpc
+	pending             map[int]chan callResult
 	active              chan domain.Event
 	activeDone          chan struct{}
 	diagnostics         []domain.Event
 	activeReady         bool
 	pendingEvents       []domain.Event
-	pendingClose        bool
+	pendingTerminal     *domain.Event
 	done                chan struct{}
+	exited              chan struct{}
+	finishOnce          sync.Once
+	killOnce            sync.Once
 }
+
+type callResult struct {
+	rpc rpc
+	err error
+}
+
 type rpc struct {
 	ID     any             `json:"id"`
 	Method string          `json:"method"`
@@ -145,26 +173,67 @@ func start(ctx context.Context, r domain.AgentRequest, secrets []string, secretM
 	cmd := exec.CommandContext(ctx, "sh", "-lc", "exec "+command)
 	cmd.Dir = r.Workspace
 	cmd.Env = filteredEnv(secrets, secretMatcher)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	in, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, err
 	}
-	out, err := cmd.StdoutPipe()
+	out, outWriter, err := os.Pipe()
 	if err != nil {
 		return nil, err
 	}
-	stderr, err := cmd.StderrPipe()
+	stderr, stderrWriter, err := os.Pipe()
 	if err != nil {
+		_ = out.Close()
+		_ = outWriter.Close()
 		return nil, err
 	}
+	cmd.Stdout = outWriter
+	cmd.Stderr = stderrWriter
+	c := &client{cmd: cmd, in: in, workspace: r.Workspace, approval: r.ApprovalPolicy, policy: r.TurnSandboxPolicy, readTimeout: r.ReadTimeout, turnTimeout: r.TurnTimeout, ctx: ctx, handoff: handoff, pending: map[int]chan callResult{}, done: make(chan struct{}), exited: make(chan struct{})}
+	cmd.Cancel = func() error { return c.killProcessGroup() }
 	if err := cmd.Start(); err != nil {
+		_ = out.Close()
+		_ = outWriter.Close()
+		_ = stderr.Close()
+		_ = stderrWriter.Close()
 		return nil, err
 	}
-	c := &client{cmd: cmd, in: in, workspace: r.Workspace, approval: r.ApprovalPolicy, policy: r.TurnSandboxPolicy, readTimeout: r.ReadTimeout, turnTimeout: r.TurnTimeout, ctx: ctx, handoff: handoff, pending: map[int]chan rpc{}, done: make(chan struct{})}
-	go c.read(out)
-	stderrDone := make(chan struct{})
-	go func() { drain(stderr, c.diagnostic); close(stderrDone) }()
-	go func() { _ = cmd.Wait(); <-stderrDone; c.finish() }()
+	_ = outWriter.Close()
+	_ = stderrWriter.Close()
+	stdoutDone := make(chan error, 1)
+	stderrDone := make(chan error, 1)
+	go func() {
+		defer out.Close()
+		err := c.read(out)
+		stdoutDone <- err
+		if err != nil {
+			c.abort(err)
+		}
+	}()
+	go func() {
+		defer stderr.Close()
+		stderrDone <- drain(stderr, c.diagnostic)
+	}()
+	go func() {
+		waitErr := cmd.Wait()
+		// The leader can exit while descendants still hold inherited pipes.
+		// Terminating the group makes both reader completions deterministic.
+		_ = c.killProcessGroup()
+		stdoutErr := <-stdoutDone
+		stderrErr := <-stderrDone
+		switch {
+		case stdoutErr != nil:
+			c.finish(stdoutErr)
+		case stderrErr != nil:
+			c.finish(fmt.Errorf("codex stderr read failed: %w", stderrErr))
+		case waitErr != nil:
+			c.finish(fmt.Errorf("codex process exited: %w", waitErr))
+		default:
+			c.finish(errors.New("codex process exited"))
+		}
+		close(c.exited)
+	}()
 	return c, nil
 }
 func filteredEnv(names []string, secretMatcher func(string) bool) []string {
@@ -191,38 +260,56 @@ func (c *client) call(ctx context.Context, method string, params any) (map[strin
 	c.mu.Lock()
 	c.next++
 	id := c.next
-	ch := make(chan rpc, 1)
+	ch := make(chan callResult, 1)
 	c.pending[id] = ch
 	c.mu.Unlock()
 	if err := c.send(map[string]any{"jsonrpc": "2.0", "id": id, "method": method, "params": params}); err != nil {
+		c.removePending(id)
+		err = fmt.Errorf("codex %s write failed: %w", method, err)
+		c.abort(err)
 		return nil, err
 	}
 	select {
-	case x := <-ch:
+	case result := <-ch:
+		if result.err != nil {
+			return nil, result.err
+		}
+		x := result.rpc
 		if x.Error != nil {
 			return nil, fmt.Errorf("codex %s: %s", method, x.Error.Message)
 		}
 		var out map[string]any
 		if err := json.Unmarshal(x.Result, &out); err != nil {
-			return nil, fmt.Errorf("codex malformed %s response: %w", method, err)
+			err = fmt.Errorf("codex malformed %s response: %w", method, err)
+			c.abort(err)
+			return nil, err
 		}
 		return out, nil
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		c.removePending(id)
+		err := fmt.Errorf("codex %s timed out: %w", method, ctx.Err())
+		c.abort(err)
+		return nil, err
 	case <-c.done:
+		c.removePending(id)
 		return nil, errors.New("codex process exited")
 	}
 }
-func (c *client) notify(method string, params any) {
-	_ = c.send(map[string]any{"jsonrpc": "2.0", "method": method, "params": params})
+func (c *client) notify(method string, params any) error {
+	if err := c.send(map[string]any{"jsonrpc": "2.0", "method": method, "params": params}); err != nil {
+		err = fmt.Errorf("codex %s write failed: %w", method, err)
+		c.abort(err)
+		return err
+	}
+	return nil
 }
 func (c *client) send(v any) error {
 	b, err := json.Marshal(v)
 	if err != nil {
 		return err
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
 	_, err = c.in.Write(append(b, '\n'))
 	return err
 }
@@ -259,16 +346,19 @@ func (c *client) turn(ctx context.Context, thread, prompt string, r domain.Agent
 	c.activeReady = true
 	pending := c.pendingEvents
 	c.pendingEvents = nil
-	pendingClose := c.pendingClose
-	c.pendingClose = false
-	c.mu.Unlock()
-	c.emit(domain.Event{Kind: domain.EventSessionStarted, At: time.Now(), SessionID: s.ID, ThreadID: thread, TurnID: turn, PID: pid})
+	pendingTerminal := c.pendingTerminal
+	c.pendingTerminal = nil
+	events <- domain.Event{Kind: domain.EventSessionStarted, At: time.Now(), SessionID: s.ID, ThreadID: thread, TurnID: turn, PID: pid}
 	for _, event := range pending {
-		c.emit(event)
+		if len(events) < cap(events)-1 {
+			events <- event
+		}
 	}
-	if pendingClose {
-		c.closeActive()
+	if pendingTerminal != nil {
+		events <- *pendingTerminal
+		c.detachActiveLocked()
 	}
+	c.mu.Unlock()
 	if r.TurnTimeout > 0 {
 		go func() {
 			timer := time.NewTimer(r.TurnTimeout)
@@ -283,32 +373,45 @@ func (c *client) turn(ctx context.Context, thread, prompt string, r domain.Agent
 	}
 	return s, events, nil
 }
-func (c *client) read(r io.Reader) {
+func (c *client) read(r io.Reader) error {
 	scan := bufio.NewScanner(r)
 	buf := make([]byte, 0, 64<<10)
 	scan.Buffer(buf, 1<<20)
 	for scan.Scan() {
 		var x rpc
 		if err := json.Unmarshal(scan.Bytes(), &x); err != nil {
-			c.emit(domain.Event{Kind: domain.EventProgress, At: time.Now(), Message: "malformed Codex app-server message"})
-			continue
+			return fmt.Errorf("codex malformed app-server message: %w", err)
 		}
-		if x.ID != nil {
+		// A method always identifies a server request/notification. Responses
+		// have no method, so a server request may safely reuse a pending ID.
+		if x.Method == "" && x.ID != nil {
 			id, ok := asID(x.ID)
 			if ok {
 				c.mu.Lock()
 				ch := c.pending[id]
-				delete(c.pending, id)
+				if ch != nil {
+					delete(c.pending, id)
+				}
 				c.mu.Unlock()
 				if ch != nil {
-					ch <- x
+					if x.Result == nil && x.Error == nil {
+						err := errors.New("codex malformed response: missing result and error")
+						ch <- callResult{err: err}
+						return err
+					} else {
+						ch <- callResult{rpc: x}
+					}
 					continue
 				}
 			}
+			return errors.New("codex malformed response: unknown or invalid id")
 		}
 		c.handle(x)
 	}
-	c.finish()
+	if err := scan.Err(); err != nil {
+		return fmt.Errorf("codex stdout scanner failed: %w", err)
+	}
+	return nil
 }
 func (c *client) handle(x rpc) {
 	method := x.Method
@@ -339,7 +442,6 @@ func (c *client) handle(x rpc) {
 	}
 	if method == "turn/failed" || method == "turn/cancelled" {
 		c.emit(domain.Event{Kind: domain.EventFailed, At: time.Now(), Message: method})
-		c.closeActive()
 		return
 	}
 	c.emit(domain.Event{Kind: domain.EventProgress, At: time.Now(), Message: method})
@@ -374,7 +476,9 @@ func (c *client) handleToolCall(x rpc) {
 		// Do not return provider errors, issue data, or any credential-derived
 		// value to the child. The generic response is enough for the model to
 		// choose another path, while the normalized event informs the scheduler.
-		_ = c.send(map[string]any{"jsonrpc": "2.0", "id": x.ID, "result": map[string]any{"success": false, "contentItems": []any{map[string]any{"type": "inputText", "text": "Linear handoff request was rejected."}}}})
+		if !c.sendServerResponse(x.ID, map[string]any{"success": false, "contentItems": []any{map[string]any{"type": "inputText", "text": "Linear handoff request was rejected."}}}) {
+			return
+		}
 		c.emit(domain.Event{Kind: domain.EventBlocked, At: time.Now(), Message: "Codex Linear handoff request was rejected"})
 		return
 	}
@@ -383,46 +487,65 @@ func (c *client) handleToolCall(x rpc) {
 		c.unsupportedTool(x.ID)
 		return
 	}
-	_ = c.send(map[string]any{"jsonrpc": "2.0", "id": x.ID, "result": map[string]any{"success": result.Success, "contentItems": []any{map[string]any{"type": "inputText", "text": string(text)}}}})
+	c.sendServerResponse(x.ID, map[string]any{"success": result.Success, "contentItems": []any{map[string]any{"type": "inputText", "text": string(text)}}})
 }
 
 func (c *client) unsupportedTool(id any) {
-	_ = c.send(map[string]any{"jsonrpc": "2.0", "id": id, "result": map[string]any{"success": false, "contentItems": []any{map[string]any{"type": "inputText", "text": "Unsupported client-side tool."}}}})
+	if !c.sendServerResponse(id, map[string]any{"success": false, "contentItems": []any{map[string]any{"type": "inputText", "text": "Unsupported client-side tool."}}}) {
+		return
+	}
 	c.emit(domain.Event{Kind: domain.EventBlocked, At: time.Now(), Message: "Codex requested an unsupported client-side tool"})
+}
+func (c *client) sendServerResponse(id, result any) bool {
+	if err := c.send(map[string]any{"jsonrpc": "2.0", "id": id, "result": result}); err != nil {
+		c.abort(fmt.Errorf("codex server response write failed: %w", err))
+		return false
+	}
+	return true
 }
 func (c *client) emit(e domain.Event) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	ch := c.active
 	if ch != nil {
 		if !c.activeReady {
-			if len(c.pendingEvents) < 32 {
+			if terminal(e.Kind) {
+				copy := e
+				c.pendingTerminal = &copy
+			} else if c.pendingTerminal == nil && len(c.pendingEvents) < cap(ch)-2 {
 				c.pendingEvents = append(c.pendingEvents, e)
 			}
+			c.mu.Unlock()
 			return
 		}
-		select {
-		case ch <- e:
-		default:
+		if terminal(e.Kind) {
+			// Non-terminal sends reserve one slot, so terminal delivery cannot
+			// block even when the consumer falls behind.
+			ch <- e
+			c.detachActiveLocked()
+			c.mu.Unlock()
+			return
+		}
+		if len(ch) < cap(ch)-1 {
+			ch <- e
 		}
 	} else if e.Kind == domain.EventDiagnostic && len(c.diagnostics) < 16 {
 		c.diagnostics = append(c.diagnostics, e)
 	}
+	c.mu.Unlock()
 }
 func (c *client) closeActive() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.detachActiveLocked()
+}
+func (c *client) detachActiveLocked() {
 	ch := c.active
-	if ch != nil && !c.activeReady {
-		c.pendingClose = true
-		return
-	}
 	done := c.activeDone
 	c.active = nil
 	c.activeDone = nil
 	c.activeReady = false
 	c.pendingEvents = nil
-	c.pendingClose = false
+	c.pendingTerminal = nil
 	if ch != nil {
 		close(ch)
 	}
@@ -436,32 +559,91 @@ func (c *client) forceCloseActive() {
 	c.mu.Unlock()
 	c.closeActive()
 }
-func (c *client) finish() {
-	select {
-	case <-c.done:
-	default:
+func (c *client) finish(err error) {
+	c.finishOnce.Do(func() {
+		if err == nil {
+			err = errors.New("codex process exited")
+		}
+		c.failPending(err)
+		c.emit(domain.Event{Kind: domain.EventFailed, At: time.Now(), Message: observability.Text(err.Error())})
+		c.closeActive()
+		_ = c.in.Close()
 		close(c.done)
-	}
-	c.closeActive()
+	})
+}
+func (c *client) abort(err error) {
+	c.kill()
+	c.finish(err)
 }
 func (c *client) kill() {
-	if c.cmd.Process != nil {
-		_ = c.cmd.Process.Kill()
+	c.killOnce.Do(func() {
+		_ = c.in.Close()
+		_ = c.killProcessGroup()
+	})
+}
+func (c *client) killProcessGroup() error {
+	if c.cmd == nil || c.cmd.Process == nil {
+		return nil
+	}
+	err := syscall.Kill(-c.cmd.Process.Pid, syscall.SIGKILL)
+	if errors.Is(err, syscall.ESRCH) {
+		return nil
+	}
+	return err
+}
+func (c *client) removePending(id int) {
+	c.mu.Lock()
+	delete(c.pending, id)
+	c.mu.Unlock()
+}
+func (c *client) failPending(err error) {
+	c.mu.Lock()
+	pending := c.pending
+	c.pending = map[int]chan callResult{}
+	c.mu.Unlock()
+	for _, ch := range pending {
+		ch <- callResult{err: err}
 	}
 }
 func (c *client) diagnostic(message string) {
 	c.emit(domain.Event{Kind: domain.EventDiagnostic, At: time.Now(), Message: observability.Text(message)})
 }
 
-func drain(r io.Reader, report func(string)) {
-	s := bufio.NewScanner(r)
-	s.Buffer(make([]byte, 0, observability.MaxDiagnosticBytes), observability.MaxDiagnosticBytes)
-	for s.Scan() { /* diagnostics intentionally not mixed into JSON-RPC */
-		report(s.Text())
+func drain(r io.Reader, report func(string)) error {
+	reader := bufio.NewReaderSize(r, observability.MaxDiagnosticBytes)
+	line := make([]byte, 0, observability.MaxDiagnosticBytes)
+	oversized := false
+	for {
+		part, err := reader.ReadSlice('\n')
+		if !oversized {
+			remaining := observability.MaxDiagnosticBytes - len(line)
+			if len(part) <= remaining {
+				line = append(line, part...)
+			} else {
+				oversized = true
+			}
+		}
+		if errors.Is(err, bufio.ErrBufferFull) {
+			oversized = true
+			continue
+		}
+		if err != nil && !errors.Is(err, io.EOF) {
+			return err
+		}
+		if oversized {
+			report("stderr diagnostic exceeded limit")
+		} else if message := strings.TrimSuffix(strings.TrimSuffix(string(line), "\n"), "\r"); message != "" {
+			report(message)
+		}
+		line = line[:0]
+		oversized = false
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
 	}
-	if err := s.Err(); err != nil {
-		report("stderr diagnostic exceeded limit")
-	}
+}
+func terminal(kind domain.EventKind) bool {
+	return kind == domain.EventBlocked || kind == domain.EventCompleted || kind == domain.EventFailed
 }
 func nestedString(m map[string]any, a, b string) (string, bool) {
 	x, ok := m[a].(map[string]any)
@@ -471,7 +653,13 @@ func nestedString(m map[string]any, a, b string) (string, bool) {
 	v, ok := x[b].(string)
 	return v, ok
 }
-func asID(v any) (int, bool) { x, ok := v.(float64); return int(x), ok }
+func asID(v any) (int, bool) {
+	x, ok := v.(float64)
+	if !ok || x < 0 || x != math.Trunc(x) || x > float64(^uint(0)>>1) {
+		return 0, false
+	}
+	return int(x), true
+}
 func usageFrom(raw json.RawMessage) domain.Usage {
 	var value any
 	if json.Unmarshal(raw, &value) != nil {
