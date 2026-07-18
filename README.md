@@ -9,8 +9,12 @@ go run ./cmd/symphony --workflow ./WORKFLOW.md
 ```
 
 Run with `--dry-run` to validate configuration and scheduling without starting
-Codex.  A live smoke test is opt-in: set `LINEAR_API_KEY`, configure a test
-Linear project in `WORKFLOW.md`, and use `--dry-run` first.
+Codex. A live smoke test is opt-in: set `LINEAR_API_KEY`, configure a dedicated
+Symphony test project in `WORKFLOW.md`, and use `--dry-run` first. Never run a
+Symphony smoke test against Dagligvare-app or any of its Linear workspace,
+team, or projects. Report a smoke test as **skipped** when its dedicated test
+credential or project is unavailable; report it as **failed** when an attempted
+test command or validation fails. A skipped smoke test is not a passed test.
 
 Linear accepts `tracker.provider.api_key: $LINEAR_API_KEY` or a trusted local
 `tracker.provider.api_key_file`; the latter is read only by the service.
