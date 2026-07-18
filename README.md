@@ -19,7 +19,7 @@ go run ./cmd/symphony ./WORKFLOW.md
    separate agent workspace for each eligible issue.
 3. Validate the narrow change first, then run broader checks when shared
    behavior changes. Review the generated workspace before keeping its work.
-4. Open a PR with **Why**, **What was changed**, and **On Call**; merge only
+4. Open a PR with **Why**, **What changed**, and **On Call**; merge only
    after required checks and review, then move the Linear issue to **Done**.
 5. Use `--dry-run` before any live run. Live smoke tests are manual and must
    use dedicated Symphony test artifacts, never Dagligvare-app.

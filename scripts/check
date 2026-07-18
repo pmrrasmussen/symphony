@@ -1,0 +1,59 @@
+#!/bin/sh
+
+set -eu
+
+usage() {
+	cat <<'EOF'
+Usage: scripts/check <format|vet|test|race|all>
+EOF
+}
+
+check_format() {
+	unformatted=$(find . -name '*.go' -type f -exec gofmt -l {} +)
+	if [ -n "$unformatted" ]; then
+		printf 'The following files need gofmt:\n%s\n' "$unformatted" >&2
+		return 1
+	fi
+}
+
+run_vet() {
+	go vet ./...
+}
+
+run_tests() {
+	go test ./...
+}
+
+run_race_tests() {
+	go test -race ./...
+}
+
+if [ "$#" -ne 1 ]; then
+	usage >&2
+	exit 2
+fi
+
+case "$1" in
+	format)
+		check_format
+		;;
+	vet)
+		run_vet
+		;;
+	test)
+		run_tests
+		;;
+	race)
+		run_race_tests
+		;;
+	all)
+		check_format
+		run_vet
+		run_tests
+		run_race_tests
+		;;
+	*)
+		usage >&2
+		exit 2
+		;;
+esac
