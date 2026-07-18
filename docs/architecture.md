@@ -92,11 +92,13 @@ upstream Codex HEAD at inspection was `56395bddaf26eb2829387ca6a417bf9128e5b239`
 
 One bounded-run recovery detail is intentionally Go-specific: active issues
 continue on the same live Codex session, with a scheduler-controlled one-second
-delay between turns, until `agent.max_turns`. At that boundary this profile
-writes the durable completion marker for the refreshed issue version and does
-not schedule the upstream specification's separate one-second, new-worker
-continuation retry. This preserves restart suppression for unchanged work and
-makes a later Linear update the explicit redispatch boundary.
+delay between turns, until `agent.max_turns`. Reaching that boundary while the
+issue is still active is an explicit blocked/exhausted result, not successful
+completion. The coordinator logs `turn_limit_exhausted` and schedules its
+normal backoff retry, leaving the workspace eligible so a resolved external
+condition or a Linear update can be dispatched safely. Durable completion is
+reserved for a verified handoff or terminal tracker transition; an ordinary
+Codex turn completion is never enough to suppress an active issue.
 
 The upstream workflow schema does not define a continuation-prompt setting.
 Accordingly, the workflow body remains the configured first-turn task prompt,

@@ -97,7 +97,7 @@ func Run(ctx context.Context, workflowPath, logRoot string) Result {
 	if err := lifecycle(ctx, settings); err != nil {
 		result.add("scheduler_lifecycle", StatusFailed, err.Error())
 	} else {
-		result.add("scheduler_lifecycle", StatusPassed, "synthetic issue completed through no-op tracker, workspace, and agent boundaries")
+		result.add("scheduler_lifecycle", StatusPassed, "synthetic active issue exercised tracker, workspace, agent, and exhaustion-retry boundaries")
 	}
 	return result
 }
@@ -196,15 +196,18 @@ func lifecycle(ctx context.Context, settings config.Settings) error {
 	if _, err := settings.Render(issue, 0); err != nil {
 		return err
 	}
-	boundaries := &fakeBoundaries{issue: issue, completed: make(chan struct{})}
+	boundaries := &fakeBoundaries{issue: issue, afterRun: make(chan struct{})}
 	c := coordinator.New(boundaries, boundaries, boundaries, func() config.Settings { return settings }, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	c.Tick(ctx)
 	select {
-	case <-boundaries.completed:
+	case <-boundaries.afterRun:
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-time.After(time.Second):
 		return errorsf("synthetic scheduler lifecycle timed out")
+	}
+	if err := c.Shutdown(ctx); err != nil {
+		return fmt.Errorf("stop synthetic scheduler lifecycle: %w", err)
 	}
 	if err := boundaries.verify(); err != nil {
 		return err
@@ -215,7 +218,7 @@ func lifecycle(ctx context.Context, settings config.Settings) error {
 type fakeBoundaries struct {
 	mu        sync.Mutex
 	issue     domain.Issue
-	completed chan struct{}
+	afterRun  chan struct{}
 	lists     int
 	gets      int
 	shouldRun int
@@ -264,13 +267,13 @@ func (f *fakeBoundaries) AfterRun(context.Context, domain.Workspace, domain.Issu
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.after++
+	if f.after == 1 {
+		close(f.afterRun)
+	}
 }
 func (f *fakeBoundaries) MarkCompleted(context.Context, domain.Workspace, domain.Issue) error {
 	f.mu.Lock()
 	f.marks++
-	if f.marks == 1 {
-		close(f.completed)
-	}
 	f.mu.Unlock()
 	return nil
 }
@@ -301,7 +304,7 @@ func (f *fakeBoundaries) Cancel(context.Context, domain.AgentSession) error {
 func (f *fakeBoundaries) verify() error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.lists != 1 || f.gets != 2 || f.shouldRun != 2 || f.prepares != 1 || f.before != 1 || f.starts != 1 || f.after != 1 || f.marks != 1 || f.cancels != 1 {
+	if f.lists != 1 || f.gets != 1 || f.shouldRun != 2 || f.prepares != 1 || f.before != 1 || f.starts != 1 || f.after != 1 || f.marks != 0 || f.cancels != 1 {
 		return errorsf("unexpected synthetic boundary counts: list=%d get=%d should_run=%d prepare=%d before=%d start=%d after=%d mark=%d cancel=%d", f.lists, f.gets, f.shouldRun, f.prepares, f.before, f.starts, f.after, f.marks, f.cancels)
 	}
 	return nil
