@@ -21,9 +21,16 @@ When `workspace.source_root` is configured, `LocalWorkspaceExecutor` creates a
 detached Git worktree for each issue. This isolates Codex changes from the
 checkout running Symphony; a human must review and integrate the resulting
 changes. The source root must already have a commit, and Git worktrees require
-the local repository to be trusted.
+the local repository to be trusted. Completion markers are held below the
+configured workspace root and are keyed to the issue's Linear `updatedAt`
+value: a completed unchanged issue is not dispatched again, while a later
+issue edit is eligible for another turn. Cleanup refuses to remove a worktree
+with local changes or a commit that differs from its recorded base revision.
 
-Implementation baseline: upstream Symphony commit
-`7af5a7648c9fbffa08825fe0c0b18be00100aff3`.  Codex app-server protocol was
+The behavioral contract is the pinned upstream
+[Symphony specification](https://github.com/openai/symphony/blob/7af5a7648c9fbffa08825fe0c0b18be00100aff3/SPEC.md).
+It is linked rather than copied into this repository so it cannot silently
+diverge from its source. Implementation baseline: upstream Symphony commit
+`7af5a7648c9fbffa08825fe0c0b18be00100aff3`. Codex app-server protocol was
 inspected from the locally installed Codex schema generated on 2026-07-18;
 upstream Codex HEAD at inspection was `56395bddaf26eb2829387ca6a417bf9128e5b239`.

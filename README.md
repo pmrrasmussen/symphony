@@ -22,5 +22,9 @@ For ongoing repository development, configure `workspace.source_root: .`.
 Symphony then creates one detached Git worktree per issue beneath
 `workspace.root`; the original checkout is never used as an agent workspace.
 Create focused issues in the configured Linear project and move them to `Todo`
-or `In Progress` to make them eligible. Review each worktree's changes before
-merging or cherry-picking them into your development branch.
+or `In Progress` to make them eligible. Symphony records a completed turn and
+will not rerun an unchanged issue; editing the issue makes it eligible again.
+Review each worktree's changes before merging or cherry-picking them into your
+development branch. Terminal cleanup preserves worktrees with uncommitted,
+untracked, or newly committed changes rather than deleting work that needs
+review.

@@ -14,8 +14,6 @@ import (
 	"github.com/pmrrasmussen/symphony/internal/domain"
 )
 
-const continuationDelay = time.Second
-
 type Timer interface{ AfterFunc(time.Duration, func()) }
 type realTimer struct{}
 
@@ -109,7 +107,7 @@ func (c *Coordinator) Tick(ctx context.Context) {
 	}
 	sortIssues(issues)
 	for _, i := range issues {
-		if !eligible(i, s) || !c.claim(i, s) {
+		if !eligible(i, s) || !c.shouldRun(ctx, i) || !c.claim(i, s) {
 			continue
 		}
 		c.launch(ctx, i, 0)
@@ -181,20 +179,27 @@ func (c *Coordinator) launch(parent context.Context, i domain.Issue, attempt int
 	go func() {
 		defer c.wg.Done()
 		ctx, cancel := context.WithCancel(parent)
+		if !c.shouldRun(ctx, i) {
+			cancel()
+			c.release(i.ID)
+			return
+		}
 		ws, err := c.workspaces.Prepare(ctx, i)
 		if err != nil {
 			cancel()
-			c.done(i, attempt, err, false)
+			c.done(i, attempt, err)
 			return
 		}
 		if err = c.workspaces.BeforeRun(ctx, ws, i); err != nil {
 			c.workspaces.AfterRun(context.Background(), ws, i)
 			cancel()
-			c.done(i, attempt, err, false)
+			c.done(i, attempt, err)
 			return
 		}
 		s := c.settings()
 		prompt, err := render(s, i, attempt)
+		completed := false
+		var completionErr error
 		if err == nil {
 			session, events, startErr := c.agent.Start(ctx, domain.AgentRequest{Issue: i, Workspace: ws.Path, Prompt: prompt, Command: s.Codex.Command, ApprovalPolicy: s.Codex.ApprovalPolicy, ThreadSandbox: s.Codex.ThreadSandbox, TurnSandboxPolicy: s.Codex.TurnSandboxPolicy, TurnTimeout: s.Codex.TurnTimeout, ReadTimeout: s.Codex.ReadTimeout})
 			if startErr != nil {
@@ -204,26 +209,39 @@ func (c *Coordinator) launch(parent context.Context, i domain.Issue, attempt int
 				c.mu.Lock()
 				c.running[i.ID] = r
 				c.mu.Unlock()
-				err = c.consume(ctx, r, events, s)
+				completed, err = c.consume(ctx, r, events)
 				c.mu.Lock()
 				delete(c.running, i.ID)
 				c.mu.Unlock()
+				if completed {
+					r.cancel()
+					_ = c.agent.Cancel(context.Background(), r.session)
+					completionErr = c.workspaces.MarkCompleted(parent, ws, i)
+				}
 			}
 		}
 		c.workspaces.AfterRun(context.Background(), ws, i)
 		cancel()
-		c.done(i, attempt, err, err == nil)
+		if completed {
+			if completionErr != nil {
+				c.log.Error("record completed work failed", "issue", i.Identifier, "error", completionErr)
+				c.scheduleCompletionRecord(i, ws, attempt+1)
+				return
+			}
+			c.release(i.ID)
+			return
+		}
+		c.done(i, attempt, err)
 	}()
 }
-func (c *Coordinator) consume(ctx context.Context, r *running, events <-chan domain.Event, s config.Settings) error {
-	turns := 1
+func (c *Coordinator) consume(ctx context.Context, r *running, events <-chan domain.Event) (bool, error) {
 	for {
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return false, ctx.Err()
 		case e, ok := <-events:
 			if !ok {
-				return nil
+				return false, fmt.Errorf("agent event stream closed before completion")
 			}
 			c.mu.Lock()
 			r.last = e.At
@@ -231,32 +249,16 @@ func (c *Coordinator) consume(ctx context.Context, r *running, events <-chan dom
 			c.log.Info("agent event", "issue", r.issue.Identifier, "session", e.SessionID, "event", e.Kind)
 			switch e.Kind {
 			case domain.EventBlocked:
-				return fmt.Errorf("agent blocked: %s", e.Message)
+				return false, fmt.Errorf("agent blocked: %s", e.Message)
 			case domain.EventFailed:
-				return fmt.Errorf("agent failed: %s", e.Message)
+				return false, fmt.Errorf("agent failed: %s", e.Message)
 			case domain.EventCompleted:
-				if turns >= s.Agent.MaxTurns {
-					return nil
-				}
-				fresh, err := c.tracker.GetIssues(ctx, []string{r.issue.ID})
-				if err != nil || len(fresh) != 1 || !active(fresh[0], c.settings()) || !routable(fresh[0], c.settings()) {
-					return err
-				}
-				turns++
-				next, err := c.agent.Continue(ctx, r.session, "Continue working on the issue if it remains active. Check the issue state and complete any remaining work.")
-				if err != nil {
-					return err
-				}
-				events = next
+				return true, nil
 			}
 		}
 	}
 }
-func (c *Coordinator) done(i domain.Issue, attempt int, err error, normal bool) {
-	if err == nil && normal {
-		c.schedule(i, 1, continuationDelay)
-		return
-	}
+func (c *Coordinator) done(i domain.Issue, attempt int, err error) {
 	c.schedule(i, attempt+1, backoff(attempt+1, c.settings().Agent.MaxRetryBackoff))
 }
 func (c *Coordinator) schedule(i domain.Issue, attempt int, d time.Duration) {
@@ -283,11 +285,60 @@ func (c *Coordinator) schedule(i domain.Issue, attempt int, d time.Duration) {
 			c.release(i.ID)
 			return
 		}
+		if !c.shouldRun(ctx, fresh[0]) {
+			c.release(i.ID)
+			return
+		}
 		c.mu.Lock()
 		delete(c.retries, i.ID)
 		c.mu.Unlock()
 		c.launch(ctx, fresh[0], attempt)
 	})
+}
+
+// scheduleCompletionRecord retries only durable completion recording. It keeps
+// the issue claimed so a transient state-filesystem failure cannot cause Codex
+// to rerun an already completed turn.
+func (c *Coordinator) scheduleCompletionRecord(i domain.Issue, ws domain.Workspace, attempt int) {
+	delay := backoff(attempt, c.settings().Agent.MaxRetryBackoff)
+	c.mu.Lock()
+	c.retries[i.ID] = attempt
+	c.mu.Unlock()
+	c.timer.AfterFunc(delay, func() {
+		ctx := c.context()
+		if ctx == nil || ctx.Err() != nil {
+			return
+		}
+		fresh, err := c.tracker.GetIssues(ctx, []string{i.ID})
+		if err != nil || len(fresh) != 1 {
+			c.release(i.ID)
+			return
+		}
+		s := c.settings()
+		if terminal(fresh[0], s) {
+			_ = c.workspaces.Cleanup(ctx, fresh[0])
+			c.release(i.ID)
+			return
+		}
+		if !active(fresh[0], s) || !routable(fresh[0], s) {
+			c.release(i.ID)
+			return
+		}
+		if err := c.workspaces.MarkCompleted(ctx, ws, i); err != nil {
+			c.log.Error("record completed work retry failed", "issue", i.Identifier, "error", err)
+			c.scheduleCompletionRecord(i, ws, attempt+1)
+			return
+		}
+		c.release(i.ID)
+	})
+}
+func (c *Coordinator) shouldRun(ctx context.Context, i domain.Issue) bool {
+	ok, err := c.workspaces.ShouldRun(ctx, i)
+	if err != nil {
+		c.log.Warn("workspace run eligibility check failed", "issue", i.Identifier, "error", err)
+		return false
+	}
+	return ok
 }
 func (c *Coordinator) release(id string) {
 	c.mu.Lock()
