@@ -3,6 +3,7 @@ tracker:
   kind: linear
   provider:
     project_slug: example-project
+    # Environment expansion accepts the exact $VARNAME form only.
     api_key: $LINEAR_API_KEY
     # Optional: only dispatch issues assigned to this Linear user ID, or `me`.
     # assignee: me

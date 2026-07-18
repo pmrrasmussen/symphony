@@ -6,8 +6,8 @@
 | Key | Required | Meaning |
 | --- | --- | --- |
 | `project_slug` | yes | Linear project slug ID. Every read is restricted to this project. |
-| `api_key` | yes | Linear personal API key. `$VARNAME` expansion is supported by `WORKFLOW.md`; it is never logged. |
-| `api_key_file` | optional | Trusted local file containing the API key; it is resolved by configuration loading. |
+| `api_key` | yes | Linear personal API key. Exact `$VARNAME` expansion is supported by `WORKFLOW.md`; surrounding whitespace is trimmed and the value is never logged. |
+| `api_key_file` | optional | Trusted local file containing the API key; its trimmed contents and path dependencies are tracked by configuration loading. |
 | `endpoint` | optional | Absolute HTTPS GraphQL endpoint; defaults to `https://api.linear.app/graphql`. HTTP is accepted only for `localhost`, `127.0.0.1`, or `::1` test hosts. |
 | `assignee` | optional | Unset permits all assignees. A non-empty ID permits only that assignee. `me` resolves the current Linear viewer ID for each read. |
 | `handoff_state` | optional | Enables the tightly scoped Codex `linear_graphql` compatibility tool. The name must be a non-active workflow state in the active issue's Linear team. |
@@ -15,7 +15,9 @@
 
 Invalid provider values produce `invalid_tracker_config`; a missing or empty key
 produces `missing_tracker_secret`. `api_key_file` loading errors are reported by
-configuration before the service starts.
+configuration before the service starts. Changes to a referenced environment
+value or secret file participate in reload detection even when `WORKFLOW.md`
+itself is unchanged.
 
 Candidate and terminal reads use a project-and-state filter. Configured state
 names keep their original spelling for Linear's case-sensitive filter; internal

@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -356,5 +357,231 @@ func TestRenderHandoffCommentUsesOnlyRepositoryPolicy(t *testing.T) {
 	got, err := w.Config.RenderHandoffComment(domain.Issue{Identifier: "PMR-5", Title: "Handoff"})
 	if err != nil || got != "Handoff PMR-5: Handoff" {
 		t.Fatalf("comment=%q err=%v", got, err)
+	}
+}
+
+func TestReloadTracksEnvironmentAndSecretFileDependencies(t *testing.T) {
+	d := t.TempDir()
+	firstSource := filepath.Join(d, "source-one")
+	secondSource := filepath.Join(d, "source-two")
+	for _, directory := range []string{firstSource, secondSource} {
+		if err := os.Mkdir(directory, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	secret := filepath.Join(d, "linear-key")
+	if err := os.WriteFile(secret, []byte("  first-secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PMR16_SECRET_FILE", secret)
+	t.Setenv("PMR16_SOURCE_ROOT", firstSource)
+	workflow := filepath.Join(d, "WORKFLOW.md")
+	content := "---\ntracker: {kind: linear, provider: {api_key_file: $PMR16_SECRET_FILE}, active_states: [Todo], terminal_states: [Done]}\nworkspace: {root: work, source_root: $PMR16_SOURCE_ROOT}\n---\nprompt"
+	if err := os.WriteFile(workflow, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := NewStore(workflow, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := store.Current().Config.Tracker.Provider["api_key"]; got != "first-secret" {
+		t.Fatalf("trimmed initial file secret=%q", got)
+	}
+
+	if err := os.WriteFile(secret, []byte("second-secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	changed, err := store.ReloadIfChanged()
+	if err != nil || !changed {
+		t.Fatalf("secret-only reload changed=%t err=%v", changed, err)
+	}
+	if got := store.Current().Config.Tracker.Provider["api_key"]; got != "second-secret" {
+		t.Fatalf("reloaded file secret=%q", got)
+	}
+
+	t.Setenv("PMR16_SOURCE_ROOT", secondSource)
+	changed, err = store.ReloadIfChanged()
+	if err != nil || !changed {
+		t.Fatalf("environment-only reload changed=%t err=%v", changed, err)
+	}
+	if got := store.Current().Config.Workspace.SourceRoot; got != secondSource {
+		t.Fatalf("reloaded source root=%q", got)
+	}
+
+	if err := os.WriteFile(secret, []byte(" \n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	changed, err = store.ReloadIfChanged()
+	if err == nil || changed {
+		t.Fatalf("empty secret reload changed=%t err=%v", changed, err)
+	}
+	if strings.Contains(err.Error(), "second-secret") {
+		t.Fatalf("reload error exposed secret: %v", err)
+	}
+	if got := store.Current().Config.Tracker.Provider["api_key"]; got != "second-secret" {
+		t.Fatalf("invalid reload replaced last valid secret=%q", got)
+	}
+	if changed, err = store.ReloadIfChanged(); err != nil || changed {
+		t.Fatalf("unchanged rejected dependency changed=%t err=%v", changed, err)
+	}
+	if err := os.WriteFile(secret, []byte("recovered-secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if changed, err = store.ReloadIfChanged(); err != nil || !changed {
+		t.Fatalf("recovered dependency changed=%t err=%v", changed, err)
+	}
+}
+
+func TestEnvironmentReferencesAreExactAndRequiredSourceRootMustResolve(t *testing.T) {
+	d := t.TempDir()
+	workflow := filepath.Join(d, "WORKFLOW.md")
+	for _, test := range []struct {
+		name    string
+		setting string
+		want    string
+	}{
+		{name: "braced root", setting: "workspace: {root: '${PMR16_ROOT}'}", want: "exact $VARNAME"},
+		{name: "compound root", setting: "workspace: {root: '$PMR16_ROOT/child'}", want: "exact $VARNAME"},
+		{name: "ambiguous secret", setting: "tracker: {kind: linear, provider: {api_key: '$PMR16_KEY-extra'}, active_states: [Todo], terminal_states: [Done]}", want: "exact $VARNAME"},
+		{name: "unresolved source", setting: "workspace: {source_root: $PMR16_UNSET_SOURCE}", want: "environment reference is unresolved"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			frontMatter := "tracker: {kind: linear, active_states: [Todo], terminal_states: [Done]}\n" + test.setting
+			if strings.HasPrefix(test.setting, "tracker:") {
+				frontMatter = test.setting
+			}
+			if err := os.WriteFile(workflow, []byte("---\n"+frontMatter+"\n---\nprompt"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Load(workflow, ""); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Load error=%v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestReloadPublishesEveryDynamicSettingAsOneSnapshot(t *testing.T) {
+	d := t.TempDir()
+	firstSource := filepath.Join(d, "source-one")
+	secondSource := filepath.Join(d, "source-two")
+	for _, directory := range []string{firstSource, secondSource} {
+		if err := os.Mkdir(directory, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	workflow := filepath.Join(d, "WORKFLOW.md")
+	initial := "---\ntracker: {kind: linear, provider: {api_key: ' first-key '}, active_states: [Todo], terminal_states: [Done]}\npolling: {interval_ms: 100}\nworkspace: {root: work-one, source_root: " + firstSource + "}\nhooks: {after_create: one, before_run: one, after_run: one, before_remove: one, timeout_ms: 101}\nagent: {max_concurrent_agents: 1, max_turns: 2, max_retry_backoff_ms: 102, max_concurrent_agents_by_state: {Todo: 1}}\ncodex: {command: codex-one, approval_policy: never, thread_sandbox: workspace-write, turn_sandbox_policy: {type: one}, turn_timeout_ms: 103, read_timeout_ms: 104, stall_timeout_ms: 105}\n---\nfirst"
+	if err := os.WriteFile(workflow, []byte(initial), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := NewStore(workflow, "logs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated := "---\ntracker: {kind: linear, provider: {api_key: ' second-key '}, required_labels: [Ready], active_states: [Backlog, Started], terminal_states: [Closed]}\npolling: {interval_ms: 200}\nworkspace: {root: work-two, source_root: " + secondSource + "}\nhooks: {after_create: two-create, before_run: two-before, after_run: two-after, before_remove: two-remove, timeout_ms: 201}\nagent: {max_concurrent_agents: 3, max_turns: 4, max_retry_backoff_ms: 202, max_concurrent_agents_by_state: {Started: 2}}\ncodex: {command: codex-two, approval_policy: on-request, thread_sandbox: danger-full-access, turn_sandbox_policy: {type: two}, turn_timeout_ms: 203, read_timeout_ms: 204, stall_timeout_ms: 205}\n---\nsecond"
+	if err := os.WriteFile(workflow, []byte(updated), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	changed, err := store.ReloadIfChanged()
+	if err != nil || !changed {
+		t.Fatalf("reload changed=%t err=%v", changed, err)
+	}
+	got := store.Current()
+	settings := got.Config
+	if got.Prompt != "second" || settings.Tracker.Provider["api_key"] != "second-key" || strings.Join(settings.Tracker.RequiredLabels, ",") != "ready" || strings.Join(settings.Tracker.ActiveStates, ",") != "backlog,started" || strings.Join(settings.Tracker.TerminalStates, ",") != "closed" {
+		t.Fatalf("tracker snapshot=%+v prompt=%q", settings.Tracker, got.Prompt)
+	}
+	if settings.Polling.Interval != 200*time.Millisecond || settings.Workspace.Root != filepath.Join(d, "work-two") || settings.Workspace.SourceRoot != secondSource || settings.LogRoot != filepath.Join(d, "logs") {
+		t.Fatalf("operational paths/polling=%+v %+v log=%q", settings.Polling, settings.Workspace, settings.LogRoot)
+	}
+	if settings.Hooks != (Hooks{AfterCreate: "two-create", BeforeRun: "two-before", AfterRun: "two-after", BeforeRemove: "two-remove", Timeout: 201 * time.Millisecond}) {
+		t.Fatalf("hooks=%+v", settings.Hooks)
+	}
+	if settings.Agent.MaxConcurrent != 3 || settings.Agent.MaxTurns != 4 || settings.Agent.MaxRetryBackoff != 202*time.Millisecond || settings.Agent.ByState["started"] != 2 {
+		t.Fatalf("agent=%+v", settings.Agent)
+	}
+	policy, ok := settings.Codex.TurnSandboxPolicy.(map[string]any)
+	if !ok || policy["type"] != "two" || settings.Codex.Command != "codex-two" || settings.Codex.ApprovalPolicy != "on-request" || settings.Codex.ThreadSandbox != "danger-full-access" || settings.Codex.TurnTimeout != 203*time.Millisecond || settings.Codex.ReadTimeout != 204*time.Millisecond || settings.Codex.StallTimeout != 205*time.Millisecond {
+		t.Fatalf("codex=%+v", settings.Codex)
+	}
+}
+
+func TestCurrentReturnsAnImmutableSnapshotCopy(t *testing.T) {
+	d := t.TempDir()
+	workflow := filepath.Join(d, "WORKFLOW.md")
+	content := "---\nextension: {nested: [original]}\ntracker: {kind: linear, provider: {api_key: secret, nested: {value: original}}, active_states: [Todo], terminal_states: [Done]}\nagent: {max_concurrent_agents_by_state: {Todo: 1}}\ncodex: {turn_sandbox_policy: {type: original}}\n---\nprompt"
+	if err := os.WriteFile(workflow, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := NewStore(workflow, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	copy := store.Current()
+	copy.Raw["extension"].(map[string]any)["nested"].([]any)[0] = "mutated"
+	copy.Config.Tracker.Provider["nested"].(map[string]any)["value"] = "mutated"
+	copy.Config.Tracker.ActiveStates[0] = "mutated"
+	copy.Config.Agent.ByState["todo"] = 99
+	copy.Config.Codex.TurnSandboxPolicy.(map[string]any)["type"] = "mutated"
+
+	current := store.Current()
+	if current.Raw["extension"].(map[string]any)["nested"].([]any)[0] != "original" || current.Config.Tracker.Provider["nested"].(map[string]any)["value"] != "original" || current.Config.Tracker.ActiveStates[0] != "todo" || current.Config.Agent.ByState["todo"] != 1 || current.Config.Codex.TurnSandboxPolicy.(map[string]any)["type"] != "original" {
+		t.Fatalf("published workflow was mutated through Current: %+v", current)
+	}
+}
+
+func TestConcurrentReadersNeverObserveMixedSnapshots(t *testing.T) {
+	d := t.TempDir()
+	workflow := filepath.Join(d, "WORKFLOW.md")
+	versions := []string{
+		"---\ntracker: {kind: linear, active_states: [One], terminal_states: [Done]}\npolling: {interval_ms: 1}\nagent: {max_concurrent_agents: 1}\ncodex: {command: one}\n---\none",
+		"---\ntracker: {kind: linear, active_states: [Two], terminal_states: [Done]}\npolling: {interval_ms: 2}\nagent: {max_concurrent_agents: 2}\ncodex: {command: two}\n---\ntwo",
+	}
+	if err := os.WriteFile(workflow, []byte(versions[0]), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := NewStore(workflow, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stop := make(chan struct{})
+	errors := make(chan string, 4)
+	var readers sync.WaitGroup
+	for range 4 {
+		readers.Add(1)
+		go func() {
+			defer readers.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				current := store.Current()
+				one := current.Prompt == "one" && current.Config.Polling.Interval == time.Millisecond && current.Config.Agent.MaxConcurrent == 1 && current.Config.Codex.Command == "one" && current.Config.Tracker.ActiveStates[0] == "one"
+				two := current.Prompt == "two" && current.Config.Polling.Interval == 2*time.Millisecond && current.Config.Agent.MaxConcurrent == 2 && current.Config.Codex.Command == "two" && current.Config.Tracker.ActiveStates[0] == "two"
+				if !one && !two {
+					select {
+					case errors <- "reader observed fields from different workflow versions":
+					default:
+					}
+					return
+				}
+			}
+		}()
+	}
+	for index := 0; index < 40; index++ {
+		if err := os.WriteFile(workflow, []byte(versions[index%2]), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.Reload(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	close(stop)
+	readers.Wait()
+	close(errors)
+	for message := range errors {
+		t.Error(message)
 	}
 }
