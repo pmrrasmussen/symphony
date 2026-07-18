@@ -11,6 +11,12 @@ tracker:
     agent_transitions:
       Todo: In Progress
       Merging: In Review
+    # Optional, opt-in Codex client tool. It creates a new issue only in this
+    # project/team and records the active issue as its Linear parent; it
+    # cannot select an arbitrary project, team, or issue. Intended for
+    # decomposing one task into several independently reviewable pull
+    # requests: normally one child issue per isolated worktree and PR.
+    # child_issue_creation: true
   active_states: [Todo, In Progress]
   terminal_states: [Done, Canceled]
 polling:

@@ -71,7 +71,7 @@ func (b *Backend) Start(ctx context.Context, r domain.AgentRequest) (domain.Agen
 	}
 	var handoff *linear.HandoffSession
 	var err error
-	if b.handoff != nil && (strings.TrimSpace(settings.Tracker.HandoffState) != "" || len(settings.Tracker.AgentTransitions) > 0) {
+	if b.handoff != nil && settings.LinearSessionCapabilityEnabled() {
 		handoff, err = b.handoff.PrepareWithSettings(ctx, settings, r.Issue)
 		if err != nil {
 			return domain.AgentSession{}, nil, fmt.Errorf("prepare Linear handoff: %w", err)
@@ -104,8 +104,11 @@ func (b *Backend) Start(ctx context.Context, r domain.AgentRequest) (domain.Agen
 	}
 	threadParams := map[string]any{"cwd": r.Workspace, "approvalPolicy": r.ApprovalPolicy, "sandbox": r.ThreadSandbox}
 	tools := []map[string]any{}
-	if handoff != nil {
+	if handoff != nil && (strings.TrimSpace(settings.Tracker.HandoffState) != "" || len(settings.Tracker.AgentTransitions) > 0) {
 		tools = append(tools, linearGraphQLToolDefinition())
+	}
+	if handoff != nil && settings.Tracker.ChildIssueCreation {
+		tools = append(tools, createChildIssueToolDefinition())
 	}
 	if githubSession != nil {
 		tools = append(tools, githubToolDefinition())
@@ -584,6 +587,24 @@ func linearGraphQLToolDefinition() map[string]any {
 	}
 }
 
+func createChildIssueToolDefinition() map[string]any {
+	return map[string]any{
+		"type": "function", "name": "create_child_issue",
+		"description": "Create a new Linear issue in the active issue's configured project and team, recorded as a Linear sub-issue of the active issue. Use this to split this task into independently reviewable pull requests: normally create one child issue per isolated worktree and PR. depends_on may only reference identifiers returned by earlier create_child_issue calls in this same session.",
+		"inputSchema": map[string]any{
+			"type": "object", "additionalProperties": false,
+			"properties": map[string]any{
+				"title":       map[string]any{"type": "string", "minLength": 1, "maxLength": 255},
+				"description": map[string]any{"type": "string", "maxLength": 20000},
+				"priority":    map[string]any{"type": "integer", "minimum": 0, "maximum": 4},
+				"labels":      map[string]any{"type": "array", "maxItems": 20, "items": map[string]any{"type": "string", "maxLength": 128}},
+				"depends_on":  map[string]any{"type": "array", "maxItems": 20, "items": map[string]any{"type": "string", "maxLength": 64}},
+			},
+			"required": []string{"title"},
+		},
+	}
+}
+
 func githubToolDefinition() map[string]any {
 	return map[string]any{
 		"type": "function", "name": "github_publish_pr",
@@ -614,6 +635,22 @@ func (c *client) handleToolCall(x rpc) {
 		}
 		content, _ := json.Marshal(map[string]any{"branch": result.Branch, "pull_request": result.URL, "number": result.Number})
 		c.sendServerResponse(x.ID, map[string]any{"success": true, "contentItems": []any{map[string]any{"type": "inputText", "text": string(content)}}})
+		return
+	}
+	if request.Tool == "create_child_issue" && c.handoff != nil {
+		result, err := c.handoff.CreateChildIssue(c.ctx, request.Arguments)
+		if err != nil {
+			// Do not return provider errors, issue data, or any credential-derived
+			// value to the child, mirroring the linear_graphql failure contract below.
+			c.toolFailure(x.ID, "Linear child issue creation was rejected.")
+			return
+		}
+		text, err := json.Marshal(result.Data)
+		if err != nil {
+			c.unsupportedTool(x.ID)
+			return
+		}
+		c.sendServerResponse(x.ID, map[string]any{"success": result.Success, "contentItems": []any{map[string]any{"type": "inputText", "text": string(text)}}})
 		return
 	}
 	if request.Tool != "linear_graphql" || c.handoff == nil {

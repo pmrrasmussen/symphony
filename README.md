@@ -107,6 +107,17 @@ To let a Codex session hand an issue off safely, optionally configure
 not general Linear or GraphQL access; see the Linear tracker profile for its
 strict scope.
 
+To let a Codex session split a task into independently reviewable pull
+requests, optionally configure `tracker.provider.child_issue_creation: true`.
+This enables a session-bound `create_child_issue` tool, not general Linear
+issue creation: it can only create a new issue in the active issue's already
+configured Linear project and team, always records the active issue as the
+new issue's Linear parent, and accepts only a bounded set of fields (title,
+description, priority, labels drawn from the team's existing labels, and
+dependencies on issues the same session already created). The intended
+pattern is one child issue per isolated Symphony worktree and pull request;
+see the [Linear tracker profile](docs/linear-tracker.md) for its exact scope.
+
 An optional host-side GitHub integration can publish a completed, clean
 worktree and create or reuse its pull request. It requires the Linear handoff
 policy above and a fixed repository configuration:
