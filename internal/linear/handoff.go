@@ -8,8 +8,10 @@ package linear
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 
 	"github.com/pmrrasmussen/symphony/internal/config"
 	"github.com/pmrrasmussen/symphony/internal/domain"
@@ -22,10 +24,11 @@ const maxHandoffCommentBytes = 8 << 10
 type Handoff struct {
 	settings func() config.Settings
 	client   *http.Client
+	logger   *slog.Logger
 }
 
 func NewHandoff(settings func() config.Settings) *Handoff {
-	return &Handoff{settings: settings, client: newHTTPClient(nil)}
+	return &Handoff{settings: settings, client: newHTTPClient(nil), logger: slog.Default()}
 }
 
 func (h *Handoff) Enabled() bool {
@@ -57,6 +60,9 @@ func (h *Handoff) Prepare(ctx context.Context, issue domain.Issue) (*HandoffSess
 	if active.ID != issue.ID || active.ProjectSlug() != projectSlug || active.TeamID() == "" {
 		return nil, trackerError("handoff_scope", "active issue is outside the configured Linear project")
 	}
+	if !stateAllowed(active.State.Name, s.Tracker.ActiveStates) {
+		return nil, trackerError("handoff_scope", "active issue is not in a workflow active state")
+	}
 	stateID, err := h.resolveState(ctx, s, active.TeamID(), s.Tracker.HandoffState)
 	if err != nil {
 		return nil, err
@@ -65,9 +71,15 @@ func (h *Handoff) Prepare(ctx context.Context, issue domain.Issue) (*HandoffSess
 	if err != nil {
 		return nil, trackerError("invalid_handoff_config", "could not render configured handoff comment")
 	}
+	comment = strings.TrimSpace(comment)
+	if strings.TrimSpace(s.Tracker.HandoffCommentTemplate) != "" {
+		if err := validateComment(comment); err != nil {
+			return nil, trackerError("invalid_handoff_config", "rendered handoff comment is invalid")
+		}
+	}
 	return &HandoffSession{
 		client: h.client, settings: s, issue: active, targetStateID: stateID,
-		handoffComment: comment,
+		handoffComment: comment, logger: h.logger,
 	}, nil
 }
 
@@ -79,6 +91,8 @@ type HandoffSession struct {
 	issue          handoffIssue
 	targetStateID  string
 	handoffComment string
+	logger         *slog.Logger
+	handoffMu      sync.Mutex
 }
 
 // MatchesSecret lets the Codex launcher remove inherited values containing the
@@ -125,29 +139,21 @@ func (s *HandoffSession) Call(ctx context.Context, arguments json.RawMessage) (T
 		if strings.TrimSpace(input.Body) != "" {
 			return ToolResult{}, trackerError("handoff_request", "handoff does not accept body")
 		}
-		if s.handoffComment != "" {
-			if err := s.ensureMutable(ctx); err != nil {
-				return ToolResult{}, err
-			}
-			if err := s.comment(ctx, s.handoffComment); err != nil {
-				return ToolResult{}, err
-			}
-		}
-		if err := s.ensureMutable(ctx); err != nil {
+		if err := s.handoff(ctx); err != nil {
+			s.log("handoff_failed")
 			return ToolResult{}, err
 		}
-		if err := s.transition(ctx); err != nil {
-			return ToolResult{}, err
-		}
+		s.log("handoff_complete")
 		return ToolResult{Success: true, Data: map[string]any{"issue": s.issue.metadata(), "handoff_state": s.settings.Tracker.HandoffState}}, nil
 	case "comment":
-		if err := validateComment(input.Body); err != nil {
+		body := strings.TrimSpace(input.Body)
+		if err := validateComment(body); err != nil {
 			return ToolResult{}, err
 		}
 		if err := s.ensureMutable(ctx); err != nil {
 			return ToolResult{}, err
 		}
-		if err := s.comment(ctx, input.Body); err != nil {
+		if err := s.comment(ctx, body); err != nil {
 			return ToolResult{}, err
 		}
 		return ToolResult{Success: true, Data: map[string]any{"issue": s.issue.metadata(), "commented": true}}, nil
@@ -156,26 +162,104 @@ func (s *HandoffSession) Call(ctx context.Context, arguments json.RawMessage) (T
 	}
 }
 
+// handoff coordinates the repository-owned completion comment and transition.
+// The exact comment is durable reconciliation state in Linear: retries first
+// discover it, so a failed or ambiguous transition never duplicates delivery.
+func (s *HandoffSession) handoff(ctx context.Context) error {
+	s.handoffMu.Lock()
+	defer s.handoffMu.Unlock()
+
+	current, err := s.readScopedIssue(ctx)
+	if err != nil {
+		return err
+	}
+	if !s.isInitialState(current) && !s.isTargetState(current) {
+		return trackerError("handoff_scope", "active issue state changed after session setup")
+	}
+
+	commented := s.handoffComment == ""
+	if !commented {
+		commented, err = s.hasHandoffComment(ctx)
+		if err != nil {
+			return err
+		}
+	}
+	if s.isTargetState(current) && commented {
+		return nil
+	}
+	if !commented {
+		// Re-read immediately before mutation. A human scope/state change wins,
+		// except for the configured target state, which can be reconciled.
+		current, err = s.readScopedIssue(ctx)
+		if err != nil {
+			return err
+		}
+		if !s.isInitialState(current) && !s.isTargetState(current) {
+			return trackerError("handoff_scope", "active issue state changed after session setup")
+		}
+		if err := s.comment(ctx, s.handoffComment); err != nil {
+			return err
+		}
+	}
+	if s.isTargetState(current) {
+		return nil
+	}
+	if err := s.ensureMutable(ctx); err != nil {
+		return err
+	}
+	return s.transition(ctx)
+}
+
+func (s *HandoffSession) log(outcome string) {
+	if s.logger == nil {
+		return
+	}
+	s.logger.Info("Linear handoff", "outcome", outcome, "issue_id", s.issue.ID, "issue_identifier", s.issue.Identifier)
+}
+
 // ensureMutable re-reads the bound issue immediately before each mutation. A
 // human change since session setup (including a transition to Done) wins over
 // the agent: the request is rejected before any mutation is sent.
 func (s *HandoffSession) ensureMutable(ctx context.Context) error {
-	current, err := readHandoffIssue(ctx, s.client, s.settings, s.issue.ID)
+	current, err := s.readScopedIssue(ctx)
 	if err != nil {
 		return err
 	}
-	if current.ProjectSlug() != s.issue.ProjectSlug() || current.TeamID() != s.issue.TeamID() {
-		return trackerError("handoff_scope", "active issue scope changed after session setup")
-	}
-	if !strings.EqualFold(strings.TrimSpace(current.State.Name), strings.TrimSpace(s.issue.State.Name)) {
+	if !s.isInitialState(current) {
 		return trackerError("handoff_scope", "active issue state changed after session setup")
 	}
-	for _, active := range s.settings.Tracker.ActiveStates {
-		if strings.EqualFold(strings.TrimSpace(current.State.Name), strings.TrimSpace(active)) {
-			return nil
-		}
+	if stateAllowed(current.State.Name, s.settings.Tracker.ActiveStates) {
+		return nil
 	}
 	return trackerError("handoff_scope", "active issue is no longer in a workflow active state")
+}
+
+func (s *HandoffSession) readScopedIssue(ctx context.Context) (handoffIssue, error) {
+	current, err := readHandoffIssue(ctx, s.client, s.settings, s.issue.ID)
+	if err != nil {
+		return handoffIssue{}, err
+	}
+	if current.ID != s.issue.ID || current.ProjectSlug() != s.issue.ProjectSlug() || current.TeamID() != s.issue.TeamID() {
+		return handoffIssue{}, trackerError("handoff_scope", "active issue scope changed after session setup")
+	}
+	return current, nil
+}
+
+func (s *HandoffSession) isInitialState(issue handoffIssue) bool {
+	return issue.StateID() == s.issue.StateID() && strings.EqualFold(strings.TrimSpace(issue.State.Name), strings.TrimSpace(s.issue.State.Name))
+}
+
+func (s *HandoffSession) isTargetState(issue handoffIssue) bool {
+	return issue.StateID() == s.targetStateID && strings.EqualFold(strings.TrimSpace(issue.State.Name), strings.TrimSpace(s.settings.Tracker.HandoffState))
+}
+
+func stateAllowed(state string, allowed []string) bool {
+	for _, candidate := range allowed {
+		if strings.EqualFold(strings.TrimSpace(state), strings.TrimSpace(candidate)) {
+			return true
+		}
+	}
+	return false
 }
 
 func validateComment(body string) error {
@@ -226,6 +310,65 @@ func (s *HandoffSession) comment(ctx context.Context, body string) error {
 		return trackerError("handoff_response", "Linear did not accept the issue comment")
 	}
 	return nil
+}
+
+func (s *HandoffSession) hasHandoffComment(ctx context.Context) (bool, error) {
+	after := any(nil)
+	seen := map[string]bool{}
+	for {
+		response, err := requestWithSettings(ctx, s.client, s.settings, handoffCommentsQuery, map[string]any{
+			"issueID": s.issue.ID, "first": pageSize, "after": after,
+		})
+		if err != nil {
+			return false, err
+		}
+		var payload struct {
+			Data struct {
+				Issue *struct {
+					ID      string `json:"id"`
+					Project *struct {
+						SlugID string `json:"slugId"`
+					} `json:"project"`
+					Team *struct {
+						ID string `json:"id"`
+					} `json:"team"`
+					Comments struct {
+						Nodes []struct {
+							Body string `json:"body"`
+						} `json:"nodes"`
+						PageInfo struct {
+							HasNextPage bool    `json:"hasNextPage"`
+							EndCursor   *string `json:"endCursor"`
+						} `json:"pageInfo"`
+					} `json:"comments"`
+				} `json:"issue"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(response, &payload); err != nil || payload.Data.Issue == nil {
+			return false, trackerError("handoff_response", "Linear returned invalid issue comments")
+		}
+		issue := payload.Data.Issue
+		if issue.ID != s.issue.ID || issue.Project == nil || strings.TrimSpace(issue.Project.SlugID) != s.issue.ProjectSlug() || issue.Team == nil || strings.TrimSpace(issue.Team.ID) != s.issue.TeamID() {
+			return false, trackerError("handoff_scope", "Linear returned comments outside the active issue scope")
+		}
+		for _, comment := range issue.Comments.Nodes {
+			if strings.TrimSpace(comment.Body) == s.handoffComment {
+				return true, nil
+			}
+		}
+		if !issue.Comments.PageInfo.HasNextPage {
+			return false, nil
+		}
+		if issue.Comments.PageInfo.EndCursor == nil {
+			return false, trackerError("handoff_response", "Linear returned invalid comment pagination")
+		}
+		cursor := strings.TrimSpace(*issue.Comments.PageInfo.EndCursor)
+		if cursor == "" || seen[cursor] {
+			return false, trackerError("handoff_response", "Linear returned invalid comment pagination")
+		}
+		seen[cursor] = true
+		after = cursor
+	}
 }
 
 func (h *Handoff) readIssue(ctx context.Context, s config.Settings, issueID string) (handoffIssue, error) {
@@ -305,18 +448,20 @@ type handoffIssue struct {
 		ID string `json:"id"`
 	} `json:"team"`
 	State *struct {
+		ID   string `json:"id"`
 		Name string `json:"name"`
 	} `json:"state"`
 }
 
 func (i handoffIssue) valid() error {
-	if strings.TrimSpace(i.ID) == "" || strings.TrimSpace(i.Identifier) == "" || strings.TrimSpace(i.Title) == "" || i.Project == nil || i.Team == nil || i.State == nil {
+	if strings.TrimSpace(i.ID) == "" || strings.TrimSpace(i.Identifier) == "" || strings.TrimSpace(i.Title) == "" || i.Project == nil || i.Team == nil || i.State == nil || i.StateID() == "" {
 		return trackerError("handoff_scope", "Linear returned an incomplete active issue")
 	}
 	return nil
 }
 func (i handoffIssue) ProjectSlug() string { return strings.TrimSpace(i.Project.SlugID) }
 func (i handoffIssue) TeamID() string      { return strings.TrimSpace(i.Team.ID) }
+func (i handoffIssue) StateID() string     { return strings.TrimSpace(i.State.ID) }
 func (i handoffIssue) toDomain() domain.Issue {
 	return domain.Issue{ID: i.ID, Identifier: i.Identifier, Title: i.Title, Description: i.Description, URL: i.URL, State: i.State.Name}
 }
@@ -326,7 +471,8 @@ func (i handoffIssue) metadata() map[string]string {
 
 // Keep every GraphQL operation fixed and intentionally small. Variables are
 // generated solely from the already-bound session, never from tool input.
-const handoffReadQuery = `query SymphonyLinearHandoffIssue($issueID: String!) { issue(id: $issueID) { id identifier title description url project { slugId } team { id } state { name } } }`
+const handoffReadQuery = `query SymphonyLinearHandoffIssue($issueID: String!) { issue(id: $issueID) { id identifier title description url project { slugId } team { id } state { id name } } }`
 const handoffStatesQuery = `query SymphonyLinearHandoffStates($teamID: String!) { team(id: $teamID) { id states { nodes { id name } } } }`
 const handoffTransitionQuery = `mutation SymphonyLinearHandoffTransition($issueID: String!, $stateID: String!) { issueUpdate(id: $issueID, input: {stateId: $stateID}) { success } }`
 const handoffCommentQuery = `mutation SymphonyLinearHandoffComment($issueID: String!, $body: String!) { commentCreate(input: {issueId: $issueID, body: $body}) { success } }`
+const handoffCommentsQuery = `query SymphonyLinearHandoffComments($issueID: String!, $first: Int!, $after: String) { issue(id: $issueID) { id project { slugId } team { id } comments(first: $first, after: $after) { nodes { body } pageInfo { hasNextPage endCursor } } } }`

@@ -73,6 +73,17 @@ bound issue and rejects the action if its project, team, or state changed, or
 if it is no longer in an active workflow state. A human terminal transition
 therefore wins without any agent mutation.
 
+The typed `handoff` operation trims and validates the repository-rendered
+comment, checks the bound issue's existing comments, and then applies the
+comment before the configured state transition. The exact configured comment
+is the reconciliation record: if either mutation returns an ambiguous or
+retryable failure, a retry observes the comment and current state before doing
+more work. A completed transition is accepted only when that comment already
+exists (or no comment is configured), and a target-state issue missing its
+comment is repaired without another transition. This makes repeated delivery
+idempotent without storing an agent-supplied key or exposing a broader Linear
+write API.
+
 The compatibility name is `linear_graphql`, but it is not a GraphQL proxy. Its
 only typed operations are `read`, `handoff`, and `comment`. They are bound to
 the active issue and configured project; callers cannot supply a query, issue
@@ -80,3 +91,5 @@ ID, project, endpoint, credential, or state. `handoff` may only use the
 configured state and the optional fixed comment template. `comment` can only
 write a bounded comment to the active issue. Tool failures return generic
 responses and never reveal the Linear credential or provider payload.
+Handoff logs contain only the outcome and bound issue ID/identifier; comment
+bodies, credentials, and full agent arguments are not logged.
