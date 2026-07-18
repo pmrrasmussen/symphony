@@ -80,7 +80,7 @@ func (f *handoffFixture) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		}}})
 	case strings.Contains(query, "SymphonyLinearHandoffStates"):
 		writeJSON(f.t, w, map[string]any{"data": map[string]any{"team": map[string]any{"id": "team-1", "states": map[string]any{"nodes": []any{
-			map[string]string{"id": "todo", "name": "Todo"}, map[string]string{"id": "review", "name": "In Review"},
+			map[string]string{"id": "todo", "name": "Todo"}, map[string]string{"id": "review", "name": "In Review"}, map[string]string{"id": "done", "name": "Done"},
 		}}}}})
 	case strings.Contains(query, "SymphonyLinearHandoffComments"):
 		nodes := make([]any, 0, len(f.comments))
@@ -103,7 +103,7 @@ func (f *handoffFixture) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		if got := variables["issueID"]; got != "active" {
 			f.t.Errorf("comment issueID=%v", got)
 		}
-		if got := variables["body"]; got != "Ready PMR-18" && got != "bounded comment" {
+		if got := variables["body"]; got != "Ready PMR-18" && got != "bounded comment" && got != "https://github.com/owner/repo/pull/7" {
 			f.t.Errorf("comment body=%q", got)
 		}
 		if f.failComment {
@@ -124,7 +124,7 @@ func (f *handoffFixture) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		if got := variables["issueID"]; got != "active" {
 			f.t.Errorf("transition issueID=%v", got)
 		}
-		if got := variables["stateID"]; got != "review" {
+		if got := variables["stateID"]; got != "review" && got != "done" {
 			f.t.Errorf("transition stateID=%v", got)
 		}
 		if f.failTransition {
@@ -132,7 +132,11 @@ func (f *handoffFixture) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			writeJSON(f.t, w, map[string]any{"data": map[string]any{"issueUpdate": map[string]bool{"success": false}}})
 			return
 		}
-		f.stateID, f.stateName = "review", "In Review"
+		if variables["stateID"] == "done" {
+			f.stateID, f.stateName = "done", "Done"
+		} else {
+			f.stateID, f.stateName = "review", "In Review"
+		}
 		if f.ambiguousTransition {
 			f.ambiguousTransition = false
 			w.WriteHeader(http.StatusInternalServerError)
@@ -185,6 +189,32 @@ func TestHandoffConcurrentDuplicateDeliveryIsIdempotent(t *testing.T) {
 	}
 	if len(f.comments) != 1 || f.commentAttempts != 1 || f.transitionAttempts != 1 {
 		t.Fatalf("comments=%v comment attempts=%d transition attempts=%d", f.comments, f.commentAttempts, f.transitionAttempts)
+	}
+}
+
+func TestPullRequestLinkAndMergeCompletionAreScopedAndIdempotent(t *testing.T) {
+	f := newHandoffFixture(t)
+	session := f.session(t, nil)
+	url := "https://github.com/owner/repo/pull/7"
+	if err := session.LinkAndHandoff(context.Background(), url); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.LinkAndHandoff(context.Background(), url); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.comments) != 2 || f.comments[0] != url || f.commentAttempts != 2 || f.transitionAttempts != 1 || f.stateName != "In Review" {
+		t.Fatalf("comments=%v comment attempts=%d transitions=%d state=%s", f.comments, f.commentAttempts, f.transitionAttempts, f.stateName)
+	}
+	changed, err := session.Complete(context.Background())
+	if err != nil || !changed {
+		t.Fatalf("first completion changed=%t err=%v", changed, err)
+	}
+	changed, err = session.Complete(context.Background())
+	if err != nil || changed {
+		t.Fatalf("duplicate completion changed=%t err=%v", changed, err)
+	}
+	if f.transitionAttempts != 2 || f.stateName != "Done" {
+		t.Fatalf("transitions=%d state=%s", f.transitionAttempts, f.stateName)
 	}
 }
 

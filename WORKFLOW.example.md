@@ -32,6 +32,14 @@ codex:
   turn_timeout_ms: 3600000
   read_timeout_ms: 5000
   stall_timeout_ms: 300000
+# Optional. Requires tracker.provider.handoff_state and a fine-grained token
+# restricted to exactly this repository. token_file may replace token.
+# github:
+#   owner: your-github-owner
+#   repository: your-repository
+#   base_branch: main
+#   token: $SYMPHONY_GITHUB_TOKEN
+#   poll_interval_ms: 30000
 ---
 Work on {{.issue.identifier}}: {{.issue.title}}
 

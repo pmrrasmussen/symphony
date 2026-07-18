@@ -80,7 +80,7 @@ func TestStartDrainsStderrBeforeProcessFinalization(t *testing.T) {
 	script := writeAppServer(t, dir, `
 printf '%s\n' 'token=do-not-log-this' >&2
 `)
-	c, err := start(context.Background(), request(dir, script), nil, nil, nil)
+	c, err := start(context.Background(), request(dir, script), nil, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -484,6 +484,21 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{}}'
 	}
 	if !seenBlocked {
 		t.Fatal("disabled handoff did not retain unsupported-tool behavior")
+	}
+}
+
+func TestGitHubToolHasNoCallerControlledScopeOrCredentialFields(t *testing.T) {
+	definition := githubToolDefinition()
+	schema, ok := definition["inputSchema"].(map[string]any)
+	if !ok || schema["type"] != "object" || schema["additionalProperties"] != false {
+		t.Fatalf("schema=%#v", definition["inputSchema"])
+	}
+	if _, hasProperties := schema["properties"]; hasProperties {
+		t.Fatalf("GitHub tool unexpectedly accepts caller-controlled input: %#v", schema)
+	}
+	encoded, err := json.Marshal(definition)
+	if err != nil || strings.Contains(string(encoded), "token") || strings.Contains(string(encoded), "owner") || strings.Contains(string(encoded), "repository") {
+		t.Fatalf("tool definition exposed host scope: %s err=%v", encoded, err)
 	}
 }
 
