@@ -150,6 +150,20 @@ func TestCallRemovesPendingRequestOnTimeoutAndWriteFailure(t *testing.T) {
 	})
 }
 
+func TestCallPrefersDeliveredResponseWhenProcessExitIsReady(t *testing.T) {
+	for range 20 {
+		c := bareClient(nil)
+		c.in = responseThenExitWriteCloser{client: c}
+		result, err := c.call(context.Background(), "turn/start", map[string]any{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ok, _ := result["ok"].(bool); !ok {
+			t.Fatalf("result=%v", result)
+		}
+	}
+}
+
 func TestReadClassifiesMalformedAndOversizedStdout(t *testing.T) {
 	c := bareClient(nopWriteCloser{Writer: io.Discard})
 	if err := c.read(strings.NewReader("not-json\n")); err == nil || !strings.Contains(err.Error(), "malformed app-server message") {
@@ -528,6 +542,19 @@ type failingWriteCloser struct{}
 
 func (failingWriteCloser) Write([]byte) (int, error) { return 0, errors.New("broken pipe") }
 func (failingWriteCloser) Close() error              { return nil }
+
+type responseThenExitWriteCloser struct{ client *client }
+
+func (w responseThenExitWriteCloser) Write(p []byte) (int, error) {
+	w.client.mu.Lock()
+	response := w.client.pending[1]
+	delete(w.client.pending, 1)
+	w.client.mu.Unlock()
+	response <- callResult{rpc: rpc{Result: json.RawMessage(`{"ok":true}`)}}
+	close(w.client.done)
+	return len(p), nil
+}
+func (responseThenExitWriteCloser) Close() error { return nil }
 
 func bareClient(in io.WriteCloser) *client {
 	return &client{in: in, pending: map[int]chan callResult{}, done: make(chan struct{})}

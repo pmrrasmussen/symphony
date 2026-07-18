@@ -295,22 +295,9 @@ func (c *client) call(ctx context.Context, method string, params any) (map[strin
 		c.abort(err)
 		return nil, err
 	}
+	var result callResult
 	select {
-	case result := <-ch:
-		if result.err != nil {
-			return nil, result.err
-		}
-		x := result.rpc
-		if x.Error != nil {
-			return nil, fmt.Errorf("codex %s: %s", method, x.Error.Message)
-		}
-		var out map[string]any
-		if err := json.Unmarshal(x.Result, &out); err != nil {
-			err = fmt.Errorf("codex malformed %s response: %w", method, err)
-			c.abort(err)
-			return nil, err
-		}
-		return out, nil
+	case result = <-ch:
 	case <-ctx.Done():
 		c.removePending(id)
 		err := fmt.Errorf("codex %s timed out: %w", method, ctx.Err())
@@ -318,8 +305,29 @@ func (c *client) call(ctx context.Context, method string, params any) (map[strin
 		return nil, err
 	case <-c.done:
 		c.removePending(id)
-		return nil, errors.New("codex process exited")
+		// Process finalization waits for the stdout reader, so a response that
+		// raced with shutdown has already been dispatched. Prefer that response
+		// over the generic exit error.
+		select {
+		case result = <-ch:
+		default:
+			return nil, errors.New("codex process exited")
+		}
 	}
+	if result.err != nil {
+		return nil, result.err
+	}
+	x := result.rpc
+	if x.Error != nil {
+		return nil, fmt.Errorf("codex %s: %s", method, x.Error.Message)
+	}
+	var out map[string]any
+	if err := json.Unmarshal(x.Result, &out); err != nil {
+		err = fmt.Errorf("codex malformed %s response: %w", method, err)
+		c.abort(err)
+		return nil, err
+	}
+	return out, nil
 }
 func (c *client) notify(method string, params any) error {
 	if err := c.send(map[string]any{"jsonrpc": "2.0", "method": method, "params": params}); err != nil {
