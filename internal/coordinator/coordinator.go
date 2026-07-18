@@ -111,12 +111,17 @@ type Coordinator struct {
 	running    map[string]*running
 	claimed    map[string]bool
 	claimState map[string]string
-	retries    map[string]retryState
-	nextRetry  uint64
-	stopping   bool
-	ctx        context.Context
-	cancel     context.CancelFunc
-	wg         sync.WaitGroup
+	// admitted contains work that has reserved an orchestrator slot. Unlike a
+	// claim, it deliberately excludes delayed retry timers: a timer still owns
+	// its issue to prevent duplicate dispatch, but it must not idle a worker
+	// slot while it waits.
+	admitted  map[string]string
+	retries   map[string]retryState
+	nextRetry uint64
+	stopping  bool
+	ctx       context.Context
+	cancel    context.CancelFunc
+	wg        sync.WaitGroup
 }
 
 type running struct {
@@ -138,7 +143,7 @@ func New(t domain.Tracker, a domain.AgentBackend, w domain.WorkspaceExecutor, se
 		tracker: t, agent: a, workspaces: w, settings: settings,
 		timer: realTimer{}, clock: realClock{}, log: observability.FromSlog(logger),
 		running: map[string]*running{}, claimed: map[string]bool{},
-		claimState: map[string]string{}, retries: map[string]retryState{},
+		claimState: map[string]string{}, admitted: map[string]string{}, retries: map[string]retryState{},
 	}
 }
 
@@ -287,24 +292,30 @@ func (c *Coordinator) tick(ctx context.Context) error {
 		if !eligible(i, s) || !c.claim(i, s) {
 			continue
 		}
-		c.launch(ctx, i, 0)
+		if !c.launch(ctx, i, 0) {
+			c.release(i.ID)
+		}
 	}
 	return nil
 }
 
 func (c *Coordinator) reconcile(ctx context.Context) error {
+	type runRef struct {
+		r     *running
+		issue domain.Issue
+	}
 	c.mu.Lock()
-	runs := make([]*running, 0, len(c.running))
+	runs := make([]runRef, 0, len(c.running))
 	for _, r := range c.running {
-		runs = append(runs, r)
+		runs = append(runs, runRef{r: r, issue: r.issue})
 	}
 	c.mu.Unlock()
 	if len(runs) == 0 {
 		return nil
 	}
 	ids := make([]string, len(runs))
-	for i, r := range runs {
-		ids[i] = r.issue.ID
+	for i, run := range runs {
+		ids[i] = run.issue.ID
 	}
 	issues, err := c.tracker.GetIssues(ctx, ids)
 	if err != nil {
@@ -317,8 +328,9 @@ func (c *Coordinator) reconcile(ctx context.Context) error {
 	}
 	s := c.settings()
 	now := c.clock.Now()
-	for _, r := range runs {
-		fresh, found := byID[r.issue.ID]
+	for _, run := range runs {
+		r := run.r
+		fresh, found := byID[run.issue.ID]
 		reason := stopReason("")
 		if !found || !eligible(fresh, s) {
 			reason = stopIneligible
@@ -332,7 +344,14 @@ func (c *Coordinator) reconcile(ctx context.Context) error {
 		if reason == "" && s.Codex.StallTimeout > 0 && now.Sub(last) > s.Codex.StallTimeout {
 			reason = stopStalled
 		}
-		if reason == "" || !c.stopRun(r.issue.ID, reason) {
+		if reason == "" {
+			// Reconciliation is also the authoritative snapshot refresh. Keep
+			// state accounting in step with tracker transitions while the run
+			// remains eligible, so later admissions see the current state.
+			c.refreshRunIssue(r, fresh)
+			continue
+		}
+		if !c.stopRun(run.issue.ID, reason) {
 			continue
 		}
 		if reason == stopTerminal {
@@ -340,7 +359,7 @@ func (c *Coordinator) reconcile(ctx context.Context) error {
 				c.log.Warn("terminal workspace cleanup failed", "issue_id", fresh.ID, "issue_identifier", fresh.Identifier, "error", err)
 			}
 		}
-		c.log.Info("agent reconciled", "issue_id", r.issue.ID, "issue_identifier", r.issue.Identifier, "session_id", r.session.ID, "reason", reason)
+		c.log.Info("agent reconciled", "issue_id", run.issue.ID, "issue_identifier", run.issue.Identifier, "session_id", r.session.ID, "reason", reason)
 	}
 	return nil
 }
@@ -348,46 +367,45 @@ func (c *Coordinator) reconcile(ctx context.Context) error {
 func (c *Coordinator) claim(i domain.Issue, s config.Settings) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.stopping || c.claimed[i.ID] || len(c.claimed) >= s.Agent.MaxConcurrent {
+	if c.stopping || c.claimed[i.ID] || !c.capacityAvailableLocked(norm(i.State), s) {
 		return false
-	}
-	limit, ok := s.Agent.ByState[norm(i.State)]
-	if ok {
-		n := 0
-		for _, state := range c.claimState {
-			if state == norm(i.State) {
-				n++
-			}
-		}
-		if n >= limit {
-			return false
-		}
 	}
 	c.claimed[i.ID] = true
 	c.claimState[i.ID] = norm(i.State)
 	return true
 }
 
-func (c *Coordinator) launch(parent context.Context, i domain.Issue, attempt int) {
+// launch reserves capacity before starting asynchronous preparation. This
+// closes the gap where several goroutines could otherwise all observe room
+// before any of them had inserted a backend session into running.
+func (c *Coordinator) launch(parent context.Context, i domain.Issue, attempt int) bool {
+	s := c.settings()
 	c.mu.Lock()
 	if c.stopping {
 		c.mu.Unlock()
 		c.release(i.ID)
-		return
+		return false
+	}
+	if !c.reserveLocked(i, s) {
+		c.mu.Unlock()
+		return false
 	}
 	c.wg.Add(1)
 	c.mu.Unlock()
 	go func() {
 		defer c.wg.Done()
+		defer c.unreserve(i.ID)
 		ctx, cancel := context.WithCancel(parent)
 		defer cancel()
 		ws, err := c.workspaces.Prepare(ctx, i)
 		if err != nil {
+			c.unreserve(i.ID)
 			c.finishFailure(parent, i, attempt, "workspace_prepare", err)
 			return
 		}
 		if err = c.workspaces.BeforeRun(ctx, ws, i); err != nil {
 			c.workspaces.AfterRun(context.Background(), ws, i)
+			c.unreserve(i.ID)
 			c.finishFailure(parent, i, attempt, "before_run", err)
 			return
 		}
@@ -395,12 +413,14 @@ func (c *Coordinator) launch(parent context.Context, i domain.Issue, attempt int
 		prompt, err := render(s, i, attempt)
 		if err != nil {
 			c.workspaces.AfterRun(context.Background(), ws, i)
+			c.unreserve(i.ID)
 			c.finishFailure(parent, i, attempt, "prompt_render", err)
 			return
 		}
 		session, events, err := c.agent.Start(ctx, domain.AgentRequest{Issue: i, Workspace: ws.Path, GitMetadataRoot: ws.GitMetadataRoot, Prompt: prompt, Command: s.Codex.Command, ApprovalPolicy: s.Codex.ApprovalPolicy, ThreadSandbox: s.Codex.ThreadSandbox, TurnSandboxPolicy: s.Codex.TurnSandboxPolicy, TurnTimeout: s.Codex.TurnTimeout, ReadTimeout: s.Codex.ReadTimeout})
 		if err != nil {
 			c.workspaces.AfterRun(context.Background(), ws, i)
+			c.unreserve(i.ID)
 			c.finishFailure(parent, i, attempt, "session_start", err)
 			return
 		}
@@ -450,15 +470,24 @@ func (c *Coordinator) launch(parent context.Context, i domain.Issue, attempt int
 		}
 		if stopped != "" || ctx.Err() != nil {
 			c.log.Info("agent run cancelled", "issue_id", i.ID, "issue_identifier", i.Identifier, "session_id", session.ID, "reason", cancellationReason(stopped, ctx))
+			if stopped == stopStalled {
+				c.unreserve(i.ID)
+				c.finishFailure(parent, i, attempt, "stalled", context.DeadlineExceeded)
+				return
+			}
 			c.release(i.ID)
 			return
 		}
+		c.unreserve(i.ID)
 		c.finishFailure(parent, i, attempt, agentFailureReason(consumeErr), consumeErr)
 	}()
+	return true
 }
 
 func (c *Coordinator) runTurns(ctx context.Context, r *running, events <-chan domain.Event, settings config.Settings) (ended bool, current domain.Issue, err error) {
+	c.mu.Lock()
 	current = r.issue
+	c.mu.Unlock()
 	for {
 		completed, err := c.consume(ctx, r, events)
 		if !completed {
@@ -472,6 +501,7 @@ func (c *Coordinator) runTurns(ctx context.Context, r *running, events <-chan do
 			return true, current, nil
 		}
 		current = fresh[0]
+		c.refreshRunIssue(r, current)
 		c.mu.Lock()
 		turnCount := r.run.TurnCount
 		c.mu.Unlock()
@@ -618,11 +648,14 @@ func pollDelay(interval time.Duration, err error) time.Duration {
 }
 
 func (c *Coordinator) logEvent(r *running, event domain.Event) {
+	c.mu.Lock()
+	issue := r.issue
+	c.mu.Unlock()
 	sessionID := event.SessionID
 	if sessionID == "" {
 		sessionID = r.session.ID
 	}
-	attrs := []any{"issue_id", r.issue.ID, "issue_identifier", r.issue.Identifier, "session_id", sessionID, "event", event.Kind}
+	attrs := []any{"issue_id", issue.ID, "issue_identifier", issue.Identifier, "session_id", sessionID, "event", event.Kind}
 	switch event.Kind {
 	case domain.EventSessionStarted:
 		if event.ThreadID != "" {
@@ -674,13 +707,14 @@ func (c *Coordinator) updateUsage(r *running, update domain.Usage) domain.Usage 
 
 func (c *Coordinator) logTerminalSummary(r *running) {
 	c.mu.Lock()
+	issue := r.issue
 	usage := r.run.Usage
 	rateLimit := copyRateLimit(r.rateLimit)
 	started := r.run.StartedAt
 	attempt := r.run.Attempt
 	turnCount := r.run.TurnCount
 	c.mu.Unlock()
-	attrs := []any{"issue_id", r.issue.ID, "issue_identifier", r.issue.Identifier, "session_id", r.session.ID, "attempt", attempt, "turn_count", turnCount, "runtime_ms", c.clock.Now().Sub(started).Milliseconds(), "input_tokens", usage.InputTokens, "output_tokens", usage.OutputTokens, "total_tokens", usage.TotalTokens}
+	attrs := []any{"issue_id", issue.ID, "issue_identifier", issue.Identifier, "session_id", r.session.ID, "attempt", attempt, "turn_count", turnCount, "runtime_ms", c.clock.Now().Sub(started).Milliseconds(), "input_tokens", usage.InputTokens, "output_tokens", usage.OutputTokens, "total_tokens", usage.TotalTokens}
 	if len(rateLimit) > 0 {
 		attrs = append(attrs, "rate_limit", rateLimit)
 	}
@@ -814,10 +848,13 @@ func (c *Coordinator) runRetry(id string, generation uint64) {
 		return
 	}
 	fresh, err := c.tracker.GetIssues(ctx, []string{id})
-	if err != nil || len(fresh) != 1 || fresh[0].ID != id {
-		if err != nil {
-			c.log.Warn("retry issue refresh failed", "issue_id", id, "reason", retry.reason, "error", err)
-		}
+	if err != nil {
+		c.log.Warn("retry issue refresh failed", "issue_id", id, "reason", retry.reason, "error", err)
+		attempt := retry.attempt + 1
+		c.scheduleRetry(ctx, retry.issue, retry.workspace, attempt, retry.kind, "retry_refresh", backoff(attempt, c.settings().Agent.MaxRetryBackoff))
+		return
+	}
+	if len(fresh) != 1 || fresh[0].ID != id {
 		c.release(id)
 		return
 	}
@@ -832,7 +869,14 @@ func (c *Coordinator) runRetry(id string, generation uint64) {
 		c.release(id)
 		return
 	}
-	c.launch(ctx, issue, retry.attempt)
+	if c.launch(ctx, issue, retry.attempt) {
+		return
+	}
+	// The retry still owns its claim, but another admitted run used the slot
+	// after we refreshed it. Keep that duplicate-prevention claim and retry
+	// with the prescribed bounded backoff instead of dropping the work.
+	attempt := retry.attempt + 1
+	c.scheduleRetry(ctx, issue, retry.workspace, attempt, retry.kind, "no available orchestrator slots", backoff(attempt, s.Agent.MaxRetryBackoff))
 }
 
 func (c *Coordinator) stopRun(id string, reason stopReason) bool {
@@ -888,8 +932,56 @@ func (c *Coordinator) release(id string) {
 	}
 	delete(c.claimed, id)
 	delete(c.claimState, id)
+	delete(c.admitted, id)
 	delete(c.retries, id)
 	c.mu.Unlock()
+}
+
+func (c *Coordinator) unreserve(id string) {
+	c.mu.Lock()
+	delete(c.admitted, id)
+	c.mu.Unlock()
+}
+
+func (c *Coordinator) reserveLocked(i domain.Issue, s config.Settings) bool {
+	if _, admitted := c.admitted[i.ID]; !c.claimed[i.ID] || admitted || !c.capacityAvailableLocked(norm(i.State), s) {
+		return false
+	}
+	state := norm(i.State)
+	c.admitted[i.ID] = state
+	c.claimState[i.ID] = state
+	return true
+}
+
+func (c *Coordinator) capacityAvailableLocked(state string, s config.Settings) bool {
+	if len(c.admitted) >= s.Agent.MaxConcurrent {
+		return false
+	}
+	limit, ok := s.Agent.ByState[state]
+	if !ok {
+		return true
+	}
+	count := 0
+	for _, admittedState := range c.admitted {
+		if admittedState == state {
+			count++
+		}
+	}
+	return count < limit
+}
+
+func (c *Coordinator) refreshRunIssue(r *running, fresh domain.Issue) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.running[fresh.ID] != r || r.stopped != "" {
+		return
+	}
+	r.issue = fresh
+	state := norm(fresh.State)
+	c.claimState[fresh.ID] = state
+	if _, admitted := c.admitted[fresh.ID]; admitted {
+		c.admitted[fresh.ID] = state
+	}
 }
 
 func (c *Coordinator) context() context.Context {
