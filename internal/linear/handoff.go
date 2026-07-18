@@ -81,13 +81,12 @@ type HandoffSession struct {
 	handoffComment string
 }
 
-// SecretValue is intentionally package-bound capability plumbing: the Codex
-// launcher uses it only to remove an inherited environment variable with this
-// value before the child starts. It is never sent to Codex, returned by a tool,
-// or logged.
-func (s *HandoffSession) SecretValue() string {
+// MatchesSecret lets the Codex launcher remove inherited values containing the
+// configured credential without exposing the credential itself across the
+// adapter boundary. It is never sent to Codex, returned by a tool, or logged.
+func (s *HandoffSession) MatchesSecret(candidate string) bool {
 	value, _ := s.settings.Tracker.Provider["api_key"].(string)
-	return value
+	return value != "" && strings.Contains(candidate, value)
 }
 
 type ToolResult struct {
@@ -126,17 +125,26 @@ func (s *HandoffSession) Call(ctx context.Context, arguments json.RawMessage) (T
 		if strings.TrimSpace(input.Body) != "" {
 			return ToolResult{}, trackerError("handoff_request", "handoff does not accept body")
 		}
-		if err := s.transition(ctx); err != nil {
-			return ToolResult{}, err
-		}
 		if s.handoffComment != "" {
+			if err := s.ensureMutable(ctx); err != nil {
+				return ToolResult{}, err
+			}
 			if err := s.comment(ctx, s.handoffComment); err != nil {
 				return ToolResult{}, err
 			}
 		}
+		if err := s.ensureMutable(ctx); err != nil {
+			return ToolResult{}, err
+		}
+		if err := s.transition(ctx); err != nil {
+			return ToolResult{}, err
+		}
 		return ToolResult{Success: true, Data: map[string]any{"issue": s.issue.metadata(), "handoff_state": s.settings.Tracker.HandoffState}}, nil
 	case "comment":
 		if err := validateComment(input.Body); err != nil {
+			return ToolResult{}, err
+		}
+		if err := s.ensureMutable(ctx); err != nil {
 			return ToolResult{}, err
 		}
 		if err := s.comment(ctx, input.Body); err != nil {
@@ -146,6 +154,28 @@ func (s *HandoffSession) Call(ctx context.Context, arguments json.RawMessage) (T
 	default:
 		return ToolResult{}, trackerError("handoff_request", "unsupported linear handoff operation")
 	}
+}
+
+// ensureMutable re-reads the bound issue immediately before each mutation. A
+// human change since session setup (including a transition to Done) wins over
+// the agent: the request is rejected before any mutation is sent.
+func (s *HandoffSession) ensureMutable(ctx context.Context) error {
+	current, err := readHandoffIssue(ctx, s.client, s.settings, s.issue.ID)
+	if err != nil {
+		return err
+	}
+	if current.ProjectSlug() != s.issue.ProjectSlug() || current.TeamID() != s.issue.TeamID() {
+		return trackerError("handoff_scope", "active issue scope changed after session setup")
+	}
+	if !strings.EqualFold(strings.TrimSpace(current.State.Name), strings.TrimSpace(s.issue.State.Name)) {
+		return trackerError("handoff_scope", "active issue state changed after session setup")
+	}
+	for _, active := range s.settings.Tracker.ActiveStates {
+		if strings.EqualFold(strings.TrimSpace(current.State.Name), strings.TrimSpace(active)) {
+			return nil
+		}
+	}
+	return trackerError("handoff_scope", "active issue is no longer in a workflow active state")
 }
 
 func validateComment(body string) error {
@@ -199,7 +229,11 @@ func (s *HandoffSession) comment(ctx context.Context, body string) error {
 }
 
 func (h *Handoff) readIssue(ctx context.Context, s config.Settings, issueID string) (handoffIssue, error) {
-	response, err := requestWithSettings(ctx, h.client, s, handoffReadQuery, map[string]any{"issueID": issueID})
+	return readHandoffIssue(ctx, h.client, s, issueID)
+}
+
+func readHandoffIssue(ctx context.Context, client *http.Client, s config.Settings, issueID string) (handoffIssue, error) {
+	response, err := requestWithSettings(ctx, client, s, handoffReadQuery, map[string]any{"issueID": issueID})
 	if err != nil {
 		return handoffIssue{}, err
 	}
@@ -243,6 +277,11 @@ func (h *Handoff) resolveState(ctx context.Context, s config.Settings, teamID, t
 		if strings.EqualFold(strings.TrimSpace(state.Name), strings.TrimSpace(target)) {
 			if found != "" || strings.TrimSpace(state.ID) == "" {
 				return "", trackerError("handoff_scope", "configured handoff state is ambiguous")
+			}
+			for _, terminal := range s.Tracker.TerminalStates {
+				if strings.EqualFold(strings.TrimSpace(state.Name), strings.TrimSpace(terminal)) {
+					return "", trackerError("handoff_scope", "configured handoff state is terminal")
+				}
 			}
 			found = strings.TrimSpace(state.ID)
 		}

@@ -47,11 +47,11 @@ func (b *Backend) Start(ctx context.Context, r domain.AgentRequest) (domain.Agen
 			return domain.AgentSession{}, nil, fmt.Errorf("prepare Linear handoff: %w", err)
 		}
 	}
-	secretValues := []string{}
+	var secretMatcher func(string) bool
 	if handoff != nil {
-		secretValues = append(secretValues, handoff.SecretValue())
+		secretMatcher = handoff.MatchesSecret
 	}
-	c, err := start(ctx, r, b.secretNames, secretValues, handoff)
+	c, err := start(ctx, r, b.secretNames, secretMatcher, handoff)
 	if err != nil {
 		return domain.AgentSession{}, nil, err
 	}
@@ -132,14 +132,14 @@ type rpc struct {
 	} `json:"error"`
 }
 
-func start(ctx context.Context, r domain.AgentRequest, secrets, secretValues []string, handoff *linear.HandoffSession) (*client, error) {
+func start(ctx context.Context, r domain.AgentRequest, secrets []string, secretMatcher func(string) bool, handoff *linear.HandoffSession) (*client, error) {
 	command := strings.TrimSpace(r.Command)
 	if command == "" {
 		command = "codex app-server"
 	}
 	cmd := exec.CommandContext(ctx, "sh", "-lc", "exec "+command)
 	cmd.Dir = r.Workspace
-	cmd.Env = filteredEnv(secrets, secretValues)
+	cmd.Env = filteredEnv(secrets, secretMatcher)
 	in, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, err
@@ -161,7 +161,7 @@ func start(ctx context.Context, r domain.AgentRequest, secrets, secretValues []s
 	go func() { _ = cmd.Wait(); c.finish() }()
 	return c, nil
 }
-func filteredEnv(names, secretValues []string) []string {
+func filteredEnv(names []string, secretMatcher func(string) bool) []string {
 	blocked := map[string]bool{}
 	for _, n := range names {
 		blocked[n] = true
@@ -170,19 +170,11 @@ func filteredEnv(names, secretValues []string) []string {
 	for _, v := range os.Environ() {
 		k := strings.SplitN(v, "=", 2)[0]
 		value := strings.TrimPrefix(v, k+"=")
-		if !blocked[k] && !containsSecret(secretValues, value) {
+		if !blocked[k] && (secretMatcher == nil || !secretMatcher(value)) {
 			out = append(out, v)
 		}
 	}
 	return out
-}
-func containsSecret(values []string, candidate string) bool {
-	for _, value := range values {
-		if value != "" && candidate == value {
-			return true
-		}
-	}
-	return false
 }
 func (c *client) call(ctx context.Context, method string, params any) (map[string]any, error) {
 	if c.readTimeout > 0 {

@@ -54,6 +54,11 @@ state in that team, and freezes those values for the Codex session before the
 child process starts. A workflow reload affects later sessions only; an invalid
 reload retains the last valid policy.
 
+Before every handoff transition or comment mutation, Symphony re-reads the
+bound issue and rejects the action if its project, team, or state changed, or
+if it is no longer in an active workflow state. A human terminal transition
+therefore wins without any agent mutation.
+
 The compatibility name is `linear_graphql`, but it is not a GraphQL proxy. Its
 only typed operations are `read`, `handoff`, and `comment`. They are bound to
 the active issue and configured project; callers cannot supply a query, issue

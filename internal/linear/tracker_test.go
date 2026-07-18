@@ -137,8 +137,45 @@ func TestHandoffBindsIssueProjectTeamAndFixedOperations(t *testing.T) {
 	if _, err := session.Call(context.Background(), json.RawMessage(`{"operation":"handoff","issueID":"other"}`)); err == nil {
 		t.Fatal("arbitrary issue argument was accepted")
 	}
-	if len(calls) != 5 { // prepare read+state, then transition+fixed comment+active comment
+	if len(calls) != 8 { // prepare read+state; revalidate before each mutation
 		t.Fatalf("calls=%d", len(calls))
+	}
+}
+
+func TestHandoffRejectsHumanTerminalChangeBeforeMutation(t *testing.T) {
+	var reads, mutations int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		request := decodeRequest(t, r)
+		query := request["query"].(string)
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.Contains(query, "SymphonyLinearHandoffIssue"):
+			reads++
+			state := "Todo"
+			if reads > 1 {
+				state = "Done" // a human completed it after session setup
+			}
+			writeJSON(t, w, map[string]any{"data": map[string]any{"issue": map[string]any{
+				"id": "active", "identifier": "PMR-5", "title": "Handoff", "project": map[string]string{"slugId": "project-1"}, "team": map[string]string{"id": "team-1"}, "state": map[string]string{"name": state},
+			}}})
+		case strings.Contains(query, "SymphonyLinearHandoffStates"):
+			writeJSON(t, w, map[string]any{"data": map[string]any{"team": map[string]any{"id": "team-1", "states": map[string]any{"nodes": []any{map[string]string{"id": "review", "name": "In Review"}}}}}})
+		default:
+			mutations++
+			writeJSON(t, w, map[string]any{"data": map[string]any{"issueUpdate": map[string]bool{"success": true}}})
+		}
+	}))
+	defer server.Close()
+	settings := config.Settings{Tracker: config.Tracker{Provider: map[string]any{"api_key": "test-token", "project_slug": "project-1", "endpoint": server.URL}, ActiveStates: []string{"todo"}, TerminalStates: []string{"done"}, HandoffState: "In Review"}}
+	session, err := NewHandoff(func() config.Settings { return settings }).Prepare(context.Background(), domain.Issue{ID: "active"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := session.Call(context.Background(), json.RawMessage(`{"operation":"handoff"}`)); err == nil {
+		t.Fatal("handoff succeeded after a human completed the issue")
+	}
+	if mutations != 0 {
+		t.Fatalf("mutations=%d want 0", mutations)
 	}
 }
 

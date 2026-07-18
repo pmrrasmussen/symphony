@@ -178,7 +178,7 @@ func decode(raw map[string]any, base, path, logRoot string) (Settings, error) {
 	if err != nil {
 		return Settings{}, err
 	}
-	handoffState, handoffCommentTemplate, err := handoffPolicy(resolvedProvider, activeStates)
+	handoffState, handoffCommentTemplate, err := handoffPolicy(resolvedProvider, activeStates, terminalStates)
 	if err != nil {
 		return Settings{}, err
 	}
@@ -296,7 +296,7 @@ func decode(raw map[string]any, base, path, logRoot string) (Settings, error) {
 // exposing an immutable, typed policy to the Codex/Linear handoff adapter.
 // Handoff is deliberately opt-in: a state is required before the client tool
 // can be used, and it may never be one of the states the scheduler dispatches.
-func handoffPolicy(provider map[string]any, activeStates []string) (string, string, error) {
+func handoffPolicy(provider map[string]any, activeStates, terminalStates []string) (string, string, error) {
 	stateValue, hasState := provider["handoff_state"]
 	commentValue, hasComment := provider["handoff_comment_template"]
 	if !hasState && !hasComment {
@@ -313,6 +313,11 @@ func handoffPolicy(provider map[string]any, activeStates []string) (string, stri
 	for _, active := range activeStates {
 		if strings.EqualFold(strings.TrimSpace(active), state) {
 			return "", "", errors.New("invalid configuration: tracker.provider.handoff_state must not be an active state")
+		}
+	}
+	for _, terminal := range terminalStates {
+		if strings.EqualFold(strings.TrimSpace(terminal), state) {
+			return "", "", errors.New("invalid configuration: tracker.provider.handoff_state must not be a terminal state")
 		}
 	}
 	if !hasComment {
