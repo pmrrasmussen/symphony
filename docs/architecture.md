@@ -12,6 +12,15 @@ configured approval and sandbox policy; this service does not provide Docker,
 VM, SSH, distributed execution, or a database.  Linear credentials stay in
 the host process and are removed from Codex's environment.
 
+The loader validates the supported core front-matter fields but preserves
+unknown extension keys for forward compatibility. It applies documented
+defaults, resolves explicit `$VARNAME` references only for documented secret
+and path fields, and normalizes paths relative to the workflow file. Valid
+changes take effect for future work without a restart; invalid reloads retain
+the last known good configuration. Prompts render strictly per run with
+lowercase `issue` and nullable `attempt` variables, so template failures do
+not prevent polling or configuration reload.
+
 Authoritative durable state is Linear plus the workspace tree under the
 configured root.  In-memory claims are rebuilt after restart; startup cleans
 workspaces for terminal issues.  Logs are written to the configured log root

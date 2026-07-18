@@ -28,9 +28,9 @@ codex:
   read_timeout_ms: 5000
   stall_timeout_ms: 300000
 ---
-Work on {{.Issue.Identifier}}: {{.Issue.Title}}
+Work on {{.issue.identifier}}: {{.issue.title}}
 
-{{.Issue.Description}}
+{{.issue.description}}
 
 Follow the repository instructions, validate your changes, and leave the issue
 in its workflow-defined handoff state.
