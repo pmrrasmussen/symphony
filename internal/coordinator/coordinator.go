@@ -37,8 +37,9 @@ func (realClock) Now() time.Time { return time.Now() }
 type retryKind string
 
 const (
-	retryAgent      retryKind = "agent"
-	retryCompletion retryKind = "completion_marker"
+	retryAgent        retryKind = "agent"
+	retryCompletion   retryKind = "completion_marker"
+	continuationDelay           = time.Second
 )
 
 // retryState is the coordinator's complete durable-in-process intent for a
@@ -90,14 +91,12 @@ type Coordinator struct {
 type running struct {
 	issue     domain.Issue
 	session   domain.AgentSession
-	started   time.Time
 	last      time.Time
 	cancel    context.CancelFunc
-	attempt   int
 	workspace domain.Workspace
 	stopped   stopReason
-	usage     domain.Usage
 	rateLimit map[string]int64
+	run       domain.Run
 }
 
 func New(t domain.Tracker, a domain.AgentBackend, w domain.WorkspaceExecutor, settings func() config.Settings, logger *slog.Logger) *Coordinator {
@@ -127,6 +126,7 @@ type RunningSnapshot struct {
 	ThreadID        string
 	TurnID          string
 	Attempt         int
+	TurnCount       int
 	StartedAt       time.Time
 	LastEventAt     time.Time
 	Usage           domain.Usage
@@ -148,7 +148,7 @@ func (c *Coordinator) Snapshot() Snapshot {
 	defer c.mu.Unlock()
 	snapshot := Snapshot{Claimed: len(c.claimed), Running: make([]RunningSnapshot, 0, len(c.running)), Retrying: make([]RetrySnapshot, 0, len(c.retries))}
 	for _, run := range c.running {
-		snapshot.Running = append(snapshot.Running, RunningSnapshot{IssueIdentifier: run.issue.Identifier, SessionID: run.session.ID, ThreadID: run.session.ThreadID, TurnID: run.session.TurnID, Attempt: run.attempt, StartedAt: run.started, LastEventAt: run.last, Usage: run.usage, RateLimit: copyRateLimit(run.rateLimit)})
+		snapshot.Running = append(snapshot.Running, RunningSnapshot{IssueIdentifier: run.issue.Identifier, SessionID: run.session.ID, ThreadID: run.session.ThreadID, TurnID: run.session.TurnID, Attempt: run.run.Attempt, TurnCount: run.run.TurnCount, StartedAt: run.run.StartedAt, LastEventAt: run.last, Usage: run.run.Usage, RateLimit: copyRateLimit(run.rateLimit)})
 	}
 	for _, retry := range c.retries {
 		snapshot.Retrying = append(snapshot.Retrying, RetrySnapshot{IssueIdentifier: retry.issue.Identifier, Attempt: retry.attempt, Kind: string(retry.kind), Reason: retry.reason, Due: retry.due})
@@ -384,28 +384,45 @@ func (c *Coordinator) launch(parent context.Context, i domain.Issue, attempt int
 			return
 		}
 		now := c.clock.Now()
-		r := &running{issue: i, session: session, started: now, last: now, cancel: cancel, attempt: attempt, workspace: ws}
+		r := &running{
+			issue: i, session: session, last: now, cancel: cancel, workspace: ws,
+			run: domain.Run{IssueID: i.ID, IssueIdentifier: i.Identifier, WorkspacePath: ws.Path, SessionID: session.ID, Attempt: attempt, TurnCount: 1, StartedAt: now},
+		}
 		c.mu.Lock()
+		if c.stopping {
+			c.mu.Unlock()
+			c.cancelSession(context.Background(), session)
+			c.workspaces.AfterRun(context.Background(), ws, i)
+			c.release(i.ID)
+			return
+		}
 		c.running[i.ID] = r
 		c.mu.Unlock()
-		completed, consumeErr := c.consume(ctx, r, events)
+		ended, shouldMark, current, consumeErr := c.runTurns(ctx, r, events, s)
 		c.mu.Lock()
 		delete(c.running, i.ID)
 		stopped := r.stopped
-		completionAllowed := completed && !c.stopping && stopped == "" && parent.Err() == nil
+		completionAllowed := ended && !c.stopping && stopped == "" && parent.Err() == nil
 		c.mu.Unlock()
-		if completed && !completionAllowed {
-			completed = false
+		if ended && !completionAllowed {
+			ended = false
 			if consumeErr == nil {
 				consumeErr = context.Canceled
 			}
 		}
-		if completed {
+		c.finishRun(r, ended, stopped, ctx, consumeErr)
+		if ended {
+			c.cancelSession(context.Background(), r.session)
+		} else if consumeErr != nil && stopped == "" && ctx.Err() == nil {
 			c.cancelSession(context.Background(), r.session)
 		}
 		c.workspaces.AfterRun(context.Background(), ws, i)
-		if completed {
-			c.recordCompletion(parent, r, ws, i, attempt, s)
+		if ended {
+			if shouldMark {
+				c.recordCompletion(parent, r, ws, current, attempt, s)
+			} else {
+				c.release(i.ID)
+			}
 			return
 		}
 		if stopped != "" || ctx.Err() != nil {
@@ -415,6 +432,98 @@ func (c *Coordinator) launch(parent context.Context, i domain.Issue, attempt int
 		}
 		c.finishFailure(parent, i, attempt, "agent_event", consumeErr)
 	}()
+}
+
+func (c *Coordinator) runTurns(ctx context.Context, r *running, events <-chan domain.Event, settings config.Settings) (ended, shouldMark bool, current domain.Issue, err error) {
+	current = r.issue
+	for {
+		completed, err := c.consume(ctx, r, events)
+		if !completed {
+			return false, false, current, err
+		}
+		fresh, err := c.tracker.GetIssues(ctx, []string{current.ID})
+		if err != nil {
+			return false, false, current, fmt.Errorf("refresh issue after turn: %w", err)
+		}
+		if len(fresh) != 1 || fresh[0].ID != current.ID {
+			return true, false, current, nil
+		}
+		current = fresh[0]
+		c.mu.Lock()
+		turnCount := r.run.TurnCount
+		c.mu.Unlock()
+		if !eligible(current, settings) {
+			if terminal(current, settings) {
+				if err := c.workspaces.Cleanup(ctx, current); err != nil {
+					c.log.Warn("terminal workspace cleanup failed", "issue_id", current.ID, "issue_identifier", current.Identifier, "error", err)
+				}
+			}
+			return true, false, current, nil
+		}
+		if turnCount >= settings.Agent.MaxTurns {
+			return true, true, current, nil
+		}
+		if err := c.waitForContinuation(ctx); err != nil {
+			return false, false, current, err
+		}
+		guidance := continuationGuidance(turnCount+1, settings.Agent.MaxTurns)
+		events, err = c.agent.Continue(ctx, r.session, guidance)
+		if err != nil {
+			return false, false, current, fmt.Errorf("continue agent session: %w", err)
+		}
+		c.mu.Lock()
+		r.run.TurnCount++
+		c.mu.Unlock()
+	}
+}
+
+func (c *Coordinator) waitForContinuation(ctx context.Context) error {
+	fired := make(chan struct{})
+	timer := c.timer.AfterFunc(continuationDelay, func() { close(fired) })
+	select {
+	case <-ctx.Done():
+		timer.Stop()
+		return ctx.Err()
+	case <-fired:
+		return nil
+	}
+}
+
+func continuationGuidance(turn, maxTurns int) string {
+	// The upstream workflow schema configures the turn bound but deliberately
+	// has no continuation-prompt field. Generate its prescribed guidance here
+	// so continuation turns do not resend the repository task template.
+	return fmt.Sprintf(`Continuation guidance:
+
+- The previous Codex turn completed normally, but the tracker work item is still in an active state.
+- This is continuation turn #%d of %d for the current agent run.
+- Resume from the current workspace and workpad state instead of restarting from scratch.
+- The original task instructions and prior turn context are already present in this thread, so do not restate them before acting.
+- Focus on the remaining ticket work and do not end the turn while the issue stays active unless you are truly blocked.`, turn, maxTurns)
+}
+
+func (c *Coordinator) finishRun(r *running, completed bool, stopped stopReason, ctx context.Context, err error) {
+	c.mu.Lock()
+	switch {
+	case stopped == stopStalled:
+		r.run.Status = domain.RunStalled
+	case stopped != "" || ctx.Err() != nil:
+		r.run.Status = domain.RunCanceled
+	case completed:
+		r.run.Status = domain.RunSucceeded
+	case err != nil && strings.Contains(err.Error(), "agent blocked"):
+		r.run.Status = domain.RunBlocked
+	case err != nil && strings.Contains(strings.ToLower(err.Error()), "timeout"):
+		r.run.Status = domain.RunTimedOut
+	default:
+		r.run.Status = domain.RunFailed
+	}
+	if err != nil {
+		r.run.Error = err.Error()
+	}
+	run := r.run
+	c.mu.Unlock()
+	c.log.Info("agent logical run finished", "issue_id", run.IssueID, "issue_identifier", run.IssueIdentifier, "session_id", run.SessionID, "status", string(run.Status), "attempt", run.Attempt, "turn_count", run.TurnCount)
 }
 
 // recordCompletion performs one final tracker read after an event stream says
@@ -579,28 +688,30 @@ func (c *Coordinator) updateUsage(r *running, update domain.Usage) domain.Usage 
 	c.mu.Lock()
 	// App-server usage notifications are cumulative. Taking the component-wise
 	// maximum makes repeated notifications idempotent and avoids double-counting.
-	r.usage.InputTokens = max(r.usage.InputTokens, update.InputTokens)
-	r.usage.OutputTokens = max(r.usage.OutputTokens, update.OutputTokens)
-	r.usage.TotalTokens = max(r.usage.TotalTokens, update.TotalTokens)
-	if r.usage.TotalTokens < r.usage.InputTokens+r.usage.OutputTokens {
-		r.usage.TotalTokens = r.usage.InputTokens + r.usage.OutputTokens
+	r.run.Usage.InputTokens = max(r.run.Usage.InputTokens, update.InputTokens)
+	r.run.Usage.OutputTokens = max(r.run.Usage.OutputTokens, update.OutputTokens)
+	r.run.Usage.TotalTokens = max(r.run.Usage.TotalTokens, update.TotalTokens)
+	if r.run.Usage.TotalTokens < r.run.Usage.InputTokens+r.run.Usage.OutputTokens {
+		r.run.Usage.TotalTokens = r.run.Usage.InputTokens + r.run.Usage.OutputTokens
 	}
-	usage := r.usage
+	usage := r.run.Usage
 	c.mu.Unlock()
 	return usage
 }
 
 func (c *Coordinator) logTerminalSummary(r *running) {
 	c.mu.Lock()
-	usage := r.usage
+	usage := r.run.Usage
 	rateLimit := copyRateLimit(r.rateLimit)
-	started := r.started
+	started := r.run.StartedAt
+	attempt := r.run.Attempt
+	turnCount := r.run.TurnCount
 	c.mu.Unlock()
-	attrs := []any{"issue_id", r.issue.ID, "issue_identifier", r.issue.Identifier, "session_id", r.session.ID, "attempt", r.attempt, "runtime_ms", c.clock.Now().Sub(started).Milliseconds(), "input_tokens", usage.InputTokens, "output_tokens", usage.OutputTokens, "total_tokens", usage.TotalTokens}
+	attrs := []any{"issue_id", r.issue.ID, "issue_identifier", r.issue.Identifier, "session_id", r.session.ID, "attempt", attempt, "turn_count", turnCount, "runtime_ms", c.clock.Now().Sub(started).Milliseconds(), "input_tokens", usage.InputTokens, "output_tokens", usage.OutputTokens, "total_tokens", usage.TotalTokens}
 	if len(rateLimit) > 0 {
 		attrs = append(attrs, "rate_limit", rateLimit)
 	}
-	c.log.Info("agent run completed", attrs...)
+	c.log.Info("agent turn completed", attrs...)
 }
 
 func copyRateLimit(value map[string]int64) map[string]int64 {

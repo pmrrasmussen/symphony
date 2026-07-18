@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -50,7 +51,7 @@ func TestSnapshotCopiesOnlySafeOperationalMetadata(t *testing.T) {
 	c := New(&fakeTracker{}, &fakeAgent{}, &fakeWorkspace{}, func() config.Settings { return config.Settings{} }, nil)
 	now := time.Now()
 	c.claimed["provider-id"] = true
-	c.running["provider-id"] = &running{issue: domain.Issue{ID: "provider-id", Identifier: "PMR-6", Description: "must-not-appear"}, session: domain.AgentSession{ID: "session", ThreadID: "thread", TurnID: "turn"}, attempt: 2, started: now, last: now, usage: domain.Usage{InputTokens: 1}, rateLimit: map[string]int64{"remaining": 2}}
+	c.running["provider-id"] = &running{issue: domain.Issue{ID: "provider-id", Identifier: "PMR-6", Description: "must-not-appear"}, session: domain.AgentSession{ID: "session", ThreadID: "thread", TurnID: "turn"}, last: now, run: domain.Run{Attempt: 2, TurnCount: 1, StartedAt: now, Usage: domain.Usage{InputTokens: 1}}, rateLimit: map[string]int64{"remaining": 2}}
 	c.retries["retry-id"] = retryState{issue: domain.Issue{ID: "retry-id", Identifier: "PMR-9", Description: "must-not-appear"}, attempt: 3, kind: retryAgent, reason: "agent_event", due: now}
 	snapshot := c.Snapshot()
 	if snapshot.Claimed != 1 || len(snapshot.Running) != 1 || len(snapshot.Retrying) != 1 {
@@ -70,6 +71,7 @@ type fakeTracker struct {
 	issue    domain.Issue
 	fresh    domain.Issue
 	hasFresh bool
+	gets     int
 }
 
 func (f *fakeTracker) ListCandidates(context.Context, []string) ([]domain.Issue, error) {
@@ -80,10 +82,17 @@ func (f *fakeTracker) ListCandidates(context.Context, []string) ([]domain.Issue,
 func (f *fakeTracker) GetIssues(context.Context, []string) ([]domain.Issue, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.gets++
 	if f.hasFresh {
 		return []domain.Issue{f.fresh}, nil
 	}
 	return []domain.Issue{f.issue}, nil
+}
+
+func (f *fakeTracker) getCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.gets
 }
 func (f *fakeTracker) ListTerminal(context.Context, []string) ([]domain.Issue, error) {
 	return nil, nil
@@ -101,12 +110,17 @@ func (f *fakeTracker) setFresh(issue domain.Issue) {
 }
 
 type fakeAgent struct {
-	mu        sync.Mutex
-	starts    int
-	continues int
-	cancels   int
-	started   chan struct{}
-	events    func() <-chan domain.Event
+	mu                 sync.Mutex
+	starts             int
+	continues          int
+	cancels            int
+	started            chan struct{}
+	events             func() <-chan domain.Event
+	continuationEvents []func() <-chan domain.Event
+	continueErr        error
+	continueSessions   []domain.AgentSession
+	continuePrompts    []string
+	onContinue         func(int)
 }
 
 func (f *fakeAgent) Start(context.Context, domain.AgentRequest) (domain.AgentSession, <-chan domain.Event, error) {
@@ -119,11 +133,26 @@ func (f *fakeAgent) Start(context.Context, domain.AgentRequest) (domain.AgentSes
 	}
 	return domain.AgentSession{ID: "t-u", ThreadID: "t", TurnID: "u"}, f.events(), nil
 }
-func (f *fakeAgent) Continue(context.Context, domain.AgentSession, string) (<-chan domain.Event, error) {
+func (f *fakeAgent) Continue(_ context.Context, session domain.AgentSession, prompt string) (<-chan domain.Event, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
+	index := f.continues
 	f.continues++
-	return nil, nil
+	f.continueSessions = append(f.continueSessions, session)
+	f.continuePrompts = append(f.continuePrompts, prompt)
+	events := f.continuationEvents
+	err := f.continueErr
+	onContinue := f.onContinue
+	f.mu.Unlock()
+	if onContinue != nil {
+		onContinue(index)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if index >= len(events) {
+		return closedEvents(), nil
+	}
+	return events[index](), nil
 }
 func (f *fakeAgent) Cancel(context.Context, domain.AgentSession) error {
 	f.mu.Lock()
@@ -137,6 +166,12 @@ func (f *fakeAgent) counts() (starts, continues, cancels int) {
 	return f.starts, f.continues, f.cancels
 }
 
+func (f *fakeAgent) continuations() ([]domain.AgentSession, []string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]domain.AgentSession(nil), f.continueSessions...), append([]string(nil), f.continuePrompts...)
+}
+
 type fakeWorkspace struct {
 	mu             sync.Mutex
 	shouldRun      bool
@@ -145,6 +180,7 @@ type fakeWorkspace struct {
 	marks          int
 	cleanups       int
 	cleaned        chan struct{}
+	marked         chan struct{}
 	markErr        error
 	after          chan struct{}
 }
@@ -169,9 +205,14 @@ func (f *fakeWorkspace) AfterRun(context.Context, domain.Workspace, domain.Issue
 }
 func (f *fakeWorkspace) MarkCompleted(context.Context, domain.Workspace, domain.Issue) error {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.marks++
-	return f.markErr
+	err := f.markErr
+	marked := f.marked
+	f.mu.Unlock()
+	if err == nil && marked != nil {
+		marked <- struct{}{}
+	}
+	return err
 }
 func (f *fakeWorkspace) Cleanup(context.Context, domain.Issue) error {
 	f.mu.Lock()
@@ -313,13 +354,14 @@ func TestCompletionIsRecordedAndDoesNotContinueOrRetry(t *testing.T) {
 	w := testSettings(t)
 	issue := testIssue()
 	agent := &fakeAgent{events: completedEvents}
-	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{}, 1)}
+	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{}, 1), marked: make(chan struct{}, 1)}
 	c := testCoordinator(w.Config, &fakeTracker{issue: issue}, agent, ws)
 	timer := &fakeTimer{}
 	c.timer = timer
 
 	c.Tick(context.Background())
 	<-ws.after
+	<-ws.marked
 
 	starts, continues, cancels := agent.counts()
 	if starts != 1 || continues != 0 || cancels != 1 {
@@ -331,6 +373,153 @@ func TestCompletionIsRecordedAndDoesNotContinueOrRetry(t *testing.T) {
 	}
 	if timer.scheduled() != 0 {
 		t.Fatalf("completed run scheduled retries=%d", timer.scheduled())
+	}
+}
+
+func TestBoundedRunRefreshesAndContinuesSameSessionToExactMaxTurns(t *testing.T) {
+	w := testSettings(t)
+	w.Config.Agent.MaxTurns = 3
+	issue := testIssue()
+	tracker := &fakeTracker{issue: issue}
+	observedRefreshes := make([]int, 0, 2)
+	var observedMu sync.Mutex
+	agent := &fakeAgent{
+		events:             completedEvents,
+		continuationEvents: []func() <-chan domain.Event{completedEvents, completedEvents},
+		onContinue: func(_ int) {
+			observedMu.Lock()
+			observedRefreshes = append(observedRefreshes, tracker.getCount())
+			observedMu.Unlock()
+		},
+	}
+	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{}, 1), marked: make(chan struct{}, 1)}
+	c := testCoordinator(w.Config, tracker, agent, ws)
+	timer := &fakeTimer{signal: make(chan struct{}, 2)}
+	c.timer = timer
+
+	c.Tick(context.Background())
+	for index := 0; index < 2; index++ {
+		<-timer.signal
+		timer.fire(index)
+	}
+	<-ws.after
+	<-ws.marked
+
+	starts, continues, cancels := agent.counts()
+	if starts != 1 || continues != 2 || cancels != 1 {
+		t.Fatalf("starts=%d continues=%d cancels=%d", starts, continues, cancels)
+	}
+	sessions, prompts := agent.continuations()
+	wantSession := (domain.AgentSession{ID: "t-u", ThreadID: "t", TurnID: "u"})
+	if len(sessions) != 2 || sessions[0] != wantSession || sessions[1] != wantSession {
+		t.Fatalf("continuation sessions=%+v, want same initial session twice", sessions)
+	}
+	for index, prompt := range prompts {
+		want := continuationGuidance(index+2, 3)
+		if prompt != want {
+			t.Fatalf("continuation prompt %d=%q, want configured guidance %q", index+2, prompt, want)
+		}
+	}
+	observedMu.Lock()
+	refreshes := append([]int(nil), observedRefreshes...)
+	observedMu.Unlock()
+	if !reflect.DeepEqual(refreshes, []int{1, 2}) {
+		t.Fatalf("tracker refresh counts at continuation=%v, want [1 2]", refreshes)
+	}
+	if tracker.getCount() != 4 {
+		t.Fatalf("tracker refreshes=%d, want one after each turn plus final marker revalidation", tracker.getCount())
+	}
+	_, marks, _, _ := ws.counts()
+	if marks != 1 {
+		t.Fatalf("completion markers=%d, want one only after the bounded lifecycle", marks)
+	}
+}
+
+func TestBoundedRunStopsAtHandoffWithoutContinuationOrMarker(t *testing.T) {
+	w := testSettings(t)
+	w.Config.Agent.MaxTurns = 3
+	w.Config.Tracker.HandoffState = "Review"
+	issue := testIssue()
+	handoff := issue
+	handoff.State = "Review"
+	handoff.Dispatchable = false
+	tracker := &fakeTracker{issue: issue}
+	tracker.setFresh(handoff)
+	agent := &fakeAgent{events: completedEvents}
+	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{}, 1)}
+	c := testCoordinator(w.Config, tracker, agent, ws)
+	timer := &fakeTimer{}
+	c.timer = timer
+
+	c.Tick(context.Background())
+	<-ws.after
+
+	starts, continues, cancels := agent.counts()
+	if starts != 1 || continues != 0 || cancels != 1 {
+		t.Fatalf("handoff starts=%d continues=%d cancels=%d", starts, continues, cancels)
+	}
+	_, marks, _, _ := ws.counts()
+	if marks != 0 || timer.scheduled() != 0 {
+		t.Fatalf("handoff markers=%d timers=%d, want neither", marks, timer.scheduled())
+	}
+}
+
+func TestBoundedRunCancellationDuringContinuationDelayStopsCleanly(t *testing.T) {
+	w := testSettings(t)
+	w.Config.Agent.MaxTurns = 2
+	issue := testIssue()
+	agent := &fakeAgent{events: completedEvents, continuationEvents: []func() <-chan domain.Event{completedEvents}}
+	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{}, 1)}
+	c := testCoordinator(w.Config, &fakeTracker{issue: issue}, agent, ws)
+	timer := &fakeTimer{signal: make(chan struct{}, 1)}
+	c.timer = timer
+
+	c.Tick(context.Background())
+	<-timer.signal
+	if err := c.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	<-ws.after
+
+	starts, continues, cancels := agent.counts()
+	if starts != 1 || continues != 0 || cancels != 1 {
+		t.Fatalf("cancelled starts=%d continues=%d cancels=%d", starts, continues, cancels)
+	}
+	_, marks, _, _ := ws.counts()
+	if marks != 0 {
+		t.Fatalf("cancelled completion markers=%d, want 0", marks)
+	}
+}
+
+func TestBoundedRunContinuationFailureStopsSessionAndUsesFailureRetry(t *testing.T) {
+	w := testSettings(t)
+	w.Config.Agent.MaxTurns = 2
+	issue := testIssue()
+	agent := &fakeAgent{events: completedEvents, continueErr: errors.New("continuation unavailable")}
+	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{}, 1)}
+	c := testCoordinator(w.Config, &fakeTracker{issue: issue}, agent, ws)
+	timer := &fakeTimer{signal: make(chan struct{}, 2)}
+	c.timer = timer
+
+	c.Tick(context.Background())
+	<-timer.signal
+	timer.fire(0)
+	<-ws.after
+	<-timer.signal
+
+	starts, continues, cancels := agent.counts()
+	if starts != 1 || continues != 1 || cancels != 1 {
+		t.Fatalf("failed continuation starts=%d continues=%d cancels=%d", starts, continues, cancels)
+	}
+	_, marks, _, _ := ws.counts()
+	if marks != 0 {
+		t.Fatalf("failed continuation markers=%d, want 0", marks)
+	}
+	c.mu.Lock()
+	retry := c.retries[issue.ID]
+	c.mu.Unlock()
+	if retry.kind != retryAgent || retry.reason != "agent_event" || retry.attempt != 1 {
+		t.Fatalf("failed continuation retry=%+v", retry)
 	}
 }
 
@@ -581,7 +770,7 @@ func testSettings(t *testing.T) config.Workflow {
 	t.Helper()
 	d := t.TempDir()
 	workflow := filepath.Join(d, "WORKFLOW.md")
-	if err := os.WriteFile(workflow, []byte("---\ntracker: {kind: linear, active_states: [Todo], terminal_states: [Done]}\nagent: {max_concurrent_agents: 1}\nworkspace: {root: /tmp/work}\n---\nWork on {{.issue.identifier}}"), 0o600); err != nil {
+	if err := os.WriteFile(workflow, []byte("---\ntracker: {kind: linear, active_states: [Todo], terminal_states: [Done]}\nagent: {max_concurrent_agents: 1, max_turns: 1}\nworkspace: {root: /tmp/work}\n---\nWork on {{.issue.identifier}}"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	w, err := config.Load(workflow, "")
