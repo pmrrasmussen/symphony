@@ -49,7 +49,19 @@ type Tracker struct {
 }
 
 func New(settings func() config.Settings) *Tracker {
-	return &Tracker{settings: settings, client: &http.Client{Timeout: 30 * time.Second}}
+	return &Tracker{settings: settings, client: newHTTPClient(nil)}
+}
+
+func newHTTPClient(transport http.RoundTripper) *http.Client {
+	return &http.Client{
+		Timeout:   30 * time.Second,
+		Transport: transport,
+		// The Linear key is a bearer credential. Refusing all redirects avoids
+		// forwarding it to a different endpoint, including HTTPS-to-HTTP hops.
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
 }
 
 // Validate checks the documented Linear profile. The token is deliberately

@@ -216,6 +216,27 @@ func TestEndpointRequiresHTTPSOutsideLocalTestHosts(t *testing.T) {
 	}
 }
 
+func TestRedirectNeverForwardsBearerTokenToPlaintext(t *testing.T) {
+	var receivedAuthorization string
+	plaintext := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedAuthorization = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer plaintext.Close()
+	secure := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, plaintext.URL, http.StatusFound)
+	}))
+	defer secure.Close()
+
+	tracker := newTestTracker(secure.URL, "")
+	tracker.client = newHTTPClient(secure.Client().Transport)
+	_, err := tracker.ListCandidates(context.Background(), []string{"Todo"})
+	assertCategory(t, err, "tracker_status")
+	if receivedAuthorization != "" {
+		t.Fatalf("bearer token was forwarded to plaintext redirect target: %q", receivedAuthorization)
+	}
+}
+
 func TestGraphQLErrorsAreClassifiedAndRedacted(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(t, w, map[string]any{"errors": []map[string]string{{"message": "test-token must never be exposed"}}})
