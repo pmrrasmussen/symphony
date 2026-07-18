@@ -71,3 +71,17 @@ diverge from its source. Implementation baseline: upstream Symphony commit
 `7af5a7648c9fbffa08825fe0c0b18be00100aff3`. Codex app-server protocol was
 inspected from the locally installed Codex schema generated on 2026-07-18;
 upstream Codex HEAD at inspection was `56395bddaf26eb2829387ca6a417bf9128e5b239`.
+
+One bounded-run recovery detail is intentionally Go-specific: active issues
+continue on the same live Codex session, with a scheduler-controlled one-second
+delay between turns, until `agent.max_turns`. At that boundary this profile
+writes the durable completion marker for the refreshed issue version and does
+not schedule the upstream specification's separate one-second, new-worker
+continuation retry. This preserves restart suppression for unchanged work;
+PMR-15 owns any change to completion-marker recovery after a bounded run.
+
+The upstream workflow schema does not define a continuation-prompt setting.
+Accordingly, the workflow body remains the configured first-turn task prompt,
+while later turns receive generated upstream-style continuation guidance using
+the configured `agent.max_turns` value. This avoids replaying the original task
+prompt already present in the live thread.
