@@ -1017,14 +1017,11 @@ func sortIssues(v []domain.Issue) {
 		if ap != bp {
 			return ap < bp
 		}
-		if a.CreatedAt == nil {
-			return false
-		}
-		if b.CreatedAt == nil {
-			return true
-		}
-		if !a.CreatedAt.Equal(*b.CreatedAt) {
+		if a.CreatedAt != nil && b.CreatedAt != nil && !a.CreatedAt.Equal(*b.CreatedAt) {
 			return a.CreatedAt.Before(*b.CreatedAt)
+		}
+		if (a.CreatedAt == nil) != (b.CreatedAt == nil) {
+			return a.CreatedAt != nil
 		}
 		return a.Identifier < b.Identifier
 	})
