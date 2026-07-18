@@ -128,6 +128,10 @@ func (s *Session) Publish(ctx context.Context) (Result, error) {
 	if err := s.linear.EnsureActive(ctx); err != nil {
 		return Result{}, err
 	}
+	origin, err := s.manager.git.Run(ctx, s.workspace, []string{"remote", "get-url", "origin"}, nil)
+	if err != nil || !matchesRepository(origin, s.settings.Owner, s.settings.Repository) {
+		return Result{}, errors.New("github publish worktree origin does not match the configured repository")
+	}
 	status, err := s.manager.git.Run(ctx, s.workspace, []string{"status", "--porcelain"}, nil)
 	if err != nil || status != "" {
 		return Result{}, errors.New("github publish requires a clean worktree")
@@ -161,6 +165,39 @@ func (s *Session) Publish(ctx context.Context) (Result, error) {
 	s.manager.track(s.issue, pr, s.settings, s.linear)
 	s.manager.logger.Info("GitHub pull request handoff", "issue_id", s.issue.ID, "issue_identifier", s.issue.Identifier, "repository", s.settings.Owner+"/"+s.settings.Repository, "branch", s.branch, "pr_number", pr.Number)
 	return Result{Branch: s.branch, URL: pr.URL, Number: pr.Number}, nil
+}
+
+func matchesRepository(remote, owner, repository string) bool {
+	remote = strings.TrimSpace(remote)
+	if strings.HasPrefix(remote, "git@github.com:") {
+		return matchesRepositoryPath(strings.TrimPrefix(remote, "git@github.com:"), owner, repository)
+	}
+	parsed, err := url.Parse(remote)
+	if err != nil || !strings.EqualFold(parsed.Hostname(), "github.com") || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return false
+	}
+	switch parsed.Scheme {
+	case "https":
+		if parsed.User != nil || parsed.Port() != "" {
+			return false
+		}
+	case "ssh":
+		if parsed.User == nil || parsed.User.Username() != "git" || parsed.User.String() != "git" || parsed.Port() != "" {
+			return false
+		}
+	default:
+		return false
+	}
+	return matchesRepositoryPath(strings.TrimPrefix(parsed.EscapedPath(), "/"), owner, repository)
+}
+
+func matchesRepositoryPath(path, owner, repository string) bool {
+	if strings.Contains(path, "%") {
+		return false
+	}
+	path = strings.TrimSuffix(strings.TrimSuffix(path, "/"), ".git")
+	parts := strings.Split(path, "/")
+	return len(parts) == 2 && strings.EqualFold(parts[0], owner) && strings.EqualFold(parts[1], repository)
 }
 
 type pull struct {

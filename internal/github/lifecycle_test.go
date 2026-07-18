@@ -31,6 +31,8 @@ func (g *fakeGit) Run(_ context.Context, _ string, args, env []string) (string, 
 	g.calls = append(g.calls, append([]string(nil), args...))
 	g.envs = append(g.envs, append([]string(nil), env...))
 	switch args[0] {
+	case "remote":
+		return "https://github.com/owner/repo.git", nil
 	case "status":
 		if g.dirty {
 			return " M file.go", nil
@@ -204,6 +206,69 @@ func TestPublishRejectsDirtyNoChangeAndStaleIssueBeforeMutation(t *testing.T) {
 				t.Fatalf("created=%d links=%v", api.created, linear.links)
 			}
 		})
+	}
+}
+
+func TestPublishRejectsCrossRepositoryOriginBeforeAnyMutation(t *testing.T) {
+	api, linear := newAPI(t), &fakeLinear{}
+	git := &fakeGit{}
+	_, session := testSession(t, api, git, linear, nil)
+	session.manager.git = originGit{fakeGit: git, origin: "git@github.com:someone/other.git"}
+	if _, err := session.Publish(context.Background()); err == nil || !strings.Contains(err.Error(), "origin") {
+		t.Fatalf("cross-repository publish error=%v", err)
+	}
+	if api.created != 0 || len(api.auth) != 0 || len(linear.links) != 0 || linear.completed != 0 {
+		t.Fatalf("GitHub/Linear mutation occurred: created=%d requests=%d links=%v completed=%d", api.created, len(api.auth), linear.links, linear.completed)
+	}
+	git.mu.Lock()
+	defer git.mu.Unlock()
+	for _, call := range git.calls {
+		if call[0] == "push" {
+			t.Fatalf("cross-repository worktree was pushed: %v", call)
+		}
+	}
+}
+
+type originGit struct {
+	*fakeGit
+	origin string
+}
+
+func (g originGit) Run(ctx context.Context, dir string, args, env []string) (string, error) {
+	if args[0] == "remote" {
+		g.fakeGit.mu.Lock()
+		g.fakeGit.calls = append(g.fakeGit.calls, append([]string(nil), args...))
+		g.fakeGit.envs = append(g.fakeGit.envs, append([]string(nil), env...))
+		g.fakeGit.mu.Unlock()
+		return g.origin, nil
+	}
+	return g.fakeGit.Run(ctx, dir, args, env)
+}
+
+func TestRepositoryOriginAcceptsOnlyCanonicalCredentialFreeGitHubForms(t *testing.T) {
+	for _, remote := range []string{
+		"https://github.com/owner/repo.git",
+		"https://github.com/OWNER/REPO",
+		"git@github.com:owner/repo.git",
+		"ssh://git@github.com/owner/repo.git",
+	} {
+		if !matchesRepository(remote, "owner", "repo") {
+			t.Errorf("canonical remote rejected: %q", remote)
+		}
+	}
+	for _, remote := range []string{
+		"https://token@github.com/owner/repo.git",
+		"https://github.com/owner/other.git",
+		"git@github.com:other/repo.git",
+		"ssh://user@github.com/owner/repo.git",
+		"git://github.com/owner/repo.git",
+		"https://example.com/owner/repo.git",
+		"https://github.com/owner/repo.git?token=secret",
+		"https://github.com/owner%2Frepo.git",
+	} {
+		if matchesRepository(remote, "owner", "repo") {
+			t.Errorf("unsafe remote accepted: %q", remote)
+		}
 	}
 }
 
