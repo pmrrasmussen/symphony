@@ -345,12 +345,7 @@ func (c *Coordinator) launch(parent context.Context, i domain.Issue, attempt int
 		}
 		c.workspaces.AfterRun(context.Background(), ws, i)
 		if completed {
-			if err := c.workspaces.MarkCompleted(parent, ws, i); err != nil {
-				c.log.Error("record completed work failed", "issue_id", i.ID, "issue_identifier", i.Identifier, "session_id", session.ID, "error", err)
-				c.scheduleRetry(parent, i, ws, attempt+1, retryCompletion, "completion_marker", backoff(attempt+1, s.Agent.MaxRetryBackoff))
-				return
-			}
-			c.release(i.ID)
+			c.recordCompletion(parent, r, ws, i, attempt, s)
 			return
 		}
 		if stopped != "" || ctx.Err() != nil {
@@ -360,6 +355,68 @@ func (c *Coordinator) launch(parent context.Context, i domain.Issue, attempt int
 		}
 		c.finishFailure(parent, i, attempt, "agent_event", consumeErr)
 	}()
+}
+
+// recordCompletion performs one final tracker read after an event stream says
+// the turn completed. Reconciliation can have taken a snapshot just before the
+// worker removes itself from running; without this read, that interleaving can
+// write a stale completion marker for a terminal or rerouted issue.
+func (c *Coordinator) recordCompletion(parent context.Context, r *running, ws domain.Workspace, issue domain.Issue, attempt int, settings config.Settings) {
+	if !c.completionAllowed(parent, r) {
+		c.log.Info("agent run cancelled", "issue_id", issue.ID, "issue_identifier", issue.Identifier, "session_id", r.session.ID, "reason", cancellationReason(r.stopped, parent))
+		c.release(issue.ID)
+		return
+	}
+	fresh, err := c.tracker.GetIssues(parent, []string{issue.ID})
+	if err != nil {
+		if parent.Err() != nil {
+			c.release(issue.ID)
+			return
+		}
+		c.log.Warn("completion issue refresh failed", "issue_id", issue.ID, "issue_identifier", issue.Identifier, "session_id", r.session.ID, "error", err)
+		c.scheduleRetry(parent, issue, ws, attempt+1, retryCompletion, "completion_reconcile", backoff(attempt+1, settings.Agent.MaxRetryBackoff))
+		return
+	}
+	if len(fresh) != 1 || fresh[0].ID != issue.ID {
+		c.log.Warn("completion issue refresh returned no matching issue", "issue_id", issue.ID, "issue_identifier", issue.Identifier, "session_id", r.session.ID)
+		c.release(issue.ID)
+		return
+	}
+	current := fresh[0]
+	if !eligible(current, settings) {
+		if terminal(current, settings) {
+			if err := c.workspaces.Cleanup(parent, current); err != nil {
+				c.log.Warn("terminal workspace cleanup failed", "issue_id", current.ID, "issue_identifier", current.Identifier, "error", err)
+			}
+		}
+		c.release(issue.ID)
+		return
+	}
+	if !sameIssueVersion(issue, current) {
+		c.log.Info("completion marker skipped for updated issue", "issue_id", issue.ID, "issue_identifier", issue.Identifier, "session_id", r.session.ID)
+		c.release(issue.ID)
+		return
+	}
+	if !c.completionAllowed(parent, r) {
+		c.log.Info("agent run cancelled", "issue_id", issue.ID, "issue_identifier", issue.Identifier, "session_id", r.session.ID, "reason", cancellationReason(r.stopped, parent))
+		c.release(issue.ID)
+		return
+	}
+	if err := c.workspaces.MarkCompleted(parent, ws, current); err != nil {
+		c.log.Error("record completed work failed", "issue_id", issue.ID, "issue_identifier", issue.Identifier, "session_id", r.session.ID, "error", err)
+		c.scheduleRetry(parent, issue, ws, attempt+1, retryCompletion, "completion_marker", backoff(attempt+1, settings.Agent.MaxRetryBackoff))
+		return
+	}
+	c.release(issue.ID)
+}
+
+func (c *Coordinator) completionAllowed(parent context.Context, r *running) bool {
+	if parent.Err() != nil {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return !c.stopping && r.stopped == ""
 }
 
 func (c *Coordinator) consume(ctx context.Context, r *running, events <-chan domain.Event) (bool, error) {

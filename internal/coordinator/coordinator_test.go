@@ -14,8 +14,10 @@ import (
 )
 
 type fakeTracker struct {
-	mu    sync.Mutex
-	issue domain.Issue
+	mu       sync.Mutex
+	issue    domain.Issue
+	fresh    domain.Issue
+	hasFresh bool
 }
 
 func (f *fakeTracker) ListCandidates(context.Context, []string) ([]domain.Issue, error) {
@@ -26,6 +28,9 @@ func (f *fakeTracker) ListCandidates(context.Context, []string) ([]domain.Issue,
 func (f *fakeTracker) GetIssues(context.Context, []string) ([]domain.Issue, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.hasFresh {
+		return []domain.Issue{f.fresh}, nil
+	}
 	return []domain.Issue{f.issue}, nil
 }
 func (f *fakeTracker) ListTerminal(context.Context, []string) ([]domain.Issue, error) {
@@ -34,6 +39,12 @@ func (f *fakeTracker) ListTerminal(context.Context, []string) ([]domain.Issue, e
 func (f *fakeTracker) setIssue(issue domain.Issue) {
 	f.mu.Lock()
 	f.issue = issue
+	f.mu.Unlock()
+}
+func (f *fakeTracker) setFresh(issue domain.Issue) {
+	f.mu.Lock()
+	f.fresh = issue
+	f.hasFresh = true
 	f.mu.Unlock()
 }
 
@@ -81,6 +92,7 @@ type fakeWorkspace struct {
 	prepares       int
 	marks          int
 	cleanups       int
+	cleaned        chan struct{}
 	markErr        error
 	after          chan struct{}
 }
@@ -111,8 +123,12 @@ func (f *fakeWorkspace) MarkCompleted(context.Context, domain.Workspace, domain.
 }
 func (f *fakeWorkspace) Cleanup(context.Context, domain.Issue) error {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.cleanups++
+	cleaned := f.cleaned
+	f.mu.Unlock()
+	if cleaned != nil {
+		cleaned <- struct{}{}
+	}
 	return nil
 }
 func (f *fakeWorkspace) Execute(context.Context, domain.Workspace, string, []string) ([]byte, error) {
@@ -379,6 +395,29 @@ func TestCompletedEventAfterReconciliationCancellationDoesNotComplete(t *testing
 	}
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("error=%v, want context cancellation", err)
+	}
+}
+
+func TestCompletionRevalidatesTerminalIssueBeforeMarker(t *testing.T) {
+	w := testSettings(t)
+	issue := testIssue()
+	tracker := &fakeTracker{issue: issue}
+	terminal := issue
+	terminal.State = "Done"
+	terminal.Dispatchable = false
+	tracker.setFresh(terminal)
+	agent := &fakeAgent{events: completedEvents}
+	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{}, 1), cleaned: make(chan struct{}, 1)}
+	c := testCoordinator(w.Config, tracker, agent, ws)
+
+	c.Tick(context.Background())
+	<-ws.cleaned
+	_, marks, cleanups, _ := ws.counts()
+	if marks != 0 {
+		t.Fatalf("completion marker writes=%d, want 0 for terminal issue", marks)
+	}
+	if cleanups != 1 {
+		t.Fatalf("terminal workspace cleanups=%d, want 1", cleanups)
 	}
 }
 
