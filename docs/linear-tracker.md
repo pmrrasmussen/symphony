@@ -19,11 +19,20 @@ configuration before the service starts. Changes to a referenced environment
 value or secret file participate in reload detection even when `WORKFLOW.md`
 itself is unchanged.
 
-Candidate and terminal reads use a project-and-state filter, fetch 50 issues per
-page, and require a fresh non-repeating cursor while `hasNextPage` is true. A
-failed page returns no partial list. Refresh-by-ID uses project-and-ID filtering,
-batches requested IDs in groups of 50, rejects malformed returned records, and
-preserves the requested ID order for records still in scope.
+Candidate and terminal reads use a project-and-state filter. Configured state
+names keep their original spelling for Linear's case-sensitive filter; internal
+state comparisons remain case-insensitive. Each read freezes its project,
+states, assignee policy, terminal states, endpoint, and credential before its
+first request, so a workflow reload takes effect only on the next read.
+
+Reads normally fetch 50 issues per page and require a fresh non-repeating cursor
+while `hasNextPage` is true. If a page exceeds the bounded response size, only
+that cursor is retried with progressively smaller pages. A malformed page or a
+page that is still oversized at one issue fails that poll without returning a
+partial list; the next poll starts cleanly at the normal page size.
+Refresh-by-ID uses project-and-ID filtering, batches requested IDs in groups of
+50, rejects malformed returned records, and preserves the requested ID order for
+records still in scope.
 
 The stable dispatch ID is Linear's issue ID; `native_ref` is omitted because no
 additional provider ID is needed. Required `id`, `identifier`, `title`, and
@@ -43,9 +52,12 @@ reconciliation.
 Errors are redacted `linear.Error` values. Categories are
 `invalid_tracker_config`, `missing_tracker_secret`, `tracker_request`,
 `tracker_status`, `tracker_response`, `tracker_pagination`, and
-`tracker_rate_limited`. HTTP 429 is retryable and honors numeric `Retry-After`;
-5xx status errors are retryable. GraphQL response bodies and transport details
-are intentionally not included in public error text or logs.
+`tracker_rate_limited`. HTTP 429 is retryable and honors numeric or HTTP-date
+`Retry-After` plus Linear's request-reset header. The coordinator schedules the
+later of that delay and the normal polling interval through its timer; it never
+sleeps or immediately hot-loops. 5xx status errors are retryable. GraphQL
+response bodies and transport details are intentionally not included in public
+error text or logs.
 
 ## Optional Codex handoff capability
 

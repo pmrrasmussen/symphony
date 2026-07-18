@@ -21,7 +21,10 @@ import (
 	"github.com/pmrrasmussen/symphony/internal/domain"
 )
 
-const pageSize = 50
+const (
+	pageSize        = 50
+	maxResponseSize = 1 << 20
+)
 
 // Error is a portable, redacted tracker failure. Its Category is one of the
 // categories described by the Symphony tracker contract.
@@ -30,6 +33,16 @@ type Error struct {
 	Message    string
 	Retryable  bool
 	RetryAfter time.Duration
+	oversized  bool
+}
+
+// RetryDelay lets schedulers honor a provider backoff without depending on
+// Linear-specific error types.
+func (e *Error) RetryDelay() time.Duration {
+	if e == nil || !e.Retryable {
+		return 0
+	}
+	return e.RetryAfter
 }
 
 func (e *Error) Error() string {
@@ -46,10 +59,11 @@ func trackerError(category, message string) error {
 type Tracker struct {
 	settings func() config.Settings
 	client   *http.Client
+	now      func() time.Time
 }
 
 func New(settings func() config.Settings) *Tracker {
-	return &Tracker{settings: settings, client: newHTTPClient(nil)}
+	return &Tracker{settings: settings, client: newHTTPClient(nil), now: time.Now}
 }
 
 func newHTTPClient(transport http.RoundTripper) *http.Client {
@@ -118,11 +132,11 @@ func (t *Tracker) GetIssues(ctx context.Context, ids []string) ([]domain.Issue, 
 	if len(ids) == 0 {
 		return nil, nil
 	}
-	if err := t.Validate(); err != nil {
+	s := trackerSnapshot(t.settings())
+	if err := validateProvider(s.Tracker.Provider); err != nil {
 		return nil, err
 	}
-	s := t.settings()
-	assignee, err := t.assigneeFilter(ctx, s.Tracker.Provider)
+	assignee, err := t.assigneeFilter(ctx, s)
 	if err != nil {
 		return nil, err
 	}
@@ -137,7 +151,7 @@ func (t *Tracker) GetIssues(ctx context.Context, ids []string) ([]domain.Issue, 
 		if end > len(ids) {
 			end = len(ids)
 		}
-		page, err := t.requestIssues(ctx, queryByIDs, map[string]any{
+		page, err := t.requestIssues(ctx, s, queryByIDs, map[string]any{
 			"ids":           ids[start:end],
 			"projectSlug":   strings.TrimSpace(stringValue(s.Tracker.Provider["project_slug"])),
 			"first":         end - start,
@@ -172,27 +186,32 @@ func (t *Tracker) listByStates(ctx context.Context, states []string) ([]domain.I
 	if len(states) == 0 {
 		return nil, nil
 	}
-	if err := t.Validate(); err != nil {
+	s := trackerSnapshot(t.settings())
+	if err := validateProvider(s.Tracker.Provider); err != nil {
 		return nil, err
 	}
-	s := t.settings()
-	assignee, err := t.assigneeFilter(ctx, s.Tracker.Provider)
+	assignee, err := t.assigneeFilter(ctx, s)
 	if err != nil {
 		return nil, err
 	}
 
 	var all []domain.Issue
 	after := any(nil)
+	first := pageSize
 	seenCursors := map[string]bool{}
 	for {
-		page, err := t.requestIssues(ctx, queryByStates, map[string]any{
+		page, err := t.requestIssues(ctx, s, queryByStates, map[string]any{
 			"projectSlug":   strings.TrimSpace(stringValue(s.Tracker.Provider["project_slug"])),
 			"stateNames":    states,
-			"first":         pageSize,
+			"first":         first,
 			"relationFirst": pageSize,
 			"after":         after,
 		})
 		if err != nil {
+			if isOversized(err) && first > 1 {
+				first = max(1, first/2)
+				continue
+			}
 			return nil, err // Atomic: never expose a partial poll.
 		}
 		issues, err := normalizeIssues(page.Nodes, assignee, s.Tracker.TerminalStates, false)
@@ -215,7 +234,8 @@ func (t *Tracker) listByStates(ctx context.Context, states []string) ([]domain.I
 	}
 }
 
-func (t *Tracker) assigneeFilter(ctx context.Context, provider map[string]any) (string, error) {
+func (t *Tracker) assigneeFilter(ctx context.Context, s config.Settings) (string, error) {
+	provider := s.Tracker.Provider
 	configured, exists := provider["assignee"]
 	if !exists {
 		return "", nil
@@ -228,7 +248,7 @@ func (t *Tracker) assigneeFilter(ctx context.Context, provider map[string]any) (
 	if value != "me" {
 		return value, nil
 	}
-	viewerID, err := t.requestViewer(ctx)
+	viewerID, err := t.requestViewer(ctx, s)
 	if err != nil {
 		return "", err
 	}
@@ -238,8 +258,8 @@ func (t *Tracker) assigneeFilter(ctx context.Context, provider map[string]any) (
 	return viewerID, nil
 }
 
-func (t *Tracker) requestViewer(ctx context.Context) (string, error) {
-	resp, err := t.request(ctx, viewerQuery, nil)
+func (t *Tracker) requestViewer(ctx context.Context, s config.Settings) (string, error) {
+	resp, err := t.request(ctx, s, viewerQuery, nil)
 	if err != nil {
 		return "", err
 	}
@@ -256,8 +276,8 @@ func (t *Tracker) requestViewer(ctx context.Context) (string, error) {
 	return strings.TrimSpace(data.Data.Viewer.ID), nil
 }
 
-func (t *Tracker) requestIssues(ctx context.Context, query string, variables map[string]any) (issueConnection, error) {
-	resp, err := t.request(ctx, query, variables)
+func (t *Tracker) requestIssues(ctx context.Context, s config.Settings, query string, variables map[string]any) (issueConnection, error) {
+	resp, err := t.request(ctx, s, query, variables)
 	if err != nil {
 		return issueConnection{}, err
 	}
@@ -272,15 +292,18 @@ func (t *Tracker) requestIssues(ctx context.Context, query string, variables map
 	return data.Data.Issues, nil
 }
 
-func (t *Tracker) request(ctx context.Context, query string, variables map[string]any) ([]byte, error) {
-	s := t.settings()
-	return requestWithSettings(ctx, t.client, s, query, variables)
+func (t *Tracker) request(ctx context.Context, s config.Settings, query string, variables map[string]any) ([]byte, error) {
+	return requestWithSettingsAt(ctx, t.client, s, query, variables, t.now())
 }
 
 // requestWithSettings is shared with the session-bound handoff adapter. The
 // caller supplies a configuration snapshot so a reload cannot silently widen a
 // running Codex session's authority.
 func requestWithSettings(ctx context.Context, client *http.Client, s config.Settings, query string, variables map[string]any) ([]byte, error) {
+	return requestWithSettingsAt(ctx, client, s, query, variables, time.Now())
+}
+
+func requestWithSettingsAt(ctx context.Context, client *http.Client, s config.Settings, query string, variables map[string]any, now time.Time) ([]byte, error) {
 	p := s.Tracker.Provider
 	if err := validateProvider(p); err != nil {
 		return nil, err
@@ -304,12 +327,15 @@ func requestWithSettings(ctx context.Context, client *http.Client, s config.Sett
 		return nil, trackerError("tracker_request", "Linear request failed")
 	}
 	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseSize+1))
 	if err != nil {
 		return nil, trackerError("tracker_response", "could not read Linear response")
 	}
+	if len(body) > maxResponseSize {
+		return nil, &Error{Category: "tracker_response", Message: "Linear response exceeded the size limit", oversized: true}
+	}
 	if resp.StatusCode == http.StatusTooManyRequests {
-		return nil, &Error{Category: "tracker_rate_limited", Message: "Linear rate limited the request", Retryable: true, RetryAfter: retryAfter(resp.Header.Get("Retry-After"))}
+		return nil, &Error{Category: "tracker_rate_limited", Message: "Linear rate limited the request", Retryable: true, RetryAfter: retryAfter(resp.Header, now)}
 	}
 	if resp.StatusCode/100 != 2 {
 		return nil, &Error{Category: "tracker_status", Message: fmt.Sprintf("Linear returned HTTP status %d", resp.StatusCode), Retryable: resp.StatusCode >= 500}
@@ -331,6 +357,26 @@ func requestWithSettings(ctx context.Context, client *http.Client, s config.Sett
 		return nil, trackerError("tracker_response", "Linear response did not contain data")
 	}
 	return body, nil
+}
+
+func trackerSnapshot(s config.Settings) config.Settings {
+	s.Tracker.Provider = cloneMap(s.Tracker.Provider)
+	s.Tracker.ActiveStates = append([]string(nil), s.Tracker.ActiveStates...)
+	s.Tracker.TerminalStates = append([]string(nil), s.Tracker.TerminalStates...)
+	return s
+}
+
+func cloneMap(source map[string]any) map[string]any {
+	out := make(map[string]any, len(source))
+	for key, value := range source {
+		out[key] = value
+	}
+	return out
+}
+
+func isOversized(err error) bool {
+	var trackerErr *Error
+	return errors.As(err, &trackerErr) && trackerErr.oversized
 }
 
 // issueConnection mirrors only the GraphQL fields used by this adapter.
@@ -510,12 +556,26 @@ func uniqueNonEmpty(values []string) []string {
 	return out
 }
 
-func retryAfter(value string) time.Duration {
-	seconds, err := strconv.Atoi(strings.TrimSpace(value))
-	if err != nil || seconds < 0 {
-		return 0
+func retryAfter(header http.Header, now time.Time) time.Duration {
+	var delay time.Duration
+	value := strings.TrimSpace(header.Get("Retry-After"))
+	if seconds, err := strconv.Atoi(value); err == nil && seconds >= 0 {
+		delay = time.Duration(seconds) * time.Second
+	} else if reset, err := http.ParseTime(value); err == nil && reset.After(now) {
+		delay = reset.Sub(now)
 	}
-	return time.Duration(seconds) * time.Second
+	if raw := strings.TrimSpace(header.Get("X-RateLimit-Requests-Reset")); raw != "" {
+		if value, err := strconv.ParseInt(raw, 10, 64); err == nil {
+			reset := time.Unix(value, 0)
+			if value > 1_000_000_000_000 {
+				reset = time.UnixMilli(value)
+			}
+			if until := reset.Sub(now); until > delay {
+				delay = until
+			}
+		}
+	}
+	return max(0, delay)
 }
 
 func isLocalHTTPHost(host string) bool {

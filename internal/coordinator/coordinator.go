@@ -177,14 +177,15 @@ func (c *Coordinator) Start(parent context.Context) {
 	go func() {
 		defer c.wg.Done()
 		for {
-			c.Tick(ctx)
-			d := c.settings().Polling.Interval
-			timer := time.NewTimer(d)
+			err := c.tick(ctx)
+			d := pollDelay(c.settings().Polling.Interval, err)
+			fired := make(chan struct{})
+			timer := c.timer.AfterFunc(d, func() { close(fired) })
 			select {
 			case <-ctx.Done():
 				timer.Stop()
 				return
-			case <-timer.C:
+			case <-fired:
 			}
 		}
 	}()
@@ -228,32 +229,39 @@ func (c *Coordinator) Shutdown(ctx context.Context) error {
 }
 
 func (c *Coordinator) Tick(ctx context.Context) {
+	_ = c.tick(ctx)
+}
+
+func (c *Coordinator) tick(ctx context.Context) error {
 	if ctx.Err() != nil || c.isStopping() {
-		return
+		return ctx.Err()
 	}
-	c.reconcile(ctx)
+	if err := c.reconcile(ctx); err != nil {
+		return err
+	}
 	if ctx.Err() != nil {
-		return
+		return ctx.Err()
 	}
 	s := c.settings()
 	issues, err := c.tracker.ListCandidates(ctx, s.Tracker.ActiveStates)
 	if err != nil {
 		c.log.Error("candidate poll failed", "error", err)
-		return
+		return err
 	}
 	sortIssues(issues)
 	for _, i := range issues {
 		if ctx.Err() != nil || c.isStopping() {
-			return
+			return ctx.Err()
 		}
 		if !eligible(i, s) || !c.shouldRun(ctx, i) || !c.claim(i, s) {
 			continue
 		}
 		c.launch(ctx, i, 0)
 	}
+	return nil
 }
 
-func (c *Coordinator) reconcile(ctx context.Context) {
+func (c *Coordinator) reconcile(ctx context.Context) error {
 	c.mu.Lock()
 	runs := make([]*running, 0, len(c.running))
 	for _, r := range c.running {
@@ -261,7 +269,7 @@ func (c *Coordinator) reconcile(ctx context.Context) {
 	}
 	c.mu.Unlock()
 	if len(runs) == 0 {
-		return
+		return nil
 	}
 	ids := make([]string, len(runs))
 	for i, r := range runs {
@@ -270,7 +278,7 @@ func (c *Coordinator) reconcile(ctx context.Context) {
 	issues, err := c.tracker.GetIssues(ctx, ids)
 	if err != nil {
 		c.log.Warn("running issue refresh failed", "error", err)
-		return
+		return err
 	}
 	byID := map[string]domain.Issue{}
 	for _, i := range issues {
@@ -303,6 +311,7 @@ func (c *Coordinator) reconcile(ctx context.Context) {
 		}
 		c.log.Info("agent reconciled", "issue_id", r.issue.ID, "issue_identifier", r.issue.Identifier, "session_id", r.session.ID, "reason", reason)
 	}
+	return nil
 }
 
 func (c *Coordinator) claim(i domain.Issue, s config.Settings) bool {
@@ -511,6 +520,19 @@ func (c *Coordinator) consume(ctx context.Context, r *running, events <-chan dom
 			}
 		}
 	}
+}
+
+type retryDelayError interface {
+	RetryDelay() time.Duration
+}
+
+func pollDelay(interval time.Duration, err error) time.Duration {
+	delay := interval
+	var retry retryDelayError
+	if errors.As(err, &retry) && retry.RetryDelay() > delay {
+		delay = retry.RetryDelay()
+	}
+	return delay
 }
 
 func (c *Coordinator) logEvent(r *running, event domain.Event) {
@@ -844,7 +866,7 @@ func cancellationReason(stopped stopReason, ctx context.Context) stopReason {
 
 func active(i domain.Issue, s config.Settings) bool {
 	for _, x := range s.Tracker.ActiveStates {
-		if norm(i.State) == x {
+		if norm(i.State) == norm(x) {
 			return true
 		}
 	}
@@ -852,7 +874,7 @@ func active(i domain.Issue, s config.Settings) bool {
 }
 func terminal(i domain.Issue, s config.Settings) bool {
 	for _, x := range s.Tracker.TerminalStates {
-		if norm(i.State) == x {
+		if norm(i.State) == norm(x) {
 			return true
 		}
 	}
