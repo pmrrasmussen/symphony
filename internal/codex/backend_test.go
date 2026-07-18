@@ -13,6 +13,7 @@ import (
 
 	"github.com/pmrrasmussen/symphony/internal/config"
 	"github.com/pmrrasmussen/symphony/internal/domain"
+	"github.com/pmrrasmussen/symphony/internal/observability"
 )
 
 func TestStartNormalizesAppServerLifecycle(t *testing.T) {
@@ -55,36 +56,15 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"
 	}
 }
 
-func TestStartReportsBoundedRedactedStderr(t *testing.T) {
-	dir := t.TempDir()
-	script := filepath.Join(dir, "fake-app-server.sh")
-	body := `#!/bin/sh
-IFS= read -r line
-printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'
-IFS= read -r line
-IFS= read -r line
-printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thread-1"}}}'
-IFS= read -r line
-printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn-1"}}}'
-printf '%s\n' 'token=do-not-log-this' >&2
-printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{}}'
-`
-	if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
-		t.Fatal(err)
+func TestDrainReportsBoundedRedactedStderrBeforeTurn(t *testing.T) {
+	c := &client{}
+	drain(strings.NewReader("token=do-not-log-this\n"), c.diagnostic)
+	if len(c.diagnostics) != 1 {
+		t.Fatalf("diagnostic count=%d want 1", len(c.diagnostics))
 	}
-	b := New()
-	_, events, err := b.Start(context.Background(), domain.AgentRequest{Workspace: dir, Prompt: "work", Command: "sh " + script, ApprovalPolicy: "never", ThreadSandbox: "workspace-write", TurnTimeout: time.Minute})
-	if err != nil {
-		t.Fatal(err)
-	}
-	var diagnostic string
-	for event := range events {
-		if event.Kind == domain.EventDiagnostic {
-			diagnostic = event.Message
-		}
-	}
-	if diagnostic == "" || strings.Contains(diagnostic, "do-not-log-this") || !strings.Contains(diagnostic, "[REDACTED]") {
-		t.Fatalf("stderr diagnostic=%q", diagnostic)
+	diagnostic := c.diagnostics[0]
+	if diagnostic.Kind != domain.EventDiagnostic || strings.Contains(diagnostic.Message, "do-not-log-this") || !strings.Contains(diagnostic.Message, "[REDACTED]") || len(diagnostic.Message) > observability.MaxDiagnosticBytes {
+		t.Fatalf("stderr diagnostic=%q", diagnostic.Message)
 	}
 }
 

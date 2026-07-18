@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+  workflow_dispatch:
+    inputs:
+      run_live_smoke:
+        description: Run the isolated Linear and Codex smoke profile
+        required: true
+        default: false
+        type: boolean
+      linear_project_slug:
+        description: Dedicated disposable Linear project slug (never a production project)
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: go test ./...
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go test ./...
+
+  vet:
+    name: go vet ./...
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go vet ./...
+
+  race:
+    name: go test -race ./...
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go test -race ./...
+
+  live-smoke:
+    name: isolated live smoke
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      inputs.run_live_smoke &&
+      inputs.linear_project_slug != ''
+    runs-on: ubuntu-latest
+    environment: live-smoke
+    env:
+      LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+      LINEAR_SMOKE_PROJECT_SLUG: ${{ inputs.linear_project_slug }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Prepare isolated workflow
+        run: |
+          cp WORKFLOW.smoke.example.md "$RUNNER_TEMP/symphony-smoke-workflow.md"
+          sed -i "s|__LINEAR_SMOKE_PROJECT_SLUG__|$LINEAR_SMOKE_PROJECT_SLUG|" "$RUNNER_TEMP/symphony-smoke-workflow.md"
+      - name: Validate Linear connectivity without Codex
+        run: go run ./cmd/symphony --workflow "$RUNNER_TEMP/symphony-smoke-workflow.md" --dry-run
