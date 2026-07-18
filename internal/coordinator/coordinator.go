@@ -757,7 +757,6 @@ func (c *Coordinator) finishFailure(ctx context.Context, i domain.Issue, attempt
 		c.release(i.ID)
 		return
 	}
-	c.scheduleRetry(ctx, i, domain.Workspace{}, attempt+1, retryAgent, reason, backoff(attempt+1, c.settings().Agent.MaxRetryBackoff))
 	attrs := []any{"issue_id", i.ID, "issue_identifier", i.Identifier, "reason", reason, "attempt", attempt + 1}
 	var blocked blockedError
 	if errors.As(err, &blocked) {
@@ -767,6 +766,7 @@ func (c *Coordinator) finishFailure(ctx context.Context, i domain.Issue, attempt
 		attrs = append(attrs, "error", err)
 	}
 	c.log.Warn("agent run retry scheduled", attrs...)
+	c.scheduleRetry(ctx, i, domain.Workspace{}, attempt+1, retryAgent, reason, backoff(attempt+1, c.settings().Agent.MaxRetryBackoff))
 }
 
 func (c *Coordinator) scheduleRetry(ctx context.Context, i domain.Issue, ws domain.Workspace, attempt int, kind retryKind, reason string, delay time.Duration) {

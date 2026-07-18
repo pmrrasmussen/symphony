@@ -152,7 +152,7 @@ func (w *observingLocalWorkspace) Execute(ctx context.Context, workspace domain.
 	return w.local.Execute(ctx, workspace, command, args)
 }
 
-func TestLocalWorkspaceCompletionLifecycleIsDurable(t *testing.T) {
+func TestLocalWorkspaceActiveTurnLimitRemainsEligibleAfterRestart(t *testing.T) {
 	root := t.TempDir()
 	updated := time.Date(2026, time.July, 18, 12, 0, 0, 0, time.UTC)
 	issue := lifecycleIssue(updated)
@@ -160,7 +160,7 @@ func TestLocalWorkspaceCompletionLifecycleIsDurable(t *testing.T) {
 	agent := &lifecycleAgent{requests: make(chan domain.AgentRequest, 2)}
 	settings := lifecycleSettings(root, "printf after-run > .after-run")
 	local := localworkspace.New(func() config.Settings { return settings })
-	workspaces := &observingLocalWorkspace{local: local, marked: make(chan struct{}, 2), afterRun: make(chan struct{}, 2)}
+	workspaces := &observingLocalWorkspace{local: local, afterRun: make(chan struct{}, 2)}
 	coordinator := New(tracker, agent, workspaces, func() config.Settings { return settings }, nil)
 	canonicalRoot, err := filepath.EvalSymlinks(root)
 	if err != nil {
@@ -173,42 +173,29 @@ func TestLocalWorkspaceCompletionLifecycleIsDurable(t *testing.T) {
 	if request.Workspace != workspacePath {
 		t.Fatalf("agent workspace=%q, want prepared workspace %q", request.Workspace, workspacePath)
 	}
-	<-workspaces.marked
 	<-workspaces.afterRun
+	if err := coordinator.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := os.Stat(filepath.Join(workspacePath, ".after-run")); err != nil {
 		t.Fatalf("after_run hook did not use prepared workspace: %v", err)
 	}
-	if shouldRun, err := local.ShouldRun(context.Background(), issue); err != nil || shouldRun {
-		t.Fatalf("completed issue should be durably skipped: shouldRun=%t err=%v", shouldRun, err)
+	if shouldRun, err := local.ShouldRun(context.Background(), issue); err != nil || !shouldRun {
+		t.Fatalf("active exhausted issue should remain eligible: shouldRun=%t err=%v", shouldRun, err)
 	}
 	if starts, cancels, sent := agent.counts(); starts != 1 || cancels != 1 {
 		t.Fatalf("first lifecycle starts=%d cancels=%d, want 1 each", starts, cancels)
 	} else if want := []domain.EventKind{domain.EventSessionStarted, domain.EventProgress, domain.EventUsage, domain.EventRateLimit, domain.EventCompleted}; !reflect.DeepEqual(sent, want) {
-		t.Fatalf("success event sequence=%v, want %v", sent, want)
+		t.Fatalf("event sequence=%v, want %v", sent, want)
 	}
 
-	// The persisted marker suppresses the exact completed Linear version after
-	// an orchestrator restart, when in-memory claims are empty again.
+	// Restarting with the exact same active issue must dispatch it again because
+	// turn-limit exhaustion did not write a durable completion marker.
 	restarted := New(tracker, agent, workspaces, func() config.Settings { return settings }, nil)
 	restarted.Tick(context.Background())
-	if starts, _, _ := agent.counts(); starts != 1 {
-		t.Fatalf("unchanged completed issue restarted %d times", starts)
-	}
-
-	// A material Linear update is a new lifecycle and must run once more.
-	changed := issue
-	changedAt := updated.Add(time.Second)
-	changed.UpdatedAt = &changedAt
-	tracker.setIssue(changed)
-	restarted.Tick(context.Background())
 	<-agent.requests
-	<-workspaces.marked
-	<-workspaces.afterRun
-	if shouldRun, err := local.ShouldRun(context.Background(), changed); err != nil || shouldRun {
-		t.Fatalf("updated completion should be durably recorded: shouldRun=%t err=%v", shouldRun, err)
-	}
-	if starts, cancels, _ := agent.counts(); starts != 2 || cancels != 2 {
-		t.Fatalf("updated lifecycle starts=%d cancels=%d, want 2 each", starts, cancels)
+	if err := restarted.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
 	}
 }
 
