@@ -103,3 +103,28 @@ To let a Codex session hand an issue off safely, optionally configure
 `handoff_comment_template`). This enables a session-bound compatibility tool,
 not general Linear or GraphQL access; see the Linear tracker profile for its
 strict scope.
+
+An optional host-side GitHub integration can publish a completed, clean
+worktree and create or reuse its pull request. It requires the Linear handoff
+policy above and a fixed repository configuration:
+
+```yaml
+github:
+  owner: pmrrasmussen
+  repository: symphony
+  base_branch: main
+  token_file: $SYMPHONY_GITHUB_TOKEN_FILE
+  # Alternatively: token: $SYMPHONY_GITHUB_TOKEN
+  poll_interval_ms: 30000
+```
+
+Use a fine-grained token restricted to that repository. Symphony removes the
+resolved token (including inherited environment values containing it) from the
+Codex child environment. The dynamic tool accepts no issue, repository,
+branch, or credential input: it verifies the worktree's credential-free GitHub
+origin and committed clean changes, pushes
+`symphony/<lowercase-issue-identifier>`, links the PR, and moves only the active
+issue to the configured review state. A confirmed human merge moves that
+linked issue to `Done`; closing without merge leaves it in review and emits a
+warning. Invalid or incomplete GitHub settings disable the tool, preserving
+the manual workflow. Symphony never merges pull requests.

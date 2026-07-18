@@ -80,7 +80,7 @@ func TestStartDrainsStderrBeforeProcessFinalization(t *testing.T) {
 	script := writeAppServer(t, dir, `
 printf '%s\n' 'token=do-not-log-this' >&2
 `)
-	c, err := start(context.Background(), request(dir, script), nil, nil, nil)
+	c, err := start(context.Background(), request(dir, script), nil, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -487,14 +487,32 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{}}'
 	}
 }
 
+func TestGitHubToolHasNoCallerControlledScopeOrCredentialFields(t *testing.T) {
+	definition := githubToolDefinition()
+	schema, ok := definition["inputSchema"].(map[string]any)
+	if !ok || schema["type"] != "object" || schema["additionalProperties"] != false {
+		t.Fatalf("schema=%#v", definition["inputSchema"])
+	}
+	if _, hasProperties := schema["properties"]; hasProperties {
+		t.Fatalf("GitHub tool unexpectedly accepts caller-controlled input: %#v", schema)
+	}
+	encoded, err := json.Marshal(definition)
+	if err != nil || strings.Contains(string(encoded), "token") || strings.Contains(string(encoded), "owner") || strings.Contains(string(encoded), "repository") {
+		t.Fatalf("tool definition exposed host scope: %s err=%v", encoded, err)
+	}
+}
+
 func TestFilteredEnvRemovesConfiguredSecretByNameAndValue(t *testing.T) {
 	t.Setenv("PMR5_TOKEN_BY_NAME", "visible-if-broken")
 	t.Setenv("PMR5_TOKEN_BY_VALUE", "linear-secret")
 	t.Setenv("PMR5_TOKEN_WITH_PREFIX", "Bearer linear-secret")
 	t.Setenv("PMR5_TOKEN_WITH_SUFFIX", "linear-secret:suffix")
-	for _, value := range filteredEnv([]string{"PMR5_TOKEN_BY_NAME"}, func(candidate string) bool { return strings.Contains(candidate, "linear-secret") }) {
-		if strings.HasPrefix(value, "PMR5_TOKEN_BY_NAME=") || strings.HasPrefix(value, "PMR5_TOKEN_BY_VALUE=") {
-			t.Fatalf("child environment retained Linear secret: %q", value)
+	t.Setenv("SYMPHONY_LINEAR_API_KEY_FILE", "/private/linear-key")
+	t.Setenv("SYMPHONY_GITHUB_TOKEN_FILE", "/private/github-key")
+	blockedNames := []string{"PMR5_TOKEN_BY_NAME", "SYMPHONY_LINEAR_API_KEY_FILE", "SYMPHONY_GITHUB_TOKEN_FILE"}
+	for _, value := range filteredEnv(blockedNames, func(candidate string) bool { return strings.Contains(candidate, "linear-secret") }) {
+		if strings.HasPrefix(value, "PMR5_TOKEN_BY_NAME=") || strings.HasPrefix(value, "PMR5_TOKEN_BY_VALUE=") || strings.HasPrefix(value, "SYMPHONY_LINEAR_API_KEY_FILE=") || strings.HasPrefix(value, "SYMPHONY_GITHUB_TOKEN_FILE=") {
+			t.Fatalf("child environment retained a configured credential variable: %q", value)
 		}
 		if strings.HasPrefix(value, "PMR5_TOKEN_WITH_PREFIX=") || strings.HasPrefix(value, "PMR5_TOKEN_WITH_SUFFIX=") {
 			t.Fatalf("child environment retained embedded Linear secret: %q", value)
