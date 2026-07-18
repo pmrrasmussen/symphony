@@ -21,7 +21,11 @@ func TestKeyAndWorkspaceRemainBelowRoot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasPrefix(ws.Path, root+string(filepath.Separator)) {
+	effectiveRoot, err := resolveExistingAncestors(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(ws.Path, effectiveRoot+string(filepath.Separator)) {
 		t.Fatalf("escaped root: %s", ws.Path)
 	}
 	if !strings.Contains(ws.Key, "--") {
@@ -37,6 +41,102 @@ func TestKeyNeverResolvesToWorkspaceRoot(t *testing.T) {
 		if key := Key(identifier); key == stateDirectory {
 			t.Fatalf("workspace key conflicts with durable state directory for %q", identifier)
 		}
+	}
+}
+
+func TestWorkspaceOperationsRejectSymlinkedWorkspace(t *testing.T) {
+	root := t.TempDir()
+	target := t.TempDir()
+	s := config.Settings{Workspace: config.Workspace{Root: root}, Hooks: config.Hooks{BeforeRun: "true"}}
+	l := New(func() config.Settings { return s })
+	issue := domain.Issue{ID: "1", Identifier: "PMR-1"}
+	path := filepath.Join(root, Key(issue.Identifier))
+	if err := os.Symlink(target, path); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := l.Prepare(context.Background(), issue); err == nil || !strings.Contains(err.Error(), "must not be a symlink") {
+		t.Fatalf("Prepare error = %v, want symlink rejection", err)
+	}
+	ws := domain.Workspace{Path: path, Key: Key(issue.Identifier)}
+	if _, err := l.Execute(context.Background(), ws, "true", nil); err == nil || !strings.Contains(err.Error(), "must not be a symlink") {
+		t.Fatalf("Execute error = %v, want symlink rejection", err)
+	}
+	if err := l.BeforeRun(context.Background(), ws, issue); err == nil || !strings.Contains(err.Error(), "must not be a symlink") {
+		t.Fatalf("BeforeRun error = %v, want symlink rejection", err)
+	}
+	if err := l.MarkCompleted(context.Background(), ws, issue); err == nil || !strings.Contains(err.Error(), "must not be a symlink") {
+		t.Fatalf("MarkCompleted error = %v, want symlink rejection", err)
+	}
+	if err := l.Cleanup(context.Background(), issue); err == nil || !strings.Contains(err.Error(), "must not be a symlink") {
+		t.Fatalf("Cleanup error = %v, want symlink rejection", err)
+	}
+	if _, err := os.Stat(target); err != nil {
+		t.Fatalf("symlink target must not be removed: %v", err)
+	}
+}
+
+func TestStatePathsRejectSymlinkedDirectoryAndMarker(t *testing.T) {
+	root := t.TempDir()
+	target := t.TempDir()
+	s := config.Settings{Workspace: config.Workspace{Root: root}, Hooks: config.Hooks{}}
+	l := New(func() config.Settings { return s })
+	issue := domain.Issue{ID: "1", Identifier: "PMR-1"}
+	stateDir := filepath.Join(root, stateDirectory)
+	if err := os.Symlink(target, stateDir); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := l.ShouldRun(context.Background(), issue); err == nil || !strings.Contains(err.Error(), "workspace state directory path must not be a symlink") {
+		t.Fatalf("ShouldRun directory error = %v, want state symlink rejection", err)
+	}
+	if entries, err := os.ReadDir(target); err != nil || len(entries) != 0 {
+		t.Fatalf("state target must remain untouched: entries=%v err=%v", entries, err)
+	}
+	if err := os.Remove(stateDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(stateDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	marker, err := l.statePath(issue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(target, "marker.json"), marker); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := l.ShouldRun(context.Background(), issue); err == nil || !strings.Contains(err.Error(), "workspace state marker path must not be a symlink") {
+		t.Fatalf("ShouldRun marker error = %v, want state marker symlink rejection", err)
+	}
+}
+
+func TestPrepareCanonicalizesSymlinkedConfiguredRoot(t *testing.T) {
+	base := t.TempDir()
+	target := filepath.Join(t.TempDir(), "workspaces")
+	if err := os.Mkdir(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	configured := filepath.Join(base, "configured-root")
+	if err := os.Symlink(target, configured); err != nil {
+		t.Fatal(err)
+	}
+	s := config.Settings{Workspace: config.Workspace{Root: configured}, Hooks: config.Hooks{}}
+	l := New(func() config.Settings { return s })
+	issue := domain.Issue{ID: "1", Identifier: "PMR-1"}
+	ws, err := l.Prepare(context.Background(), issue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	effectiveTarget, err := resolveExistingAncestors(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(effectiveTarget, Key(issue.Identifier))
+	if ws.Path != want {
+		t.Fatalf("workspace path = %q, want canonical root path %q", ws.Path, want)
+	}
+	if _, err := os.Stat(filepath.Join(target, stateDirectory)); err != nil {
+		t.Fatalf("state directory should use canonical root: %v", err)
 	}
 }
 
