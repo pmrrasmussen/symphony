@@ -36,6 +36,13 @@ snapshot, and invalid reloads retain that snapshot. Prompts render strictly per
 run with lowercase `issue` and nullable `attempt` variables, so template
 failures do not prevent polling or configuration reload.
 
+Linear project scope is normalized to `project_slug_id`. The deprecated
+`project_slug` alias is converted before publication and produces only a
+constant migration warning; simultaneous canonical and legacy keys are rejected
+as ambiguous. Credential-file paths should enter repository-owned policy through
+`$SYMPHONY_LINEAR_API_KEY_FILE`. Neither migration warnings nor secret-file read
+errors include configured project, credential, or path values.
+
 Successful reloads affect settings reads which begin after publication. Future
 polls and run launches therefore use the new states, intervals, limits, hooks,
 paths, and Codex settings. A Codex process already launched keeps its captured

@@ -89,12 +89,18 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 	defer f.Close()
 	log := observability.New(slog.NewJSONHandler(f, &slog.HandlerOptions{Level: slog.LevelInfo}), stderr)
+	for _, warning := range s.Warnings {
+		log.Warn("workflow configuration warning", "warning", warning)
+	}
 	settings := func() config.Settings {
 		changed, err := store.ReloadIfChanged()
 		if err != nil {
 			log.Error("workflow reload rejected; retaining last valid configuration", "error", err)
 		} else if changed {
 			log.Info("workflow configuration reloaded")
+			for _, warning := range store.Current().Config.Warnings {
+				log.Warn("workflow configuration warning", "warning", warning)
+			}
 		}
 		return store.Current().Config
 	}
@@ -108,7 +114,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 	ws := workspace.New(settings)
 	// Optional host capabilities stay disabled until WORKFLOW.md supplies their
 	// fixed scope; resolved credentials are filtered from the Codex child.
-	backend, githubLifecycle := codex.NewWithIntegrations(settings, slog.New(log.Handler()), "LINEAR_API_KEY", "GITHUB_TOKEN")
+	backend, githubLifecycle := codex.NewWithIntegrations(settings, slog.New(log.Handler()),
+		"LINEAR_API_KEY", "SYMPHONY_LINEAR_API_KEY_FILE",
+		"GITHUB_TOKEN", "SYMPHONY_GITHUB_TOKEN", "SYMPHONY_GITHUB_TOKEN_FILE")
 	go githubLifecycle.Run(ctx)
 	var t domain.Tracker = tracker
 	var a domain.AgentBackend = backend

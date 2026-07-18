@@ -438,7 +438,7 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{}}'
 		t.Fatal(err)
 	}
 	settings := config.Settings{Tracker: config.Tracker{
-		Provider:     map[string]any{"api_key": "test-token", "project_slug": "project-1", "endpoint": server.URL},
+		Provider:     map[string]any{"api_key": "test-token", "project_slug_id": "project-1", "endpoint": server.URL},
 		ActiveStates: []string{"todo"}, HandoffState: "In Review",
 	}}
 	b := NewWithLinearHandoff(func() config.Settings { return settings }, "LINEAR_API_KEY")
@@ -507,9 +507,12 @@ func TestFilteredEnvRemovesConfiguredSecretByNameAndValue(t *testing.T) {
 	t.Setenv("PMR5_TOKEN_BY_VALUE", "linear-secret")
 	t.Setenv("PMR5_TOKEN_WITH_PREFIX", "Bearer linear-secret")
 	t.Setenv("PMR5_TOKEN_WITH_SUFFIX", "linear-secret:suffix")
-	for _, value := range filteredEnv([]string{"PMR5_TOKEN_BY_NAME"}, func(candidate string) bool { return strings.Contains(candidate, "linear-secret") }) {
-		if strings.HasPrefix(value, "PMR5_TOKEN_BY_NAME=") || strings.HasPrefix(value, "PMR5_TOKEN_BY_VALUE=") {
-			t.Fatalf("child environment retained Linear secret: %q", value)
+	t.Setenv("SYMPHONY_LINEAR_API_KEY_FILE", "/private/linear-key")
+	t.Setenv("SYMPHONY_GITHUB_TOKEN_FILE", "/private/github-key")
+	blockedNames := []string{"PMR5_TOKEN_BY_NAME", "SYMPHONY_LINEAR_API_KEY_FILE", "SYMPHONY_GITHUB_TOKEN_FILE"}
+	for _, value := range filteredEnv(blockedNames, func(candidate string) bool { return strings.Contains(candidate, "linear-secret") }) {
+		if strings.HasPrefix(value, "PMR5_TOKEN_BY_NAME=") || strings.HasPrefix(value, "PMR5_TOKEN_BY_VALUE=") || strings.HasPrefix(value, "SYMPHONY_LINEAR_API_KEY_FILE=") || strings.HasPrefix(value, "SYMPHONY_GITHUB_TOKEN_FILE=") {
+			t.Fatalf("child environment retained a configured credential variable: %q", value)
 		}
 		if strings.HasPrefix(value, "PMR5_TOKEN_WITH_PREFIX=") || strings.HasPrefix(value, "PMR5_TOKEN_WITH_SUFFIX=") {
 			t.Fatalf("child environment retained embedded Linear secret: %q", value)
@@ -556,20 +559,22 @@ func writeAppServer(t *testing.T, dir, body string) string {
 func waitForPID(t *testing.T, path string) int {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
+	var lastErr error
 	for {
 		text, err := os.ReadFile(path)
 		if err == nil {
-			pid, err := strconv.Atoi(string(text))
-			if err != nil {
-				t.Fatal(err)
+			pid, parseErr := strconv.Atoi(strings.TrimSpace(string(text)))
+			if parseErr == nil {
+				return pid
 			}
-			return pid
-		}
-		if !errors.Is(err, os.ErrNotExist) {
+			// The shell creates/truncates the file before writing the PID. Under
+			// the race detector, a read can observe that short empty window.
+			lastErr = parseErr
+		} else if !errors.Is(err, os.ErrNotExist) {
 			t.Fatal(err)
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("child pid was not written to %s", path)
+			t.Fatalf("child pid was not written to %s: %v", path, lastErr)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}

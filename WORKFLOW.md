@@ -3,9 +3,9 @@ tracker:
   kind: linear
   provider:
     # Linear project slug ID for the pmrrasmussen/Symphony project.
-    project_slug: 6e13e4a9f215
-    # Keep the API key outside this repository; create this file with mode 600.
-    api_key_file: /Users/peter/.config/symphony/linear-api-key
+    project_slug_id: 6e13e4a9f215
+    # Set this to an absolute path for a mode-600 file outside the repository.
+    api_key_file: $SYMPHONY_LINEAR_API_KEY_FILE
   active_states: [Todo, In Progress]
   terminal_states: [Done, Canceled]
 polling:
@@ -33,7 +33,7 @@ codex:
 #   owner: pmrrasmussen
 #   repository: symphony
 #   base_branch: main
-#   token_file: /Users/peter/.config/symphony/github-token
+#   token_file: $SYMPHONY_GITHUB_TOKEN_FILE
 #   poll_interval_ms: 30000
 ---
 Work on {{.issue.identifier}}: {{.issue.title}}

@@ -2,9 +2,11 @@
 tracker:
   kind: linear
   provider:
-    project_slug: example-project
-    # Environment expansion accepts the exact $VARNAME form only.
-    api_key: $LINEAR_API_KEY
+    project_slug_id: example-project
+    # Recommended: point this variable at a mode-600 file outside the repo.
+    api_key_file: $SYMPHONY_LINEAR_API_KEY_FILE
+    # Alternatively, inject the credential value directly from the environment:
+    # api_key: $LINEAR_API_KEY
     # Optional: only dispatch issues assigned to this Linear user ID, or `me`.
     # assignee: me
     # Optional, opt-in Codex client tool. It can only read/comment on the
@@ -33,12 +35,13 @@ codex:
   read_timeout_ms: 5000
   stall_timeout_ms: 300000
 # Optional. Requires tracker.provider.handoff_state and a fine-grained token
-# restricted to exactly this repository. token_file may replace token.
+# restricted to exactly this repository.
 # github:
 #   owner: your-github-owner
 #   repository: your-repository
 #   base_branch: main
-#   token: $SYMPHONY_GITHUB_TOKEN
+#   token_file: $SYMPHONY_GITHUB_TOKEN_FILE
+#   # Alternatively: token: $SYMPHONY_GITHUB_TOKEN
 #   poll_interval_ms: 30000
 ---
 Work on {{.issue.identifier}}: {{.issue.title}}
