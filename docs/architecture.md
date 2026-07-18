@@ -63,13 +63,12 @@ changes. The source root must already have a commit, and Git worktrees require
 the local repository to be trusted. A workspace-write Codex turn receives the
 validated common Git directory for that linked worktree so it can create local
 commits; this does not grant network access or a GitHub credential. The host
-still owns all GitHub publishing authority. Completion markers are held below the
-configured workspace root and are keyed to the issue's Linear `updatedAt`
-value: a completed unchanged issue is not dispatched again, while a later
-issue edit is eligible for another bounded lifecycle. Invalid state and state
-missing beside an existing workspace fail closed. The schema, exact dispatch
-policy, and deliberate operator remediation procedure are documented in
-[completion markers and recovery](completion-markers.md). Cleanup refuses to
+still owns all GitHub publishing authority. Workspace state below the configured
+root records durable ownership and Git cleanup identity; it never suppresses an
+otherwise active issue. Invalid ownership state, or missing state beside an
+existing workspace, fails closed during preparation. The schema, restart
+behavior, and deliberate operator remediation procedure are documented in
+[workspace ownership and recovery](completion-markers.md). Cleanup refuses to
 remove a worktree with local changes or a commit that differs from its recorded
 base revision.
 

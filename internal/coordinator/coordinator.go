@@ -43,8 +43,8 @@ const (
 
 // turnLimitError means that the agent used its bounded session without
 // reaching a verified handoff or a terminal tracker state. It is deliberately
-// retriable: the issue remains active and no durable completion marker is
-// written for work that may still be incomplete.
+// retriable: the issue remains active and no terminal tracker transition occurs
+// for work that may still be incomplete.
 type turnLimitError struct{ limit int }
 
 func (e turnLimitError) Error() string {
@@ -284,7 +284,7 @@ func (c *Coordinator) tick(ctx context.Context) error {
 		if ctx.Err() != nil || c.isStopping() {
 			return ctx.Err()
 		}
-		if !eligible(i, s) || !c.shouldRun(ctx, i) || !c.claim(i, s) {
+		if !eligible(i, s) || !c.claim(i, s) {
 			continue
 		}
 		c.launch(ctx, i, 0)
@@ -381,10 +381,6 @@ func (c *Coordinator) launch(parent context.Context, i domain.Issue, attempt int
 		defer c.wg.Done()
 		ctx, cancel := context.WithCancel(parent)
 		defer cancel()
-		if !c.shouldRun(ctx, i) {
-			c.release(i.ID)
-			return
-		}
 		ws, err := c.workspaces.Prepare(ctx, i)
 		if err != nil {
 			c.finishFailure(parent, i, attempt, "workspace_prepare", err)
@@ -590,7 +586,7 @@ func (c *Coordinator) consume(ctx context.Context, r *running, events <-chan dom
 			case domain.EventCompleted:
 				// Reconciliation and event delivery can race. An event that
 				// arrives after reconciliation has canceled this run must never
-				// turn into a durable completion marker.
+				// turn into a successful terminal outcome.
 				c.mu.Lock()
 				stopped := r.stopped
 				stopping := c.stopping
@@ -836,10 +832,6 @@ func (c *Coordinator) runRetry(id string, generation uint64) {
 		c.release(id)
 		return
 	}
-	if !c.shouldRun(ctx, issue) {
-		c.release(id)
-		return
-	}
 	c.launch(ctx, issue, retry.attempt)
 }
 
@@ -887,15 +879,6 @@ func (c *Coordinator) cancelSession(parent context.Context, session domain.Agent
 	case <-ctx.Done():
 		c.log.Warn("agent cancellation timed out", "session_id", session.ID)
 	}
-}
-
-func (c *Coordinator) shouldRun(ctx context.Context, i domain.Issue) bool {
-	ok, err := c.workspaces.ShouldRun(ctx, i)
-	if err != nil {
-		c.log.Warn("workspace run eligibility check failed", "issue_id", i.ID, "issue_identifier", i.Identifier, "error", err)
-		return false
-	}
-	return ok
 }
 
 func (c *Coordinator) release(id string) {

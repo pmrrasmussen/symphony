@@ -244,12 +244,6 @@ type fakeWorkspace struct {
 	after          chan struct{}
 }
 
-func (f *fakeWorkspace) ShouldRun(context.Context, domain.Issue) (bool, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.shouldRunCalls++
-	return f.shouldRun, nil
-}
 func (f *fakeWorkspace) Prepare(context.Context, domain.Issue) (domain.Workspace, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -261,17 +255,6 @@ func (f *fakeWorkspace) AfterRun(context.Context, domain.Workspace, domain.Issue
 	if f.after != nil {
 		f.after <- struct{}{}
 	}
-}
-func (f *fakeWorkspace) MarkCompleted(context.Context, domain.Workspace, domain.Issue) error {
-	f.mu.Lock()
-	f.marks++
-	err := f.markErr
-	marked := f.marked
-	f.mu.Unlock()
-	if err == nil && marked != nil {
-		marked <- struct{}{}
-	}
-	return err
 }
 func (f *fakeWorkspace) Cleanup(context.Context, domain.Issue) error {
 	f.mu.Lock()
@@ -654,27 +637,6 @@ func TestClosedEventStreamSchedulesDeterministicAgentRetry(t *testing.T) {
 	c.mu.Unlock()
 	if retry.kind != retryAgent || retry.reason != "agent_event" || retry.attempt != 1 {
 		t.Fatalf("retry=%+v", retry)
-	}
-}
-
-func TestShouldRunPreventsClaimAndLaunch(t *testing.T) {
-	w := testSettings(t)
-	issue := testIssue()
-	agent := &fakeAgent{events: completedEvents}
-	ws := &fakeWorkspace{shouldRun: false, after: make(chan struct{}, 1)}
-	c := testCoordinator(w.Config, &fakeTracker{issue: issue}, agent, ws)
-
-	c.Tick(context.Background())
-	starts, _, _ := agent.counts()
-	prepares, _, _, checks := ws.counts()
-	if starts != 0 || prepares != 0 || checks != 1 {
-		t.Fatalf("starts=%d prepares=%d should-run-checks=%d", starts, prepares, checks)
-	}
-	c.mu.Lock()
-	claimed := c.claimed[issue.ID]
-	c.mu.Unlock()
-	if claimed {
-		t.Fatal("issue was claimed despite workspace refusing to run")
 	}
 }
 

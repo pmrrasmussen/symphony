@@ -216,18 +216,16 @@ func lifecycle(ctx context.Context, settings config.Settings) error {
 }
 
 type fakeBoundaries struct {
-	mu        sync.Mutex
-	issue     domain.Issue
-	afterRun  chan struct{}
-	lists     int
-	gets      int
-	shouldRun int
-	prepares  int
-	before    int
-	starts    int
-	after     int
-	marks     int
-	cancels   int
+	mu       sync.Mutex
+	issue    domain.Issue
+	afterRun chan struct{}
+	lists    int
+	gets     int
+	prepares int
+	before   int
+	starts   int
+	after    int
+	cancels  int
 }
 
 func (f *fakeBoundaries) ListCandidates(context.Context, []string) ([]domain.Issue, error) {
@@ -244,12 +242,6 @@ func (f *fakeBoundaries) GetIssues(context.Context, []string) ([]domain.Issue, e
 }
 func (*fakeBoundaries) ListTerminal(context.Context, []string) ([]domain.Issue, error) {
 	return nil, nil
-}
-func (f *fakeBoundaries) ShouldRun(context.Context, domain.Issue) (bool, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.shouldRun++
-	return true, nil
 }
 func (f *fakeBoundaries) Prepare(context.Context, domain.Issue) (domain.Workspace, error) {
 	f.mu.Lock()
@@ -270,12 +262,6 @@ func (f *fakeBoundaries) AfterRun(context.Context, domain.Workspace, domain.Issu
 	if f.after == 1 {
 		close(f.afterRun)
 	}
-}
-func (f *fakeBoundaries) MarkCompleted(context.Context, domain.Workspace, domain.Issue) error {
-	f.mu.Lock()
-	f.marks++
-	f.mu.Unlock()
-	return nil
 }
 func (*fakeBoundaries) Cleanup(context.Context, domain.Issue) error {
 	return errorsf("unexpected cleanup")
@@ -304,8 +290,8 @@ func (f *fakeBoundaries) Cancel(context.Context, domain.AgentSession) error {
 func (f *fakeBoundaries) verify() error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.lists != 1 || f.gets != 1 || f.shouldRun != 2 || f.prepares != 1 || f.before != 1 || f.starts != 1 || f.after != 1 || f.marks != 0 || f.cancels != 1 {
-		return errorsf("unexpected synthetic boundary counts: list=%d get=%d should_run=%d prepare=%d before=%d start=%d after=%d mark=%d cancel=%d", f.lists, f.gets, f.shouldRun, f.prepares, f.before, f.starts, f.after, f.marks, f.cancels)
+	if f.lists != 1 || f.gets != 1 || f.prepares != 1 || f.before != 1 || f.starts != 1 || f.after != 1 || f.cancels != 1 {
+		return errorsf("unexpected synthetic boundary counts: list=%d get=%d prepare=%d before=%d start=%d after=%d cancel=%d", f.lists, f.gets, f.prepares, f.before, f.starts, f.after, f.cancels)
 	}
 	return nil
 }
