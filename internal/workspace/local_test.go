@@ -2,6 +2,7 @@ package workspace
 
 import (
 	"context"
+	"encoding/json"
 	"github.com/pmrrasmussen/symphony/internal/config"
 	"github.com/pmrrasmussen/symphony/internal/domain"
 	"os"
@@ -244,7 +245,7 @@ func TestCompletionMarkerValidationFailsClosed(t *testing.T) {
 		want string
 	}{
 		{name: "corrupt", body: `{`, want: "decode workspace state"},
-		{name: "unknown schema", body: `{"schema":"symphony.workspace-state/v2","issue_id":"issue-1","identifier":"PMR-1"}`, want: "unsupported schema"},
+		{name: "unknown schema", body: `{"schema":"symphony.workspace-state/v3","issue_id":"issue-1","identifier":"PMR-1"}`, want: "unsupported schema"},
 		{name: "unknown field", body: `{"schema":"symphony.workspace-state/v1","issue_id":"issue-1","identifier":"PMR-1","surprise":true}`, want: "unknown field"},
 		{name: "missing owner", body: `{"schema":"symphony.workspace-state/v1","identifier":"PMR-1"}`, want: "required ownership fields"},
 		{name: "wrong owner", body: `{"schema":"symphony.workspace-state/v1","issue_id":"issue-2","identifier":"PMR-1"}`, want: "belongs to issue"},
@@ -385,6 +386,301 @@ func TestCleanupPreservesChangedGitWorktrees(t *testing.T) {
 	}
 	if _, statErr := os.Stat(ws.Path); statErr != nil {
 		t.Fatalf("changed-HEAD worktree must be preserved: %v", statErr)
+	}
+}
+
+func TestCleanupPreservesWorktreeWhenEntireSourceRepositoryIsRemoved(t *testing.T) {
+	source := newGitRepository(t)
+	root := filepath.Join(t.TempDir(), "workspaces")
+	s := config.Settings{Workspace: config.Workspace{Root: root, SourceRoot: source}}
+	l := New(func() config.Settings { return s })
+	issue := domain.Issue{ID: "issue-17", Identifier: "PMR-17"}
+	ws, err := l.Prepare(context.Background(), issue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, found, err := l.loadState(issue)
+	if err != nil || !found || state.SourceRoot == "" || state.GitCommonDir == "" || state.GitWorktreeDir == "" {
+		t.Fatalf("persisted identity=%+v found=%t err=%v", state, found, err)
+	}
+	if err := os.RemoveAll(source); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(ws.Path, "local.txt"), []byte("must survive"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Cleanup(context.Background(), issue); err == nil || !strings.Contains(err.Error(), "local changes cannot be verified") {
+		t.Fatalf("Cleanup error=%v", err)
+	}
+	if b, err := os.ReadFile(filepath.Join(ws.Path, "local.txt")); err != nil || string(b) != "must survive" {
+		t.Fatalf("local work was not preserved: %q err=%v", b, err)
+	}
+	if _, found, err := l.loadState(issue); err != nil || !found {
+		t.Fatalf("state must remain for manual recovery: found=%t err=%v", found, err)
+	}
+}
+
+func TestCleanupUsesCommonDirWhenLinkedSourceWorktreeIsRemoved(t *testing.T) {
+	commonSource := newGitRepository(t)
+	linkedSource := filepath.Join(t.TempDir(), "linked-source")
+	runGit(t, commonSource, "worktree", "add", "--detach", linkedSource, "HEAD")
+	root := filepath.Join(t.TempDir(), "workspaces")
+	s := config.Settings{Workspace: config.Workspace{Root: root, SourceRoot: linkedSource}}
+	l := New(func() config.Settings { return s })
+	issue := domain.Issue{ID: "issue-17", Identifier: "PMR-17"}
+	ws, err := l.Prepare(context.Background(), issue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, commonSource, "worktree", "remove", "--force", linkedSource)
+	if err := l.Cleanup(context.Background(), issue); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(ws.Path); !os.IsNotExist(err) {
+		t.Fatalf("worktree remains after common-dir cleanup: %v", err)
+	}
+	cmd := exec.Command("git", "-C", commonSource, "worktree", "list", "--porcelain")
+	out, err := cmd.Output()
+	if err != nil || strings.Contains(string(out), ws.Path) {
+		t.Fatalf("stale worktree registration output=%q err=%v", out, err)
+	}
+}
+
+func TestCleanupLegacyGitStateFailsClosedWithoutUsingCurrentSource(t *testing.T) {
+	source := newGitRepository(t)
+	root := filepath.Join(t.TempDir(), "workspaces")
+	s := config.Settings{Workspace: config.Workspace{Root: root, SourceRoot: source}}
+	l := New(func() config.Settings { return s })
+	issue := domain.Issue{ID: "issue-17", Identifier: "PMR-17"}
+	ws, err := l.Prepare(context.Background(), issue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { runGit(t, source, "worktree", "remove", "--force", ws.Path) })
+	state, _, err := l.loadState(issue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state.Schema = legacyWorkspaceStateSchema
+	state.Preparation = ""
+	state.SourceRoot, state.GitCommonDir, state.GitWorktreeDir = "", "", ""
+	state.GitCommonDevice, state.GitCommonInode = 0, 0
+	b, err := json.Marshal(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker, err := l.statePath(issue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(marker, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Cleanup(context.Background(), issue); err == nil || !strings.Contains(err.Error(), "legacy Git workspace") {
+		t.Fatalf("Cleanup error=%v", err)
+	}
+	if _, err := os.Stat(ws.Path); err != nil {
+		t.Fatalf("legacy/unowned worktree was removed: %v", err)
+	}
+}
+
+func TestAfterCreateFailureRemovesPartialWorkspaceBeforeRetry(t *testing.T) {
+	source := newGitRepository(t)
+	root := filepath.Join(t.TempDir(), "workspaces")
+	s := config.Settings{Workspace: config.Workspace{Root: root, SourceRoot: source}, Hooks: config.Hooks{AfterCreate: "printf partial > partial.txt; exit 7"}}
+	l := New(func() config.Settings { return s })
+	issue := domain.Issue{ID: "issue-17", Identifier: "PMR-17"}
+	path := filepath.Join(root, Key(issue.Identifier))
+	if _, err := l.Prepare(context.Background(), issue); err == nil || !strings.Contains(err.Error(), "after_create hook failed") {
+		t.Fatalf("Prepare error=%v", err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("failed-hook workspace was reused/preserved: %v", err)
+	}
+	if _, found, err := l.loadState(issue); err != nil || found {
+		t.Fatalf("failed-hook state remains: found=%t err=%v", found, err)
+	}
+	s.Hooks.AfterCreate = "test ! -e partial.txt"
+	ws, err := l.Prepare(context.Background(), issue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = l.Cleanup(context.Background(), issue) })
+	if !ws.CreatedNow {
+		t.Fatal("retry must create a fresh workspace")
+	}
+}
+
+func TestInterruptedPreparationMarkerIsReconciled(t *testing.T) {
+	source := newGitRepository(t)
+	root := filepath.Join(t.TempDir(), "workspaces")
+	s := config.Settings{Workspace: config.Workspace{Root: root, SourceRoot: source}}
+	l := New(func() config.Settings { return s })
+	issue := domain.Issue{ID: "issue-17", Identifier: "PMR-17"}
+	identity, err := sourceIdentity(context.Background(), source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := l.writeState(issue, workspaceState{Schema: workspaceStateSchema, IssueID: issue.ID, Identifier: issue.Identifier, Preparation: preparationCreating, SourceRoot: identity.sourceRoot, GitCommonDir: identity.commonDir, GitCommonDevice: identity.commonDevice, GitCommonInode: identity.commonInode}); err != nil {
+		t.Fatal(err)
+	}
+	ws, err := l.Prepare(context.Background(), issue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = l.Cleanup(context.Background(), issue) })
+	state, found, err := l.loadState(issue)
+	if err != nil || !found || state.Preparation != preparationReady {
+		t.Fatalf("reconciled state=%+v found=%t err=%v", state, found, err)
+	}
+	if _, err := os.Stat(ws.Path); err != nil {
+		t.Fatalf("recreated workspace: %v", err)
+	}
+}
+
+func TestCleanupRetryPreservesMarkerUntilWorkspaceIsSafe(t *testing.T) {
+	source := newGitRepository(t)
+	root := filepath.Join(t.TempDir(), "workspaces")
+	s := config.Settings{Workspace: config.Workspace{Root: root, SourceRoot: source}}
+	l := New(func() config.Settings { return s })
+	issue := domain.Issue{ID: "issue-17", Identifier: "PMR-17"}
+	ws, err := l.Prepare(context.Background(), issue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dirty := filepath.Join(ws.Path, "retry.txt")
+	if err := os.WriteFile(dirty, []byte("operator work"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Cleanup(context.Background(), issue); err == nil || !strings.Contains(err.Error(), "uncommitted or untracked") {
+		t.Fatalf("first Cleanup error=%v", err)
+	}
+	if _, found, err := l.loadState(issue); err != nil || !found {
+		t.Fatalf("retry state found=%t err=%v", found, err)
+	}
+	if err := os.Remove(dirty); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Cleanup(context.Background(), issue); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRestartReconcilesHookPendingWorkspaceAndRerunsHook(t *testing.T) {
+	source := newGitRepository(t)
+	root := filepath.Join(t.TempDir(), "workspaces")
+	counter := filepath.Join(t.TempDir(), "counter")
+	t.Setenv("PMR17_HOOK_COUNTER", counter)
+	s := config.Settings{Workspace: config.Workspace{Root: root, SourceRoot: source}, Hooks: config.Hooks{AfterCreate: `printf x >> "$PMR17_HOOK_COUNTER"`}}
+	issue := domain.Issue{ID: "issue-17", Identifier: "PMR-17"}
+	first := New(func() config.Settings { return s })
+	if _, err := first.Prepare(context.Background(), issue); err != nil {
+		t.Fatal(err)
+	}
+	state, _, err := first.loadState(issue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state.Preparation = preparationHookPending
+	if err := first.writeState(issue, state); err != nil {
+		t.Fatal(err)
+	}
+	restarted := New(func() config.Settings { return s })
+	if _, err := restarted.Prepare(context.Background(), issue); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = restarted.Cleanup(context.Background(), issue) })
+	b, err := os.ReadFile(counter)
+	if err != nil || string(b) != "xx" {
+		t.Fatalf("hook counter=%q err=%v, want two fresh executions", b, err)
+	}
+}
+
+func TestCleanupRejectsUnownedWorktreeIdentity(t *testing.T) {
+	source := newGitRepository(t)
+	root := filepath.Join(t.TempDir(), "workspaces")
+	s := config.Settings{Workspace: config.Workspace{Root: root, SourceRoot: source}}
+	l := New(func() config.Settings { return s })
+	issue := domain.Issue{ID: "issue-17", Identifier: "PMR-17"}
+	ws, err := l.Prepare(context.Background(), issue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { runGit(t, source, "worktree", "remove", "--force", ws.Path) })
+	state, _, err := l.loadState(issue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state.GitWorktreeDir = filepath.Join(t.TempDir(), "unowned")
+	if err := l.writeState(issue, state); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Cleanup(context.Background(), issue); err == nil || !strings.Contains(err.Error(), "recorded identity") {
+		t.Fatalf("Cleanup error=%v", err)
+	}
+	if _, err := os.Stat(ws.Path); err != nil {
+		t.Fatalf("unowned workspace was removed: %v", err)
+	}
+}
+
+func TestCleanupRejectsReplacedSourceRepository(t *testing.T) {
+	source := newGitRepository(t)
+	originalParent := filepath.Dir(source)
+	root := filepath.Join(t.TempDir(), "workspaces")
+	s := config.Settings{Workspace: config.Workspace{Root: root, SourceRoot: source}}
+	l := New(func() config.Settings { return s })
+	issue := domain.Issue{ID: "issue-17", Identifier: "PMR-17"}
+	ws, err := l.Prepare(context.Background(), issue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	preserved := filepath.Join(originalParent, "preserved-source")
+	if err := os.Rename(source, preserved); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(source, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, source, "init")
+	if err := l.Cleanup(context.Background(), issue); err == nil || !strings.Contains(err.Error(), "different Git repository") {
+		t.Fatalf("Cleanup error=%v", err)
+	}
+	if _, err := os.Stat(ws.Path); err != nil {
+		t.Fatalf("workspace was removed through replaced source: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(source, ".git")); err != nil {
+		t.Fatalf("replacement repository was mutated: %v", err)
+	}
+}
+
+func TestAfterCreateDiagnosticsAreBounded(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "workspaces")
+	script := `(yes stdout | head -c 40000); (yes stderr | head -c 40000 >&2); exit 1`
+	s := config.Settings{Workspace: config.Workspace{Root: root}, Hooks: config.Hooks{AfterCreate: script}}
+	l := New(func() config.Settings { return s })
+	issue := domain.Issue{ID: "issue-17", Identifier: "PMR-17"}
+	_, err := l.Prepare(context.Background(), issue)
+	if err == nil {
+		t.Fatal("Prepare unexpectedly succeeded")
+	}
+	if len(err.Error()) > 2*maxHookOutput+1024 {
+		t.Fatalf("hook error is not bounded: %d bytes", len(err.Error()))
+	}
+	if !strings.Contains(err.Error(), "[truncated]") {
+		t.Fatalf("hook error lacks truncation marker: %v", err)
+	}
+}
+
+func TestAfterCreateCannotCreateUnclassifiableGitRepository(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "workspaces")
+	s := config.Settings{Workspace: config.Workspace{Root: root}, Hooks: config.Hooks{AfterCreate: "git init -q"}}
+	l := New(func() config.Settings { return s })
+	issue := domain.Issue{ID: "issue-17", Identifier: "PMR-17"}
+	if _, err := l.Prepare(context.Background(), issue); err == nil || !strings.Contains(err.Error(), "without a source-worktree identity") {
+		t.Fatalf("Prepare error=%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, Key(issue.Identifier))); !os.IsNotExist(err) {
+		t.Fatalf("unclassifiable Git repository remains: %v", err)
 	}
 }
 

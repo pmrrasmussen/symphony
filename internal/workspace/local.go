@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/pmrrasmussen/symphony/internal/config"
@@ -24,7 +25,16 @@ const maxHookOutput = 16 << 10
 
 const stateDirectory = ".symphony-state"
 
-const workspaceStateSchema = "symphony.workspace-state/v1"
+const (
+	legacyWorkspaceStateSchema = "symphony.workspace-state/v1"
+	workspaceStateSchema       = "symphony.workspace-state/v2"
+)
+
+const (
+	preparationCreating    = "creating"
+	preparationHookPending = "hook_pending"
+	preparationReady       = "ready"
+)
 
 var unsafe = regexp.MustCompile(`[^A-Za-z0-9._-]`)
 
@@ -39,6 +49,12 @@ type workspaceState struct {
 	IssueID            string     `json:"issue_id"`
 	Identifier         string     `json:"identifier"`
 	BaseCommit         string     `json:"base_commit,omitempty"`
+	Preparation        string     `json:"preparation,omitempty"`
+	SourceRoot         string     `json:"source_root,omitempty"`
+	GitCommonDir       string     `json:"git_common_dir,omitempty"`
+	GitWorktreeDir     string     `json:"git_worktree_dir,omitempty"`
+	GitCommonDevice    uint64     `json:"git_common_device,omitempty"`
+	GitCommonInode     uint64     `json:"git_common_inode,omitempty"`
 	CompletedUpdatedAt *time.Time `json:"completed_updated_at,omitempty"`
 }
 
@@ -109,6 +125,21 @@ func (l *Local) Prepare(ctx context.Context, issue domain.Issue) (domain.Workspa
 	if err != nil {
 		return domain.Workspace{}, err
 	}
+	state, found, err := l.loadState(issue)
+	if err != nil {
+		return domain.Workspace{}, err
+	}
+	if found {
+		if err := validateStateOwner(state, issue); err != nil {
+			return domain.Workspace{}, err
+		}
+		if state.Preparation != "" && state.Preparation != preparationReady {
+			if err := l.recoverPreparation(ctx, issue, path, state); err != nil {
+				return domain.Workspace{}, err
+			}
+			state, found = workspaceState{}, false
+		}
+	}
 	info, err := os.Stat(path)
 	created := os.IsNotExist(err)
 	if err == nil && !info.IsDir() {
@@ -120,10 +151,37 @@ func (l *Local) Prepare(ctx context.Context, issue domain.Issue) (domain.Workspa
 	settings := l.settings()
 	if created {
 		if settings.Workspace.SourceRoot != "" {
-			if err := addWorktree(ctx, settings.Workspace.SourceRoot, path); err != nil {
+			identity, err := sourceIdentity(ctx, settings.Workspace.SourceRoot)
+			if err != nil {
 				return domain.Workspace{}, err
 			}
-		} else if err := os.MkdirAll(path, 0o755); err != nil {
+			state = workspaceState{Schema: workspaceStateSchema, IssueID: issue.ID, Identifier: issue.Identifier, Preparation: preparationCreating, SourceRoot: identity.sourceRoot, GitCommonDir: identity.commonDir, GitCommonDevice: identity.commonDevice, GitCommonInode: identity.commonInode}
+			if err := l.writeState(issue, state); err != nil {
+				return domain.Workspace{}, err
+			}
+			if err := addWorktree(ctx, identity.sourceRoot, path); err != nil {
+				return domain.Workspace{}, err
+			}
+			worktreeDir, err := worktreeIdentity(ctx, path, identity.commonDir)
+			if err != nil {
+				return domain.Workspace{}, err
+			}
+			state.GitWorktreeDir = worktreeDir
+			state.BaseCommit, err = gitHead(ctx, path)
+			if err != nil {
+				return domain.Workspace{}, err
+			}
+		} else {
+			state = workspaceState{Schema: workspaceStateSchema, IssueID: issue.ID, Identifier: issue.Identifier, Preparation: preparationCreating}
+			if err := l.writeState(issue, state); err != nil {
+				return domain.Workspace{}, err
+			}
+			if err := os.MkdirAll(path, 0o755); err != nil {
+				return domain.Workspace{}, err
+			}
+		}
+		state.Preparation = preparationHookPending
+		if err := l.writeState(issue, state); err != nil {
 			return domain.Workspace{}, err
 		}
 	}
@@ -136,6 +194,29 @@ func (l *Local) Prepare(ctx context.Context, issue domain.Issue) (domain.Workspa
 	ws := domain.Workspace{Path: path, Key: key, CreatedNow: created}
 	if created && settings.Hooks.AfterCreate != "" {
 		if err := l.hook(ctx, ws, issue, "after_create", settings.Hooks.AfterCreate); err != nil {
+			recoveryErr := l.recoverPreparation(ctx, issue, path, state)
+			if recoveryErr != nil {
+				return domain.Workspace{}, fmt.Errorf("%w; partial workspace recovery also failed: %v; retry cleanup or preserve the workspace outside the managed root for manual recovery", err, recoveryErr)
+			}
+			return domain.Workspace{}, err
+		}
+	}
+	if created {
+		if state.SourceRoot == "" {
+			git, gitErr := isGitWorkspace(path)
+			if gitErr != nil {
+				return domain.Workspace{}, gitErr
+			}
+			if git {
+				recoveryErr := l.recoverPreparation(ctx, issue, path, state)
+				if recoveryErr != nil {
+					return domain.Workspace{}, fmt.Errorf("after_create created an unclassifiable plain Git repository; recovery failed: %v; manual recovery is required", recoveryErr)
+				}
+				return domain.Workspace{}, errors.New("after_create created a Git repository without a source-worktree identity; the partial workspace was removed and must be configured with workspace.source_root")
+			}
+		}
+		state.Preparation = preparationReady
+		if err := l.writeState(issue, state); err != nil {
 			return domain.Workspace{}, err
 		}
 	}
@@ -191,12 +272,14 @@ func (l *Local) MarkCompleted(ctx context.Context, ws domain.Workspace, issue do
 	state.Schema = workspaceStateSchema
 	state.IssueID = issue.ID
 	state.Identifier = issue.Identifier
+	if state.Preparation == "" {
+		state.Preparation = preparationReady
+	}
 	state.CompletedUpdatedAt = cloneTime(issue.UpdatedAt)
 	return l.writeState(issue, state)
 }
 
 func (l *Local) Cleanup(ctx context.Context, issue domain.Issue) error {
-	settings := l.settings()
 	path, err := l.workspacePath(issue)
 	if err != nil {
 		return err
@@ -204,6 +287,16 @@ func (l *Local) Cleanup(ctx context.Context, issue domain.Issue) error {
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		return l.removeState(issue)
 	} else if err != nil {
+		return err
+	}
+	state, found, err := l.loadState(issue)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return errors.New("refusing to remove workspace without durable ownership state; preserve it outside the managed root for manual recovery")
+	}
+	if err := validateStateOwner(state, issue); err != nil {
 		return err
 	}
 	ws := domain.Workspace{Path: path, Key: Key(issue.Identifier)}
@@ -215,28 +308,40 @@ func (l *Local) Cleanup(ctx context.Context, issue domain.Issue) error {
 		return err
 	}
 	if git {
-		state, found, err := l.loadState(issue)
-		if err != nil {
-			return err
-		}
-		if !found || state.BaseCommit == "" {
+		if state.BaseCommit == "" {
 			return errors.New("refusing to remove Git workspace without a recorded base commit")
 		}
-		if state.IssueID != issue.ID {
-			return fmt.Errorf("refusing to remove Git workspace owned by issue %q", state.IssueID)
-		}
-		if err := ensureGitWorkspaceUnchanged(ctx, path, state.BaseCommit); err != nil {
-			return err
-		}
-		if settings.Workspace.SourceRoot != "" {
-			if err := removeWorktree(ctx, settings.Workspace.SourceRoot, path); err != nil {
+		if state.SourceRoot != "" {
+			if err := validateWorktreeIdentity(path, state); err != nil {
 				return err
 			}
-		} else if err := os.RemoveAll(path); err != nil {
+			available, availableErr := gitRepositoryAvailable(ctx, state)
+			if availableErr != nil {
+				return availableErr
+			}
+			if available {
+				if err := ensureGitWorkspaceUnchanged(ctx, path, state.BaseCommit); err != nil {
+					return err
+				}
+				if err := removeRecordedWorktree(ctx, state, path, false); err != nil {
+					return err
+				}
+				if err := pruneRecordedWorktrees(ctx, state); err != nil {
+					return err
+				}
+			} else {
+				return errors.New("recorded source and Git common directory are unavailable; refusing to remove a worktree whose local changes cannot be verified; preserve it outside the managed root for manual recovery")
+			}
+		} else {
+			return errors.New("refusing to remove legacy Git workspace without recorded source-worktree identity; preserve it outside the managed root for manual recovery")
+		}
+	} else {
+		if state.SourceRoot != "" || state.GitCommonDir != "" || state.GitWorktreeDir != "" || state.BaseCommit != "" {
+			return errors.New("recorded Git workspace no longer has its worktree identity; refusing cleanup because local changes cannot be verified; manual recovery is required")
+		}
+		if err := os.RemoveAll(path); err != nil {
 			return err
 		}
-	} else if err := os.RemoveAll(path); err != nil {
-		return err
 	}
 	// Do not discard the completion record until the workspace was removed.
 	return l.removeState(issue)
@@ -297,11 +402,17 @@ func (l *Local) loadState(issue domain.Issue) (workspaceState, bool, error) {
 	if err := ensureJSONEOF(decoder); err != nil {
 		return workspaceState{}, false, fmt.Errorf("decode workspace state %q: %w", path, err)
 	}
-	if state.Schema != "" && state.Schema != workspaceStateSchema {
+	if state.Schema != "" && state.Schema != legacyWorkspaceStateSchema && state.Schema != workspaceStateSchema {
 		return workspaceState{}, false, fmt.Errorf("workspace state %q uses unsupported schema %q; manual recovery is required", path, state.Schema)
 	}
 	if strings.TrimSpace(state.IssueID) == "" || strings.TrimSpace(state.Identifier) == "" {
 		return workspaceState{}, false, fmt.Errorf("workspace state %q is missing required ownership fields; manual recovery is required", path)
+	}
+	if state.Preparation != "" && state.Preparation != preparationCreating && state.Preparation != preparationHookPending && state.Preparation != preparationReady {
+		return workspaceState{}, false, fmt.Errorf("workspace state %q has invalid preparation phase %q; manual recovery is required", path, state.Preparation)
+	}
+	if state.Schema == legacyWorkspaceStateSchema && (state.Preparation != "" || state.SourceRoot != "" || state.GitCommonDir != "" || state.GitWorktreeDir != "" || state.GitCommonDevice != 0 || state.GitCommonInode != 0) {
+		return workspaceState{}, false, fmt.Errorf("workspace state %q mixes v2 recovery fields into the v1 schema; manual recovery is required", path)
 	}
 	return state, true, nil
 }
@@ -397,6 +508,9 @@ func (l *Local) ensureState(ctx context.Context, ws domain.Workspace, issue doma
 		return err
 	}
 	if git && state.BaseCommit == "" {
+		if state.SourceRoot == "" {
+			return errors.New("workspace became a Git repository without recorded source-worktree identity; manual recovery is required")
+		}
 		state.BaseCommit, err = gitHead(ctx, ws.Path)
 		if err != nil {
 			return err
@@ -404,6 +518,9 @@ func (l *Local) ensureState(ctx context.Context, ws domain.Workspace, issue doma
 	}
 	state.IssueID = issue.ID
 	state.Identifier = issue.Identifier
+	if state.Preparation == "" {
+		state.Preparation = preparationReady
+	}
 	return l.writeState(issue, state)
 }
 
@@ -419,12 +536,10 @@ func isGitWorkspace(path string) (bool, error) {
 }
 
 func gitHead(ctx context.Context, path string) (string, error) {
-	cmd := exec.CommandContext(ctx, "git", "-C", path, "rev-parse", "--verify", "HEAD")
-	out, err := cmd.CombinedOutput()
+	head, err := gitMetadata(ctx, path, "rev-parse", "--verify", "HEAD")
 	if err != nil {
-		return "", fmt.Errorf("read Git workspace HEAD: %w: %s", err, strings.TrimSpace(string(out)))
+		return "", fmt.Errorf("read Git workspace HEAD: %w", err)
 	}
-	head := strings.TrimSpace(string(out))
 	if head == "" {
 		return "", errors.New("read Git workspace HEAD: empty commit")
 	}
@@ -432,12 +547,11 @@ func gitHead(ctx context.Context, path string) (string, error) {
 }
 
 func ensureGitWorkspaceUnchanged(ctx context.Context, path, baseCommit string) error {
-	status := exec.CommandContext(ctx, "git", "-C", path, "status", "--porcelain=v1", "--untracked-files=all")
-	out, err := status.CombinedOutput()
+	status, err := gitMetadataAllowEmpty(ctx, path, "status", "--porcelain=v1", "--untracked-files=all")
 	if err != nil {
-		return fmt.Errorf("inspect Git workspace changes: %w: %s", err, strings.TrimSpace(string(out)))
+		return fmt.Errorf("inspect Git workspace changes: %w", err)
 	}
-	if strings.TrimSpace(string(out)) != "" {
+	if strings.TrimSpace(status) != "" {
 		return errors.New("refusing to remove Git workspace with uncommitted or untracked changes")
 	}
 	head, err := gitHead(ctx, path)
@@ -481,12 +595,12 @@ func (l *Local) hook(ctx context.Context, ws domain.Workspace, issue domain.Issu
 	cmd := exec.CommandContext(cctx, "sh", "-lc", script)
 	cmd.Dir = path
 	cmd.Env = append(os.Environ(), "SYMPHONY_ISSUE_ID="+issue.ID, "SYMPHONY_ISSUE_IDENTIFIER="+issue.Identifier)
-	out, err := cmd.CombinedOutput()
-	if len(out) > maxHookOutput {
-		out = append(out[:maxHookOutput], []byte("...[truncated]")...)
-	}
+	var stdout, stderr boundedBuffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	err = cmd.Run()
 	if err != nil {
-		return fmt.Errorf("%s hook failed: %w: %s", name, err, strings.TrimSpace(string(out)))
+		diagnostics := strings.TrimSpace(strings.Join([]string{stdout.String(), stderr.String()}, "\n"))
+		return fmt.Errorf("%s hook failed: %w: %s", name, err, diagnostics)
 	}
 	return nil
 }
@@ -650,20 +764,325 @@ func below(root, path string) bool {
 	return err == nil && rel != "." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && rel != ".."
 }
 
-func addWorktree(ctx context.Context, sourceRoot, path string) error {
-	cmd := exec.CommandContext(ctx, "git", "-C", sourceRoot, "worktree", "add", "--detach", path, "HEAD")
-	out, err := cmd.CombinedOutput()
+type gitSourceIdentity struct {
+	sourceRoot   string
+	commonDir    string
+	commonDevice uint64
+	commonInode  uint64
+}
+
+func sourceIdentity(ctx context.Context, sourceRoot string) (gitSourceIdentity, error) {
+	top, err := gitMetadata(ctx, sourceRoot, "rev-parse", "--path-format=absolute", "--show-toplevel")
 	if err != nil {
-		return fmt.Errorf("create workspace worktree: %w: %s", err, strings.TrimSpace(string(out)))
+		return gitSourceIdentity{}, fmt.Errorf("classify workspace source repository: %w", err)
+	}
+	common, err := gitMetadata(ctx, sourceRoot, "rev-parse", "--path-format=absolute", "--git-common-dir")
+	if err != nil {
+		return gitSourceIdentity{}, fmt.Errorf("classify workspace source Git directory: %w", err)
+	}
+	top, err = canonicalExistingDirectory(top)
+	if err != nil {
+		return gitSourceIdentity{}, fmt.Errorf("resolve workspace source repository: %w", err)
+	}
+	common, err = canonicalExistingDirectory(common)
+	if err != nil {
+		return gitSourceIdentity{}, fmt.Errorf("resolve workspace source Git directory: %w", err)
+	}
+	device, inode, err := directoryIdentity(common)
+	if err != nil {
+		return gitSourceIdentity{}, fmt.Errorf("identify workspace source Git directory: %w", err)
+	}
+	return gitSourceIdentity{sourceRoot: top, commonDir: common, commonDevice: device, commonInode: inode}, nil
+}
+
+func directoryIdentity(path string) (uint64, uint64, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0, 0, err
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, 0, errors.New("filesystem does not expose stable directory identity")
+	}
+	return uint64(stat.Dev), uint64(stat.Ino), nil
+}
+
+func worktreeIdentity(ctx context.Context, path, expectedCommon string) (string, error) {
+	common, err := gitMetadata(ctx, path, "rev-parse", "--path-format=absolute", "--git-common-dir")
+	if err != nil {
+		return "", fmt.Errorf("classify created worktree common directory: %w", err)
+	}
+	common, err = canonicalExistingDirectory(common)
+	if err != nil {
+		return "", fmt.Errorf("resolve created worktree common directory: %w", err)
+	}
+	if common != expectedCommon {
+		return "", fmt.Errorf("created worktree belongs to Git directory %q, expected %q; manual recovery is required", common, expectedCommon)
+	}
+	gitDir, err := gitMetadata(ctx, path, "rev-parse", "--path-format=absolute", "--absolute-git-dir")
+	if err != nil {
+		return "", fmt.Errorf("classify created worktree Git directory: %w", err)
+	}
+	gitDir, err = canonicalExistingDirectory(gitDir)
+	if err != nil {
+		return "", fmt.Errorf("resolve created worktree Git directory: %w", err)
+	}
+	return gitDir, nil
+}
+
+func canonicalExistingDirectory(path string) (string, error) {
+	resolved, err := filepath.EvalSymlinks(strings.TrimSpace(path))
+	if err != nil {
+		return "", err
+	}
+	abs, err := filepath.Abs(resolved)
+	if err != nil {
+		return "", err
+	}
+	info, err := os.Stat(abs)
+	if err != nil {
+		return "", err
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("not a directory: %s", abs)
+	}
+	return filepath.Clean(abs), nil
+}
+
+func validateWorktreeIdentity(path string, state workspaceState) error {
+	if state.GitWorktreeDir == "" || state.GitCommonDir == "" || state.GitCommonDevice == 0 || state.GitCommonInode == 0 {
+		return errors.New("refusing to remove Git workspace with incomplete source-worktree identity; preserve it outside the managed root for manual recovery")
+	}
+	b, err := os.ReadFile(filepath.Join(path, ".git"))
+	if err != nil {
+		return fmt.Errorf("read owned worktree identity: %w", err)
+	}
+	line := strings.TrimSpace(string(b))
+	if !strings.HasPrefix(line, "gitdir:") {
+		return errors.New("owned worktree has an unrecognized .git identity; manual recovery is required")
+	}
+	gitDir := strings.TrimSpace(strings.TrimPrefix(line, "gitdir:"))
+	if !filepath.IsAbs(gitDir) {
+		gitDir = filepath.Join(path, gitDir)
+	}
+	abs, err := filepath.Abs(filepath.Clean(gitDir))
+	if err != nil {
+		return fmt.Errorf("resolve owned worktree identity: %w", err)
+	}
+	if abs != filepath.Clean(state.GitWorktreeDir) {
+		return fmt.Errorf("refusing to remove worktree whose Git directory is %q, not recorded identity %q; manual recovery is required", abs, state.GitWorktreeDir)
+	}
+	if !below(filepath.Clean(state.GitCommonDir), abs) {
+		return errors.New("recorded worktree Git directory is outside its recorded Git common directory; manual recovery is required")
 	}
 	return nil
 }
 
-func removeWorktree(ctx context.Context, sourceRoot, path string) error {
-	cmd := exec.CommandContext(ctx, "git", "-C", sourceRoot, "worktree", "remove", path)
-	out, err := cmd.CombinedOutput()
+func (l *Local) recoverPreparation(ctx context.Context, issue domain.Issue, path string, state workspaceState) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if state.Preparation != preparationCreating && state.Preparation != preparationHookPending {
+		return fmt.Errorf("workspace preparation phase %q cannot be recovered automatically; manual recovery is required", state.Preparation)
+	}
+	managedPath, err := l.workspacePath(issue)
 	if err != nil {
-		return fmt.Errorf("remove workspace worktree: %w: %s", err, strings.TrimSpace(string(out)))
+		return err
+	}
+	if filepath.Clean(path) != managedPath {
+		return errors.New("partial workspace is outside its owned managed path")
+	}
+	_, statErr := os.Stat(path)
+	if statErr == nil {
+		git, err := isGitWorkspace(path)
+		if err != nil {
+			return err
+		}
+		if git && state.SourceRoot != "" {
+			if state.GitWorktreeDir == "" {
+				if _, sourceErr := os.Stat(state.SourceRoot); sourceErr != nil {
+					return errors.New("partial worktree identity is incomplete and its source repository is unavailable; manual recovery is required")
+				}
+				state.GitWorktreeDir, err = worktreeIdentity(ctx, path, state.GitCommonDir)
+				if err != nil {
+					return err
+				}
+				if err := l.writeState(issue, state); err != nil {
+					return err
+				}
+			}
+			if err := validateWorktreeIdentity(path, state); err != nil {
+				return err
+			}
+		}
+		if state.SourceRoot != "" {
+			available, availableErr := gitRepositoryAvailable(ctx, state)
+			if availableErr != nil {
+				return availableErr
+			}
+			if available {
+				// Failure is recoverable below: removing the owned path followed by
+				// prune reconciles a stale registration left by Git.
+				_ = removeRecordedWorktree(ctx, state, path, true)
+			}
+		}
+		if _, err := os.Stat(path); err == nil {
+			if err := os.RemoveAll(path); err != nil {
+				return fmt.Errorf("remove partial owned workspace: %w", err)
+			}
+		} else if !os.IsNotExist(err) {
+			return fmt.Errorf("inspect partial owned workspace: %w", err)
+		}
+	} else if !os.IsNotExist(statErr) {
+		return fmt.Errorf("inspect partial owned workspace: %w", statErr)
+	}
+	if state.SourceRoot != "" {
+		available, availableErr := gitRepositoryAvailable(ctx, state)
+		if availableErr != nil {
+			return availableErr
+		}
+		if available {
+			if err := pruneRecordedWorktrees(ctx, state); err != nil {
+				return err
+			}
+		}
+	}
+	return l.removeState(issue)
+}
+
+type boundedBuffer struct {
+	b []byte
+}
+
+func (b *boundedBuffer) Write(p []byte) (int, error) {
+	n := len(p)
+	remaining := maxHookOutput - len(b.b)
+	if remaining > 0 {
+		if len(p) > remaining {
+			p = p[:remaining]
+		}
+		b.b = append(b.b, p...)
+	}
+	return n, nil
+}
+
+func (b *boundedBuffer) String() string {
+	value := strings.TrimSpace(string(b.b))
+	if len(b.b) == maxHookOutput {
+		value += "...[truncated]"
+	}
+	return value
+}
+
+func gitMetadata(ctx context.Context, dir string, args ...string) (string, error) {
+	value, err := gitMetadataAllowEmpty(ctx, dir, args...)
+	if err != nil {
+		return "", err
+	}
+	if value == "" {
+		return "", fmt.Errorf("git %s returned empty metadata", strings.Join(args, " "))
+	}
+	return value, nil
+}
+
+func gitMetadataAllowEmpty(ctx context.Context, dir string, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", dir}, args...)...)
+	var stdout, stderr boundedBuffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, stderr.String())
+	}
+	value := stdout.String()
+	return value, nil
+}
+
+func addWorktree(ctx context.Context, sourceRoot, path string) error {
+	if err := gitMutation(ctx, sourceRoot, "worktree", "add", "--detach", path, "HEAD"); err != nil {
+		return fmt.Errorf("create workspace worktree: %w", err)
+	}
+	return nil
+}
+
+func gitRepositoryAvailable(ctx context.Context, state workspaceState) (bool, error) {
+	if _, err := os.Stat(state.SourceRoot); err == nil {
+		identity, identityErr := sourceIdentity(ctx, state.SourceRoot)
+		if identityErr != nil {
+			return false, fmt.Errorf("validate recorded source repository: %w; manual recovery is required", identityErr)
+		}
+		if identity.sourceRoot != filepath.Clean(state.SourceRoot) || identity.commonDir != filepath.Clean(state.GitCommonDir) || identity.commonDevice != state.GitCommonDevice || identity.commonInode != state.GitCommonInode {
+			return false, errors.New("recorded source path now identifies a different Git repository; manual recovery is required")
+		}
+		return true, nil
+	} else if !os.IsNotExist(err) {
+		return false, fmt.Errorf("inspect recorded source repository path: %w", err)
+	}
+	if common, err := canonicalExistingDirectory(state.GitCommonDir); err == nil {
+		device, inode, identityErr := directoryIdentity(common)
+		if identityErr != nil {
+			return false, identityErr
+		}
+		if device != state.GitCommonDevice || inode != state.GitCommonInode {
+			return false, errors.New("recorded Git common directory now identifies a different repository; manual recovery is required")
+		}
+		return true, nil
+	} else if !os.IsNotExist(err) {
+		return false, fmt.Errorf("inspect recorded Git common directory: %w", err)
+	}
+	return false, nil
+}
+
+func removeRecordedWorktree(ctx context.Context, state workspaceState, path string, force bool) error {
+	args := []string{"worktree", "remove"}
+	if force {
+		args = append(args, "--force")
+	}
+	args = append(args, path)
+	if err := gitRecordedMutation(ctx, state, args...); err != nil {
+		return fmt.Errorf("remove workspace worktree: %w", err)
+	}
+	return nil
+}
+
+func pruneRecordedWorktrees(ctx context.Context, state workspaceState) error {
+	if err := gitRecordedMutation(ctx, state, "worktree", "prune"); err != nil {
+		return fmt.Errorf("prune workspace worktrees: %w", err)
+	}
+	return nil
+}
+
+func gitRecordedMutation(ctx context.Context, state workspaceState, args ...string) error {
+	if _, err := os.Stat(state.SourceRoot); err == nil {
+		identity, identityErr := sourceIdentity(ctx, state.SourceRoot)
+		if identityErr != nil || identity.sourceRoot != filepath.Clean(state.SourceRoot) || identity.commonDir != filepath.Clean(state.GitCommonDir) || identity.commonDevice != state.GitCommonDevice || identity.commonInode != state.GitCommonInode {
+			return errors.New("recorded source path no longer identifies the expected Git repository; manual recovery is required")
+		}
+		return gitMutation(ctx, state.SourceRoot, args...)
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("inspect recorded source repository: %w", err)
+	}
+	if _, err := os.Stat(state.GitCommonDir); err != nil {
+		return fmt.Errorf("inspect recorded Git common directory: %w", err)
+	}
+	device, inode, err := directoryIdentity(state.GitCommonDir)
+	if err != nil || device != state.GitCommonDevice || inode != state.GitCommonInode {
+		return errors.New("recorded Git common directory no longer identifies the expected repository; manual recovery is required")
+	}
+	cmd := exec.CommandContext(ctx, "git", append([]string{"--git-dir=" + state.GitCommonDir}, args...)...)
+	var stdout, stderr boundedBuffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, stderr.String())
+	}
+	return nil
+}
+
+func gitMutation(ctx context.Context, sourceRoot string, args ...string) error {
+	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", sourceRoot}, args...)...)
+	var stdout, stderr boundedBuffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, stderr.String())
 	}
 	return nil
 }
