@@ -37,8 +37,22 @@ Linear accepts `tracker.provider.api_key: $LINEAR_API_KEY` or a trusted local
 
 `WORKFLOW.md` front matter is validated for the supported core fields while
 unknown extension fields are preserved. Changes are reloaded for future work;
-an invalid replacement keeps the last valid configuration. Prompt templates use
-strict, lowercase variables: `issue` (for example
+an invalid replacement keeps the last valid configuration. Reload detection
+includes referenced environment values and `api_key_file` contents, so those
+inputs can change without touching `WORKFLOW.md`. Environment-backed fields use
+exact `$VARNAME` syntax; braced or compound forms are rejected instead of being
+treated as literal paths or secrets. Inline and file-backed API keys are
+whitespace-trimmed before use and are never included in reload logs.
+
+Each successful reload publishes one complete settings snapshot. Settings
+reads that start afterward use the new polling, state, concurrency, hook,
+workspace, and Codex policy. An already-started Codex process keeps the command,
+sandbox, and timeout values captured for its launch; new concurrency limits
+govern later admissions, while current state and stall policies continue to be
+applied by reconciliation. `--logs-root` selects the process log destination at
+startup and is not a reloadable `WORKFLOW.md` field.
+
+Prompt templates use strict, lowercase variables: `issue` (for example
 `{{.issue.identifier}}`) and `attempt` (nil on the first run, then a 1-based
 retry/continuation number). Template errors fail only that run attempt.
 Relative workspace and log paths are resolved from the workflow file; omitted

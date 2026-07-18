@@ -8,11 +8,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"text/template"
 	"time"
-	"unicode"
 
 	"gopkg.in/yaml.v3"
 
@@ -72,23 +72,30 @@ func Load(path, logRoot string) (Workflow, error) {
 	if err != nil {
 		return Workflow{}, fmt.Errorf("missing_workflow_file: %w", err)
 	}
-	b, err := os.ReadFile(abs)
+	w, _, err := loadCandidate(abs, logRoot)
+	return w, err
+}
+
+func loadCandidate(path, logRoot string) (Workflow, [sha256.Size]byte, error) {
+	b, err := os.ReadFile(path)
 	if err != nil {
-		return Workflow{}, fmt.Errorf("missing_workflow_file: %w", err)
+		return Workflow{}, sha256.Sum256(nil), fmt.Errorf("missing_workflow_file: %w", err)
 	}
 	raw, body, err := parse(b)
 	if err != nil {
-		return Workflow{}, err
+		return Workflow{}, sha256.Sum256(b), err
 	}
-	s, err := decode(raw, filepath.Dir(abs), abs, logRoot)
+	sources := newSourceSnapshot(b)
+	s, err := decode(raw, filepath.Dir(path), path, logRoot, sources)
+	digest := sources.digest()
 	if err != nil {
-		return Workflow{}, err
+		return Workflow{}, digest, err
 	}
 	s.Prompt = strings.TrimSpace(body)
 	if s.Prompt == "" {
 		s.Prompt = fallbackPrompt
 	}
-	return Workflow{Raw: raw, Prompt: s.Prompt, Config: s}, nil
+	return Workflow{Raw: raw, Prompt: s.Prompt, Config: s}, digest, nil
 }
 
 func parse(b []byte) (map[string]any, string, error) {
@@ -128,7 +135,7 @@ func parse(b []byte) (map[string]any, string, error) {
 	return raw, strings.Join(lines[end+1:], "\n"), nil
 }
 
-func decode(raw map[string]any, base, path, logRoot string) (Settings, error) {
+func decode(raw map[string]any, base, path, logRoot string, sources *sourceSnapshot) (Settings, error) {
 	tr, err := object(raw, "tracker")
 	if err != nil {
 		return Settings{}, err
@@ -174,7 +181,7 @@ func decode(raw map[string]any, base, path, logRoot string) (Settings, error) {
 	if err != nil {
 		return Settings{}, err
 	}
-	resolvedProvider, err := resolveProvider(provider, base)
+	resolvedProvider, err := resolveProvider(provider, base, sources)
 	if err != nil {
 		return Settings{}, err
 	}
@@ -187,11 +194,11 @@ func decode(raw map[string]any, base, path, logRoot string) (Settings, error) {
 	if err != nil {
 		return Settings{}, err
 	}
-	workspaceRoot, err := pathValue(workspace, "root", filepath.Join(os.TempDir(), "symphony_workspaces"), base)
+	workspaceRoot, err := pathValue(workspace, "root", filepath.Join(os.TempDir(), "symphony_workspaces"), base, sources)
 	if err != nil {
 		return Settings{}, err
 	}
-	sourceRoot, err := optionalPathValue(workspace, "source_root", base)
+	sourceRoot, err := optionalPathValue(workspace, "source_root", base, sources)
 	if err != nil {
 		return Settings{}, err
 	}
@@ -394,6 +401,7 @@ func templateIssue(issue any) any {
 
 type Store struct {
 	mu            sync.RWMutex
+	reloadMu      sync.Mutex
 	path, logRoot string
 	current       Workflow
 	digest        [sha256.Size]byte
@@ -402,50 +410,100 @@ type Store struct {
 }
 
 func NewStore(path, logRoot string) (*Store, error) {
-	w, err := Load(path, logRoot)
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return nil, fmt.Errorf("missing_workflow_file: %w", err)
+	}
+	w, digest, err := loadCandidate(abs, logRoot)
 	if err != nil {
 		return nil, err
 	}
-	b, err := os.ReadFile(w.Config.WorkflowPath)
-	if err != nil {
-		return nil, err
-	}
-	return &Store{path: w.Config.WorkflowPath, logRoot: logRoot, current: w, digest: sha256.Sum256(b)}, nil
+	return &Store{path: w.Config.WorkflowPath, logRoot: logRoot, current: w, digest: digest}, nil
 }
 
 func (s *Store) Current() Workflow {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.current
+	return cloneWorkflow(s.current)
 }
 
-// Reload retains the last valid workflow when the new file is malformed. A
-// repeated invalid byte-for-byte version is ignored until it changes again.
+// Reload builds and validates a complete candidate before publishing it. Its
+// digest includes referenced environment values and files, so fixing an input
+// retries a previously rejected WORKFLOW.md without requiring an edit.
 func (s *Store) Reload() error {
-	b, err := os.ReadFile(s.path)
-	if err != nil {
-		return fmt.Errorf("missing_workflow_file: %w", err)
-	}
-	digest := sha256.Sum256(b)
-	s.mu.RLock()
-	unchanged := digest == s.digest || (s.hasRejected && digest == s.rejected)
-	s.mu.RUnlock()
-	if unchanged {
-		return nil
-	}
-	w, err := Load(s.path, s.logRoot)
+	_, err := s.ReloadIfChanged()
+	return err
+}
+
+// ReloadIfChanged reports whether a new valid snapshot was published. A
+// repeated rejected input is suppressed, while changes to its referenced
+// environment values or files cause it to be validated again.
+func (s *Store) ReloadIfChanged() (bool, error) {
+	s.reloadMu.Lock()
+	defer s.reloadMu.Unlock()
+	w, digest, err := loadCandidate(s.path, s.logRoot)
 	if err != nil {
 		s.mu.Lock()
+		if s.hasRejected && digest == s.rejected {
+			s.mu.Unlock()
+			return false, nil
+		}
 		s.rejected, s.hasRejected = digest, true
 		s.mu.Unlock()
-		return err
+		return false, err
 	}
 	s.mu.Lock()
+	if digest == s.digest {
+		s.hasRejected = false
+		s.mu.Unlock()
+		return false, nil
+	}
 	s.current = w
 	s.digest = digest
 	s.hasRejected = false
 	s.mu.Unlock()
-	return nil
+	return true, nil
+}
+
+func cloneWorkflow(w Workflow) Workflow {
+	w.Raw = cloneMap(w.Raw)
+	w.Config.Tracker.Provider = cloneMap(w.Config.Tracker.Provider)
+	w.Config.Tracker.RequiredLabels = append([]string(nil), w.Config.Tracker.RequiredLabels...)
+	w.Config.Tracker.ActiveStates = append([]string(nil), w.Config.Tracker.ActiveStates...)
+	w.Config.Tracker.TerminalStates = append([]string(nil), w.Config.Tracker.TerminalStates...)
+	byState := w.Config.Agent.ByState
+	w.Config.Agent.ByState = make(map[string]int, len(byState))
+	for state, limit := range byState {
+		w.Config.Agent.ByState[state] = limit
+	}
+	w.Config.Codex.TurnSandboxPolicy = cloneValue(w.Config.Codex.TurnSandboxPolicy)
+	return w
+}
+
+func cloneMap(source map[string]any) map[string]any {
+	if source == nil {
+		return nil
+	}
+	copy := make(map[string]any, len(source))
+	for key, value := range source {
+		copy[key] = cloneValue(value)
+	}
+	return copy
+}
+
+func cloneValue(value any) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		return cloneMap(typed)
+	case []any:
+		copy := make([]any, len(typed))
+		for index, value := range typed {
+			copy[index] = cloneValue(value)
+		}
+		return copy
+	default:
+		return value
+	}
 }
 
 func object(parent map[string]any, key string) (map[string]any, error) {
@@ -558,7 +616,7 @@ func stateLimits(v any) (map[string]int, error) {
 	return out, nil
 }
 
-func resolveProvider(m map[string]any, base string) (map[string]any, error) {
+func resolveProvider(m map[string]any, base string, sources *sourceSnapshot) (map[string]any, error) {
 	out := make(map[string]any, len(m)+1)
 	for key, value := range m {
 		out[key] = value
@@ -575,11 +633,14 @@ func resolveProvider(m map[string]any, base string) (map[string]any, error) {
 		if !ok {
 			return nil, errors.New("invalid configuration: tracker.provider.api_key_file must be a string")
 		}
-		file = resolveEnvReference(file)
+		file, err := sources.expand(file, "tracker.provider.api_key_file")
+		if err != nil {
+			return nil, err
+		}
 		if strings.TrimSpace(file) == "" {
 			return nil, errors.New("invalid linear api_key_file: empty path")
 		}
-		b, err := os.ReadFile(normalizePath(file, base))
+		b, err := sources.readFile(normalizePath(file, base))
 		if err != nil {
 			return nil, fmt.Errorf("invalid linear api_key_file: %w", err)
 		}
@@ -595,15 +656,19 @@ func resolveProvider(m map[string]any, base string) (map[string]any, error) {
 	if !hasAPIKey {
 		return out, nil
 	}
-	resolved := resolveEnvReference(apiKey.(string))
-	if strings.TrimSpace(resolved) == "" {
+	resolved, err := sources.expand(apiKey.(string), "tracker.provider.api_key")
+	if err != nil {
+		return nil, err
+	}
+	resolved = strings.TrimSpace(resolved)
+	if resolved == "" {
 		return nil, errors.New("invalid linear api_key: resolved secret is empty")
 	}
 	out["api_key"] = resolved
 	return out, nil
 }
 
-func pathValue(m map[string]any, key, fallback, base string) (string, error) {
+func pathValue(m map[string]any, key, fallback, base string, sources *sourceSnapshot) (string, error) {
 	v, exists := m[key]
 	if !exists {
 		return normalizePath(fallback, base), nil
@@ -612,14 +677,17 @@ func pathValue(m map[string]any, key, fallback, base string) (string, error) {
 	if !ok {
 		return "", fmt.Errorf("invalid configuration: %s must be a path string", key)
 	}
-	s = resolveEnvReference(s)
+	s, err := sources.expand(s, "workspace."+key)
+	if err != nil {
+		return "", err
+	}
 	if strings.TrimSpace(s) == "" {
 		return "", fmt.Errorf("invalid configuration: %s must not be empty", key)
 	}
 	return normalizePath(s, base), nil
 }
 
-func optionalPathValue(m map[string]any, key, base string) (string, error) {
+func optionalPathValue(m map[string]any, key, base string, sources *sourceSnapshot) (string, error) {
 	v, exists := m[key]
 	if !exists || v == nil {
 		return "", nil
@@ -631,24 +699,104 @@ func optionalPathValue(m map[string]any, key, base string) (string, error) {
 	if strings.TrimSpace(s) == "" {
 		return "", nil
 	}
-	s = resolveEnvReference(s)
+	s, err := sources.expand(s, "workspace."+key)
+	if err != nil {
+		return "", err
+	}
 	if strings.TrimSpace(s) == "" {
-		return "", nil
+		return "", fmt.Errorf("invalid configuration: workspace.%s environment reference is unresolved", key)
 	}
 	return normalizePath(s, base), nil
 }
 
-func resolveEnvReference(value string) string {
-	if !strings.HasPrefix(value, "$") || len(value) == 1 {
-		return value
-	}
-	name := value[1:]
-	for index, r := range name {
-		if !(r == '_' || unicode.IsLetter(r) || (index > 0 && unicode.IsDigit(r))) {
-			return value
+type fileSource struct {
+	content []byte
+	err     error
+}
+
+// sourceSnapshot freezes process environment values and caches referenced
+// files while one candidate is decoded. The resulting digest deliberately
+// includes only source identities and bytes, never values in errors or logs.
+type sourceSnapshot struct {
+	workflow    []byte
+	environment map[string]string
+	references  map[string]string
+	files       map[string]fileSource
+}
+
+func newSourceSnapshot(workflow []byte) *sourceSnapshot {
+	environment := make(map[string]string)
+	for _, assignment := range os.Environ() {
+		name, value, found := strings.Cut(assignment, "=")
+		if found {
+			environment[name] = value
 		}
 	}
-	return os.Getenv(name)
+	return &sourceSnapshot{workflow: workflow, environment: environment, references: map[string]string{}, files: map[string]fileSource{}}
+}
+
+func (s *sourceSnapshot) expand(value, field string) (string, error) {
+	if !strings.HasPrefix(value, "$") {
+		return value, nil
+	}
+	name := strings.TrimPrefix(value, "$")
+	if !validEnvironmentName(name) {
+		return "", fmt.Errorf("invalid configuration: %s must use exact $VARNAME environment syntax", field)
+	}
+	resolved := s.environment[name]
+	s.references[name] = resolved
+	return resolved, nil
+}
+
+func validEnvironmentName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for index, character := range name {
+		if character == '_' || character >= 'a' && character <= 'z' || character >= 'A' && character <= 'Z' || index > 0 && character >= '0' && character <= '9' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func (s *sourceSnapshot) readFile(path string) ([]byte, error) {
+	if source, ok := s.files[path]; ok {
+		return append([]byte(nil), source.content...), source.err
+	}
+	content, err := os.ReadFile(path)
+	s.files[path] = fileSource{content: append([]byte(nil), content...), err: err}
+	return content, err
+}
+
+func (s *sourceSnapshot) digest() [sha256.Size]byte {
+	hash := sha256.New()
+	_, _ = hash.Write(s.workflow)
+	names := make([]string, 0, len(s.references))
+	for name := range s.references {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		_, _ = fmt.Fprintf(hash, "\x00env:%s\x00%s", name, s.references[name])
+	}
+	paths := make([]string, 0, len(s.files))
+	for path := range s.files {
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
+	for _, path := range paths {
+		source := s.files[path]
+		_, _ = fmt.Fprintf(hash, "\x00file:%s\x00", path)
+		_, _ = hash.Write(source.content)
+		if source.err != nil {
+			_, _ = fmt.Fprint(hash, "\x00unreadable")
+		}
+	}
+	var digest [sha256.Size]byte
+	copy(digest[:], hash.Sum(nil))
+	return digest
 }
 
 func normalizePath(value, base string) string {
