@@ -253,6 +253,62 @@ type fakeClock struct{ now time.Time }
 
 func (f fakeClock) Now() time.Time { return f.now }
 
+type retryPollError struct{ delay time.Duration }
+
+func (e retryPollError) Error() string             { return "rate limited" }
+func (e retryPollError) RetryDelay() time.Duration { return e.delay }
+
+type rateLimitPollTracker struct {
+	mu    sync.Mutex
+	calls int
+}
+
+func (t *rateLimitPollTracker) ListCandidates(context.Context, []string) ([]domain.Issue, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.calls++
+	if t.calls == 1 {
+		return nil, retryPollError{delay: 2 * time.Minute}
+	}
+	return nil, nil
+}
+func (*rateLimitPollTracker) GetIssues(context.Context, []string) ([]domain.Issue, error) {
+	return nil, nil
+}
+func (*rateLimitPollTracker) ListTerminal(context.Context, []string) ([]domain.Issue, error) {
+	return nil, nil
+}
+
+func TestStartSchedulesRateLimitRecoveryWithInjectedTimer(t *testing.T) {
+	w := testSettings(t)
+	w.Config.Polling.Interval = 30 * time.Second
+	tracker := &rateLimitPollTracker{}
+	c := testCoordinator(w.Config, tracker, &fakeAgent{}, &fakeWorkspace{})
+	timer := &fakeTimer{signal: make(chan struct{}, 2)}
+	c.timer = timer
+	ctx, cancel := context.WithCancel(context.Background())
+	c.Start(ctx)
+	<-timer.signal
+	timer.mu.Lock()
+	firstDelay := timer.delays[0]
+	timer.mu.Unlock()
+	if firstDelay != 2*time.Minute {
+		t.Fatalf("rate-limit delay=%v want 2m", firstDelay)
+	}
+	timer.fire(0)
+	<-timer.signal
+	timer.mu.Lock()
+	secondDelay := timer.delays[1]
+	timer.mu.Unlock()
+	if secondDelay != 30*time.Second {
+		t.Fatalf("recovery delay=%v want 30s", secondDelay)
+	}
+	cancel()
+	if err := c.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestCompletionIsRecordedAndDoesNotContinueOrRetry(t *testing.T) {
 	w := testSettings(t)
 	issue := testIssue()

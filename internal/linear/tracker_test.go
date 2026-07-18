@@ -1,11 +1,14 @@
 package linear
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strconv"
 	"strings"
@@ -69,6 +72,146 @@ func TestListCandidatesPaginatesScopesAndNormalizes(t *testing.T) {
 	}
 	if !issues[1].Dispatchable {
 		t.Fatalf("completed blocker must not prevent dispatch: %#v", issues[1])
+	}
+}
+
+func TestLoadedWorkflowPreservesCaseSensitiveStateFilter(t *testing.T) {
+	var stateNames []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		request := decodeRequest(t, r)
+		stateNames = stringSlice(request["variables"].(map[string]any)["stateNames"])
+		writeJSON(t, w, issuePage([]any{issue("one", "PMR-1", "First", "Todo", "", nil, nil)}, false, ""))
+	}))
+	defer server.Close()
+
+	path := filepath.Join(t.TempDir(), "WORKFLOW.md")
+	content := "---\ntracker:\n  kind: linear\n  provider: {api_key: test-token, project_slug: project-1, endpoint: " + server.URL + "}\n  active_states: [Todo, In Progress]\n  terminal_states: [Done]\n---\nprompt"
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	workflow, err := config.Load(path, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	issues, err := New(func() config.Settings { return workflow.Config }).ListCandidates(context.Background(), workflow.Config.Tracker.ActiveStates)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := stateNames, []string{"Todo", "In Progress"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("state filter=%v want %v", got, want)
+	}
+	if len(issues) != 1 || issues[0].State != "Todo" {
+		t.Fatalf("issues=%#v", issues)
+	}
+}
+
+func TestListCandidatesFreezesSettingsAcrossPages(t *testing.T) {
+	var requests int
+	var settingsCalls int
+	var settings config.Settings
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		request := decodeRequest(t, r)
+		variables := request["variables"].(map[string]any)
+		if got := r.Header.Get("Authorization"); got != "first-token" {
+			t.Errorf("authorization=%q", got)
+		}
+		if got := variables["projectSlug"]; got != "first-project" {
+			t.Errorf("projectSlug=%v", got)
+		}
+		if got, want := stringSlice(variables["stateNames"]), []string{"Todo"}; !reflect.DeepEqual(got, want) {
+			t.Errorf("stateNames=%v want %v", got, want)
+		}
+		if requests == 1 {
+			settings.Tracker.Provider = map[string]any{"api_key": "second-token", "project_slug": "second-project", "endpoint": "http://" + r.Host}
+			settings.Tracker.ActiveStates = []string{"In Progress"}
+			settings.Tracker.TerminalStates = []string{"Canceled"}
+			writeJSON(t, w, issuePage(nil, true, "next"))
+			return
+		}
+		writeJSON(t, w, issuePage([]any{issue("one", "PMR-1", "First", "Todo", "owner", nil, []relation{{Type: "blocks", ID: "done", Identifier: "PMR-0", State: "Done"}})}, false, ""))
+	}))
+	defer server.Close()
+	settings = config.Settings{Tracker: config.Tracker{
+		Provider:       map[string]any{"api_key": "first-token", "project_slug": "first-project", "endpoint": server.URL, "assignee": "owner"},
+		ActiveStates:   []string{"Todo"},
+		TerminalStates: []string{"Done"},
+	}}
+
+	issues, err := New(func() config.Settings {
+		settingsCalls++
+		return settings
+	}).ListCandidates(context.Background(), []string{"Todo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if settingsCalls != 1 || requests != 2 || len(issues) != 1 || !issues[0].Dispatchable {
+		t.Fatalf("settings calls=%d requests=%d issues=%#v", settingsCalls, requests, issues)
+	}
+}
+
+func TestOversizedPageRetriesSmallerAndMalformedPollRecovers(t *testing.T) {
+	var requests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		variables := decodeRequest(t, r)["variables"].(map[string]any)
+		switch requests {
+		case 1:
+			if got := variables["first"]; got != float64(pageSize) {
+				t.Errorf("first=%v", got)
+			}
+			_, _ = w.Write(bytes.Repeat([]byte("x"), maxResponseSize+1))
+		case 2:
+			if got := variables["first"]; got != float64(pageSize/2) {
+				t.Errorf("reduced first=%v", got)
+			}
+			writeJSON(t, w, issuePage([]any{issue("one", "PMR-1", "First", "Todo", "", nil, nil)}, false, ""))
+		case 3:
+			if got := variables["first"]; got != float64(pageSize) {
+				t.Errorf("new poll first=%v", got)
+			}
+			_, _ = w.Write([]byte(`{"data":`))
+		default:
+			writeJSON(t, w, issuePage([]any{issue("one", "PMR-1", "First", "Todo", "", nil, nil)}, false, ""))
+		}
+	}))
+	defer server.Close()
+	tracker := newTestTracker(server.URL, "")
+
+	issues, err := tracker.ListCandidates(context.Background(), []string{"Todo"})
+	if err != nil || len(issues) != 1 {
+		t.Fatalf("oversized recovery issues=%#v err=%v", issues, err)
+	}
+	issues, err = tracker.ListCandidates(context.Background(), []string{"Todo"})
+	if issues != nil {
+		t.Fatalf("malformed poll returned partial issues=%#v", issues)
+	}
+	assertCategory(t, err, "tracker_response")
+	issues, err = tracker.ListCandidates(context.Background(), []string{"Todo"})
+	if err != nil || len(issues) != 1 {
+		t.Fatalf("recovery issues=%#v err=%v", issues, err)
+	}
+}
+
+func TestRateLimitUsesLatestRedactedReset(t *testing.T) {
+	now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "10")
+		w.Header().Set("X-RateLimit-Requests-Reset", strconv.FormatInt(now.Add(90*time.Second).UnixMilli(), 10))
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"errors":[{"message":"test-token and private payload"}]}`))
+	}))
+	defer server.Close()
+	tracker := newTestTracker(server.URL, "")
+	tracker.now = func() time.Time { return now }
+
+	_, err := tracker.ListCandidates(context.Background(), []string{"Todo"})
+	var trackerErr *Error
+	if !errors.As(err, &trackerErr) || trackerErr.Category != "tracker_rate_limited" || trackerErr.RetryDelay() != 90*time.Second {
+		t.Fatalf("error=%#v", err)
+	}
+	if strings.Contains(err.Error(), "test-token") || strings.Contains(err.Error(), "private payload") {
+		t.Fatalf("rate-limit error leaked response: %v", err)
 	}
 }
 
@@ -375,7 +518,7 @@ func newTestTracker(endpoint, assignee string) *Tracker {
 	if assignee != "" {
 		provider["assignee"] = assignee
 	}
-	settings := config.Settings{Tracker: config.Tracker{Provider: provider, TerminalStates: []string{"done", "canceled"}}}
+	settings := config.Settings{Tracker: config.Tracker{Provider: provider, ActiveStates: []string{"Todo"}, TerminalStates: []string{"Done", "Canceled"}}}
 	return New(func() config.Settings { return settings })
 }
 

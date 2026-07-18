@@ -260,11 +260,14 @@ func decode(raw map[string]any, base, path, logRoot string) (Settings, error) {
 		WorkflowPath: path,
 		LogRoot:      normalizePath(logRootOrDefault(logRoot), base),
 		Tracker: Tracker{
-			Kind:                   strings.TrimSpace(trackerKind),
-			Provider:               resolvedProvider,
-			RequiredLabels:         stringsLower(requiredLabels),
-			ActiveStates:           stringsLower(activeStates),
-			TerminalStates:         stringsLower(terminalStates),
+			Kind:           strings.TrimSpace(trackerKind),
+			Provider:       resolvedProvider,
+			RequiredLabels: stringsLower(requiredLabels),
+			// Linear's state-name filter is case-sensitive. Preserve the
+			// repository-owned spelling here and normalize only at comparison
+			// sites inside the coordinator and adapters.
+			ActiveStates:           activeStates,
+			TerminalStates:         terminalStates,
 			HandoffState:           handoffState,
 			HandoffCommentTemplate: handoffCommentTemplate,
 		},

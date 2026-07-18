@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -29,6 +30,24 @@ func TestLoadExpandsAndNormalizes(t *testing.T) {
 	}
 	if got, err := w.Config.Render(domain.Issue{Identifier: "PMR-7"}, 0); err != nil || got != "Hello PMR-7" {
 		t.Fatalf("render=%q err=%v", got, err)
+	}
+}
+
+func TestLoadPreservesLinearStateFilterSpelling(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "WORKFLOW.md")
+	content := "---\ntracker: {kind: linear, active_states: [ Todo, In Progress ], terminal_states: [ Done ]}\n---\nprompt"
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	workflow, err := Load(path, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := workflow.Config.Tracker.ActiveStates, []string{"Todo", "In Progress"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("active states=%v want %v", got, want)
+	}
+	if got, want := workflow.Config.Tracker.TerminalStates, []string{"Done"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("terminal states=%v want %v", got, want)
 	}
 }
 func TestInvalidReloadKeepsLastValid(t *testing.T) {
