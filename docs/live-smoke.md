@@ -8,9 +8,9 @@ go test ./...
 go vet ./...
 ```
 
-Run `go test -race ./...` locally when practical. Race CI is deferred to
-PMR-13 because the Codex app-server process lifecycle can hang on Linux; it is
-not a required GitHub Actions check until that repair is complete.
+Run `go test -race ./...` locally when practical. Race CI runs the same suite
+with a finite timeout now that the Codex and coordinator process lifecycles are
+bounded and cancellation-safe.
 
 The live profile is deliberately separate. It verifies configuration and a
 local full-lifecycle preflight with `--dry-run`; that flag does not contact
