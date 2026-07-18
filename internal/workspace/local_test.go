@@ -21,7 +21,11 @@ func TestKeyAndWorkspaceRemainBelowRoot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasPrefix(ws.Path, root+string(filepath.Separator)) {
+	effectiveRoot, err := resolveExistingAncestors(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(ws.Path, effectiveRoot+string(filepath.Separator)) {
 		t.Fatalf("escaped root: %s", ws.Path)
 	}
 	if !strings.Contains(ws.Key, "--") {
@@ -123,7 +127,11 @@ func TestPrepareCanonicalizesSymlinkedConfiguredRoot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := filepath.Join(target, Key(issue.Identifier))
+	effectiveTarget, err := resolveExistingAncestors(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(effectiveTarget, Key(issue.Identifier))
 	if ws.Path != want {
 		t.Fatalf("workspace path = %q, want canonical root path %q", ws.Path, want)
 	}

@@ -456,23 +456,32 @@ func (l *Local) managedWorkspacePath(path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	rel, err := filepath.Rel(root, path)
-	if err != nil || rel == "." || filepath.Dir(rel) != "." || rel == stateDirectory {
-		return "", fmt.Errorf("workspace path is not a direct workspace below the configured root")
-	}
-	if err := regularManagedPath(root, path, "workspace"); err != nil {
-		return "", err
-	}
-	info, err := os.Stat(path)
+	path, err = filepath.Abs(filepath.Clean(path))
 	if err != nil {
-		return "", fmt.Errorf("inspect workspace path: %w", err)
+		return "", fmt.Errorf("resolve workspace path: %w", err)
 	}
-	if !info.IsDir() {
-		return "", fmt.Errorf("workspace path is not a directory: %s", path)
+	if info, err := os.Lstat(path); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		return "", fmt.Errorf("workspace path must not be a symlink: %s", path)
+	} else if err != nil && !os.IsNotExist(err) {
+		return "", fmt.Errorf("inspect workspace path: %w", err)
 	}
 	resolved, err := resolveExistingAncestors(path)
 	if err != nil {
 		return "", fmt.Errorf("resolve workspace path: %w", err)
+	}
+	rel, err := filepath.Rel(root, resolved)
+	if err != nil || rel == "." || filepath.Dir(rel) != "." || rel == stateDirectory {
+		return "", fmt.Errorf("workspace path is not a direct workspace below the configured root")
+	}
+	if err := regularManagedPath(root, resolved, "workspace"); err != nil {
+		return "", err
+	}
+	info, err := os.Stat(resolved)
+	if err != nil {
+		return "", fmt.Errorf("inspect workspace path: %w", err)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("workspace path is not a directory: %s", resolved)
 	}
 	if !below(root, resolved) {
 		return "", fmt.Errorf("workspace path escapes root")
