@@ -4,6 +4,7 @@ package linear
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/pmrrasmussen/symphony/internal/config"
@@ -60,6 +62,16 @@ type Tracker struct {
 	settings func() config.Settings
 	client   *http.Client
 	now      func() time.Time
+
+	viewerMu sync.Mutex
+	viewer   *viewerResolution
+}
+
+type viewerResolution struct {
+	key      [sha256.Size]byte
+	ready    chan struct{}
+	viewerID string
+	err      error
 }
 
 func New(settings func() config.Settings) *Tracker {
@@ -134,6 +146,7 @@ func (t *Tracker) GetIssues(ctx context.Context, ids []string) ([]domain.Issue, 
 	}
 	s := trackerSnapshot(t.settings())
 	if err := validateProvider(s.Tracker.Provider); err != nil {
+		t.invalidateViewer()
 		return nil, err
 	}
 	assignee, err := t.assigneeFilter(ctx, s)
@@ -188,6 +201,7 @@ func (t *Tracker) listByStates(ctx context.Context, states []string) ([]domain.I
 	}
 	s := trackerSnapshot(t.settings())
 	if err := validateProvider(s.Tracker.Provider); err != nil {
+		t.invalidateViewer()
 		return nil, err
 	}
 	assignee, err := t.assigneeFilter(ctx, s)
@@ -238,6 +252,7 @@ func (t *Tracker) assigneeFilter(ctx context.Context, s config.Settings) (string
 	provider := s.Tracker.Provider
 	configured, exists := provider["assignee"]
 	if !exists {
+		t.invalidateViewer()
 		return "", nil
 	}
 	value, ok := configured.(string)
@@ -246,16 +261,76 @@ func (t *Tracker) assigneeFilter(ctx context.Context, s config.Settings) (string
 	}
 	value = strings.TrimSpace(value)
 	if value != "me" {
+		t.invalidateViewer()
 		return value, nil
 	}
-	viewerID, err := t.requestViewer(ctx, s)
-	if err != nil {
-		return "", err
+	return t.cachedViewer(ctx, s)
+}
+
+func (t *Tracker) cachedViewer(ctx context.Context, s config.Settings) (string, error) {
+	key := viewerCacheKey(s)
+
+	t.viewerMu.Lock()
+	resolution := t.viewer
+	if resolution == nil || resolution.key != key {
+		resolution = &viewerResolution{key: key, ready: make(chan struct{})}
+		t.viewer = resolution
+		t.viewerMu.Unlock()
+
+		viewerID, err := t.requestViewer(ctx, s)
+		if err == nil && viewerID == "" {
+			err = trackerError("tracker_response", "Linear did not provide the configured viewer identity")
+		}
+
+		t.viewerMu.Lock()
+		resolution.viewerID = viewerID
+		resolution.err = err
+		close(resolution.ready)
+		if err != nil && t.viewer == resolution {
+			t.viewer = nil
+		}
+		t.viewerMu.Unlock()
+		return viewerID, err
 	}
-	if viewerID == "" {
-		return "", trackerError("tracker_response", "Linear did not provide the configured viewer identity")
+	ready := resolution.ready
+	viewerID := resolution.viewerID
+	t.viewerMu.Unlock()
+
+	if ready != nil {
+		select {
+		case <-ctx.Done():
+			return "", trackerError("tracker_request", "Linear request failed")
+		case <-ready:
+		}
+		viewerID = resolution.viewerID
 	}
-	return viewerID, nil
+	return viewerID, resolution.err
+}
+
+func (t *Tracker) invalidateViewer() {
+	t.viewerMu.Lock()
+	t.viewer = nil
+	t.viewerMu.Unlock()
+}
+
+func viewerCacheKey(s config.Settings) [sha256.Size]byte {
+	provider := s.Tracker.Provider
+	endpoint := strings.TrimSpace(stringValue(provider["endpoint"]))
+	if endpoint == "" {
+		endpoint = "https://api.linear.app/graphql"
+	}
+	payload, _ := json.Marshal(struct {
+		Endpoint   string `json:"endpoint"`
+		Project    string `json:"project"`
+		Credential string `json:"credential"`
+		Source     string `json:"source"`
+	}{
+		Endpoint:   endpoint,
+		Project:    strings.TrimSpace(stringValue(provider["project_slug"])),
+		Credential: stringValue(provider["api_key"]),
+		Source:     strings.TrimSpace(stringValue(provider["api_key_file"])),
+	})
+	return sha256.Sum256(payload)
 }
 
 func (t *Tracker) requestViewer(ctx context.Context, s config.Settings) (string, error) {
