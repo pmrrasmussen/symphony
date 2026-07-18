@@ -112,10 +112,12 @@ func run(args []string, stdout, stderr io.Writer) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	ws := workspace.New(settings)
-	// The backend receives only the already-loaded settings callback. Its
-	// optional Linear handoff capability stays disabled until WORKFLOW.md
-	// explicitly declares tracker.provider.handoff_state.
-	backend := codex.NewWithLinearHandoff(settings, "LINEAR_API_KEY", "SYMPHONY_LINEAR_API_KEY_FILE")
+	// Optional host capabilities stay disabled until WORKFLOW.md supplies their
+	// fixed scope; resolved credentials are filtered from the Codex child.
+	backend, githubLifecycle := codex.NewWithIntegrations(settings, slog.New(log.Handler()),
+		"LINEAR_API_KEY", "SYMPHONY_LINEAR_API_KEY_FILE",
+		"GITHUB_TOKEN", "SYMPHONY_GITHUB_TOKEN", "SYMPHONY_GITHUB_TOKEN_FILE")
+	go githubLifecycle.Run(ctx)
 	var t domain.Tracker = tracker
 	var a domain.AgentBackend = backend
 	var w domain.WorkspaceExecutor = ws

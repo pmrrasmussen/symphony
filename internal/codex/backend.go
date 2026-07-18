@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math"
 	"os"
 	"os/exec"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/pmrrasmussen/symphony/internal/config"
 	"github.com/pmrrasmussen/symphony/internal/domain"
+	githubhost "github.com/pmrrasmussen/symphony/internal/github"
 	"github.com/pmrrasmussen/symphony/internal/linear"
 	"github.com/pmrrasmussen/symphony/internal/observability"
 )
@@ -27,6 +29,7 @@ type Backend struct {
 	sessions    map[string]*client
 	secretNames []string
 	handoff     *linear.Handoff
+	github      *githubhost.Manager
 }
 
 func New(secretNames ...string) *Backend {
@@ -41,6 +44,15 @@ func NewWithLinearHandoff(settings func() config.Settings, secretNames ...string
 	b.handoff = linear.NewHandoff(settings)
 	return b
 }
+
+// NewWithIntegrations enables the fixed-scope Linear and optional GitHub
+// capabilities and returns the GitHub manager so the host can poll linked PRs.
+func NewWithIntegrations(settings func() config.Settings, logger *slog.Logger, secretNames ...string) (*Backend, *githubhost.Manager) {
+	b := NewWithLinearHandoff(settings, secretNames...)
+	manager := githubhost.New(settings, logger)
+	b.github = manager
+	return b, manager
+}
 func (b *Backend) Start(ctx context.Context, r domain.AgentRequest) (domain.AgentSession, <-chan domain.Event, error) {
 	var handoff *linear.HandoffSession
 	var err error
@@ -51,10 +63,16 @@ func (b *Backend) Start(ctx context.Context, r domain.AgentRequest) (domain.Agen
 		}
 	}
 	var secretMatcher func(string) bool
-	if handoff != nil {
-		secretMatcher = handoff.MatchesSecret
+	var githubSession *githubhost.Session
+	if b.github != nil {
+		githubSession = b.github.Prepare(r.Issue, r.Workspace, handoff)
 	}
-	c, err := start(ctx, r, b.secretNames, secretMatcher, handoff)
+	if handoff != nil || b.github != nil {
+		secretMatcher = func(candidate string) bool {
+			return handoff != nil && handoff.MatchesSecret(candidate) || githubSession != nil && githubSession.MatchesSecret(candidate)
+		}
+	}
+	c, err := start(ctx, r, b.secretNames, secretMatcher, handoff, githubSession)
 	if err != nil {
 		return domain.AgentSession{}, nil, err
 	}
@@ -67,8 +85,15 @@ func (b *Backend) Start(ctx context.Context, r domain.AgentRequest) (domain.Agen
 		return domain.AgentSession{}, nil, err
 	}
 	threadParams := map[string]any{"cwd": r.Workspace, "approvalPolicy": r.ApprovalPolicy, "sandbox": r.ThreadSandbox}
+	tools := []map[string]any{}
 	if handoff != nil {
-		threadParams["dynamicTools"] = []map[string]any{linearGraphQLToolDefinition()}
+		tools = append(tools, linearGraphQLToolDefinition())
+	}
+	if githubSession != nil {
+		tools = append(tools, githubToolDefinition())
+	}
+	if len(tools) > 0 {
+		threadParams["dynamicTools"] = tools
 	}
 	res, err := c.call(ctx, "thread/start", threadParams)
 	if err != nil {
@@ -134,6 +159,7 @@ type client struct {
 	turnTimeout         time.Duration
 	ctx                 context.Context
 	handoff             *linear.HandoffSession
+	github              *githubhost.Session
 	mu                  sync.Mutex
 	writeMu             sync.Mutex
 	next                int
@@ -165,7 +191,7 @@ type rpc struct {
 	} `json:"error"`
 }
 
-func start(ctx context.Context, r domain.AgentRequest, secrets []string, secretMatcher func(string) bool, handoff *linear.HandoffSession) (*client, error) {
+func start(ctx context.Context, r domain.AgentRequest, secrets []string, secretMatcher func(string) bool, handoff *linear.HandoffSession, githubSession *githubhost.Session) (*client, error) {
 	command := strings.TrimSpace(r.Command)
 	if command == "" {
 		command = "codex app-server"
@@ -190,7 +216,7 @@ func start(ctx context.Context, r domain.AgentRequest, secrets []string, secretM
 	}
 	cmd.Stdout = outWriter
 	cmd.Stderr = stderrWriter
-	c := &client{cmd: cmd, in: in, workspace: r.Workspace, approval: r.ApprovalPolicy, policy: r.TurnSandboxPolicy, readTimeout: r.ReadTimeout, turnTimeout: r.TurnTimeout, ctx: ctx, handoff: handoff, pending: map[int]chan callResult{}, done: make(chan struct{}), exited: make(chan struct{})}
+	c := &client{cmd: cmd, in: in, workspace: r.Workspace, approval: r.ApprovalPolicy, policy: r.TurnSandboxPolicy, readTimeout: r.ReadTimeout, turnTimeout: r.TurnTimeout, ctx: ctx, handoff: handoff, github: githubSession, pending: map[int]chan callResult{}, done: make(chan struct{}), exited: make(chan struct{})}
 	cmd.Cancel = func() error { return c.killProcessGroup() }
 	if err := cmd.Start(); err != nil {
 		_ = out.Close()
@@ -465,12 +491,41 @@ func linearGraphQLToolDefinition() map[string]any {
 	}
 }
 
+func githubToolDefinition() map[string]any {
+	return map[string]any{
+		"type": "function", "name": "github_publish_pr",
+		"description": "Publish the current committed clean worktree to its fixed issue branch, create or reuse its pull request, and hand the active Linear issue to review.",
+		"inputSchema": map[string]any{"type": "object", "additionalProperties": false},
+	}
+}
+
 func (c *client) handleToolCall(x rpc) {
 	var request struct {
 		Tool      string          `json:"tool"`
 		Arguments json.RawMessage `json:"arguments"`
 	}
-	if err := json.Unmarshal(x.Params, &request); err != nil || request.Tool != "linear_graphql" || c.handoff == nil {
+	if err := json.Unmarshal(x.Params, &request); err != nil {
+		c.unsupportedTool(x.ID)
+		return
+	}
+	if request.Tool == "github_publish_pr" && c.github != nil {
+		var args map[string]json.RawMessage
+		if json.Unmarshal(request.Arguments, &args) != nil || len(args) != 0 {
+			c.unsupportedTool(x.ID)
+			return
+		}
+		result, err := c.github.Publish(c.ctx)
+		if err != nil {
+			if c.sendServerResponse(x.ID, map[string]any{"success": false, "contentItems": []any{map[string]any{"type": "inputText", "text": "GitHub pull request publication was rejected."}}}) {
+				c.emit(domain.Event{Kind: domain.EventBlocked, At: time.Now(), Message: "Codex GitHub publication request was rejected"})
+			}
+			return
+		}
+		content, _ := json.Marshal(map[string]any{"branch": result.Branch, "pull_request": result.URL, "number": result.Number})
+		c.sendServerResponse(x.ID, map[string]any{"success": true, "contentItems": []any{map[string]any{"type": "inputText", "text": string(content)}}})
+		return
+	}
+	if request.Tool != "linear_graphql" || c.handoff == nil {
 		c.unsupportedTool(x.ID)
 		return
 	}

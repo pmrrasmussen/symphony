@@ -408,6 +408,61 @@ func TestHandoffPolicyIsOptInAndInvalidReloadRetainsLastKnownGood(t *testing.T) 
 	}
 }
 
+func TestGitHubConfigurationIsOptionalScopedAndSecretBacked(t *testing.T) {
+	d := t.TempDir()
+	secret := filepath.Join(d, "github-token")
+	if err := os.WriteFile(secret, []byte("  github-secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	workflow := filepath.Join(d, "WORKFLOW.md")
+	content := "---\ntracker: {kind: linear, active_states: [Todo], terminal_states: [Done]}\ngithub: {owner: pmrrasmussen, repository: symphony, base_branch: main, token_file: github-token, poll_interval_ms: 123}\n---\nprompt"
+	if err := os.WriteFile(workflow, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	w, err := Load(workflow, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := w.Config.GitHub
+	if !got.Enabled || got.Owner != "pmrrasmussen" || got.Repository != "symphony" || got.BaseBranch != "main" || got.Token != "github-secret" || got.PollInterval != 123*time.Millisecond {
+		t.Fatalf("github settings=%+v", got)
+	}
+	if raw := w.Raw["github"].(map[string]any); raw["token_file"] != "github-token" {
+		t.Fatalf("raw config unexpectedly contains resolved secret: %#v", raw)
+	}
+	t.Setenv("PMR27_GITHUB_TOKEN", "environment-secret")
+	content = "---\ntracker: {kind: linear, active_states: [Todo], terminal_states: [Done]}\ngithub: {owner: pmrrasmussen, repository: symphony, token: $PMR27_GITHUB_TOKEN}\n---\nprompt"
+	if err := os.WriteFile(workflow, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	w, err = Load(workflow, "")
+	if err != nil || !w.Config.GitHub.Enabled || w.Config.GitHub.Token != "environment-secret" {
+		t.Fatalf("environment-backed github=%+v err=%v", w.Config.GitHub, err)
+	}
+}
+
+func TestInvalidGitHubConfigurationStaysDisabledWithoutAffectingWorkflow(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "WORKFLOW.md")
+	for _, githubConfig := range []string{
+		"github: []",
+		"github: {owner: owner, repository: repo, token: $UNSET_PMR27_TOKEN}",
+		"github: {owner: '../owner', repository: repo, token: secret}",
+		"github: {owner: owner, repository: repo, token: secret, endpoint: 'http://example.com'}",
+	} {
+		content := "---\ntracker: {kind: linear, active_states: [Todo], terminal_states: [Done]}\n" + githubConfig + "\n---\nmanual"
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		workflow, err := Load(path, "")
+		if err != nil {
+			t.Fatalf("optional invalid config affected workflow: %v", err)
+		}
+		if workflow.Config.GitHub.Enabled || workflow.Prompt != "manual" {
+			t.Fatalf("github=%+v prompt=%q", workflow.Config.GitHub, workflow.Prompt)
+		}
+	}
+}
+
 func TestRenderHandoffCommentUsesOnlyRepositoryPolicy(t *testing.T) {
 	d := t.TempDir()
 	p := filepath.Join(d, "WORKFLOW.md")

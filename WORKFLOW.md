@@ -27,6 +27,14 @@ codex:
   turn_timeout_ms: 3600000
   read_timeout_ms: 5000
   stall_timeout_ms: 300000
+# Optional GitHub PR lifecycle (disabled until configured). Requires
+# tracker.provider.handoff_state and a repository-scoped fine-grained token.
+# github:
+#   owner: pmrrasmussen
+#   repository: symphony
+#   base_branch: main
+#   token_file: $SYMPHONY_GITHUB_TOKEN_FILE
+#   poll_interval_ms: 30000
 ---
 Work on {{.issue.identifier}}: {{.issue.title}}
 

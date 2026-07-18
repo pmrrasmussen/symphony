@@ -168,6 +168,10 @@ func (s *HandoffSession) Call(ctx context.Context, arguments json.RawMessage) (T
 func (s *HandoffSession) handoff(ctx context.Context) error {
 	s.handoffMu.Lock()
 	defer s.handoffMu.Unlock()
+	return s.handoffLocked(ctx)
+}
+
+func (s *HandoffSession) handoffLocked(ctx context.Context) error {
 
 	current, err := s.readScopedIssue(ctx)
 	if err != nil {
@@ -208,6 +212,94 @@ func (s *HandoffSession) handoff(ctx context.Context) error {
 		return err
 	}
 	return s.transition(ctx)
+}
+
+// EnsureActive revalidates the session-bound issue immediately before a
+// host-side integration performs an irreversible external mutation.
+func (s *HandoffSession) EnsureActive(ctx context.Context) error {
+	s.handoffMu.Lock()
+	defer s.handoffMu.Unlock()
+	current, err := s.readScopedIssue(ctx)
+	if err != nil {
+		return err
+	}
+	if !s.isInitialState(current) && !s.isTargetState(current) {
+		return trackerError("handoff_scope", "active issue state changed after session setup")
+	}
+	return nil
+}
+
+// LinkAndHandoff adds the fixed PR URL exactly once, then reconciles the
+// repository-owned review handoff. The URL is supplied by the trusted GitHub
+// adapter, never by Codex.
+func (s *HandoffSession) LinkAndHandoff(ctx context.Context, prURL string) error {
+	s.handoffMu.Lock()
+	defer s.handoffMu.Unlock()
+	prURL = strings.TrimSpace(prURL)
+	if err := validateComment(prURL); err != nil || !strings.HasPrefix(prURL, "https://") {
+		return trackerError("handoff_request", "pull request URL is invalid")
+	}
+	current, err := s.readScopedIssue(ctx)
+	if err != nil {
+		return err
+	}
+	if !s.isInitialState(current) && !s.isTargetState(current) {
+		return trackerError("handoff_scope", "active issue state changed after session setup")
+	}
+	linked, err := s.hasComment(ctx, prURL)
+	if err != nil {
+		return err
+	}
+	if !linked {
+		if !s.isInitialState(current) {
+			return trackerError("handoff_scope", "review issue is missing its bound pull request link")
+		}
+		if err := s.comment(ctx, prURL); err != nil {
+			return err
+		}
+		s.log("pull_request_linked")
+	}
+	if err := s.handoffLocked(ctx); err != nil {
+		return err
+	}
+	s.log("pull_request_handoff_complete")
+	return nil
+}
+
+// Complete moves the bound review issue to the configured Done state. It
+// returns true only for the call that performed the mutation.
+func (s *HandoffSession) Complete(ctx context.Context) (bool, error) {
+	s.handoffMu.Lock()
+	defer s.handoffMu.Unlock()
+	current, err := s.readScopedIssue(ctx)
+	if err != nil {
+		return false, err
+	}
+	if strings.EqualFold(strings.TrimSpace(current.State.Name), "Done") {
+		return false, nil
+	}
+	if !s.isTargetState(current) {
+		return false, trackerError("handoff_scope", "linked issue is no longer in the configured review state")
+	}
+	doneName := ""
+	for _, state := range s.settings.Tracker.TerminalStates {
+		if strings.EqualFold(strings.TrimSpace(state), "Done") {
+			doneName = strings.TrimSpace(state)
+			break
+		}
+	}
+	if doneName == "" {
+		return false, trackerError("invalid_handoff_config", "terminal state Done is required for GitHub completion")
+	}
+	doneID, err := (&Handoff{client: s.client}).resolveStateAllowTerminal(ctx, s.settings, s.issue.TeamID(), doneName)
+	if err != nil {
+		return false, err
+	}
+	if err := s.transitionTo(ctx, doneID); err != nil {
+		return false, err
+	}
+	s.log("github_merge_completed")
+	return true, nil
 }
 
 func (s *HandoffSession) log(outcome string) {
@@ -273,8 +365,12 @@ func validateComment(body string) error {
 }
 
 func (s *HandoffSession) transition(ctx context.Context) error {
+	return s.transitionTo(ctx, s.targetStateID)
+}
+
+func (s *HandoffSession) transitionTo(ctx context.Context, stateID string) error {
 	response, err := requestWithSettings(ctx, s.client, s.settings, handoffTransitionQuery, map[string]any{
-		"issueID": s.issue.ID, "stateID": s.targetStateID,
+		"issueID": s.issue.ID, "stateID": stateID,
 	})
 	if err != nil {
 		return err
@@ -313,6 +409,10 @@ func (s *HandoffSession) comment(ctx context.Context, body string) error {
 }
 
 func (s *HandoffSession) hasHandoffComment(ctx context.Context) (bool, error) {
+	return s.hasComment(ctx, s.handoffComment)
+}
+
+func (s *HandoffSession) hasComment(ctx context.Context, expected string) (bool, error) {
 	after := any(nil)
 	seen := map[string]bool{}
 	for {
@@ -352,7 +452,7 @@ func (s *HandoffSession) hasHandoffComment(ctx context.Context) (bool, error) {
 			return false, trackerError("handoff_scope", "Linear returned comments outside the active issue scope")
 		}
 		for _, comment := range issue.Comments.Nodes {
-			if strings.TrimSpace(comment.Body) == s.handoffComment {
+			if strings.TrimSpace(comment.Body) == strings.TrimSpace(expected) {
 				return true, nil
 			}
 		}
@@ -395,6 +495,14 @@ func readHandoffIssue(ctx context.Context, client *http.Client, s config.Setting
 }
 
 func (h *Handoff) resolveState(ctx context.Context, s config.Settings, teamID, target string) (string, error) {
+	return h.resolveStateWithPolicy(ctx, s, teamID, target, false)
+}
+
+func (h *Handoff) resolveStateAllowTerminal(ctx context.Context, s config.Settings, teamID, target string) (string, error) {
+	return h.resolveStateWithPolicy(ctx, s, teamID, target, true)
+}
+
+func (h *Handoff) resolveStateWithPolicy(ctx context.Context, s config.Settings, teamID, target string, allowTerminal bool) (string, error) {
 	response, err := requestWithSettings(ctx, h.client, s, handoffStatesQuery, map[string]any{"teamID": teamID})
 	if err != nil {
 		return "", err
@@ -422,7 +530,7 @@ func (h *Handoff) resolveState(ctx context.Context, s config.Settings, teamID, t
 				return "", trackerError("handoff_scope", "configured handoff state is ambiguous")
 			}
 			for _, terminal := range s.Tracker.TerminalStates {
-				if strings.EqualFold(strings.TrimSpace(state.Name), strings.TrimSpace(terminal)) {
+				if !allowTerminal && strings.EqualFold(strings.TrimSpace(state.Name), strings.TrimSpace(terminal)) {
 					return "", trackerError("handoff_scope", "configured handoff state is terminal")
 				}
 			}

@@ -12,6 +12,17 @@ configured approval and sandbox policy; this service does not provide Docker,
 VM, SSH, distributed execution, or a database.  Linear credentials stay in
 the host process and are removed from Codex's environment.
 
+The optional GitHub adapter follows the same capability model. Configuration
+fixes one owner, repository, base branch, and host-only fine-grained token.
+Each Codex session can receive only a zero-argument publish capability bound to
+its active Linear issue and managed worktree. The host verifies a clean,
+committed descendant of the configured base, pushes a deterministic issue
+branch, creates or reuses that branch's PR, and records the PR/issue pair for
+polling. Polling can transition that one review issue to `Done` after GitHub
+confirms a human merge; it has no merge operation. Closed-unmerged PRs only
+produce an operator warning. The linked-pair and completion guard are
+process-local, while retries reconcile durable GitHub PRs and Linear comments.
+
 The loader validates the supported core front-matter fields but preserves
 unknown extension keys for forward compatibility. It applies documented
 defaults, resolves explicit `$VARNAME` references only for documented secret

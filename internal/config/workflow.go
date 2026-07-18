@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -35,10 +36,19 @@ type Settings struct {
 	Hooks        Hooks
 	Agent        Agent
 	Codex        Codex
+	GitHub       GitHub
 	WorkflowPath string
 	LogRoot      string
 	Prompt       string
 	Warnings     []string
+}
+
+// GitHub is an optional, fixed-repository host integration. Invalid optional
+// settings remain disabled so they cannot affect the manual workflow.
+type GitHub struct {
+	Enabled                                        bool
+	Owner, Repository, BaseBranch, Token, Endpoint string
+	PollInterval                                   time.Duration
 }
 
 const legacyProjectSlugWarning = "tracker.provider.project_slug is deprecated; migrate to project_slug_id"
@@ -167,6 +177,10 @@ func decode(raw map[string]any, base, path, logRoot string, sources *sourceSnaps
 	if err != nil {
 		return Settings{}, err
 	}
+	github, githubObjectValid := raw["github"].(map[string]any)
+	if _, exists := raw["github"]; !exists {
+		github, githubObjectValid = nil, true
+	}
 
 	trackerKind, err := stringValue(tr, "kind")
 	if err != nil {
@@ -265,6 +279,7 @@ func decode(raw map[string]any, base, path, logRoot string, sources *sourceSnaps
 	if err != nil {
 		return Settings{}, err
 	}
+	githubSettings := decodeGitHub(github, githubObjectValid, base, sources)
 
 	s := Settings{
 		WorkflowPath: path,
@@ -286,6 +301,7 @@ func decode(raw map[string]any, base, path, logRoot string, sources *sourceSnaps
 		Hooks:     Hooks{AfterCreate: afterCreate, BeforeRun: beforeRun, AfterRun: afterRun, BeforeRemove: beforeRemove, Timeout: hookTimeout},
 		Agent:     Agent{MaxConcurrent: maxConcurrent, MaxTurns: maxTurns, MaxRetryBackoff: maxRetryBackoff, ByState: byState},
 		Codex:     Codex{Command: command, ApprovalPolicy: approvalPolicy, ThreadSandbox: threadSandbox, TurnSandboxPolicy: codex["turn_sandbox_policy"], TurnTimeout: turnTimeout, ReadTimeout: readTimeout, StallTimeout: stallTimeout},
+		GitHub:    githubSettings,
 		Warnings:  providerWarnings,
 	}
 	if s.Tracker.Kind != "linear" {
@@ -304,6 +320,69 @@ func decode(raw map[string]any, base, path, logRoot string, sources *sourceSnaps
 		}
 	}
 	return s, nil
+}
+
+func decodeGitHub(raw map[string]any, objectValid bool, base string, sources *sourceSnapshot) GitHub {
+	if raw == nil || !objectValid {
+		return GitHub{}
+	}
+	read := func(key string) (string, bool) {
+		value, exists := raw[key]
+		text, ok := value.(string)
+		return strings.TrimSpace(text), exists && ok
+	}
+	owner, ownerOK := read("owner")
+	repository, repositoryOK := read("repository")
+	baseBranch, baseOK := read("base_branch")
+	if !baseOK || baseBranch == "" {
+		baseBranch, baseOK = "main", true
+	}
+	endpoint, endpointOK := read("endpoint")
+	if !endpointOK || endpoint == "" {
+		endpoint, endpointOK = "https://api.github.com", true
+	}
+	pollMS, pollOK := raw["poll_interval_ms"].(int)
+	if _, exists := raw["poll_interval_ms"]; !exists {
+		pollMS, pollOK = 30_000, true
+	}
+	token, tokenOK := read("token")
+	if file, exists := raw["token_file"]; exists {
+		path, ok := file.(string)
+		if !ok {
+			return GitHub{}
+		}
+		expanded, err := sources.expand(path, "github.token_file")
+		if err != nil || strings.TrimSpace(expanded) == "" {
+			return GitHub{}
+		}
+		content, err := sources.readFile(normalizePath(expanded, base))
+		if err != nil {
+			return GitHub{}
+		}
+		token, tokenOK = strings.TrimSpace(string(content)), true
+	} else if tokenOK && strings.HasPrefix(token, "$") {
+		resolved, err := sources.expand(token, "github.token")
+		if err != nil {
+			return GitHub{}
+		}
+		token = strings.TrimSpace(resolved)
+	} else if tokenOK {
+		return GitHub{}
+	}
+	endpointURL, err := url.Parse(endpoint)
+	endpointValid := err == nil && endpointURL.Host != "" && (endpointURL.Scheme == "https" || endpointURL.Scheme == "http" && isLocalConfigHost(endpointURL.Hostname()))
+	validName := func(value string) bool {
+		return value != "" && !strings.ContainsAny(value, "/\\\r\n\t ") && value != "." && value != ".."
+	}
+	enabled := ownerOK && repositoryOK && baseOK && endpointOK && pollOK && tokenOK && validName(owner) && validName(repository) && validName(baseBranch) && token != "" && pollMS > 0 && endpointValid
+	if !enabled {
+		return GitHub{}
+	}
+	return GitHub{Enabled: true, Owner: owner, Repository: repository, BaseBranch: baseBranch, Token: token, Endpoint: strings.TrimRight(endpoint, "/"), PollInterval: time.Duration(pollMS) * time.Millisecond}
+}
+
+func isLocalConfigHost(host string) bool {
+	return host == "localhost" || host == "127.0.0.1" || host == "::1"
 }
 
 // handoffPolicy keeps the Linear-specific values in tracker.provider while
