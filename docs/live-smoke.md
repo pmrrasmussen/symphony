@@ -13,7 +13,8 @@ PMR-13 because the Codex app-server process lifecycle can hang on Linux; it is
 not a required GitHub Actions check until that repair is complete.
 
 The live profile is deliberately separate. It verifies configuration and a
-single Linear poll with `--dry-run`; that flag does not launch Codex. This
+local full-lifecycle preflight with `--dry-run`; that flag does not contact
+Linear, launch Codex, execute hooks, or prepare a workspace. This
 keeps the default live check read-only and prevents the profile from consuming
 Codex capacity or changing an issue by accident.
 
@@ -34,26 +35,24 @@ Codex capacity or changing an issue by accident.
 The checked-in template, [WORKFLOW.smoke.example.md](../WORKFLOW.smoke.example.md),
 contains no project identifier or credential. It is not the default workflow.
 
-## Local Linear smoke
+## Local preflight
 
 Copy the template to an ignored local location, replace
-`__LINEAR_SMOKE_PROJECT_SLUG__` with the dedicated project's slug, and export
-the credential in the current shell. Do not put the credential in the copied
-file.
+`__LINEAR_SMOKE_PROJECT_SLUG__` with the dedicated project's slug, and use a
+placeholder key. The preflight requires the field but does not send its value.
+Do not put a live credential in the copied file.
 
 ```sh
 mkdir -p .symphony
 cp WORKFLOW.smoke.example.md .symphony/smoke-workflow.md
 # Edit .symphony/smoke-workflow.md and replace __LINEAR_SMOKE_PROJECT_SLUG__.
-export LINEAR_API_KEY
-go run ./cmd/symphony --workflow .symphony/smoke-workflow.md --dry-run
+LINEAR_API_KEY=preflight go run ./cmd/symphony --dry-run .symphony/smoke-workflow.md
 ```
 
-A successful command prints that the configuration and Linear poll succeeded
-and that Codex was not started. Treat a missing credential or project as
-**skipped**, not passed. Treat an attempted command that returns non-zero as
-**failed**. Remove the copied workflow and generated smoke workspaces when the
-test ends.
+A successful command emits a structured preflight result and does not verify
+live Linear connectivity. Treat an attempted command that returns non-zero as
+**failed**. The preflight does not generate smoke workspaces; remove the copied
+workflow when the test ends.
 
 ## Deliberate Codex exercise
 
@@ -89,7 +88,7 @@ to the read-only smoke job.
 The job prepares a temporary workflow and runs:
 
 ```sh
-go run ./cmd/symphony --workflow "$RUNNER_TEMP/symphony-smoke-workflow.md" --dry-run
+go run ./cmd/symphony --dry-run "$RUNNER_TEMP/symphony-smoke-workflow.md"
 ```
 
 Its command does not echo the secret, and workflow files must continue to

@@ -6,6 +6,8 @@ deterministic local workspace.
 
 ```sh
 go run ./cmd/symphony --workflow ./WORKFLOW.md
+# Equivalent positional workflow-file form:
+go run ./cmd/symphony ./WORKFLOW.md
 ```
 
 ## Working with Symphony
@@ -26,9 +28,22 @@ For the delivery sequence, see [HOW_WE_WORK.md](HOW_WE_WORK.md). For runtime
 configuration and operational details, use [WORKFLOW.example.md](WORKFLOW.example.md)
 and [docs/architecture.md](docs/architecture.md).
 
-Run with `--dry-run` to validate configuration and scheduling without starting
-Codex. Live Linear and Codex smoke testing is always opt-in and uses a
-dedicated disposable project; see [the live smoke profile](docs/live-smoke.md).
+Run a full-lifecycle local preflight against the example without live
+credentials:
+
+```sh
+LINEAR_API_KEY=preflight go run ./cmd/symphony --dry-run ./WORKFLOW.example.md
+```
+
+`--dry-run` emits a structured result for workflow parsing, tracker selection,
+workspace and log roots, hook syntax, executable availability, and a synthetic
+scheduler lifecycle. It does not contact Linear, execute hooks, start Codex, or
+create configured logs or workspaces. A missing future root is a warning; an
+invalid boundary is a failure and exits non-zero. The placeholder key above is
+used only to validate required configuration and is never sent anywhere.
+
+Live Linear and Codex smoke testing is always opt-in and uses a dedicated
+disposable project; see [the live smoke profile](docs/live-smoke.md).
 Never run a Symphony smoke test against Dagligvare-app or any of its Linear
 workspace, team, or projects.
 

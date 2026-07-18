@@ -62,5 +62,5 @@ jobs:
         run: |
           cp WORKFLOW.smoke.example.md "$RUNNER_TEMP/symphony-smoke-workflow.md"
           sed -i "s|__LINEAR_SMOKE_PROJECT_SLUG__|$LINEAR_SMOKE_PROJECT_SLUG|" "$RUNNER_TEMP/symphony-smoke-workflow.md"
-      - name: Validate Linear connectivity without Codex
-        run: go run ./cmd/symphony --workflow "$RUNNER_TEMP/symphony-smoke-workflow.md" --dry-run
+      - name: Validate live profile without side effects
+        run: go run ./cmd/symphony --dry-run "$RUNNER_TEMP/symphony-smoke-workflow.md"
