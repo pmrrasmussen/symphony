@@ -5,9 +5,10 @@
 
 | Key | Required | Meaning |
 | --- | --- | --- |
-| `project_slug` | yes | Linear project slug ID. Every read is restricted to this project. |
-| `api_key` | yes | Linear personal API key. Exact `$VARNAME` expansion is supported by `WORKFLOW.md`; surrounding whitespace is trimmed and the value is never logged. |
-| `api_key_file` | optional | Trusted local file containing the API key; its trimmed contents and path dependencies are tracked by configuration loading. |
+| `project_slug_id` | yes | Linear project slug ID. Every read is restricted to this project. |
+| `project_slug` | deprecated | Legacy alias for `project_slug_id`. It emits a value-free migration warning; setting both names is rejected. |
+| `api_key` | alternative | Linear personal API key. Exact `$VARNAME` expansion is supported by `WORKFLOW.md`; surrounding whitespace is trimmed and the value is never logged. |
+| `api_key_file` | recommended | Trusted local file containing the API key. Prefer `$SYMPHONY_LINEAR_API_KEY_FILE`, whose value is the absolute file path; file contents and path dependencies are tracked by configuration loading. When both credential fields exist, this file takes precedence. |
 | `endpoint` | optional | Absolute HTTPS GraphQL endpoint; defaults to `https://api.linear.app/graphql`. HTTP is accepted only for `localhost`, `127.0.0.1`, or `::1` test hosts. |
 | `assignee` | optional | Unset permits all assignees. A non-empty ID permits only that assignee. `me` resolves the current Linear viewer ID for each read. |
 | `handoff_state` | optional | Enables the tightly scoped Codex `linear_graphql` compatibility tool. The name must be a non-active workflow state in the active issue's Linear team. |
@@ -15,9 +16,12 @@
 
 Invalid provider values produce `invalid_tracker_config`; a missing or empty key
 produces `missing_tracker_secret`. `api_key_file` loading errors are reported by
-configuration before the service starts. Changes to a referenced environment
-value or secret file participate in reload detection even when `WORKFLOW.md`
-itself is unchanged.
+configuration before the service starts without including the configured path.
+Changes to a referenced environment value or secret file participate in reload
+detection even when `WORKFLOW.md` itself is unchanged. A rejected ambiguous
+project-key migration retains the last valid configuration.
+The legacy alias will be removed only in a future breaking configuration
+release; the warning is the migration notice for existing workflows.
 
 Candidate and terminal reads use a project-and-state filter. Configured state
 names keep their original spelling for Linear's case-sensitive filter; internal

@@ -15,7 +15,7 @@ func TestRunAcceptsPositionalWorkflowForDryRun(t *testing.T) {
 	workflow := filepath.Join(dir, "workflow.md")
 	workspaceRoot := filepath.Join(dir, "workspaces")
 	logRoot := filepath.Join(dir, "logs")
-	content := "---\ntracker: {kind: linear, provider: {project_slug: preflight, api_key: dummy}, active_states: [Todo], terminal_states: [Done]}\nworkspace: {root: " + workspaceRoot + ", source_root: " + dir + "}\ncodex: {command: go}\n---\n{{.issue.identifier}}"
+	content := "---\ntracker: {kind: linear, provider: {project_slug_id: preflight, api_key: dummy}, active_states: [Todo], terminal_states: [Done]}\nworkspace: {root: " + workspaceRoot + ", source_root: " + dir + "}\ncodex: {command: go}\n---\n{{.issue.identifier}}"
 	if err := os.WriteFile(workflow, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}

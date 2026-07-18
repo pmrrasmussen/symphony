@@ -211,6 +211,71 @@ func TestAPIKeyFileTakesPrecedenceOverInlineReference(t *testing.T) {
 	}
 }
 
+func TestProjectSlugMigrationNormalizesAndWarnsWithoutValues(t *testing.T) {
+	d := t.TempDir()
+	p := filepath.Join(d, "WORKFLOW.md")
+	legacyValue := "private-project-value"
+	content := "---\ntracker: {kind: linear, provider: {project_slug: " + legacyValue + ", api_key: test-key}, active_states: [Todo], terminal_states: [Done]}\n---\nprompt"
+	if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	w, err := Load(p, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := w.Config.Tracker.Provider["project_slug_id"]; got != legacyValue {
+		t.Fatalf("normalized project_slug_id=%q", got)
+	}
+	if _, exists := w.Config.Tracker.Provider["project_slug"]; exists {
+		t.Fatal("deprecated project_slug remained in normalized provider")
+	}
+	if len(w.Config.Warnings) != 1 || w.Config.Warnings[0] != legacyProjectSlugWarning {
+		t.Fatalf("migration warnings=%q", w.Config.Warnings)
+	}
+	if strings.Contains(w.Config.Warnings[0], legacyValue) {
+		t.Fatalf("migration warning exposed configured project value: %q", w.Config.Warnings[0])
+	}
+}
+
+func TestCanonicalAndLegacyProjectSlugAreAmbiguousAndReloadIsTransactional(t *testing.T) {
+	d := t.TempDir()
+	p := filepath.Join(d, "WORKFLOW.md")
+	canonical := "---\ntracker: {kind: linear, provider: {project_slug_id: project-one, api_key: test-key}, active_states: [Todo], terminal_states: [Done]}\n---\ngood"
+	if err := os.WriteFile(p, []byte(canonical), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := NewStore(p, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ambiguous := "---\ntracker: {kind: linear, provider: {project_slug_id: project-two, project_slug: legacy-project, api_key: test-key}, active_states: [Todo], terminal_states: [Done]}\n---\nbad"
+	if err := os.WriteFile(p, []byte(ambiguous), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Reload(); err == nil || !strings.Contains(err.Error(), "must not both be set") {
+		t.Fatalf("ambiguous reload error=%v", err)
+	}
+	current := store.Current()
+	if current.Prompt != "good" || current.Config.Tracker.Provider["project_slug_id"] != "project-one" {
+		t.Fatalf("ambiguous reload replaced last valid workflow: %+v", current)
+	}
+}
+
+func TestAPIKeyFileReadErrorDoesNotExposeConfiguredPath(t *testing.T) {
+	d := t.TempDir()
+	p := filepath.Join(d, "WORKFLOW.md")
+	secretPath := filepath.Join(d, "private-secret-location")
+	t.Setenv("SYMPHONY_LINEAR_API_KEY_FILE", secretPath)
+	content := "---\ntracker: {kind: linear, provider: {project_slug_id: project, api_key_file: $SYMPHONY_LINEAR_API_KEY_FILE}, active_states: [Todo], terminal_states: [Done]}\n---\nprompt"
+	if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Load(p, "")
+	if err == nil || strings.Contains(err.Error(), secretPath) {
+		t.Fatalf("secret file error=%v", err)
+	}
+}
+
 func TestTemplateErrorsAreDeferredAndPromptContractIsLowercase(t *testing.T) {
 	d := t.TempDir()
 	p := filepath.Join(d, "WORKFLOW.md")
@@ -509,7 +574,7 @@ func TestReloadPublishesEveryDynamicSettingAsOneSnapshot(t *testing.T) {
 func TestCurrentReturnsAnImmutableSnapshotCopy(t *testing.T) {
 	d := t.TempDir()
 	workflow := filepath.Join(d, "WORKFLOW.md")
-	content := "---\nextension: {nested: [original]}\ntracker: {kind: linear, provider: {api_key: secret, nested: {value: original}}, active_states: [Todo], terminal_states: [Done]}\nagent: {max_concurrent_agents_by_state: {Todo: 1}}\ncodex: {turn_sandbox_policy: {type: original}}\n---\nprompt"
+	content := "---\nextension: {nested: [original]}\ntracker: {kind: linear, provider: {project_slug: project, api_key: secret, nested: {value: original}}, active_states: [Todo], terminal_states: [Done]}\nagent: {max_concurrent_agents_by_state: {Todo: 1}}\ncodex: {turn_sandbox_policy: {type: original}}\n---\nprompt"
 	if err := os.WriteFile(workflow, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -523,9 +588,10 @@ func TestCurrentReturnsAnImmutableSnapshotCopy(t *testing.T) {
 	copy.Config.Tracker.ActiveStates[0] = "mutated"
 	copy.Config.Agent.ByState["todo"] = 99
 	copy.Config.Codex.TurnSandboxPolicy.(map[string]any)["type"] = "mutated"
+	copy.Config.Warnings[0] = "mutated"
 
 	current := store.Current()
-	if current.Raw["extension"].(map[string]any)["nested"].([]any)[0] != "original" || current.Config.Tracker.Provider["nested"].(map[string]any)["value"] != "original" || current.Config.Tracker.ActiveStates[0] != "Todo" || current.Config.Agent.ByState["todo"] != 1 || current.Config.Codex.TurnSandboxPolicy.(map[string]any)["type"] != "original" {
+	if current.Raw["extension"].(map[string]any)["nested"].([]any)[0] != "original" || current.Config.Tracker.Provider["nested"].(map[string]any)["value"] != "original" || current.Config.Tracker.ActiveStates[0] != "Todo" || current.Config.Agent.ByState["todo"] != 1 || current.Config.Codex.TurnSandboxPolicy.(map[string]any)["type"] != "original" || current.Config.Warnings[0] != legacyProjectSlugWarning {
 		t.Fatalf("published workflow was mutated through Current: %+v", current)
 	}
 }

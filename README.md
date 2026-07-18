@@ -32,23 +32,32 @@ Run a full-lifecycle local preflight against the example without live
 credentials:
 
 ```sh
-LINEAR_API_KEY=preflight go run ./cmd/symphony --dry-run ./WORKFLOW.example.md
+SYMPHONY_LINEAR_API_KEY_FILE=/path/to/a/mode-600-key-file \
+  go run ./cmd/symphony --dry-run ./WORKFLOW.example.md
 ```
 
 `--dry-run` emits a structured result for workflow parsing, tracker selection,
 workspace and log roots, hook syntax, executable availability, and a synthetic
 scheduler lifecycle. It does not contact Linear, execute hooks, start Codex, or
 create configured logs or workspaces. A missing future root is a warning; an
-invalid boundary is a failure and exits non-zero. The placeholder key above is
-used only to validate required configuration and is never sent anywhere.
+invalid boundary is a failure and exits non-zero. The referenced file is read
+only to validate required configuration and is never sent anywhere during
+preflight.
 
 Live Linear and Codex smoke testing is always opt-in and uses a dedicated
 disposable project; see [the live smoke profile](docs/live-smoke.md).
 Never run a Symphony smoke test against Dagligvare-app or any of its Linear
 workspace, team, or projects.
 
-Linear accepts `tracker.provider.api_key: $LINEAR_API_KEY` or a trusted local
-`tracker.provider.api_key_file`; the latter is read only by the service.
+Linear configuration uses canonical `tracker.provider.project_slug_id`.
+Legacy `project_slug` remains supported during its documented deprecation and
+emits a value-free migration warning; configuring both names is rejected.
+For credentials, prefer
+`tracker.provider.api_key_file: $SYMPHONY_LINEAR_API_KEY_FILE`, where the
+environment value is an absolute path to a mode-600 file outside the
+repository. `tracker.provider.api_key: $LINEAR_API_KEY` remains supported when
+the deployment injects the credential value directly. A literal trusted local
+`api_key_file` path is also supported for non-versioned workflow files.
 
 `WORKFLOW.md` front matter is validated for the supported core fields while
 unknown extension fields are preserved. Changes are reloaded for future work;

@@ -438,7 +438,7 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{}}'
 		t.Fatal(err)
 	}
 	settings := config.Settings{Tracker: config.Tracker{
-		Provider:     map[string]any{"api_key": "test-token", "project_slug": "project-1", "endpoint": server.URL},
+		Provider:     map[string]any{"api_key": "test-token", "project_slug_id": "project-1", "endpoint": server.URL},
 		ActiveStates: []string{"todo"}, HandoffState: "In Review",
 	}}
 	b := NewWithLinearHandoff(func() config.Settings { return settings }, "LINEAR_API_KEY")
@@ -541,20 +541,22 @@ func writeAppServer(t *testing.T, dir, body string) string {
 func waitForPID(t *testing.T, path string) int {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
+	var lastErr error
 	for {
 		text, err := os.ReadFile(path)
 		if err == nil {
-			pid, err := strconv.Atoi(string(text))
-			if err != nil {
-				t.Fatal(err)
+			pid, parseErr := strconv.Atoi(strings.TrimSpace(string(text)))
+			if parseErr == nil {
+				return pid
 			}
-			return pid
-		}
-		if !errors.Is(err, os.ErrNotExist) {
+			// The shell creates/truncates the file before writing the PID. Under
+			// the race detector, a read can observe that short empty window.
+			lastErr = parseErr
+		} else if !errors.Is(err, os.ErrNotExist) {
 			t.Fatal(err)
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("child pid was not written to %s", path)
+			t.Fatalf("child pid was not written to %s: %v", path, lastErr)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
