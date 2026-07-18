@@ -114,9 +114,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	ws := workspace.New(settings)
 	// Optional host capabilities stay disabled until WORKFLOW.md supplies their
 	// fixed scope; resolved credentials are filtered from the Codex child.
-	backend, githubLifecycle := codex.NewWithIntegrations(settings, slog.New(log.Handler()),
-		"LINEAR_API_KEY", "SYMPHONY_LINEAR_API_KEY_FILE",
-		"GITHUB_TOKEN", "SYMPHONY_GITHUB_TOKEN", "SYMPHONY_GITHUB_TOKEN_FILE")
+	backend, githubLifecycle := codex.NewWithIntegrations(settings, slog.New(log.Handler()))
 	go githubLifecycle.Run(ctx)
 	var t domain.Tracker = tracker
 	var a domain.AgentBackend = backend

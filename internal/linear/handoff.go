@@ -39,7 +39,12 @@ func (h *Handoff) Enabled() bool {
 // the configured team's target state, and freezes the policy for one session.
 // No Codex child is started when this fails.
 func (h *Handoff) Prepare(ctx context.Context, issue domain.Issue) (*HandoffSession, error) {
-	s := h.settings()
+	return h.PrepareWithSettings(ctx, h.settings(), issue)
+}
+
+// PrepareWithSettings binds a single repository settings snapshot to the
+// session. The Codex backend calls this once before it launches the child.
+func (h *Handoff) PrepareWithSettings(ctx context.Context, s config.Settings, issue domain.Issue) (*HandoffSession, error) {
 	if strings.TrimSpace(s.Tracker.HandoffState) == "" {
 		return nil, nil
 	}

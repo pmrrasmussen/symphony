@@ -468,7 +468,7 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{}}'
 	}
 }
 
-func TestDisabledLinearHandoffIsNotAdvertisedAndRemainsUnsupported(t *testing.T) {
+func TestUnsupportedToolIsRejectedWithoutBlockingTheTurn(t *testing.T) {
 	dir := t.TempDir()
 	script := filepath.Join(dir, "fake-app-server.sh")
 	body := `#!/bin/sh
@@ -493,12 +493,143 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{}}'
 	if err != nil {
 		t.Fatal(err)
 	}
-	seenBlocked := false
+	seenCompleted := false
 	for event := range events {
-		seenBlocked = seenBlocked || event.Kind == domain.EventBlocked
+		if event.Kind == domain.EventBlocked {
+			t.Fatalf("unsupported tool blocked a non-interactive turn: %+v", event)
+		}
+		seenCompleted = seenCompleted || event.Kind == domain.EventCompleted
 	}
-	if !seenBlocked {
-		t.Fatal("disabled handoff did not retain unsupported-tool behavior")
+	if !seenCompleted {
+		t.Fatal("unsupported tool did not allow turn completion")
+	}
+}
+
+func TestRejectedLinearAndGitHubToolsDoNotBlockTheTurn(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		var request map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		query := request["query"].(string)
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.Contains(query, "SymphonyLinearHandoffIssue"):
+			_, _ = w.Write([]byte(`{"data":{"issue":{"id":"active","identifier":"PMR-5","title":"Handoff","description":"safe","url":"https://linear.app/issue/PMR-5","project":{"slugId":"project-1"},"team":{"id":"team-1"},"state":{"id":"todo","name":"Todo"}}}}`))
+		case strings.Contains(query, "SymphonyLinearHandoffStates"):
+			_, _ = w.Write([]byte(`{"data":{"team":{"id":"team-1","states":{"nodes":[{"id":"review","name":"In Review"}]}}}}`))
+		default:
+			t.Fatalf("unexpected query: %s", query)
+		}
+	}))
+	defer server.Close()
+	dir := t.TempDir()
+	script := writeAppServer(t, dir, `
+IFS= read -r line
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'
+IFS= read -r line
+IFS= read -r line
+case "$line" in *linear_graphql*github_publish_pr*) ;; *) exit 20;; esac
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thread-1"}}}'
+IFS= read -r line
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn-1"}}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":99,"method":"item/tool/call","params":{"tool":"unsupported","arguments":{}}}'
+IFS= read -r line
+case "$line" in *'"success":false'*) ;; *) exit 21;; esac
+printf '%s\n' '{"jsonrpc":"2.0","id":100,"method":"item/tool/call","params":{"tool":"linear_graphql","arguments":{"operation":"invalid"}}}'
+IFS= read -r line
+case "$line" in *'"success":false'*) ;; *) exit 22;; esac
+printf '%s\n' '{"jsonrpc":"2.0","id":101,"method":"item/tool/call","params":{"tool":"github_publish_pr","arguments":{}}}'
+IFS= read -r line
+case "$line" in *'"success":false'*) ;; *) exit 23;; esac
+printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{}}'
+`)
+	settings := config.Settings{
+		Tracker: config.Tracker{Provider: map[string]any{"api_key": "linear-token", "project_slug_id": "project-1", "endpoint": server.URL}, ActiveStates: []string{"todo"}, HandoffState: "In Review"},
+		GitHub:  config.GitHub{Enabled: true, Owner: "owner", Repository: "repo", BaseBranch: "main", Token: "github-token", Endpoint: server.URL},
+	}
+	b, _ := NewWithIntegrations(func() config.Settings { return settings }, nil)
+	_, events, err := b.Start(context.Background(), domain.AgentRequest{Issue: domain.Issue{ID: "active", Identifier: "PMR-5"}, Workspace: dir, Prompt: "work", Command: "sh " + script, ApprovalPolicy: "never", ThreadSandbox: "workspace-write", TurnTimeout: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seenCompleted := false
+	for event := range events {
+		if event.Kind == domain.EventBlocked {
+			t.Fatalf("tool rejection blocked a non-interactive turn: %+v", event)
+		}
+		seenCompleted = seenCompleted || event.Kind == domain.EventCompleted
+	}
+	if !seenCompleted {
+		t.Fatal("tool rejection did not allow turn completion")
+	}
+}
+
+func TestStartUsesBashForConfiguredCommands(t *testing.T) {
+	dir := t.TempDir()
+	command := `function app_server {
+IFS= read -r line
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'
+IFS= read -r line
+IFS= read -r line
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thread-1"}}}'
+IFS= read -r line
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn-1"}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{}}'
+}
+app_server`
+	_, events, err := New().Start(context.Background(), domain.AgentRequest{Workspace: dir, Prompt: "work", Command: command, ApprovalPolicy: "never", ThreadSandbox: "workspace-write", TurnTimeout: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for event := range events {
+		if event.Kind == domain.EventCompleted {
+			return
+		}
+	}
+	t.Fatal("Bash-specific configured command did not complete")
+}
+
+func TestStartFiltersSettingsSnapshotSecrets(t *testing.T) {
+	dir := t.TempDir()
+	environment := filepath.Join(dir, "environment")
+	t.Setenv("PMR33_LINEAR_TOKEN", "linear-token")
+	t.Setenv("PMR33_OTHER_NAME", "Bearer linear-token")
+	t.Setenv("PMR33_GITHUB_TOKEN", "github-token")
+	t.Setenv("LINEAR_API_KEY", "reserved-linear-token")
+	command := `env > environment
+IFS= read -r line
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'
+IFS= read -r line
+IFS= read -r line
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thread-1"}}}'
+IFS= read -r line
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn-1"}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{}}'`
+	settings := config.Settings{HostSecretEnvNames: []string{"PMR33_LINEAR_TOKEN", "PMR33_GITHUB_TOKEN"}, HostSecretValues: []string{"linear-token", "github-token"}}
+	settingsCalls := 0
+	b := NewWithLinearHandoff(func() config.Settings {
+		settingsCalls++
+		return settings
+	})
+	_, events, err := b.Start(context.Background(), domain.AgentRequest{Workspace: dir, Prompt: "work", Command: command, ApprovalPolicy: "never", ThreadSandbox: "workspace-write", TurnTimeout: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range events {
+	}
+	if settingsCalls != 1 {
+		t.Fatalf("settings callback calls=%d want one snapshot", settingsCalls)
+	}
+	data, err := os.ReadFile(environment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, value := range []string{"PMR33_LINEAR_TOKEN=", "PMR33_GITHUB_TOKEN=", "PMR33_OTHER_NAME=", "LINEAR_API_KEY="} {
+		if strings.Contains(string(data), value) {
+			t.Fatalf("child environment retained %q: %s", value, data)
+		}
 	}
 }
 

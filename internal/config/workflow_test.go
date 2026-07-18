@@ -96,6 +96,10 @@ func TestHostSecretEnvNamesIncludeCredentialReferencesEvenWhenGitHubIsDisabled(t
 	if got := loaded.Config.HostSecretEnvNames; !reflect.DeepEqual(got, want) {
 		t.Fatalf("secret environment names=%v want %v", got, want)
 	}
+	wantValues := []string{"github-file-secret", "linear-file-secret"}
+	if got := loaded.Config.HostSecretValues; !reflect.DeepEqual(got, wantValues) {
+		t.Fatalf("secret values=%v want %v", got, wantValues)
+	}
 	for _, value := range []string{"linear-env-secret", "linear-file-secret", "github-env-secret", "github-file-secret"} {
 		if strings.Contains(strings.Join(loaded.Config.HostSecretEnvNames, ","), value) {
 			t.Fatalf("secret metadata exposed resolved value %q", value)
