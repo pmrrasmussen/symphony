@@ -10,37 +10,39 @@ go run ./cmd/symphony --workflow ./WORKFLOW.md
 
 ## Using Symphony
 
-Symphony turns focused Linear issues into isolated Codex workspaces. You keep
-control of the work: decide which issues are eligible, inspect each worktree,
-and create and review the pull request before marking the issue complete.
+Symphony turns focused Linear issues into isolated Codex workspaces while
+keeping review and merge approval with a human. Today, the default workflow is
+manual: you inspect the generated work, publish it, open a pull request, and
+move the linked issue to `Done` after the pull request merges.
 
 ```mermaid
 flowchart LR
     B[Backlog] --> T[Todo]
     T --> I[In Progress]
-    I --> W[Symphony creates an isolated worktree]
-    W --> R[Review changes and open a PR]
-    R --> V[In Review]
-    V --> D[Done]
+    I --> W[Codex works in an isolated worktree]
+    W --> P[Inspect and publish a pull request]
+    P --> V[In Review]
+    V --> M[Human reviews and merges]
+    M --> D[Done]
     T --> C[Canceled]
     I --> C
 ```
 
 `Todo` and `In Progress` are the default active states: Symphony polls only
-those states and starts Codex only for eligible issues. `Todo` issues with
-unfinished blockers are held back. `In Review` is a useful optional handoff
-state; configure it explicitly if you want Symphony to let Codex hand an issue
-over. `Done` and `Canceled` are terminal, so Symphony stops work and cleans up
-only workspaces that are safe to remove. The available state names come from
-your Linear team; `active_states` and `terminal_states` in `WORKFLOW.md` are
-the source of truth.
+those states and starts Codex only for eligible issues. A `Todo` issue with an
+unfinished blocker is held back. `In Review` is a useful optional handoff
+state; configure it explicitly if you want a Codex session to hand its active
+issue back for review. `Done` and `Canceled` are terminal, so Symphony stops
+work and removes only workspaces that are safe to clean up. Your Linear team
+defines the available state names; `active_states` and `terminal_states` in
+`WORKFLOW.md` are the runtime source of truth.
 
 ### Your workflow
 
-1. Create a small, clear issue in the Linear project configured for Symphony.
-   Put it in `Todo` when it is ready, or move it to `In Progress` when you want
-   it picked up immediately.
-2. Check the configuration and Linear connection without starting Codex:
+1. Create a small, clear issue in the configured Linear project. Put ready
+   work in `Todo`; before implementation, move the issue to `In Progress`.
+2. Check the workflow configuration and Linear connection without starting
+   Codex:
 
    ```sh
    go run ./cmd/symphony --workflow ./WORKFLOW.md --dry-run
@@ -52,21 +54,42 @@ the source of truth.
    go run ./cmd/symphony --workflow ./WORKFLOW.md
    ```
 
-4. Inspect the issue's generated worktree under `workspace.root` before you
-   keep the change. For the example configuration, use:
+4. Inspect the issue worktree below `workspace.root`, including uncommitted
+   changes and any commits Codex created. With the example configuration:
 
    ```sh
-   git -C .symphony/workspaces/<issue-worktree> status
+   git -C .symphony/workspaces/<issue-worktree> status --short --branch
    git -C .symphony/workspaces/<issue-worktree> diff
+   git -C .symphony/workspaces/<issue-worktree> log --oneline --decorate -5
    ```
 
-5. Create a pull request from the reviewed work, complete the normal review,
-   and then move the Linear issue to `Done`. Use `Canceled` when the work will
-   not continue. Do not move an issue to `Done` before its pull request merges.
+5. Publish a focused branch and open a pull request using **Why**, **What was
+   changed**, and **On Call** sections. Move the issue to `In Review`, complete
+   the normal review, and merge only after required checks pass.
+6. Move the issue to `Done` only after its pull request is merged. Use
+   `Canceled` when the work will not continue.
 
-Use a separate, dedicated Linear project and credentials for any live smoke
-test. Always run `--dry-run` first. Never run a Symphony smoke test against
-Dagligvare-app or any of its Linear workspace, team, or projects.
+Symphony records a completed turn and does not rerun an unchanged issue. A
+later Linear edit makes it eligible for another turn. Terminal cleanup
+preserves a worktree with uncommitted, untracked, or newly committed work.
+
+### Planned optional GitHub lifecycle
+
+[PMR-27](https://linear.app/pmrrasmussen/issue/PMR-27/add-optional-github-pr-lifecycle-integration)
+tracks an opt-in host-side GitHub integration. It is not part of the current
+configuration yet. It will target one fixed `owner/repository` and base branch,
+using a repository-scoped fine-grained token loaded from an environment
+reference or trusted local secret file. Once implemented, a configured
+Symphony host will be able to verify committed clean work, publish a
+deterministic issue branch, create or reuse its pull request, link it to the
+active Linear issue, and hand that issue to review idempotently.
+
+GitHub credentials will remain in the Symphony host process and will never be
+passed to Codex. Symphony will observe only the linked pull request: a confirmed
+human merge will move that issue to `Done`, while a close without merge will
+leave it in review and notify the operator. Symphony will never approve or
+merge a pull request. With GitHub integration absent or invalid, the manual
+workflow above remains unchanged.
 
 ### Set up a repository
 
@@ -75,48 +98,48 @@ Dagligvare-app or any of its Linear workspace, team, or projects.
    also contains the prompt Codex receives.
 2. Under `tracker.provider`, set `project_slug` to that Linear project's slug
    ID. Supply its API key with `api_key: $LINEAR_API_KEY`, or point
-   `api_key_file` at a local file with mode `600`; never commit the key.
+   `api_key_file` at a trusted local file; never commit the key.
 3. Set the states Symphony should process and finish. The example uses
    `active_states: [Todo, In Progress]` and
-   `terminal_states: [Done, Canceled]`. If you use `In Review`, set
-   `tracker.provider.handoff_state: In Review` as well.
+   `terminal_states: [Done, Canceled]`. To enable the current scoped Codex
+   handoff capability, also set `tracker.provider.handoff_state: In Review`
+   and, optionally, a fixed `handoff_comment_template`.
 4. Set `workspace.root` to a writable location and `workspace.source_root: .`
-   to create a detached Git worktree for each issue. Keep `source_root` on a
+   to create a detached Git worktree for each issue. `source_root` must be a
    committed Git repository; Symphony never runs Codex in the original
    checkout.
 5. Run the dry-run command above. Once it succeeds, start Symphony.
 
-For all configuration fields, see [WORKFLOW.example.md](WORKFLOW.example.md)
-and the [Linear tracker profile](docs/linear-tracker.md). The trust and
-workspace model are described in [docs/architecture.md](docs/architecture.md).
+Linear credentials stay in the host process and are removed from Codex's
+environment. `api_key_file` is read only by Symphony; restrict the file to the
+service user, for example with mode `600` on Unix systems.
 
-Run with `--dry-run` to validate configuration and scheduling without starting
-Codex. A live smoke test is opt-in: set `LINEAR_API_KEY`, configure a dedicated
-Symphony test project in `WORKFLOW.md`, and use `--dry-run` first. Never run a
-Symphony smoke test against Dagligvare-app or any of its Linear workspace,
-team, or projects. Report a smoke test as **skipped** when its dedicated test
-credential or project is unavailable; report it as **failed** when an attempted
-test command or validation fails. A skipped smoke test is not a passed test.
-
-Linear accepts `tracker.provider.api_key: $LINEAR_API_KEY` or a trusted local
-`tracker.provider.api_key_file`; the latter is read only by the service.
-
-`WORKFLOW.md` front matter is validated for the supported core fields while
-unknown extension fields are preserved. Changes are reloaded for future work;
-an invalid replacement keeps the last valid configuration. Prompt templates use
-strict, lowercase variables: `issue` (for example
+`WORKFLOW.md` front matter is validated for supported core fields while
+unknown extension fields are preserved. Valid changes are reloaded for future
+work; an invalid replacement keeps the last valid configuration. Prompt
+templates use strict lowercase variables: `issue` (for example
 `{{.issue.identifier}}`) and `attempt` (nil on the first run, then a 1-based
-retry/continuation number). Template errors fail only that run attempt.
-Relative workspace and log paths are resolved from the workflow file; omitted
+retry or continuation number). A template error fails only that run attempt.
+Relative workspace and log paths resolve from the workflow file; omitted
 `workspace.root` defaults to the system temporary directory's
 `symphony_workspaces` path.
 
-See [docs/architecture.md](docs/architecture.md), the
-[Linear tracker profile](docs/linear-tracker.md), and
-[WORKFLOW.example.md](WORKFLOW.example.md).
+The optional current handoff capability is session-bound to the active issue
+and configured project. Despite its compatibility name, `linear_graphql` is
+not a general Linear or GraphQL tool; see the
+[Linear tracker profile](docs/linear-tracker.md) for its strict scope.
 
-To let a Codex session hand an issue off safely, optionally configure
-`tracker.provider.handoff_state` (and, if useful, a fixed
-`handoff_comment_template`). This enables a session-bound compatibility tool,
-not general Linear or GraphQL access; see the Linear tracker profile for its
-strict scope.
+For the full configuration, trust, and delivery contracts, see
+[WORKFLOW.example.md](WORKFLOW.example.md),
+[docs/architecture.md](docs/architecture.md), and
+[HOW_WE_WORK.md](HOW_WE_WORK.md).
+
+## Live smoke tests
+
+Live smoke testing is opt-in. Use a separate, dedicated Linear project and
+credentials, and always run `--dry-run` first. Never run a Symphony smoke test
+against Dagligvare-app or any of its Linear workspace, team, or projects.
+
+Report a smoke test as **skipped** when its dedicated credential or project is
+unavailable, and as **failed** when an attempted command or validation fails.
+A skipped smoke test is not a passed test.
