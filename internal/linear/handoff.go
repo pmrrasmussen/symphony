@@ -49,9 +49,9 @@ func (h *Handoff) Prepare(ctx context.Context, issue domain.Issue) (*HandoffSess
 	if strings.TrimSpace(issue.ID) == "" {
 		return nil, trackerError("invalid_handoff_issue", "active issue ID is missing")
 	}
-	projectSlug := strings.TrimSpace(stringValue(s.Tracker.Provider["project_slug"]))
+	projectSlug := strings.TrimSpace(stringValue(s.Tracker.Provider["project_slug_id"]))
 	if projectSlug == "" {
-		return nil, trackerError("invalid_tracker_config", "linear project_slug is missing")
+		return nil, trackerError("invalid_tracker_config", "linear project_slug_id is missing")
 	}
 	active, err := h.readIssue(ctx, s, issue.ID)
 	if err != nil {

@@ -101,9 +101,9 @@ func validateProvider(p map[string]any) error {
 	if !tokenOK || strings.TrimSpace(token) == "" {
 		return trackerError("missing_tracker_secret", "linear api_key is missing")
 	}
-	project, projectOK := p["project_slug"].(string)
+	project, projectOK := p["project_slug_id"].(string)
 	if !projectOK || strings.TrimSpace(project) == "" {
-		return trackerError("invalid_tracker_config", "linear project_slug is missing")
+		return trackerError("invalid_tracker_config", "linear project_slug_id is missing")
 	}
 	if endpoint, exists := p["endpoint"]; exists {
 		value, ok := endpoint.(string)
@@ -166,7 +166,7 @@ func (t *Tracker) GetIssues(ctx context.Context, ids []string) ([]domain.Issue, 
 		}
 		page, err := t.requestIssues(ctx, s, queryByIDs, map[string]any{
 			"ids":           ids[start:end],
-			"projectSlug":   strings.TrimSpace(stringValue(s.Tracker.Provider["project_slug"])),
+			"projectSlug":   strings.TrimSpace(stringValue(s.Tracker.Provider["project_slug_id"])),
 			"first":         end - start,
 			"relationFirst": pageSize,
 		})
@@ -215,7 +215,7 @@ func (t *Tracker) listByStates(ctx context.Context, states []string) ([]domain.I
 	seenCursors := map[string]bool{}
 	for {
 		page, err := t.requestIssues(ctx, s, queryByStates, map[string]any{
-			"projectSlug":   strings.TrimSpace(stringValue(s.Tracker.Provider["project_slug"])),
+			"projectSlug":   strings.TrimSpace(stringValue(s.Tracker.Provider["project_slug_id"])),
 			"stateNames":    states,
 			"first":         first,
 			"relationFirst": pageSize,
@@ -326,7 +326,7 @@ func viewerCacheKey(s config.Settings) [sha256.Size]byte {
 		Source     string `json:"source"`
 	}{
 		Endpoint:   endpoint,
-		Project:    strings.TrimSpace(stringValue(provider["project_slug"])),
+		Project:    strings.TrimSpace(stringValue(provider["project_slug_id"])),
 		Credential: stringValue(provider["api_key"]),
 		Source:     strings.TrimSpace(stringValue(provider["api_key_file"])),
 	})

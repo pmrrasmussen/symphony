@@ -89,12 +89,18 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 	defer f.Close()
 	log := observability.New(slog.NewJSONHandler(f, &slog.HandlerOptions{Level: slog.LevelInfo}), stderr)
+	for _, warning := range s.Warnings {
+		log.Warn("workflow configuration warning", "warning", warning)
+	}
 	settings := func() config.Settings {
 		changed, err := store.ReloadIfChanged()
 		if err != nil {
 			log.Error("workflow reload rejected; retaining last valid configuration", "error", err)
 		} else if changed {
 			log.Info("workflow configuration reloaded")
+			for _, warning := range store.Current().Config.Warnings {
+				log.Warn("workflow configuration warning", "warning", warning)
+			}
 		}
 		return store.Current().Config
 	}
@@ -109,7 +115,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	// The backend receives only the already-loaded settings callback. Its
 	// optional Linear handoff capability stays disabled until WORKFLOW.md
 	// explicitly declares tracker.provider.handoff_state.
-	backend := codex.NewWithLinearHandoff(settings, "LINEAR_API_KEY")
+	backend := codex.NewWithLinearHandoff(settings, "LINEAR_API_KEY", "SYMPHONY_LINEAR_API_KEY_FILE")
 	var t domain.Tracker = tracker
 	var a domain.AgentBackend = backend
 	var w domain.WorkspaceExecutor = ws

@@ -85,7 +85,7 @@ func TestLoadedWorkflowPreservesCaseSensitiveStateFilter(t *testing.T) {
 	defer server.Close()
 
 	path := filepath.Join(t.TempDir(), "WORKFLOW.md")
-	content := "---\ntracker:\n  kind: linear\n  provider: {api_key: test-token, project_slug: project-1, endpoint: " + server.URL + "}\n  active_states: [Todo, In Progress]\n  terminal_states: [Done]\n---\nprompt"
+	content := "---\ntracker:\n  kind: linear\n  provider: {api_key: test-token, project_slug_id: project-1, endpoint: " + server.URL + "}\n  active_states: [Todo, In Progress]\n  terminal_states: [Done]\n---\nprompt"
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -123,7 +123,7 @@ func TestListCandidatesFreezesSettingsAcrossPages(t *testing.T) {
 			t.Errorf("stateNames=%v want %v", got, want)
 		}
 		if requests == 1 {
-			settings.Tracker.Provider = map[string]any{"api_key": "second-token", "project_slug": "second-project", "endpoint": "http://" + r.Host}
+			settings.Tracker.Provider = map[string]any{"api_key": "second-token", "project_slug_id": "second-project", "endpoint": "http://" + r.Host}
 			settings.Tracker.ActiveStates = []string{"In Progress"}
 			settings.Tracker.TerminalStates = []string{"Canceled"}
 			writeJSON(t, w, issuePage(nil, true, "next"))
@@ -133,7 +133,7 @@ func TestListCandidatesFreezesSettingsAcrossPages(t *testing.T) {
 	}))
 	defer server.Close()
 	settings = config.Settings{Tracker: config.Tracker{
-		Provider:       map[string]any{"api_key": "first-token", "project_slug": "first-project", "endpoint": server.URL, "assignee": "owner"},
+		Provider:       map[string]any{"api_key": "first-token", "project_slug_id": "first-project", "endpoint": server.URL, "assignee": "owner"},
 		ActiveStates:   []string{"Todo"},
 		TerminalStates: []string{"Done"},
 	}}
@@ -262,7 +262,7 @@ func TestHandoffBindsIssueProjectTeamAndFixedOperations(t *testing.T) {
 	}))
 	defer server.Close()
 	settings := config.Settings{Tracker: config.Tracker{
-		Provider:     map[string]any{"api_key": "test-token", "project_slug": "project-1", "endpoint": server.URL},
+		Provider:     map[string]any{"api_key": "test-token", "project_slug_id": "project-1", "endpoint": server.URL},
 		ActiveStates: []string{"todo"}, TerminalStates: []string{"done"}, HandoffState: "In Review", HandoffCommentTemplate: "Ready {{.issue.identifier}}",
 	}}
 	handoff := NewHandoff(func() config.Settings { return settings })
@@ -311,7 +311,7 @@ func TestHandoffRejectsHumanTerminalChangeBeforeMutation(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	settings := config.Settings{Tracker: config.Tracker{Provider: map[string]any{"api_key": "test-token", "project_slug": "project-1", "endpoint": server.URL}, ActiveStates: []string{"todo"}, TerminalStates: []string{"done"}, HandoffState: "In Review"}}
+	settings := config.Settings{Tracker: config.Tracker{Provider: map[string]any{"api_key": "test-token", "project_slug_id": "project-1", "endpoint": server.URL}, ActiveStates: []string{"todo"}, TerminalStates: []string{"done"}, HandoffState: "In Review"}}
 	session, err := NewHandoff(func() config.Settings { return settings }).Prepare(context.Background(), domain.Issue{ID: "active"})
 	if err != nil {
 		t.Fatal(err)
@@ -331,7 +331,7 @@ func TestHandoffRejectsIssueOutsideConfiguredProject(t *testing.T) {
 		}}})
 	}))
 	defer server.Close()
-	settings := config.Settings{Tracker: config.Tracker{Provider: map[string]any{"api_key": "test-token", "project_slug": "project-1", "endpoint": server.URL}, HandoffState: "In Review"}}
+	settings := config.Settings{Tracker: config.Tracker{Provider: map[string]any{"api_key": "test-token", "project_slug_id": "project-1", "endpoint": server.URL}, HandoffState: "In Review"}}
 	_, err := NewHandoff(func() config.Settings { return settings }).Prepare(context.Background(), domain.Issue{ID: "active"})
 	assertCategory(t, err, "handoff_scope")
 }
@@ -456,7 +456,7 @@ func TestAssigneeMeInvalidatesViewerForTrackerAndPolicyChanges(t *testing.T) {
 	defer server.Close()
 
 	settings := config.Settings{Tracker: config.Tracker{
-		Provider:       map[string]any{"api_key": "first-token", "project_slug": "first-project", "endpoint": server.URL, "assignee": "me", "api_key_file": "first-key-file"},
+		Provider:       map[string]any{"api_key": "first-token", "project_slug_id": "first-project", "endpoint": server.URL, "assignee": "me", "api_key_file": "first-key-file"},
 		ActiveStates:   []string{"Todo"},
 		TerminalStates: []string{"Done"},
 	}}
@@ -470,7 +470,7 @@ func TestAssigneeMeInvalidatesViewerForTrackerAndPolicyChanges(t *testing.T) {
 	}
 
 	assertPoll(true)
-	settings.Tracker.Provider = map[string]any{"api_key": "second-token", "project_slug": "second-project", "endpoint": server.URL, "assignee": "me", "api_key_file": "second-key-file"}
+	settings.Tracker.Provider = map[string]any{"api_key": "second-token", "project_slug_id": "second-project", "endpoint": server.URL, "assignee": "me", "api_key_file": "second-key-file"}
 	assertPoll(true)
 	if viewerCalls != 2 {
 		t.Fatalf("viewer calls after tracker change=%d want 2", viewerCalls)
@@ -668,7 +668,7 @@ func TestGraphQLErrorsAreClassifiedAndRedacted(t *testing.T) {
 }
 
 func newTestTracker(endpoint, assignee string) *Tracker {
-	provider := map[string]any{"api_key": "test-token", "project_slug": "project-1", "endpoint": endpoint}
+	provider := map[string]any{"api_key": "test-token", "project_slug_id": "project-1", "endpoint": endpoint}
 	if assignee != "" {
 		provider["assignee"] = assignee
 	}

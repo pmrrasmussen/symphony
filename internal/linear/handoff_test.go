@@ -45,7 +45,7 @@ func newHandoffFixture(t *testing.T) *handoffFixture {
 
 func (f *handoffFixture) settings() config.Settings {
 	return config.Settings{Tracker: config.Tracker{
-		Provider:               map[string]any{"api_key": "test-token", "project_slug": "project-1", "endpoint": f.server.URL},
+		Provider:               map[string]any{"api_key": "test-token", "project_slug_id": "project-1", "endpoint": f.server.URL},
 		ActiveStates:           []string{"Todo", "In Progress"},
 		TerminalStates:         []string{"Done"},
 		HandoffState:           "In Review",

@@ -38,7 +38,10 @@ type Settings struct {
 	WorkflowPath string
 	LogRoot      string
 	Prompt       string
+	Warnings     []string
 }
+
+const legacyProjectSlugWarning = "tracker.provider.project_slug is deprecated; migrate to project_slug_id"
 
 type Tracker struct {
 	Kind                                         string
@@ -181,7 +184,7 @@ func decode(raw map[string]any, base, path, logRoot string, sources *sourceSnaps
 	if err != nil {
 		return Settings{}, err
 	}
-	resolvedProvider, err := resolveProvider(provider, base, sources)
+	resolvedProvider, providerWarnings, err := resolveProvider(provider, base, sources)
 	if err != nil {
 		return Settings{}, err
 	}
@@ -283,6 +286,7 @@ func decode(raw map[string]any, base, path, logRoot string, sources *sourceSnaps
 		Hooks:     Hooks{AfterCreate: afterCreate, BeforeRun: beforeRun, AfterRun: afterRun, BeforeRemove: beforeRemove, Timeout: hookTimeout},
 		Agent:     Agent{MaxConcurrent: maxConcurrent, MaxTurns: maxTurns, MaxRetryBackoff: maxRetryBackoff, ByState: byState},
 		Codex:     Codex{Command: command, ApprovalPolicy: approvalPolicy, ThreadSandbox: threadSandbox, TurnSandboxPolicy: codex["turn_sandbox_policy"], TurnTimeout: turnTimeout, ReadTimeout: readTimeout, StallTimeout: stallTimeout},
+		Warnings:  providerWarnings,
 	}
 	if s.Tracker.Kind != "linear" {
 		return s, fmt.Errorf("invalid configuration: tracker.kind must be linear")
@@ -474,6 +478,7 @@ func cloneWorkflow(w Workflow) Workflow {
 	w.Config.Tracker.RequiredLabels = append([]string(nil), w.Config.Tracker.RequiredLabels...)
 	w.Config.Tracker.ActiveStates = append([]string(nil), w.Config.Tracker.ActiveStates...)
 	w.Config.Tracker.TerminalStates = append([]string(nil), w.Config.Tracker.TerminalStates...)
+	w.Config.Warnings = append([]string(nil), w.Config.Warnings...)
 	byState := w.Config.Agent.ByState
 	w.Config.Agent.ByState = make(map[string]int, len(byState))
 	for state, limit := range byState {
@@ -619,56 +624,74 @@ func stateLimits(v any) (map[string]int, error) {
 	return out, nil
 }
 
-func resolveProvider(m map[string]any, base string, sources *sourceSnapshot) (map[string]any, error) {
+func resolveProvider(m map[string]any, base string, sources *sourceSnapshot) (map[string]any, []string, error) {
 	out := make(map[string]any, len(m)+1)
 	for key, value := range m {
 		out[key] = value
 	}
+	warnings, err := normalizeProjectSlug(out)
+	if err != nil {
+		return nil, nil, err
+	}
 	apiKey, hasAPIKey := out["api_key"]
 	if hasAPIKey {
 		if _, ok := apiKey.(string); !ok {
-			return nil, errors.New("invalid configuration: tracker.provider.api_key must be a string")
+			return nil, nil, errors.New("invalid configuration: tracker.provider.api_key must be a string")
 		}
 	}
 	v, exists := out["api_key_file"]
 	if exists {
 		file, ok := v.(string)
 		if !ok {
-			return nil, errors.New("invalid configuration: tracker.provider.api_key_file must be a string")
+			return nil, nil, errors.New("invalid configuration: tracker.provider.api_key_file must be a string")
 		}
 		file, err := sources.expand(file, "tracker.provider.api_key_file")
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if strings.TrimSpace(file) == "" {
-			return nil, errors.New("invalid linear api_key_file: empty path")
+			return nil, nil, errors.New("invalid linear api_key_file: empty path")
 		}
 		b, err := sources.readFile(normalizePath(file, base))
 		if err != nil {
-			return nil, fmt.Errorf("invalid linear api_key_file: %w", err)
+			return nil, nil, errors.New("invalid linear api_key_file: could not read configured secret file")
 		}
 		if value := strings.TrimSpace(string(b)); value == "" {
-			return nil, errors.New("invalid linear api_key_file: empty secret")
+			return nil, nil, errors.New("invalid linear api_key_file: empty secret")
 		} else {
 			// The explicitly configured secret file takes precedence over an
 			// inline reference, including an unset inline $VAR reference.
 			out["api_key"] = value
 		}
-		return out, nil
+		return out, warnings, nil
 	}
 	if !hasAPIKey {
-		return out, nil
+		return out, warnings, nil
 	}
 	resolved, err := sources.expand(apiKey.(string), "tracker.provider.api_key")
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	resolved = strings.TrimSpace(resolved)
 	if resolved == "" {
-		return nil, errors.New("invalid linear api_key: resolved secret is empty")
+		return nil, nil, errors.New("invalid linear api_key: resolved secret is empty")
 	}
 	out["api_key"] = resolved
-	return out, nil
+	return out, warnings, nil
+}
+
+func normalizeProjectSlug(provider map[string]any) ([]string, error) {
+	legacy, hasLegacy := provider["project_slug"]
+	_, hasCanonical := provider["project_slug_id"]
+	if hasLegacy && hasCanonical {
+		return nil, errors.New("invalid configuration: tracker.provider.project_slug_id and deprecated project_slug must not both be set")
+	}
+	if !hasLegacy {
+		return nil, nil
+	}
+	provider["project_slug_id"] = legacy
+	delete(provider, "project_slug")
+	return []string{legacyProjectSlugWarning}, nil
 }
 
 func pathValue(m map[string]any, key, fallback, base string, sources *sourceSnapshot) (string, error) {
