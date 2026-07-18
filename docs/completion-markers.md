@@ -7,25 +7,38 @@ directory instead of guessing a name.
 
 ## Schema and ownership
 
-New writes use the `symphony.workspace-state/v1` schema:
+New writes use the `symphony.workspace-state/v2` schema:
 
 ```json
 {
-  "schema": "symphony.workspace-state/v1",
+  "schema": "symphony.workspace-state/v2",
   "issue_id": "the Linear issue UUID",
   "identifier": "PMR-15",
   "base_commit": "the detached worktree's initial Git commit",
+  "preparation": "ready",
+  "source_root": "/canonical/source/repository",
+  "git_common_dir": "/canonical/source/repository/.git",
+  "git_worktree_dir": "/canonical/source/repository/.git/worktrees/PMR-15",
+  "git_common_device": 16777230,
+  "git_common_inode": 12345678,
   "completed_updated_at": "2026-07-18T19:00:00Z"
 }
 ```
 
 `issue_id` and `identifier` bind the file to one Linear issue. `base_commit` is
 present for Git worktrees and makes terminal cleanup refuse locally changed or
-committed work. `completed_updated_at` is present only after a successful full
-lifecycle. A state file without `schema`, written by an older Symphony build,
-is accepted as the known legacy form and is rewritten as v1 on the next state
-write. Other schema values, unknown fields, malformed JSON, and missing or
-mismatched ownership fields are invalid and fail closed.
+committed work. `preparation` advances through `creating`, `hook_pending`, and
+`ready`; an interrupted pre-ready workspace is discarded and recreated before
+the after-create hook is retried. The three source-worktree paths and the
+common-directory filesystem identity reject replaced/unowned repositories and
+support safe Git registration reconciliation.
+`completed_updated_at` is present only after a successful full lifecycle.
+
+Schema v1 and state without `schema`, written by older Symphony builds, remain
+readable and are rewritten as v2 on the next state write. Other schema values,
+unknown fields, malformed JSON, and missing or mismatched ownership fields are
+invalid and fail closed. A legacy Git marker without source-worktree identity
+cannot use source-loss recovery and requires the manual procedure below.
 
 Symphony owns these files. Do not edit them while Symphony is running. Writes
 are atomic replacements with owner-only file permissions.
