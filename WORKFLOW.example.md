@@ -4,6 +4,8 @@ tracker:
   provider:
     project_slug: example-project
     api_key: $LINEAR_API_KEY
+    # Optional: only dispatch issues assigned to this Linear user ID, or `me`.
+    # assignee: me
   active_states: [Todo, In Progress]
   terminal_states: [Done, Canceled]
 polling:

@@ -15,7 +15,8 @@ Linear project in `WORKFLOW.md`, and use `--dry-run` first.
 Linear accepts `tracker.provider.api_key: $LINEAR_API_KEY` or a trusted local
 `tracker.provider.api_key_file`; the latter is read only by the service.
 
-See [docs/architecture.md](docs/architecture.md) and
+See [docs/architecture.md](docs/architecture.md), the
+[Linear tracker profile](docs/linear-tracker.md), and
 [WORKFLOW.example.md](WORKFLOW.example.md).
 
 For ongoing repository development, configure `workspace.source_root: .`.
