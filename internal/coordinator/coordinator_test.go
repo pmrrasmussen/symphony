@@ -168,6 +168,51 @@ func (f *fakeTracker) setFresh(issue domain.Issue) {
 	f.mu.Unlock()
 }
 
+// issueMapTracker makes capacity and reconciliation tests deterministic when
+// more than one issue is eligible at the same time.
+type issueMapTracker struct {
+	mu         sync.Mutex
+	candidates []domain.Issue
+	issues     map[string]domain.Issue
+	getErr     error
+}
+
+func (t *issueMapTracker) ListCandidates(context.Context, []string) ([]domain.Issue, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return append([]domain.Issue(nil), t.candidates...), nil
+}
+
+func (t *issueMapTracker) GetIssues(_ context.Context, ids []string) ([]domain.Issue, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.getErr != nil {
+		return nil, t.getErr
+	}
+	issues := make([]domain.Issue, 0, len(ids))
+	for _, id := range ids {
+		if issue, ok := t.issues[id]; ok {
+			issues = append(issues, issue)
+		}
+	}
+	return issues, nil
+}
+
+func (*issueMapTracker) ListTerminal(context.Context, []string) ([]domain.Issue, error) {
+	return nil, nil
+}
+
+func (t *issueMapTracker) setIssue(issue domain.Issue) {
+	t.mu.Lock()
+	t.issues[issue.ID] = issue
+	for index, candidate := range t.candidates {
+		if candidate.ID == issue.ID {
+			t.candidates[index] = issue
+		}
+	}
+	t.mu.Unlock()
+}
+
 type fakeAgent struct {
 	mu                 sync.Mutex
 	starts             int
@@ -242,12 +287,26 @@ type fakeWorkspace struct {
 	marked         chan struct{}
 	markErr        error
 	after          chan struct{}
+	prepareStarted chan struct{}
+	prepareGate    <-chan struct{}
 }
 
-func (f *fakeWorkspace) Prepare(context.Context, domain.Issue) (domain.Workspace, error) {
+func (f *fakeWorkspace) Prepare(ctx context.Context, _ domain.Issue) (domain.Workspace, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.prepares++
+	started := f.prepareStarted
+	gate := f.prepareGate
+	f.mu.Unlock()
+	if started != nil {
+		started <- struct{}{}
+	}
+	if gate != nil {
+		select {
+		case <-ctx.Done():
+			return domain.Workspace{}, ctx.Err()
+		case <-gate:
+		}
+	}
 	return domain.Workspace{Path: "/tmp/work"}, nil
 }
 func (f *fakeWorkspace) BeforeRun(context.Context, domain.Workspace, domain.Issue) error { return nil }
@@ -335,6 +394,23 @@ func (f *fakeTimer) scheduled() int {
 type fakeClock struct{ now time.Time }
 
 func (f fakeClock) Now() time.Time { return f.now }
+
+type mutableClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func (c *mutableClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *mutableClock) set(now time.Time) {
+	c.mu.Lock()
+	c.now = now
+	c.mu.Unlock()
+}
 
 type retryPollError struct{ delay time.Duration }
 
@@ -799,6 +875,207 @@ func TestClaimPreventsDuplicateConcurrentLaunches(t *testing.T) {
 	if err := c.Shutdown(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+	<-ws.after
+}
+
+func TestQueuedRetryDoesNotConsumeAnOrchestratorSlot(t *testing.T) {
+	w := testSettings(t)
+	retrying := testIssue()
+	retrying.ID, retrying.Identifier = "retrying", "ENG-2"
+	ready := testIssue()
+	ready.ID, ready.Identifier = "ready", "ENG-3"
+	tracker := &issueMapTracker{candidates: []domain.Issue{ready}, issues: map[string]domain.Issue{retrying.ID: retrying, ready.ID: ready}}
+	block := make(chan domain.Event)
+	agent := &fakeAgent{events: func() <-chan domain.Event { return block }, started: make(chan struct{}, 1)}
+	ws := &fakeWorkspace{after: make(chan struct{}, 1)}
+	c := testCoordinator(w.Config, tracker, agent, ws)
+	timer := &fakeTimer{}
+	c.timer = timer
+
+	if !c.claim(retrying, w.Config) {
+		t.Fatal("retrying issue was not claimed")
+	}
+	c.scheduleRetry(context.Background(), retrying, domain.Workspace{}, 1, retryAgent, "test", time.Minute)
+	c.Tick(context.Background())
+	<-agent.started
+
+	starts, _, _ := agent.counts()
+	if starts != 1 {
+		t.Fatalf("starts=%d, want unrelated ready issue to use the slot", starts)
+	}
+	if err := c.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	<-ws.after
+}
+
+func TestLaunchReservationPreventsOversubscriptionBeforeSessionStart(t *testing.T) {
+	w := testSettings(t)
+	first := testIssue()
+	second := testIssue()
+	second.ID, second.Identifier = "second", "ENG-2"
+	gate := make(chan struct{})
+	ws := &fakeWorkspace{prepareStarted: make(chan struct{}, 1), prepareGate: gate, after: make(chan struct{}, 1)}
+	block := make(chan domain.Event)
+	agent := &fakeAgent{events: func() <-chan domain.Event { return block }, started: make(chan struct{}, 1)}
+	c := testCoordinator(w.Config, &fakeTracker{issue: first}, agent, ws)
+
+	if !c.claim(first, w.Config) || !c.launch(context.Background(), first, 0) {
+		t.Fatal("first launch was not admitted")
+	}
+	<-ws.prepareStarted
+	if c.claim(second, w.Config) {
+		t.Fatal("second issue claimed a slot while first preparation had reserved it")
+	}
+	close(gate)
+	<-agent.started
+	if err := c.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	<-ws.after
+}
+
+func TestRetryAtCapacityRequeuesWithBoundedBackoff(t *testing.T) {
+	w := testSettings(t)
+	w.Config.Agent.MaxRetryBackoff = 15 * time.Second
+	retrying := testIssue()
+	retrying.ID, retrying.Identifier = "retrying", "ENG-2"
+	running := testIssue()
+	running.ID, running.Identifier = "running", "ENG-3"
+	tracker := &issueMapTracker{issues: map[string]domain.Issue{retrying.ID: retrying, running.ID: running}}
+	block := make(chan domain.Event)
+	agent := &fakeAgent{events: func() <-chan domain.Event { return block }, started: make(chan struct{}, 1)}
+	ws := &fakeWorkspace{after: make(chan struct{}, 1)}
+	c := testCoordinator(w.Config, tracker, agent, ws)
+	timer := &fakeTimer{}
+	c.timer = timer
+
+	if !c.claim(retrying, w.Config) {
+		t.Fatal("retrying issue was not claimed")
+	}
+	c.scheduleRetry(context.Background(), retrying, domain.Workspace{}, 1, retryAgent, "test", time.Second)
+	if !c.claim(running, w.Config) || !c.launch(context.Background(), running, 0) {
+		t.Fatal("running issue was not admitted")
+	}
+	<-agent.started
+	timer.fire(0)
+
+	c.mu.Lock()
+	retry := c.retries[retrying.ID]
+	c.mu.Unlock()
+	if retry.reason != "no available orchestrator slots" || retry.attempt != 2 {
+		t.Fatalf("retry=%+v", retry)
+	}
+	if len(timer.delays) != 2 || timer.delays[1] != 15*time.Second {
+		t.Fatalf("retry delays=%v, want capped 15s second retry", timer.delays)
+	}
+	if err := c.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	<-ws.after
+}
+
+func TestRetryRefreshFailureIncrementsAttemptAndRetries(t *testing.T) {
+	w := testSettings(t)
+	w.Config.Agent.MaxRetryBackoff = 15 * time.Second
+	issue := testIssue()
+	tracker := &issueMapTracker{issues: map[string]domain.Issue{issue.ID: issue}, getErr: errors.New("temporary tracker failure")}
+	c := testCoordinator(w.Config, tracker, &fakeAgent{}, &fakeWorkspace{})
+	timer := &fakeTimer{}
+	c.timer = timer
+
+	if !c.claim(issue, w.Config) {
+		t.Fatal("issue was not claimed")
+	}
+	c.scheduleRetry(context.Background(), issue, domain.Workspace{}, 1, retryAgent, "test", time.Second)
+	timer.fire(0)
+
+	c.mu.Lock()
+	retry := c.retries[issue.ID]
+	c.mu.Unlock()
+	if retry.reason != "retry_refresh" || retry.attempt != 2 {
+		t.Fatalf("retry=%+v", retry)
+	}
+	if len(timer.delays) != 2 || timer.delays[1] != 15*time.Second {
+		t.Fatalf("retry delays=%v, want capped 15s refresh retry", timer.delays)
+	}
+	if err := c.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestStalledRunCancelsAndSchedulesRetry(t *testing.T) {
+	w := testSettings(t)
+	w.Config.Codex.StallTimeout = time.Second
+	issue := testIssue()
+	tracker := &fakeTracker{issue: issue}
+	block := make(chan domain.Event)
+	agent := &fakeAgent{events: func() <-chan domain.Event { return block }, started: make(chan struct{}, 1)}
+	ws := &fakeWorkspace{after: make(chan struct{}, 1)}
+	c := testCoordinator(w.Config, tracker, agent, ws)
+	clock := &mutableClock{now: time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)}
+	c.clock = clock
+	timer := &fakeTimer{signal: make(chan struct{}, 1)}
+	c.timer = timer
+
+	c.Tick(context.Background())
+	<-agent.started
+	clock.set(time.Date(2026, 7, 18, 12, 0, 2, 0, time.UTC))
+	c.Tick(context.Background())
+	<-ws.after
+	<-timer.signal
+
+	starts, _, cancels := agent.counts()
+	if starts != 1 || cancels != 1 {
+		t.Fatalf("starts=%d cancels=%d, want stalled session cancelled once", starts, cancels)
+	}
+	c.mu.Lock()
+	retry := c.retries[issue.ID]
+	c.mu.Unlock()
+	if retry.reason != "stalled" || retry.attempt != 1 {
+		t.Fatalf("retry=%+v", retry)
+	}
+	if err := c.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReconciliationRefreshesStateCapacityForLaterAdmissions(t *testing.T) {
+	w := testSettings(t)
+	w.Config.Agent.MaxConcurrent = 2
+	w.Config.Tracker.ActiveStates = []string{"Todo", "Doing"}
+	w.Config.Agent.ByState = map[string]int{"todo": 1, "doing": 1}
+	first := testIssue()
+	second := testIssue()
+	second.ID, second.Identifier = "second", "ENG-2"
+	tracker := &issueMapTracker{candidates: []domain.Issue{first, second}, issues: map[string]domain.Issue{first.ID: first, second.ID: second}}
+	block := make(chan domain.Event)
+	agent := &fakeAgent{events: func() <-chan domain.Event { return block }, started: make(chan struct{}, 2)}
+	ws := &fakeWorkspace{after: make(chan struct{}, 2)}
+	c := testCoordinator(w.Config, tracker, agent, ws)
+
+	c.Tick(context.Background())
+	<-agent.started
+	fresh := first
+	fresh.State = "Doing"
+	tracker.setIssue(fresh)
+	c.Tick(context.Background())
+	<-agent.started
+
+	c.mu.Lock()
+	state := c.admitted[first.ID]
+	c.mu.Unlock()
+	if state != "doing" {
+		t.Fatalf("first admitted state=%q, want refreshed doing", state)
+	}
+	starts, _, _ := agent.counts()
+	if starts != 2 {
+		t.Fatalf("starts=%d, want Todo admission after first moved to Doing", starts)
+	}
+	if err := c.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	<-ws.after
 	<-ws.after
 }
 
