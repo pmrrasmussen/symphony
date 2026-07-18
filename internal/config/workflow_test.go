@@ -289,3 +289,53 @@ func TestReloadAppliesValidChangesAndRetainsLastValidWorkflow(t *testing.T) {
 		t.Fatalf("last valid prompt=%q", got)
 	}
 }
+
+func TestHandoffPolicyIsOptInAndInvalidReloadRetainsLastKnownGood(t *testing.T) {
+	d := t.TempDir()
+	p := filepath.Join(d, "WORKFLOW.md")
+	good := "---\ntracker: {kind: linear, provider: {handoff_state: \"In Review\", handoff_comment_template: \"Ready: {{.issue.identifier}}\"}, active_states: [Todo, In Progress], terminal_states: [Done]}\n---\nprompt"
+	if err := os.WriteFile(p, []byte(good), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := NewStore(p, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	current := s.Current().Config.Tracker
+	if current.HandoffState != "In Review" || current.HandoffCommentTemplate == "" {
+		t.Fatalf("handoff policy=%+v", current)
+	}
+	for _, invalid := range []string{
+		"tracker: {kind: linear, provider: {handoff_state: Todo}, active_states: [Todo], terminal_states: [Done]}",
+		"tracker: {kind: linear, provider: {handoff_state: Done}, active_states: [Todo], terminal_states: [Done]}",
+		"tracker: {kind: linear, provider: {handoff_comment_template: comment}, active_states: [Todo], terminal_states: [Done]}",
+		"tracker: {kind: linear, provider: {handoff_state: \"In Review\", handoff_comment_template: \"{{.issue\"}, active_states: [Todo], terminal_states: [Done]}",
+	} {
+		if err := os.WriteFile(p, []byte("---\n"+invalid+"\n---\nprompt"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Reload(); err == nil {
+			t.Fatalf("invalid handoff policy reloaded: %s", invalid)
+		}
+		if got := s.Current().Config.Tracker.HandoffState; got != "In Review" {
+			t.Fatalf("invalid reload replaced handoff policy: %q", got)
+		}
+	}
+}
+
+func TestRenderHandoffCommentUsesOnlyRepositoryPolicy(t *testing.T) {
+	d := t.TempDir()
+	p := filepath.Join(d, "WORKFLOW.md")
+	content := "---\ntracker: {kind: linear, provider: {handoff_state: \"In Review\", handoff_comment_template: \"Handoff {{.issue.identifier}}: {{.issue.title}}\"}, active_states: [Todo], terminal_states: [Done]}\n---\nprompt"
+	if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	w, err := Load(p, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := w.Config.RenderHandoffComment(domain.Issue{Identifier: "PMR-5", Title: "Handoff"})
+	if err != nil || got != "Handoff PMR-5: Handoff" {
+		t.Fatalf("comment=%q err=%v", got, err)
+	}
+}

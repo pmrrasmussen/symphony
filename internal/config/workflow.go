@@ -44,6 +44,7 @@ type Tracker struct {
 	Kind                                         string
 	Provider                                     map[string]any
 	RequiredLabels, ActiveStates, TerminalStates []string
+	HandoffState, HandoffCommentTemplate         string
 }
 
 type Polling struct{ Interval time.Duration }
@@ -177,6 +178,10 @@ func decode(raw map[string]any, base, path, logRoot string) (Settings, error) {
 	if err != nil {
 		return Settings{}, err
 	}
+	handoffState, handoffCommentTemplate, err := handoffPolicy(resolvedProvider, activeStates, terminalStates)
+	if err != nil {
+		return Settings{}, err
+	}
 
 	pollInterval, err := durationMS(polling, "interval_ms", 30_000)
 	if err != nil {
@@ -255,11 +260,13 @@ func decode(raw map[string]any, base, path, logRoot string) (Settings, error) {
 		WorkflowPath: path,
 		LogRoot:      normalizePath(logRootOrDefault(logRoot), base),
 		Tracker: Tracker{
-			Kind:           strings.TrimSpace(trackerKind),
-			Provider:       resolvedProvider,
-			RequiredLabels: stringsLower(requiredLabels),
-			ActiveStates:   stringsLower(activeStates),
-			TerminalStates: stringsLower(terminalStates),
+			Kind:                   strings.TrimSpace(trackerKind),
+			Provider:               resolvedProvider,
+			RequiredLabels:         stringsLower(requiredLabels),
+			ActiveStates:           stringsLower(activeStates),
+			TerminalStates:         stringsLower(terminalStates),
+			HandoffState:           handoffState,
+			HandoffCommentTemplate: handoffCommentTemplate,
 		},
 		Polling:   Polling{Interval: pollInterval},
 		Workspace: Workspace{Root: workspaceRoot, SourceRoot: sourceRoot},
@@ -285,6 +292,47 @@ func decode(raw map[string]any, base, path, logRoot string) (Settings, error) {
 	return s, nil
 }
 
+// handoffPolicy keeps the Linear-specific values in tracker.provider while
+// exposing an immutable, typed policy to the Codex/Linear handoff adapter.
+// Handoff is deliberately opt-in: a state is required before the client tool
+// can be used, and it may never be one of the states the scheduler dispatches.
+func handoffPolicy(provider map[string]any, activeStates, terminalStates []string) (string, string, error) {
+	stateValue, hasState := provider["handoff_state"]
+	commentValue, hasComment := provider["handoff_comment_template"]
+	if !hasState && !hasComment {
+		return "", "", nil
+	}
+	if !hasState {
+		return "", "", errors.New("invalid configuration: tracker.provider.handoff_comment_template requires handoff_state")
+	}
+	state, ok := stateValue.(string)
+	if !ok || strings.TrimSpace(state) == "" {
+		return "", "", errors.New("invalid configuration: tracker.provider.handoff_state must be a non-empty string")
+	}
+	state = strings.TrimSpace(state)
+	for _, active := range activeStates {
+		if strings.EqualFold(strings.TrimSpace(active), state) {
+			return "", "", errors.New("invalid configuration: tracker.provider.handoff_state must not be an active state")
+		}
+	}
+	for _, terminal := range terminalStates {
+		if strings.EqualFold(strings.TrimSpace(terminal), state) {
+			return "", "", errors.New("invalid configuration: tracker.provider.handoff_state must not be a terminal state")
+		}
+	}
+	if !hasComment {
+		return state, "", nil
+	}
+	comment, ok := commentValue.(string)
+	if !ok || strings.TrimSpace(comment) == "" {
+		return "", "", errors.New("invalid configuration: tracker.provider.handoff_comment_template must be a non-empty string")
+	}
+	if _, err := template.New("handoff_comment").Option("missingkey=error").Parse(comment); err != nil {
+		return "", "", fmt.Errorf("invalid configuration: tracker.provider.handoff_comment_template: %w", err)
+	}
+	return state, comment, nil
+}
+
 // Render renders a prompt for one run. The first run has a nil attempt;
 // retries and continuations receive the spec's 1-based attempt number.
 func (s Settings) Render(issue any, attempt int) (string, error) {
@@ -300,6 +348,24 @@ func (s Settings) Render(issue any, attempt int) (string, error) {
 	err = t.Execute(&out, map[string]any{"issue": templateIssue(issue), "attempt": templateAttempt})
 	if err != nil {
 		return "", fmt.Errorf("template_render_error: %w", err)
+	}
+	return out.String(), nil
+}
+
+// RenderHandoffComment renders the repository-owned optional comment template.
+// It is never populated from a Codex tool argument, so a handoff comment has
+// the same reviewable policy source as the target state.
+func (s Settings) RenderHandoffComment(issue domain.Issue) (string, error) {
+	if s.Tracker.HandoffCommentTemplate == "" {
+		return "", nil
+	}
+	t, err := template.New("handoff_comment").Option("missingkey=error").Parse(s.Tracker.HandoffCommentTemplate)
+	if err != nil {
+		return "", fmt.Errorf("handoff_comment_template: %w", err)
+	}
+	var out bytes.Buffer
+	if err := t.Execute(&out, map[string]any{"issue": templateIssue(issue)}); err != nil {
+		return "", fmt.Errorf("handoff_comment_template: %w", err)
 	}
 	return out.String(), nil
 }

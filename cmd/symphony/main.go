@@ -67,7 +67,10 @@ func main() {
 		return
 	}
 	ws := workspace.New(settings)
-	backend := codex.New("LINEAR_API_KEY")
+	// The backend receives only the already-loaded settings callback. Its
+	// optional Linear handoff capability stays disabled until WORKFLOW.md
+	// explicitly declares tracker.provider.handoff_state.
+	backend := codex.NewWithLinearHandoff(settings, "LINEAR_API_KEY")
 	var t domain.Tracker = tracker
 	var a domain.AgentBackend = backend
 	var w domain.WorkspaceExecutor = ws

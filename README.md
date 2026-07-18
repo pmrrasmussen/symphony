@@ -39,3 +39,9 @@ Review each worktree's changes before merging or cherry-picking them into your
 development branch. Terminal cleanup preserves worktrees with uncommitted,
 untracked, or newly committed changes rather than deleting work that needs
 review.
+
+To let a Codex session hand an issue off safely, optionally configure
+`tracker.provider.handoff_state` (and, if useful, a fixed
+`handoff_comment_template`). This enables a session-bound compatibility tool,
+not general Linear or GraphQL access; see the Linear tracker profile for its
+strict scope.
