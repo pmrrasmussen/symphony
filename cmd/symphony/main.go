@@ -16,6 +16,7 @@ import (
 	"github.com/pmrrasmussen/symphony/internal/coordinator"
 	"github.com/pmrrasmussen/symphony/internal/domain"
 	"github.com/pmrrasmussen/symphony/internal/linear"
+	"github.com/pmrrasmussen/symphony/internal/observability"
 	"github.com/pmrrasmussen/symphony/internal/workspace"
 )
 
@@ -32,8 +33,12 @@ func main() {
 		os.Exit(2)
 	}
 	s := store.Current().Config
-	if err := os.MkdirAll(s.LogRoot, 0o755); err != nil {
+	if err := os.MkdirAll(s.LogRoot, 0o700); err != nil {
 		fmt.Fprintln(os.Stderr, "log root:", err)
+		os.Exit(2)
+	}
+	if err := os.Chmod(s.LogRoot, 0o700); err != nil {
+		fmt.Fprintln(os.Stderr, "secure log root:", err)
 		os.Exit(2)
 	}
 	f, err := os.OpenFile(filepath.Join(s.LogRoot, "symphony.jsonl"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
@@ -42,7 +47,7 @@ func main() {
 		os.Exit(2)
 	}
 	defer f.Close()
-	log := slog.New(slog.NewJSONHandler(f, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	log := observability.New(slog.NewJSONHandler(f, &slog.HandlerOptions{Level: slog.LevelInfo}), os.Stderr)
 	settings := func() config.Settings {
 		if err := store.Reload(); err != nil {
 			log.Error("workflow reload rejected; retaining last valid configuration", "error", err)
@@ -74,7 +79,7 @@ func main() {
 	var t domain.Tracker = tracker
 	var a domain.AgentBackend = backend
 	var w domain.WorkspaceExecutor = ws
-	c := coordinator.New(t, a, w, settings, log)
+	c := coordinator.New(t, a, w, settings, slog.New(log.Handler()))
 	if terminals, err := tracker.ListTerminal(ctx, settings().Tracker.TerminalStates); err != nil {
 		log.Warn("startup terminal cleanup query failed", "error", err)
 	} else {

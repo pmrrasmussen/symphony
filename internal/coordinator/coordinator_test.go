@@ -1,10 +1,13 @@
 package coordinator
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -12,6 +15,55 @@ import (
 	"github.com/pmrrasmussen/symphony/internal/config"
 	"github.com/pmrrasmussen/symphony/internal/domain"
 )
+
+func TestObservabilityNormalizesEventsAndProtectsSensitiveMessages(t *testing.T) {
+	w := testSettings(t)
+	issue := testIssue()
+	events := make(chan domain.Event, 6)
+	events <- domain.Event{Kind: domain.EventSessionStarted, At: time.Now(), SessionID: "session", ThreadID: "thread", TurnID: "turn", PID: 123}
+	events <- domain.Event{Kind: domain.EventUsage, At: time.Now(), Usage: domain.Usage{InputTokens: 4, OutputTokens: 6}}
+	events <- domain.Event{Kind: domain.EventUsage, At: time.Now(), Usage: domain.Usage{InputTokens: 4, OutputTokens: 6, TotalTokens: 10}}
+	events <- domain.Event{Kind: domain.EventRateLimit, At: time.Now(), RateLimit: map[string]any{"remaining": float64(9), "token": "do-not-log-this"}}
+	events <- domain.Event{Kind: domain.EventDiagnostic, At: time.Now(), Message: "token=do-not-log-this"}
+	events <- domain.Event{Kind: domain.EventCompleted, At: time.Now(), Message: "prompt=do-not-log-this"}
+	close(events)
+	agent := &fakeAgent{events: func() <-chan domain.Event { return events }}
+	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{})}
+	var logs bytes.Buffer
+	c := New(&fakeTracker{issue: issue}, agent, ws, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&logs, nil)))
+	c.Tick(context.Background())
+	<-ws.after
+	output := logs.String()
+	for _, secret := range []string{"do-not-log-this", "prompt=do-not-log-this", issue.Description} {
+		if secret != "" && strings.Contains(output, secret) {
+			t.Fatalf("operator log leaked %q: %s", secret, output)
+		}
+	}
+	for _, field := range []string{`"thread_id":"thread"`, `"turn_id":"turn"`, `"pid":123`, `"input_tokens":4`, `"output_tokens":6`, `"total_tokens":10`, `"remaining":9`, `"runtime_ms"`} {
+		if !strings.Contains(output, field) {
+			t.Fatalf("operator log missing %s: %s", field, output)
+		}
+	}
+}
+
+func TestSnapshotCopiesOnlySafeOperationalMetadata(t *testing.T) {
+	c := New(&fakeTracker{}, &fakeAgent{}, &fakeWorkspace{}, func() config.Settings { return config.Settings{} }, nil)
+	now := time.Now()
+	c.claimed["provider-id"] = true
+	c.running["provider-id"] = &running{issue: domain.Issue{ID: "provider-id", Identifier: "PMR-6", Description: "must-not-appear"}, session: domain.AgentSession{ID: "session", ThreadID: "thread", TurnID: "turn"}, attempt: 2, started: now, last: now, usage: domain.Usage{InputTokens: 1}, rateLimit: map[string]int64{"remaining": 2}}
+	c.retries["retry-id"] = retryState{issue: domain.Issue{ID: "retry-id", Identifier: "PMR-9", Description: "must-not-appear"}, attempt: 3, kind: retryAgent, reason: "agent_event", due: now}
+	snapshot := c.Snapshot()
+	if snapshot.Claimed != 1 || len(snapshot.Running) != 1 || len(snapshot.Retrying) != 1 {
+		t.Fatalf("snapshot=%+v", snapshot)
+	}
+	if snapshot.Running[0].IssueIdentifier != "PMR-6" || snapshot.Running[0].RateLimit["remaining"] != 2 || snapshot.Retrying[0].IssueIdentifier != "PMR-9" {
+		t.Fatalf("snapshot=%+v", snapshot)
+	}
+	snapshot.Running[0].RateLimit["remaining"] = 99
+	if c.running["provider-id"].rateLimit["remaining"] != 2 {
+		t.Fatal("snapshot mutated live coordinator state")
+	}
+}
 
 type fakeTracker struct {
 	mu       sync.Mutex

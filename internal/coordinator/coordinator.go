@@ -13,6 +13,7 @@ import (
 
 	"github.com/pmrrasmussen/symphony/internal/config"
 	"github.com/pmrrasmussen/symphony/internal/domain"
+	"github.com/pmrrasmussen/symphony/internal/observability"
 )
 
 // Timer is intentionally small so retries can be driven deterministically in
@@ -72,7 +73,7 @@ type Coordinator struct {
 	settings   func() config.Settings
 	timer      Timer
 	clock      Clock
-	log        *slog.Logger
+	log        *observability.Logger
 
 	mu         sync.Mutex
 	running    map[string]*running
@@ -95,6 +96,8 @@ type running struct {
 	attempt   int
 	workspace domain.Workspace
 	stopped   stopReason
+	usage     domain.Usage
+	rateLimit map[string]int64
 }
 
 func New(t domain.Tracker, a domain.AgentBackend, w domain.WorkspaceExecutor, settings func() config.Settings, logger *slog.Logger) *Coordinator {
@@ -103,10 +106,58 @@ func New(t domain.Tracker, a domain.AgentBackend, w domain.WorkspaceExecutor, se
 	}
 	return &Coordinator{
 		tracker: t, agent: a, workspaces: w, settings: settings,
-		timer: realTimer{}, clock: realClock{}, log: logger,
+		timer: realTimer{}, clock: realClock{}, log: observability.FromSlog(logger),
 		running: map[string]*running{}, claimed: map[string]bool{},
 		claimState: map[string]string{}, retries: map[string]retryState{},
 	}
+}
+
+// Snapshot is a read-only, intentionally reduced view of coordinator state.
+// It excludes issue bodies, prompts, workspace paths, raw events, and tracker
+// identifiers that may be provider-specific.
+type Snapshot struct {
+	Claimed  int
+	Running  []RunningSnapshot
+	Retrying []RetrySnapshot
+}
+
+type RunningSnapshot struct {
+	IssueIdentifier string
+	SessionID       string
+	ThreadID        string
+	TurnID          string
+	Attempt         int
+	StartedAt       time.Time
+	LastEventAt     time.Time
+	Usage           domain.Usage
+	RateLimit       map[string]int64
+}
+
+type RetrySnapshot struct {
+	IssueIdentifier string
+	Attempt         int
+	Kind            string
+	Reason          string
+	Due             time.Time
+}
+
+// Snapshot copies the coordinator's public operational metadata while holding
+// its mutex, so callers cannot observe or mutate its live scheduling maps.
+func (c *Coordinator) Snapshot() Snapshot {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	snapshot := Snapshot{Claimed: len(c.claimed), Running: make([]RunningSnapshot, 0, len(c.running)), Retrying: make([]RetrySnapshot, 0, len(c.retries))}
+	for _, run := range c.running {
+		snapshot.Running = append(snapshot.Running, RunningSnapshot{IssueIdentifier: run.issue.Identifier, SessionID: run.session.ID, ThreadID: run.session.ThreadID, TurnID: run.session.TurnID, Attempt: run.attempt, StartedAt: run.started, LastEventAt: run.last, Usage: run.usage, RateLimit: copyRateLimit(run.rateLimit)})
+	}
+	for _, retry := range c.retries {
+		snapshot.Retrying = append(snapshot.Retrying, RetrySnapshot{IssueIdentifier: retry.issue.Identifier, Attempt: retry.attempt, Kind: string(retry.kind), Reason: retry.reason, Due: retry.due})
+	}
+	sort.Slice(snapshot.Running, func(i, j int) bool { return snapshot.Running[i].IssueIdentifier < snapshot.Running[j].IssueIdentifier })
+	sort.Slice(snapshot.Retrying, func(i, j int) bool {
+		return snapshot.Retrying[i].IssueIdentifier < snapshot.Retrying[j].IssueIdentifier
+	})
+	return snapshot
 }
 
 func (c *Coordinator) Start(parent context.Context) {
@@ -435,7 +486,7 @@ func (c *Coordinator) consume(ctx context.Context, r *running, events <-chan dom
 			c.mu.Lock()
 			r.last = at
 			c.mu.Unlock()
-			c.log.Info("agent event", "issue_id", r.issue.ID, "issue_identifier", r.issue.Identifier, "session_id", e.SessionID, "event", e.Kind)
+			c.logEvent(r, e)
 			switch e.Kind {
 			case domain.EventBlocked:
 				return false, fmt.Errorf("agent blocked: %s", e.Message)
@@ -455,10 +506,139 @@ func (c *Coordinator) consume(ctx context.Context, r *running, events <-chan dom
 					}
 					return false, context.Canceled
 				}
+				c.logTerminalSummary(r)
 				return true, nil
 			}
 		}
 	}
+}
+
+func (c *Coordinator) logEvent(r *running, event domain.Event) {
+	sessionID := event.SessionID
+	if sessionID == "" {
+		sessionID = r.session.ID
+	}
+	attrs := []any{"issue_id", r.issue.ID, "issue_identifier", r.issue.Identifier, "session_id", sessionID, "event", event.Kind}
+	switch event.Kind {
+	case domain.EventSessionStarted:
+		if event.ThreadID != "" {
+			attrs = append(attrs, "thread_id", event.ThreadID)
+		}
+		if event.TurnID != "" {
+			attrs = append(attrs, "turn_id", event.TurnID)
+		}
+		if event.PID > 0 {
+			attrs = append(attrs, "pid", event.PID)
+		}
+		c.log.Info("agent session started", attrs...)
+	case domain.EventUsage:
+		usage := c.updateUsage(r, event.Usage)
+		attrs = append(attrs, "input_tokens", usage.InputTokens, "output_tokens", usage.OutputTokens, "total_tokens", usage.TotalTokens)
+		c.log.Info("agent usage", attrs...)
+	case domain.EventRateLimit:
+		rateLimit := normalizedRateLimit(event.RateLimit)
+		c.mu.Lock()
+		r.rateLimit = copyRateLimit(rateLimit)
+		c.mu.Unlock()
+		attrs = append(attrs, "rate_limit", rateLimit)
+		c.log.Info("agent rate limit", attrs...)
+	case domain.EventDiagnostic:
+		attrs = append(attrs, "stderr", observability.Text(event.Message))
+		c.log.Warn("agent stderr", attrs...)
+	default:
+		// Messages can contain model output, tool arguments, prompt excerpts, or
+		// provider data. The event type is sufficient for ordinary operation.
+		c.log.Info("agent event", attrs...)
+	}
+}
+
+func (c *Coordinator) updateUsage(r *running, update domain.Usage) domain.Usage {
+	update = normalizedUsage(update)
+	c.mu.Lock()
+	// App-server usage notifications are cumulative. Taking the component-wise
+	// maximum makes repeated notifications idempotent and avoids double-counting.
+	r.usage.InputTokens = max(r.usage.InputTokens, update.InputTokens)
+	r.usage.OutputTokens = max(r.usage.OutputTokens, update.OutputTokens)
+	r.usage.TotalTokens = max(r.usage.TotalTokens, update.TotalTokens)
+	if r.usage.TotalTokens < r.usage.InputTokens+r.usage.OutputTokens {
+		r.usage.TotalTokens = r.usage.InputTokens + r.usage.OutputTokens
+	}
+	usage := r.usage
+	c.mu.Unlock()
+	return usage
+}
+
+func (c *Coordinator) logTerminalSummary(r *running) {
+	c.mu.Lock()
+	usage := r.usage
+	rateLimit := copyRateLimit(r.rateLimit)
+	started := r.started
+	c.mu.Unlock()
+	attrs := []any{"issue_id", r.issue.ID, "issue_identifier", r.issue.Identifier, "session_id", r.session.ID, "attempt", r.attempt, "runtime_ms", c.clock.Now().Sub(started).Milliseconds(), "input_tokens", usage.InputTokens, "output_tokens", usage.OutputTokens, "total_tokens", usage.TotalTokens}
+	if len(rateLimit) > 0 {
+		attrs = append(attrs, "rate_limit", rateLimit)
+	}
+	c.log.Info("agent run completed", attrs...)
+}
+
+func copyRateLimit(value map[string]int64) map[string]int64 {
+	if len(value) == 0 {
+		return nil
+	}
+	copy := make(map[string]int64, len(value))
+	for key, item := range value {
+		copy[key] = item
+	}
+	return copy
+}
+
+func normalizedUsage(usage domain.Usage) domain.Usage {
+	if usage.InputTokens < 0 {
+		usage.InputTokens = 0
+	}
+	if usage.OutputTokens < 0 {
+		usage.OutputTokens = 0
+	}
+	if usage.TotalTokens < 0 {
+		usage.TotalTokens = 0
+	}
+	if usage.TotalTokens == 0 {
+		usage.TotalTokens = usage.InputTokens + usage.OutputTokens
+	}
+	return usage
+}
+
+// normalizedRateLimit selects the small numeric subset useful to an operator.
+// In particular it never serializes the raw app-server payload, which may
+// include account, model, or provider-specific data.
+func normalizedRateLimit(raw map[string]any) map[string]int64 {
+	result := map[string]int64{}
+	var visit func(map[string]any)
+	visit = func(values map[string]any) {
+		for key, value := range values {
+			switch nested := value.(type) {
+			case map[string]any:
+				visit(nested)
+			case float64:
+				if nested < 0 {
+					continue
+				}
+				switch strings.ToLower(strings.ReplaceAll(key, "_", "")) {
+				case "limit", "remaining", "used", "resetseconds", "windowseconds":
+					result[strings.ToLower(key)] = int64(nested)
+				}
+			case int:
+				if nested >= 0 {
+					switch strings.ToLower(strings.ReplaceAll(key, "_", "")) {
+					case "limit", "remaining", "used", "resetseconds", "windowseconds":
+						result[strings.ToLower(key)] = int64(nested)
+					}
+				}
+			}
+		}
+	}
+	visit(raw)
+	return result
 }
 
 func (c *Coordinator) finishFailure(ctx context.Context, i domain.Issue, attempt int, reason string, err error) {
@@ -468,9 +648,11 @@ func (c *Coordinator) finishFailure(ctx context.Context, i domain.Issue, attempt
 		return
 	}
 	c.scheduleRetry(ctx, i, domain.Workspace{}, attempt+1, retryAgent, reason, backoff(attempt+1, c.settings().Agent.MaxRetryBackoff))
-	if err != nil {
-		c.log.Warn("agent run retry scheduled", "issue_id", i.ID, "issue_identifier", i.Identifier, "reason", reason, "error", err)
+	attrs := []any{"issue_id", i.ID, "issue_identifier", i.Identifier, "reason", reason, "attempt", attempt + 1}
+	if err != nil && reason != "prompt_render" && reason != "agent_event" {
+		attrs = append(attrs, "error", err)
 	}
+	c.log.Warn("agent run retry scheduled", attrs...)
 }
 
 func (c *Coordinator) scheduleRetry(ctx context.Context, i domain.Issue, ws domain.Workspace, attempt int, kind retryKind, reason string, delay time.Duration) {
