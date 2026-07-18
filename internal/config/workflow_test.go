@@ -488,7 +488,7 @@ func TestReloadPublishesEveryDynamicSettingAsOneSnapshot(t *testing.T) {
 	}
 	got := store.Current()
 	settings := got.Config
-	if got.Prompt != "second" || settings.Tracker.Provider["api_key"] != "second-key" || strings.Join(settings.Tracker.RequiredLabels, ",") != "ready" || strings.Join(settings.Tracker.ActiveStates, ",") != "backlog,started" || strings.Join(settings.Tracker.TerminalStates, ",") != "closed" {
+	if got.Prompt != "second" || settings.Tracker.Provider["api_key"] != "second-key" || strings.Join(settings.Tracker.RequiredLabels, ",") != "ready" || strings.Join(settings.Tracker.ActiveStates, ",") != "Backlog,Started" || strings.Join(settings.Tracker.TerminalStates, ",") != "Closed" {
 		t.Fatalf("tracker snapshot=%+v prompt=%q", settings.Tracker, got.Prompt)
 	}
 	if settings.Polling.Interval != 200*time.Millisecond || settings.Workspace.Root != filepath.Join(d, "work-two") || settings.Workspace.SourceRoot != secondSource || settings.LogRoot != filepath.Join(d, "logs") {
@@ -525,7 +525,7 @@ func TestCurrentReturnsAnImmutableSnapshotCopy(t *testing.T) {
 	copy.Config.Codex.TurnSandboxPolicy.(map[string]any)["type"] = "mutated"
 
 	current := store.Current()
-	if current.Raw["extension"].(map[string]any)["nested"].([]any)[0] != "original" || current.Config.Tracker.Provider["nested"].(map[string]any)["value"] != "original" || current.Config.Tracker.ActiveStates[0] != "todo" || current.Config.Agent.ByState["todo"] != 1 || current.Config.Codex.TurnSandboxPolicy.(map[string]any)["type"] != "original" {
+	if current.Raw["extension"].(map[string]any)["nested"].([]any)[0] != "original" || current.Config.Tracker.Provider["nested"].(map[string]any)["value"] != "original" || current.Config.Tracker.ActiveStates[0] != "Todo" || current.Config.Agent.ByState["todo"] != 1 || current.Config.Codex.TurnSandboxPolicy.(map[string]any)["type"] != "original" {
 		t.Fatalf("published workflow was mutated through Current: %+v", current)
 	}
 }
@@ -558,8 +558,8 @@ func TestConcurrentReadersNeverObserveMixedSnapshots(t *testing.T) {
 				default:
 				}
 				current := store.Current()
-				one := current.Prompt == "one" && current.Config.Polling.Interval == time.Millisecond && current.Config.Agent.MaxConcurrent == 1 && current.Config.Codex.Command == "one" && current.Config.Tracker.ActiveStates[0] == "one"
-				two := current.Prompt == "two" && current.Config.Polling.Interval == 2*time.Millisecond && current.Config.Agent.MaxConcurrent == 2 && current.Config.Codex.Command == "two" && current.Config.Tracker.ActiveStates[0] == "two"
+				one := current.Prompt == "one" && current.Config.Polling.Interval == time.Millisecond && current.Config.Agent.MaxConcurrent == 1 && current.Config.Codex.Command == "one" && current.Config.Tracker.ActiveStates[0] == "One"
+				two := current.Prompt == "two" && current.Config.Polling.Interval == 2*time.Millisecond && current.Config.Agent.MaxConcurrent == 2 && current.Config.Codex.Command == "two" && current.Config.Tracker.ActiveStates[0] == "Two"
 				if !one && !two {
 					select {
 					case errors <- "reader observed fields from different workflow versions":
