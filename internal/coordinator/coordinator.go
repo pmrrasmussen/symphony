@@ -332,7 +332,14 @@ func (c *Coordinator) launch(parent context.Context, i domain.Issue, attempt int
 		c.mu.Lock()
 		delete(c.running, i.ID)
 		stopped := r.stopped
+		completionAllowed := completed && !c.stopping && stopped == "" && parent.Err() == nil
 		c.mu.Unlock()
+		if completed && !completionAllowed {
+			completed = false
+			if consumeErr == nil {
+				consumeErr = context.Canceled
+			}
+		}
 		if completed {
 			c.cancelSession(context.Background(), r.session)
 		}
@@ -378,6 +385,19 @@ func (c *Coordinator) consume(ctx context.Context, r *running, events <-chan dom
 			case domain.EventFailed:
 				return false, fmt.Errorf("agent failed: %s", e.Message)
 			case domain.EventCompleted:
+				// Reconciliation and event delivery can race. An event that
+				// arrives after reconciliation has canceled this run must never
+				// turn into a durable completion marker.
+				c.mu.Lock()
+				stopped := r.stopped
+				stopping := c.stopping
+				c.mu.Unlock()
+				if stopped != "" || stopping || ctx.Err() != nil {
+					if err := ctx.Err(); err != nil {
+						return false, err
+					}
+					return false, context.Canceled
+				}
 				return true, nil
 			}
 		}

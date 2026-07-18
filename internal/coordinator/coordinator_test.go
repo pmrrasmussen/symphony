@@ -362,6 +362,26 @@ func TestReconciliationCancellationDoesNotRetry(t *testing.T) {
 	}
 }
 
+func TestCompletedEventAfterReconciliationCancellationDoesNotComplete(t *testing.T) {
+	w := testSettings(t)
+	issue := testIssue()
+	agent := &fakeAgent{events: completedEvents}
+	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{}, 1)}
+	c := testCoordinator(w.Config, &fakeTracker{issue: issue}, agent, ws)
+	r := &running{issue: issue, stopped: stopTerminal}
+	events := make(chan domain.Event, 1)
+	events <- domain.Event{Kind: domain.EventCompleted, SessionID: "t-u"}
+	close(events)
+
+	completed, err := c.consume(context.Background(), r, events)
+	if completed {
+		t.Fatal("completed event after reconciliation cancellation was accepted")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error=%v, want context cancellation", err)
+	}
+}
+
 func TestShutdownCancellationDoesNotRetry(t *testing.T) {
 	w := testSettings(t)
 	issue := testIssue()
