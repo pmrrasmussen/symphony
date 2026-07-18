@@ -27,6 +27,15 @@ value: a completed unchanged issue is not dispatched again, while a later
 issue edit is eligible for another turn. Cleanup refuses to remove a worktree
 with local changes or a commit that differs from its recorded base revision.
 
+Workspace containment is checked against canonical filesystem paths, including
+existing symlink ancestors. Service-owned workspace directories, the durable
+state directory, and state-marker files must not themselves be symlinks; a
+path that resolves outside the configured root is rejected before it is read,
+executed, or removed. This is a trusted-local-machine boundary, not a defence
+against a malicious same-host process: filesystem checks and subsequent use
+cannot atomically prevent a concurrent rename or symlink swap. Keep the
+configured workspace root writable only by trusted users and processes.
+
 The behavioral contract is the pinned upstream
 [Symphony specification](https://github.com/openai/symphony/blob/7af5a7648c9fbffa08825fe0c0b18be00100aff3/SPEC.md).
 It is linked rather than copied into this repository so it cannot silently

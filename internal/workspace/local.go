@@ -71,11 +71,14 @@ func (l *Local) Prepare(ctx context.Context, issue domain.Issue) (domain.Workspa
 	if err := ctx.Err(); err != nil {
 		return domain.Workspace{}, err
 	}
-	root := l.settings().Workspace.Root
+	root, err := l.ensureWorkspaceRoot()
+	if err != nil {
+		return domain.Workspace{}, err
+	}
 	key := Key(issue.Identifier)
-	path := filepath.Join(root, key)
-	if !below(root, path) {
-		return domain.Workspace{}, fmt.Errorf("workspace path escapes root")
+	path, err := workspacePath(root, key)
+	if err != nil {
+		return domain.Workspace{}, err
 	}
 	info, err := os.Stat(path)
 	created := os.IsNotExist(err)
@@ -88,15 +91,18 @@ func (l *Local) Prepare(ctx context.Context, issue domain.Issue) (domain.Workspa
 	settings := l.settings()
 	if created {
 		if settings.Workspace.SourceRoot != "" {
-			if err := os.MkdirAll(root, 0o755); err != nil {
-				return domain.Workspace{}, err
-			}
 			if err := addWorktree(ctx, settings.Workspace.SourceRoot, path); err != nil {
 				return domain.Workspace{}, err
 			}
 		} else if err := os.MkdirAll(path, 0o755); err != nil {
 			return domain.Workspace{}, err
 		}
+	}
+	// Re-check after creating the directory or invoking Git. A trusted local
+	// process can still race this check with a rename or symlink replacement;
+	// see docs/architecture.md for that unavoidable filesystem limitation.
+	if path, err = workspacePath(root, key); err != nil {
+		return domain.Workspace{}, err
 	}
 	ws := domain.Workspace{Path: path, Key: key, CreatedNow: created}
 	if created && settings.Hooks.AfterCreate != "" {
@@ -203,33 +209,36 @@ func (l *Local) Cleanup(ctx context.Context, issue domain.Issue) error {
 	return l.removeState(issue)
 }
 func (l *Local) Execute(ctx context.Context, ws domain.Workspace, command string, args []string) ([]byte, error) {
-	if !below(l.settings().Workspace.Root, ws.Path) {
-		return nil, fmt.Errorf("workspace execution path escapes root")
+	path, err := l.managedWorkspacePath(ws.Path)
+	if err != nil {
+		return nil, err
 	}
 	c := exec.CommandContext(ctx, command, args...)
-	c.Dir = ws.Path
+	c.Dir = path
 	return c.CombinedOutput()
 }
 
 func (l *Local) workspacePath(issue domain.Issue) (string, error) {
-	root := l.settings().Workspace.Root
-	path := filepath.Join(root, Key(issue.Identifier))
-	if !below(root, path) {
-		return "", fmt.Errorf("workspace path escapes root")
+	root, err := l.workspaceRoot()
+	if err != nil {
+		return "", err
 	}
-	return filepath.Clean(path), nil
+	return workspacePath(root, Key(issue.Identifier))
 }
 
 func (l *Local) statePath(issue domain.Issue) (string, error) {
-	root := l.settings().Workspace.Root
-	dir := filepath.Join(root, stateDirectory)
-	if !below(root, dir) {
-		return "", fmt.Errorf("workspace state path escapes root")
+	root, err := l.workspaceRoot()
+	if err != nil {
+		return "", err
+	}
+	dir, err := statePath(root)
+	if err != nil {
+		return "", err
 	}
 	keySum := sha256.Sum256([]byte(Key(issue.Identifier)))
 	path := filepath.Join(dir, fmt.Sprintf("%x.json", keySum[:]))
-	if !below(root, path) {
-		return "", fmt.Errorf("workspace state path escapes root")
+	if err := regularManagedPath(root, path, "workspace state marker"); err != nil {
+		return "", err
 	}
 	return path, nil
 }
@@ -254,6 +263,9 @@ func (l *Local) loadState(issue domain.Issue) (workspaceState, bool, error) {
 }
 
 func (l *Local) writeState(issue domain.Issue, state workspaceState) error {
+	if _, err := l.ensureWorkspaceRoot(); err != nil {
+		return err
+	}
 	path, err := l.statePath(issue)
 	if err != nil {
 		return err
@@ -386,8 +398,9 @@ func (l *Local) hook(ctx context.Context, ws domain.Workspace, issue domain.Issu
 	if script == "" {
 		return nil
 	}
-	if !below(l.settings().Workspace.Root, ws.Path) {
-		return fmt.Errorf("hook workspace path escapes root")
+	path, err := l.managedWorkspacePath(ws.Path)
+	if err != nil {
+		return err
 	}
 	timeout := l.settings().Hooks.Timeout
 	if timeout <= 0 {
@@ -396,7 +409,7 @@ func (l *Local) hook(ctx context.Context, ws domain.Workspace, issue domain.Issu
 	cctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	cmd := exec.CommandContext(cctx, "sh", "-lc", script)
-	cmd.Dir = ws.Path
+	cmd.Dir = path
 	cmd.Env = append(os.Environ(), "SYMPHONY_ISSUE_ID="+issue.ID, "SYMPHONY_ISSUE_IDENTIFIER="+issue.Identifier)
 	out, err := cmd.CombinedOutput()
 	if len(out) > maxHookOutput {
@@ -407,6 +420,144 @@ func (l *Local) hook(ctx context.Context, ws domain.Workspace, issue domain.Issu
 	}
 	return nil
 }
+
+// workspaceRoot resolves all existing path components before workspace paths
+// are constructed. For a root that does not exist yet, it resolves the
+// deepest existing ancestor and appends the missing components. This prevents
+// a lexical path check from overlooking a pre-existing symlink.
+func (l *Local) workspaceRoot() (string, error) {
+	root := l.settings().Workspace.Root
+	if strings.TrimSpace(root) == "" {
+		return "", errors.New("workspace root is empty")
+	}
+	return resolveExistingAncestors(root)
+}
+
+func (l *Local) ensureWorkspaceRoot() (string, error) {
+	root, err := l.workspaceRoot()
+	if err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		return "", fmt.Errorf("create workspace root: %w", err)
+	}
+	info, err := os.Stat(root)
+	if err != nil {
+		return "", fmt.Errorf("inspect workspace root: %w", err)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("workspace root is not a directory: %s", root)
+	}
+	return resolveExistingAncestors(root)
+}
+
+func (l *Local) managedWorkspacePath(path string) (string, error) {
+	root, err := l.workspaceRoot()
+	if err != nil {
+		return "", err
+	}
+	rel, err := filepath.Rel(root, path)
+	if err != nil || rel == "." || filepath.Dir(rel) != "." || rel == stateDirectory {
+		return "", fmt.Errorf("workspace path is not a direct workspace below the configured root")
+	}
+	if err := regularManagedPath(root, path, "workspace"); err != nil {
+		return "", err
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", fmt.Errorf("inspect workspace path: %w", err)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("workspace path is not a directory: %s", path)
+	}
+	resolved, err := resolveExistingAncestors(path)
+	if err != nil {
+		return "", fmt.Errorf("resolve workspace path: %w", err)
+	}
+	if !below(root, resolved) {
+		return "", fmt.Errorf("workspace path escapes root")
+	}
+	return resolved, nil
+}
+
+func workspacePath(root, key string) (string, error) {
+	path := filepath.Join(root, key)
+	if err := regularManagedPath(root, path, "workspace"); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+func statePath(root string) (string, error) {
+	path := filepath.Join(root, stateDirectory)
+	if err := regularManagedPath(root, path, "workspace state directory"); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+// regularManagedPath rejects a symlink at the service-owned path itself, then
+// resolves existing ancestors to prove the target remains below the canonical
+// workspace root. Service-owned workspace, state-directory, and marker paths
+// do not need symlinks, so rejecting them also avoids surprising rename/remove
+// semantics.
+func regularManagedPath(root, path, kind string) error {
+	if !below(root, path) {
+		return fmt.Errorf("%s path escapes workspace root", kind)
+	}
+	if info, err := os.Lstat(path); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("%s path must not be a symlink: %s", kind, path)
+	} else if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("inspect %s path: %w", kind, err)
+	}
+	resolved, err := resolveExistingAncestors(path)
+	if err != nil {
+		return fmt.Errorf("resolve %s path: %w", kind, err)
+	}
+	if !below(root, resolved) {
+		return fmt.Errorf("%s path escapes workspace root through a symlink", kind)
+	}
+	return nil
+}
+
+// resolveExistingAncestors returns an absolute path whose existing ancestors
+// have been resolved with EvalSymlinks. It deliberately supports a final path
+// that does not yet exist, which is required before creating a workspace or
+// state directory.
+func resolveExistingAncestors(path string) (string, error) {
+	abs, err := filepath.Abs(filepath.Clean(path))
+	if err != nil {
+		return "", err
+	}
+	missing := make([]string, 0)
+	for {
+		_, err := os.Lstat(abs)
+		if err == nil {
+			resolved, err := filepath.EvalSymlinks(abs)
+			if err != nil {
+				return "", err
+			}
+			info, err := os.Stat(resolved)
+			if err != nil {
+				return "", err
+			}
+			if !info.IsDir() && len(missing) > 0 {
+				return "", fmt.Errorf("existing ancestor is not a directory: %s", abs)
+			}
+			return filepath.Join(append([]string{resolved}, missing...)...), nil
+		}
+		if !os.IsNotExist(err) {
+			return "", err
+		}
+		parent := filepath.Dir(abs)
+		if parent == abs {
+			return "", fmt.Errorf("no existing ancestor for %s", path)
+		}
+		missing = append([]string{filepath.Base(abs)}, missing...)
+		abs = parent
+	}
+}
+
 func below(root, path string) bool {
 	r, err := filepath.Abs(root)
 	if err != nil {
