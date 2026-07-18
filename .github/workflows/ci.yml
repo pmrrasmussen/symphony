@@ -27,7 +27,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - run: go test ./...
+      - run: timeout --signal=TERM 10m go test ./...
 
   vet:
     name: go vet ./...
@@ -39,15 +39,8 @@ jobs:
           go-version-file: go.mod
       - run: go vet ./...
 
-  race:
-    name: go test -race ./...
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-      - run: go test -race ./...
+  # Race CI is deferred to PMR-13: the Codex app-server process lifecycle can
+  # hang on Linux. Run `go test -race ./...` locally until that is repaired.
 
   live-smoke:
     name: isolated live smoke

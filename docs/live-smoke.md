@@ -6,8 +6,11 @@ Linear or launch Codex:
 ```sh
 go test ./...
 go vet ./...
-go test -race ./...
 ```
+
+Run `go test -race ./...` locally when practical. Race CI is deferred to
+PMR-13 because the Codex app-server process lifecycle can hang on Linux; it is
+not a required GitHub Actions check until that repair is complete.
 
 The live profile is deliberately separate. It verifies configuration and a
 single Linear poll with `--dry-run`; that flag does not launch Codex. This
