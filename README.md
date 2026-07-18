@@ -15,6 +15,16 @@ Linear project in `WORKFLOW.md`, and use `--dry-run` first.
 Linear accepts `tracker.provider.api_key: $LINEAR_API_KEY` or a trusted local
 `tracker.provider.api_key_file`; the latter is read only by the service.
 
+`WORKFLOW.md` front matter is validated for the supported core fields while
+unknown extension fields are preserved. Changes are reloaded for future work;
+an invalid replacement keeps the last valid configuration. Prompt templates use
+strict, lowercase variables: `issue` (for example
+`{{.issue.identifier}}`) and `attempt` (nil on the first run, then a 1-based
+retry/continuation number). Template errors fail only that run attempt.
+Relative workspace and log paths are resolved from the workflow file; omitted
+`workspace.root` defaults to the system temporary directory's
+`symphony_workspaces` path.
+
 See [docs/architecture.md](docs/architecture.md), the
 [Linear tracker profile](docs/linear-tracker.md), and
 [WORKFLOW.example.md](WORKFLOW.example.md).

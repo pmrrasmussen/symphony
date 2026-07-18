@@ -214,7 +214,7 @@ func testSettings(t *testing.T) config.Workflow {
 	t.Helper()
 	d := t.TempDir()
 	workflow := filepath.Join(d, "WORKFLOW.md")
-	if err := os.WriteFile(workflow, []byte("---\ntracker: {kind: linear, active_states: [Todo], terminal_states: [Done]}\nagent: {max_concurrent_agents: 1}\nworkspace: {root: /tmp/work}\n---\nWork on {{.Issue.Identifier}}"), 0o600); err != nil {
+	if err := os.WriteFile(workflow, []byte("---\ntracker: {kind: linear, active_states: [Todo], terminal_states: [Done]}\nagent: {max_concurrent_agents: 1}\nworkspace: {root: /tmp/work}\n---\nWork on {{.issue.identifier}}"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	w, err := config.Load(workflow, "")

@@ -12,15 +12,22 @@ import (
 	"sync"
 	"text/template"
 	"time"
+	"unicode"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/pmrrasmussen/symphony/internal/domain"
 )
 
+const fallbackPrompt = "Work on {{.issue.identifier}}: {{.issue.title}}\n\n{{.issue.description}}"
+
 type Workflow struct {
+	// Raw preserves the complete front-matter object, including extension keys.
 	Raw    map[string]any
 	Prompt string
 	Config Settings
 }
+
 type Settings struct {
 	Tracker      Tracker
 	Polling      Polling
@@ -32,15 +39,15 @@ type Settings struct {
 	LogRoot      string
 	Prompt       string
 }
+
 type Tracker struct {
 	Kind                                         string
 	Provider                                     map[string]any
 	RequiredLabels, ActiveStates, TerminalStates []string
 }
+
 type Polling struct{ Interval time.Duration }
-type Workspace struct {
-	Root, SourceRoot string
-}
+type Workspace struct{ Root, SourceRoot string }
 type Hooks struct {
 	AfterCreate, BeforeRun, AfterRun, BeforeRemove string
 	Timeout                                        time.Duration
@@ -56,10 +63,13 @@ type Codex struct {
 	TurnTimeout, ReadTimeout, StallTimeout time.Duration
 }
 
+// Load validates the known core fields while retaining unknown extension keys.
+// Prompt parsing is intentionally deferred to Render: a malformed template must
+// fail only the affected run attempt, not stop polling or configuration reload.
 func Load(path, logRoot string) (Workflow, error) {
 	abs, err := filepath.Abs(path)
 	if err != nil {
-		return Workflow{}, err
+		return Workflow{}, fmt.Errorf("missing_workflow_file: %w", err)
 	}
 	b, err := os.ReadFile(abs)
 	if err != nil {
@@ -73,12 +83,13 @@ func Load(path, logRoot string) (Workflow, error) {
 	if err != nil {
 		return Workflow{}, err
 	}
-	if _, err := template.New("workflow").Option("missingkey=error").Parse(body); err != nil {
-		return Workflow{}, fmt.Errorf("template_parse_error: %w", err)
-	}
 	s.Prompt = strings.TrimSpace(body)
+	if s.Prompt == "" {
+		s.Prompt = fallbackPrompt
+	}
 	return Workflow{Raw: raw, Prompt: s.Prompt, Config: s}, nil
 }
+
 func parse(b []byte) (map[string]any, string, error) {
 	text := string(b)
 	if !strings.HasPrefix(text, "---\n") && !strings.HasPrefix(text, "---\r\n") {
@@ -95,8 +106,19 @@ func parse(b []byte) (map[string]any, string, error) {
 	if end < 0 {
 		return nil, "", errors.New("workflow_parse_error: unterminated front matter")
 	}
+	frontMatter := []byte(strings.Join(lines[1:end], "\n"))
+	if len(bytes.TrimSpace(frontMatter)) == 0 {
+		return map[string]any{}, strings.Join(lines[end+1:], "\n"), nil
+	}
+	var node yaml.Node
+	if err := yaml.Unmarshal(frontMatter, &node); err != nil {
+		return nil, "", fmt.Errorf("workflow_parse_error: %w", err)
+	}
+	if len(node.Content) != 1 || node.Content[0].Kind != yaml.MappingNode {
+		return nil, "", errors.New("workflow_front_matter_not_a_map")
+	}
 	var raw map[string]any
-	if err := yaml.Unmarshal([]byte(strings.Join(lines[1:end], "\n")), &raw); err != nil {
+	if err := node.Content[0].Decode(&raw); err != nil {
 		return nil, "", fmt.Errorf("workflow_parse_error: %w", err)
 	}
 	if raw == nil {
@@ -104,36 +126,154 @@ func parse(b []byte) (map[string]any, string, error) {
 	}
 	return raw, strings.Join(lines[end+1:], "\n"), nil
 }
+
 func decode(raw map[string]any, base, path, logRoot string) (Settings, error) {
-	getMap := func(k string) map[string]any {
-		if m, ok := raw[k].(map[string]any); ok {
-			return m
-		}
-		return map[string]any{}
-	}
-	tr := getMap("tracker")
-	pr := getMapFrom(tr, "provider")
-	p := getMap("polling")
-	w := getMap("workspace")
-	h := getMap("hooks")
-	a := getMap("agent")
-	c := getMap("codex")
-	provider, err := resolveProvider(pr, base)
+	tr, err := object(raw, "tracker")
 	if err != nil {
 		return Settings{}, err
 	}
-	sourceRoot := str(w["source_root"])
-	if sourceRoot != "" {
-		sourceRoot = normalizePath(expandEnv(sourceRoot), base)
+	provider, err := object(tr, "provider")
+	if err != nil {
+		return Settings{}, err
 	}
-	s := Settings{WorkflowPath: path, LogRoot: normalizePath(defaultString(logRoot, "./.symphony/logs"), base), Tracker: Tracker{Kind: str(tr["kind"]), Provider: provider, RequiredLabels: stringsLower(list(tr["required_labels"])), ActiveStates: stringsLower(list(tr["active_states"])), TerminalStates: stringsLower(list(tr["terminal_states"]))}, Polling: Polling{Interval: ms(p["interval_ms"], 30000)}, Workspace: Workspace{Root: normalizePath(expandEnv(defaultString(str(w["root"]), "/symphony_workspaces")), base), SourceRoot: sourceRoot}, Hooks: Hooks{AfterCreate: str(h["after_create"]), BeforeRun: str(h["before_run"]), AfterRun: str(h["after_run"]), BeforeRemove: str(h["before_remove"]), Timeout: ms(h["timeout_ms"], 60000)}, Agent: Agent{MaxConcurrent: num(a["max_concurrent_agents"], 10), MaxTurns: num(a["max_turns"], 20), MaxRetryBackoff: ms(a["max_retry_backoff_ms"], 300000), ByState: stateLimits(a["max_concurrent_agents_by_state"])}, Codex: Codex{Command: defaultString(str(c["command"]), "codex app-server"), ApprovalPolicy: defaultString(str(c["approval_policy"]), "never"), ThreadSandbox: defaultString(str(c["thread_sandbox"]), "workspace-write"), TurnSandboxPolicy: c["turn_sandbox_policy"], TurnTimeout: ms(c["turn_timeout_ms"], 3600000), ReadTimeout: ms(c["read_timeout_ms"], 5000), StallTimeout: ms(c["stall_timeout_ms"], 300000)}}
+	polling, err := object(raw, "polling")
+	if err != nil {
+		return Settings{}, err
+	}
+	workspace, err := object(raw, "workspace")
+	if err != nil {
+		return Settings{}, err
+	}
+	hooks, err := object(raw, "hooks")
+	if err != nil {
+		return Settings{}, err
+	}
+	agent, err := object(raw, "agent")
+	if err != nil {
+		return Settings{}, err
+	}
+	codex, err := object(raw, "codex")
+	if err != nil {
+		return Settings{}, err
+	}
+
+	trackerKind, err := stringValue(tr, "kind")
+	if err != nil {
+		return Settings{}, err
+	}
+	requiredLabels, err := stringList(tr, "required_labels")
+	if err != nil {
+		return Settings{}, err
+	}
+	activeStates, err := stringList(tr, "active_states")
+	if err != nil {
+		return Settings{}, err
+	}
+	terminalStates, err := stringList(tr, "terminal_states")
+	if err != nil {
+		return Settings{}, err
+	}
+	resolvedProvider, err := resolveProvider(provider, base)
+	if err != nil {
+		return Settings{}, err
+	}
+
+	pollInterval, err := durationMS(polling, "interval_ms", 30_000)
+	if err != nil {
+		return Settings{}, err
+	}
+	workspaceRoot, err := pathValue(workspace, "root", filepath.Join(os.TempDir(), "symphony_workspaces"), base)
+	if err != nil {
+		return Settings{}, err
+	}
+	sourceRoot, err := optionalPathValue(workspace, "source_root", base)
+	if err != nil {
+		return Settings{}, err
+	}
+	hookTimeout, err := durationMS(hooks, "timeout_ms", 60_000)
+	if err != nil {
+		return Settings{}, err
+	}
+	afterCreate, err := script(hooks, "after_create")
+	if err != nil {
+		return Settings{}, err
+	}
+	beforeRun, err := script(hooks, "before_run")
+	if err != nil {
+		return Settings{}, err
+	}
+	afterRun, err := script(hooks, "after_run")
+	if err != nil {
+		return Settings{}, err
+	}
+	beforeRemove, err := script(hooks, "before_remove")
+	if err != nil {
+		return Settings{}, err
+	}
+	maxConcurrent, err := integer(agent, "max_concurrent_agents", 10)
+	if err != nil {
+		return Settings{}, err
+	}
+	maxTurns, err := integer(agent, "max_turns", 20)
+	if err != nil {
+		return Settings{}, err
+	}
+	maxRetryBackoff, err := durationMS(agent, "max_retry_backoff_ms", 300_000)
+	if err != nil {
+		return Settings{}, err
+	}
+	byState, err := stateLimits(agent["max_concurrent_agents_by_state"])
+	if err != nil {
+		return Settings{}, err
+	}
+	command, err := stringDefault(codex, "command", "codex app-server")
+	if err != nil {
+		return Settings{}, err
+	}
+	approvalPolicy, err := stringDefault(codex, "approval_policy", "never")
+	if err != nil {
+		return Settings{}, err
+	}
+	threadSandbox, err := stringDefault(codex, "thread_sandbox", "workspace-write")
+	if err != nil {
+		return Settings{}, err
+	}
+	turnTimeout, err := durationMS(codex, "turn_timeout_ms", 3_600_000)
+	if err != nil {
+		return Settings{}, err
+	}
+	readTimeout, err := durationMS(codex, "read_timeout_ms", 5_000)
+	if err != nil {
+		return Settings{}, err
+	}
+	stallTimeout, err := durationMS(codex, "stall_timeout_ms", 300_000)
+	if err != nil {
+		return Settings{}, err
+	}
+
+	s := Settings{
+		WorkflowPath: path,
+		LogRoot:      normalizePath(logRootOrDefault(logRoot), base),
+		Tracker: Tracker{
+			Kind:           strings.TrimSpace(trackerKind),
+			Provider:       resolvedProvider,
+			RequiredLabels: stringsLower(requiredLabels),
+			ActiveStates:   stringsLower(activeStates),
+			TerminalStates: stringsLower(terminalStates),
+		},
+		Polling:   Polling{Interval: pollInterval},
+		Workspace: Workspace{Root: workspaceRoot, SourceRoot: sourceRoot},
+		Hooks:     Hooks{AfterCreate: afterCreate, BeforeRun: beforeRun, AfterRun: afterRun, BeforeRemove: beforeRemove, Timeout: hookTimeout},
+		Agent:     Agent{MaxConcurrent: maxConcurrent, MaxTurns: maxTurns, MaxRetryBackoff: maxRetryBackoff, ByState: byState},
+		Codex:     Codex{Command: command, ApprovalPolicy: approvalPolicy, ThreadSandbox: threadSandbox, TurnSandboxPolicy: codex["turn_sandbox_policy"], TurnTimeout: turnTimeout, ReadTimeout: readTimeout, StallTimeout: stallTimeout},
+	}
 	if s.Tracker.Kind != "linear" {
 		return s, fmt.Errorf("invalid configuration: tracker.kind must be linear")
 	}
 	if len(s.Tracker.ActiveStates) == 0 || len(s.Tracker.TerminalStates) == 0 {
 		return s, errors.New("invalid configuration: tracker active_states and terminal_states are required")
 	}
-	if s.Polling.Interval <= 0 || s.Hooks.Timeout <= 0 || s.Agent.MaxConcurrent <= 0 || s.Agent.MaxTurns <= 0 || s.Agent.MaxRetryBackoff <= 0 || s.Codex.Command == "" || s.Codex.TurnTimeout <= 0 || s.Codex.ReadTimeout <= 0 {
+	if s.Polling.Interval <= 0 || s.Hooks.Timeout <= 0 || s.Agent.MaxConcurrent <= 0 || s.Agent.MaxTurns <= 0 || s.Agent.MaxRetryBackoff <= 0 || strings.TrimSpace(s.Codex.Command) == "" || s.Codex.TurnTimeout <= 0 || s.Codex.ReadTimeout <= 0 {
 		return s, errors.New("invalid configuration: non-positive duration or agent limit")
 	}
 	if s.Workspace.SourceRoot != "" {
@@ -144,13 +284,46 @@ func decode(raw map[string]any, base, path, logRoot string) (Settings, error) {
 	}
 	return s, nil
 }
+
+// Render renders a prompt for one run. The first run has a nil attempt;
+// retries and continuations receive the spec's 1-based attempt number.
 func (s Settings) Render(issue any, attempt int) (string, error) {
+	t, err := template.New("workflow").Option("missingkey=error").Parse(s.Prompt)
+	if err != nil {
+		return "", fmt.Errorf("template_parse_error: %w", err)
+	}
+	var templateAttempt any
+	if attempt > 0 {
+		templateAttempt = attempt
+	}
 	var out bytes.Buffer
-	err := template.Must(template.New("workflow").Option("missingkey=error").Parse(s.Prompt)).Execute(&out, map[string]any{"Issue": issue, "Attempt": attempt})
+	err = t.Execute(&out, map[string]any{"issue": templateIssue(issue), "attempt": templateAttempt})
 	if err != nil {
 		return "", fmt.Errorf("template_render_error: %w", err)
 	}
 	return out.String(), nil
+}
+
+func templateIssue(issue any) any {
+	i, ok := issue.(domain.Issue)
+	if !ok {
+		if p, pointer := issue.(*domain.Issue); pointer && p != nil {
+			i, ok = *p, true
+		}
+	}
+	if !ok {
+		return issue
+	}
+	blockers := make([]map[string]any, 0, len(i.BlockedBy))
+	for _, b := range i.BlockedBy {
+		blockers = append(blockers, map[string]any{"id": b.ID, "identifier": b.Identifier, "state": b.State, "dispatchable": b.Dispatchable})
+	}
+	return map[string]any{
+		"id": i.ID, "identifier": i.Identifier, "title": i.Title, "description": i.Description,
+		"state": i.State, "branch_name": i.BranchName, "url": i.URL, "assignee_id": i.AssigneeID,
+		"native_ref": i.NativeRef, "priority": i.Priority, "labels": i.Labels, "blocked_by": blockers,
+		"dispatchable": i.Dispatchable, "created_at": i.CreatedAt, "updated_at": i.UpdatedAt,
+	}
 }
 
 type Store struct {
@@ -163,21 +336,29 @@ type Store struct {
 }
 
 func NewStore(path, logRoot string) (*Store, error) {
-	w, e := Load(path, logRoot)
-	if e != nil {
-		return nil, e
+	w, err := Load(path, logRoot)
+	if err != nil {
+		return nil, err
 	}
-	b, e := os.ReadFile(w.Config.WorkflowPath)
-	if e != nil {
-		return nil, e
+	b, err := os.ReadFile(w.Config.WorkflowPath)
+	if err != nil {
+		return nil, err
 	}
-	return &Store{path: path, logRoot: logRoot, current: w, digest: sha256.Sum256(b)}, nil
+	return &Store{path: w.Config.WorkflowPath, logRoot: logRoot, current: w, digest: sha256.Sum256(b)}, nil
 }
-func (s *Store) Current() Workflow { s.mu.RLock(); defer s.mu.RUnlock(); return s.current }
+
+func (s *Store) Current() Workflow {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.current
+}
+
+// Reload retains the last valid workflow when the new file is malformed. A
+// repeated invalid byte-for-byte version is ignored until it changes again.
 func (s *Store) Reload() error {
-	b, e := os.ReadFile(s.path)
-	if e != nil {
-		return e
+	b, err := os.ReadFile(s.path)
+	if err != nil {
+		return fmt.Errorf("missing_workflow_file: %w", err)
 	}
 	digest := sha256.Sum256(b)
 	s.mu.RLock()
@@ -186,12 +367,12 @@ func (s *Store) Reload() error {
 	if unchanged {
 		return nil
 	}
-	w, e := Load(s.path, s.logRoot)
-	if e != nil {
+	w, err := Load(s.path, s.logRoot)
+	if err != nil {
 		s.mu.Lock()
 		s.rejected, s.hasRejected = digest, true
 		s.mu.Unlock()
-		return e
+		return err
 	}
 	s.mu.Lock()
 	s.current = w
@@ -200,99 +381,240 @@ func (s *Store) Reload() error {
 	s.mu.Unlock()
 	return nil
 }
-func getMapFrom(m map[string]any, k string) map[string]any {
-	if x, ok := m[k].(map[string]any); ok {
-		return x
+
+func object(parent map[string]any, key string) (map[string]any, error) {
+	v, exists := parent[key]
+	if !exists {
+		return map[string]any{}, nil
 	}
-	return map[string]any{}
-}
-func str(v any) string { x, _ := v.(string); return strings.TrimSpace(x) }
-func defaultString(v, d string) string {
-	if v == "" {
-		return d
+	m, ok := v.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("invalid configuration: %s must be an object", key)
 	}
-	return v
+	return m, nil
 }
-func num(v any, d int) int {
-	switch x := v.(type) {
-	case int:
-		return x
-	case int64:
-		return int(x)
-	case float64:
-		return int(x)
+
+func stringValue(m map[string]any, key string) (string, error) {
+	v, exists := m[key]
+	if !exists {
+		return "", nil
 	}
-	return d
+	s, ok := v.(string)
+	if !ok {
+		return "", fmt.Errorf("invalid configuration: %s must be a string", key)
+	}
+	return s, nil
 }
-func ms(v any, d int) time.Duration { return time.Duration(num(v, d)) * time.Millisecond }
-func list(v any) []string {
-	xs, _ := v.([]any)
-	out := make([]string, 0, len(xs))
-	for _, x := range xs {
-		if y := str(x); y != "" {
-			out = append(out, y)
+
+func stringDefault(m map[string]any, key, fallback string) (string, error) {
+	v, exists := m[key]
+	if !exists {
+		return fallback, nil
+	}
+	s, ok := v.(string)
+	if !ok {
+		return "", fmt.Errorf("invalid configuration: %s must be a string", key)
+	}
+	return s, nil
+}
+
+func stringList(m map[string]any, key string) ([]string, error) {
+	v, exists := m[key]
+	if !exists {
+		return nil, nil
+	}
+	values, ok := v.([]any)
+	if !ok {
+		return nil, fmt.Errorf("invalid configuration: %s must be a list of strings", key)
+	}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		s, ok := value.(string)
+		if !ok {
+			return nil, fmt.Errorf("invalid configuration: %s must be a list of strings", key)
 		}
-	}
-	return out
-}
-func stringsLower(v []string) []string {
-	for i := range v {
-		v[i] = strings.ToLower(strings.TrimSpace(v[i]))
-	}
-	return v
-}
-func stateLimits(v any) map[string]int {
-	out := map[string]int{}
-	m, _ := v.(map[string]any)
-	for k, x := range m {
-		if n := num(x, 0); n > 0 {
-			out[strings.ToLower(strings.TrimSpace(k))] = n
+		if s = strings.TrimSpace(s); s != "" {
+			out = append(out, s)
 		}
-	}
-	return out
-}
-func expandEnv(v string) string {
-	if strings.HasPrefix(v, "$") && len(v) > 1 {
-		return os.Getenv(strings.TrimPrefix(v, "$"))
-	}
-	return os.ExpandEnv(v)
-}
-func resolveMap(m map[string]any) map[string]any {
-	out := map[string]any{}
-	for k, v := range m {
-		if x, ok := v.(string); ok {
-			out[k] = expandEnv(x)
-		} else {
-			out[k] = v
-		}
-	}
-	return out
-}
-func resolveProvider(m map[string]any, base string) (map[string]any, error) {
-	out := resolveMap(m)
-	file, _ := out["api_key_file"].(string)
-	if file == "" {
-		return out, nil
-	}
-	b, err := os.ReadFile(normalizePath(expandEnv(file), base))
-	if err != nil {
-		return nil, fmt.Errorf("invalid linear api_key_file: %w", err)
-	}
-	if value := strings.TrimSpace(string(b)); value == "" {
-		return nil, errors.New("invalid linear api_key_file: empty secret")
-	} else {
-		out["api_key"] = value
 	}
 	return out, nil
 }
-func normalizePath(v, base string) string {
-	if strings.HasPrefix(v, "~/") {
-		h, _ := os.UserHomeDir()
-		v = filepath.Join(h, v[2:])
+
+func integer(m map[string]any, key string, fallback int) (int, error) {
+	v, exists := m[key]
+	if !exists {
+		return fallback, nil
 	}
-	if !filepath.IsAbs(v) {
-		v = filepath.Join(base, v)
+	i, ok := v.(int)
+	if !ok {
+		return 0, fmt.Errorf("invalid configuration: %s must be an integer", key)
 	}
-	x, _ := filepath.Abs(filepath.Clean(v))
-	return x
+	return i, nil
+}
+
+func durationMS(m map[string]any, key string, fallback int) (time.Duration, error) {
+	i, err := integer(m, key, fallback)
+	if err != nil {
+		return 0, err
+	}
+	return time.Duration(i) * time.Millisecond, nil
+}
+
+func script(m map[string]any, key string) (string, error) {
+	v, exists := m[key]
+	if !exists || v == nil {
+		return "", nil
+	}
+	s, ok := v.(string)
+	if !ok {
+		return "", fmt.Errorf("invalid configuration: %s must be a string", key)
+	}
+	return s, nil
+}
+
+func stateLimits(v any) (map[string]int, error) {
+	out := map[string]int{}
+	if v == nil {
+		return out, nil
+	}
+	m, ok := v.(map[string]any)
+	if !ok {
+		return nil, errors.New("invalid configuration: max_concurrent_agents_by_state must be an object")
+	}
+	for state, value := range m {
+		limit, ok := value.(int)
+		// This map deliberately ignores invalid per-state entries, as specified.
+		if !ok || limit <= 0 || strings.TrimSpace(state) == "" {
+			continue
+		}
+		out[strings.ToLower(strings.TrimSpace(state))] = limit
+	}
+	return out, nil
+}
+
+func resolveProvider(m map[string]any, base string) (map[string]any, error) {
+	out := make(map[string]any, len(m)+1)
+	for key, value := range m {
+		out[key] = value
+	}
+	apiKey, hasAPIKey := out["api_key"]
+	if hasAPIKey {
+		if _, ok := apiKey.(string); !ok {
+			return nil, errors.New("invalid configuration: tracker.provider.api_key must be a string")
+		}
+	}
+	v, exists := out["api_key_file"]
+	if exists {
+		file, ok := v.(string)
+		if !ok {
+			return nil, errors.New("invalid configuration: tracker.provider.api_key_file must be a string")
+		}
+		file = resolveEnvReference(file)
+		if strings.TrimSpace(file) == "" {
+			return nil, errors.New("invalid linear api_key_file: empty path")
+		}
+		b, err := os.ReadFile(normalizePath(file, base))
+		if err != nil {
+			return nil, fmt.Errorf("invalid linear api_key_file: %w", err)
+		}
+		if value := strings.TrimSpace(string(b)); value == "" {
+			return nil, errors.New("invalid linear api_key_file: empty secret")
+		} else {
+			// The explicitly configured secret file takes precedence over an
+			// inline reference, including an unset inline $VAR reference.
+			out["api_key"] = value
+		}
+		return out, nil
+	}
+	if !hasAPIKey {
+		return out, nil
+	}
+	resolved := resolveEnvReference(apiKey.(string))
+	if strings.TrimSpace(resolved) == "" {
+		return nil, errors.New("invalid linear api_key: resolved secret is empty")
+	}
+	out["api_key"] = resolved
+	return out, nil
+}
+
+func pathValue(m map[string]any, key, fallback, base string) (string, error) {
+	v, exists := m[key]
+	if !exists {
+		return normalizePath(fallback, base), nil
+	}
+	s, ok := v.(string)
+	if !ok {
+		return "", fmt.Errorf("invalid configuration: %s must be a path string", key)
+	}
+	s = resolveEnvReference(s)
+	if strings.TrimSpace(s) == "" {
+		return "", fmt.Errorf("invalid configuration: %s must not be empty", key)
+	}
+	return normalizePath(s, base), nil
+}
+
+func optionalPathValue(m map[string]any, key, base string) (string, error) {
+	v, exists := m[key]
+	if !exists || v == nil {
+		return "", nil
+	}
+	s, ok := v.(string)
+	if !ok {
+		return "", fmt.Errorf("invalid configuration: %s must be a path string", key)
+	}
+	if strings.TrimSpace(s) == "" {
+		return "", nil
+	}
+	s = resolveEnvReference(s)
+	if strings.TrimSpace(s) == "" {
+		return "", nil
+	}
+	return normalizePath(s, base), nil
+}
+
+func resolveEnvReference(value string) string {
+	if !strings.HasPrefix(value, "$") || len(value) == 1 {
+		return value
+	}
+	name := value[1:]
+	for index, r := range name {
+		if !(r == '_' || unicode.IsLetter(r) || (index > 0 && unicode.IsDigit(r))) {
+			return value
+		}
+	}
+	return os.Getenv(name)
+}
+
+func normalizePath(value, base string) string {
+	if value == "~" || strings.HasPrefix(value, "~/") {
+		if home, err := os.UserHomeDir(); err == nil {
+			if value == "~" {
+				value = home
+			} else {
+				value = filepath.Join(home, value[2:])
+			}
+		}
+	}
+	if !filepath.IsAbs(value) {
+		value = filepath.Join(base, value)
+	}
+	abs, err := filepath.Abs(filepath.Clean(value))
+	if err != nil {
+		return filepath.Clean(value)
+	}
+	return abs
+}
+
+func logRootOrDefault(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return ".symphony/logs"
+	}
+	return value
+}
+
+func stringsLower(values []string) []string {
+	for i := range values {
+		values[i] = strings.ToLower(strings.TrimSpace(values[i]))
+	}
+	return values
 }
