@@ -44,10 +44,11 @@ The scheduler applies this policy before claiming an issue:
 | Corrupt, unknown, or ownership-mismatched state | Suppress and require manual recovery. |
 | Completion newer than Linear `updatedAt`, or Linear omits `updatedAt` | Suppress and require manual recovery. |
 
-Every Linear update changes `updatedAt`, including description, state, and
-comment changes. Make an intentional Linear edit only when it is safe for the
-issue to run again. Symphony reuses the existing issue workspace for that new
-lifecycle.
+An issue becomes eligible again only when Linear reports an `updatedAt` later
+than the completed marker, for example after a description or state edit that
+advances that field. Make an intentional edit only when it is safe for the
+issue to run again, and verify that `updatedAt` advanced. Symphony reuses the
+existing issue workspace for that new lifecycle.
 
 The coordinator writes `completed_updated_at` only after all configured
 bounded continuation turns complete normally and a final Linear refresh still
@@ -64,8 +65,9 @@ validation error and leaves the issue unclaimed. To recover deliberately:
    Git workspaces, review `git status --short` and `git log` before deciding
    whether the work is already complete or needs another run.
 3. If the marker is valid and the completed work is safe to redispatch, make a
-   meaningful Linear edit. Do not remove the marker; the later `updatedAt`
-   makes the new version eligible while retaining ownership and cleanup data.
+   description or state edit and verify that Linear advanced `updatedAt`. Do
+   not remove the marker; the later timestamp makes the new version eligible
+   while retaining ownership and cleanup data.
 4. If state is corrupt, unknown, or missing, move the existing workspace and
    marker (when present) to an operator-owned quarantine directory outside
    `workspace.root`. Preserve them together for review. Do not delete either
