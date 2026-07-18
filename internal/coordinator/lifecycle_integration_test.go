@@ -238,6 +238,11 @@ func TestCorruptLocalCompletionStateNeverStartsAgent(t *testing.T) {
 	agent := &lifecycleAgent{requests: make(chan domain.AgentRequest, 1)}
 	coordinator := New(tracker, agent, local, func() config.Settings { return settings }, nil)
 	coordinator.Tick(context.Background())
+	// Prepare deliberately schedules a retry when it sees the corrupt marker.
+	// Stop that background retry before TempDir cleanup removes its workspace.
+	if err := coordinator.Shutdown(context.Background()); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
 	if starts, _, _ := agent.counts(); starts != 0 {
 		t.Fatalf("corrupt marker started agent %d times", starts)
 	}
