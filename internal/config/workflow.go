@@ -497,34 +497,43 @@ func resolveProvider(m map[string]any, base string) (map[string]any, error) {
 	for key, value := range m {
 		out[key] = value
 	}
-	if v, exists := out["api_key"]; exists {
-		s, ok := v.(string)
-		if !ok {
+	apiKey, hasAPIKey := out["api_key"]
+	if hasAPIKey {
+		if _, ok := apiKey.(string); !ok {
 			return nil, errors.New("invalid configuration: tracker.provider.api_key must be a string")
 		}
-		out["api_key"] = resolveEnvReference(s)
 	}
 	v, exists := out["api_key_file"]
-	if !exists {
+	if exists {
+		file, ok := v.(string)
+		if !ok {
+			return nil, errors.New("invalid configuration: tracker.provider.api_key_file must be a string")
+		}
+		file = resolveEnvReference(file)
+		if strings.TrimSpace(file) == "" {
+			return nil, errors.New("invalid linear api_key_file: empty path")
+		}
+		b, err := os.ReadFile(normalizePath(file, base))
+		if err != nil {
+			return nil, fmt.Errorf("invalid linear api_key_file: %w", err)
+		}
+		if value := strings.TrimSpace(string(b)); value == "" {
+			return nil, errors.New("invalid linear api_key_file: empty secret")
+		} else {
+			// The explicitly configured secret file takes precedence over an
+			// inline reference, including an unset inline $VAR reference.
+			out["api_key"] = value
+		}
 		return out, nil
 	}
-	file, ok := v.(string)
-	if !ok {
-		return nil, errors.New("invalid configuration: tracker.provider.api_key_file must be a string")
+	if !hasAPIKey {
+		return out, nil
 	}
-	file = resolveEnvReference(file)
-	if strings.TrimSpace(file) == "" {
-		return nil, errors.New("invalid linear api_key_file: empty path")
+	resolved := resolveEnvReference(apiKey.(string))
+	if strings.TrimSpace(resolved) == "" {
+		return nil, errors.New("invalid linear api_key: resolved secret is empty")
 	}
-	b, err := os.ReadFile(normalizePath(file, base))
-	if err != nil {
-		return nil, fmt.Errorf("invalid linear api_key_file: %w", err)
-	}
-	if value := strings.TrimSpace(string(b)); value == "" {
-		return nil, errors.New("invalid linear api_key_file: empty secret")
-	} else {
-		out["api_key"] = value
-	}
+	out["api_key"] = resolved
 	return out, nil
 }
 

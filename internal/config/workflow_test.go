@@ -146,6 +146,51 @@ func TestEmptyRequiredPathReferenceIsRejected(t *testing.T) {
 	}
 }
 
+func TestEmptyAPIKeyReferenceRejectsReloadAndPreservesLastGoodWorkflow(t *testing.T) {
+	d := t.TempDir()
+	p := filepath.Join(d, "WORKFLOW.md")
+	t.Setenv("SYMPHONY_TEST_GOOD_KEY", "test-secret")
+	good := "---\ntracker: {kind: linear, provider: {api_key: $SYMPHONY_TEST_GOOD_KEY}, active_states: [Todo], terminal_states: [Done]}\n---\ngood"
+	if err := os.WriteFile(p, []byte(good), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := NewStore(p, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	invalid := "---\ntracker: {kind: linear, provider: {api_key: $UNSET_SYMPHONY_TEST_KEY}, active_states: [Todo], terminal_states: [Done]}\n---\nbad"
+	if err := os.WriteFile(p, []byte(invalid), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Reload(); err == nil || !strings.Contains(err.Error(), "resolved secret is empty") {
+		t.Fatalf("empty key reload error=%v", err)
+	}
+	current := s.Current()
+	if current.Prompt != "good" || current.Config.Tracker.Provider["api_key"] != "test-secret" {
+		t.Fatal("invalid reload replaced the last known good workflow")
+	}
+}
+
+func TestAPIKeyFileTakesPrecedenceOverInlineReference(t *testing.T) {
+	d := t.TempDir()
+	secret := filepath.Join(d, "linear-key")
+	if err := os.WriteFile(secret, []byte("file-secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(d, "WORKFLOW.md")
+	content := "---\ntracker: {kind: linear, provider: {api_key: $UNSET_SYMPHONY_TEST_KEY, api_key_file: linear-key}, active_states: [Todo], terminal_states: [Done]}\n---\nprompt"
+	if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	w, err := Load(p, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := w.Config.Tracker.Provider["api_key"]; got != "file-secret" {
+		t.Fatalf("file key precedence=%q", got)
+	}
+}
+
 func TestTemplateErrorsAreDeferredAndPromptContractIsLowercase(t *testing.T) {
 	d := t.TempDir()
 	p := filepath.Join(d, "WORKFLOW.md")
