@@ -8,23 +8,87 @@ deterministic local workspace.
 go run ./cmd/symphony --workflow ./WORKFLOW.md
 ```
 
-## Working with Symphony
+## Using Symphony
 
-1. Create one focused Linear issue, move it to **In Progress**, and work from
-   an isolated Git worktree—not the primary checkout.
-2. Keep the workflow policy in the repository. Configure
-   `workspace.source_root` for the source repository; Symphony creates a
-   separate agent workspace for each eligible issue.
-3. Validate the narrow change first, then run broader checks when shared
-   behavior changes. Review the generated workspace before keeping its work.
-4. Open a PR with **Why**, **What was changed**, and **On Call**; merge only
-   after required checks and review, then move the Linear issue to **Done**.
-5. Use `--dry-run` before any live run. Live smoke tests are manual and must
-   use dedicated Symphony test artifacts, never Dagligvare-app.
+Symphony turns focused Linear issues into isolated Codex workspaces. You keep
+control of the work: decide which issues are eligible, inspect each worktree,
+and create and review the pull request before marking the issue complete.
 
-For the delivery sequence, see [HOW_WE_WORK.md](HOW_WE_WORK.md). For runtime
-configuration and operational details, use [WORKFLOW.example.md](WORKFLOW.example.md)
-and [docs/architecture.md](docs/architecture.md).
+```mermaid
+flowchart LR
+    B[Backlog] --> T[Todo]
+    T --> I[In Progress]
+    I --> W[Symphony creates an isolated worktree]
+    W --> R[Review changes and open a PR]
+    R --> V[In Review]
+    V --> D[Done]
+    T --> C[Canceled]
+    I --> C
+```
+
+`Todo` and `In Progress` are the default active states: Symphony polls only
+those states and starts Codex only for eligible issues. `Todo` issues with
+unfinished blockers are held back. `In Review` is a useful optional handoff
+state; configure it explicitly if you want Symphony to let Codex hand an issue
+over. `Done` and `Canceled` are terminal, so Symphony stops work and cleans up
+only workspaces that are safe to remove. The available state names come from
+your Linear team; `active_states` and `terminal_states` in `WORKFLOW.md` are
+the source of truth.
+
+### Your workflow
+
+1. Create a small, clear issue in the Linear project configured for Symphony.
+   Put it in `Todo` when it is ready, or move it to `In Progress` when you want
+   it picked up immediately.
+2. Check the configuration and Linear connection without starting Codex:
+
+   ```sh
+   go run ./cmd/symphony --workflow ./WORKFLOW.md --dry-run
+   ```
+
+3. Start Symphony and leave it running while it polls for eligible issues:
+
+   ```sh
+   go run ./cmd/symphony --workflow ./WORKFLOW.md
+   ```
+
+4. Inspect the issue's generated worktree under `workspace.root` before you
+   keep the change. For the example configuration, use:
+
+   ```sh
+   git -C .symphony/workspaces/<issue-worktree> status
+   git -C .symphony/workspaces/<issue-worktree> diff
+   ```
+
+5. Create a pull request from the reviewed work, complete the normal review,
+   and then move the Linear issue to `Done`. Use `Canceled` when the work will
+   not continue. Do not move an issue to `Done` before its pull request merges.
+
+Use a separate, dedicated Linear project and credentials for any live smoke
+test. Always run `--dry-run` first. Never run a Symphony smoke test against
+Dagligvare-app or any of its Linear workspace, team, or projects.
+
+### Set up a repository
+
+1. Copy [WORKFLOW.example.md](WORKFLOW.example.md) to `WORKFLOW.md` in the
+   repository you want Symphony to work on. The file is versioned policy and
+   also contains the prompt Codex receives.
+2. Under `tracker.provider`, set `project_slug` to that Linear project's slug
+   ID. Supply its API key with `api_key: $LINEAR_API_KEY`, or point
+   `api_key_file` at a local file with mode `600`; never commit the key.
+3. Set the states Symphony should process and finish. The example uses
+   `active_states: [Todo, In Progress]` and
+   `terminal_states: [Done, Canceled]`. If you use `In Review`, set
+   `tracker.provider.handoff_state: In Review` as well.
+4. Set `workspace.root` to a writable location and `workspace.source_root: .`
+   to create a detached Git worktree for each issue. Keep `source_root` on a
+   committed Git repository; Symphony never runs Codex in the original
+   checkout.
+5. Run the dry-run command above. Once it succeeds, start Symphony.
+
+For all configuration fields, see [WORKFLOW.example.md](WORKFLOW.example.md)
+and the [Linear tracker profile](docs/linear-tracker.md). The trust and
+workspace model are described in [docs/architecture.md](docs/architecture.md).
 
 Run with `--dry-run` to validate configuration and scheduling without starting
 Codex. A live smoke test is opt-in: set `LINEAR_API_KEY`, configure a dedicated
@@ -50,17 +114,6 @@ Relative workspace and log paths are resolved from the workflow file; omitted
 See [docs/architecture.md](docs/architecture.md), the
 [Linear tracker profile](docs/linear-tracker.md), and
 [WORKFLOW.example.md](WORKFLOW.example.md).
-
-For ongoing repository development, configure `workspace.source_root: .`.
-Symphony then creates one detached Git worktree per issue beneath
-`workspace.root`; the original checkout is never used as an agent workspace.
-Create focused issues in the configured Linear project and move them to `Todo`
-or `In Progress` to make them eligible. Symphony records a completed turn and
-will not rerun an unchanged issue; editing the issue makes it eligible again.
-Review each worktree's changes before merging or cherry-picking them into your
-development branch. Terminal cleanup preserves worktrees with uncommitted,
-untracked, or newly committed changes rather than deleting work that needs
-review.
 
 To let a Codex session hand an issue off safely, optionally configure
 `tracker.provider.handoff_state` (and, if useful, a fixed
