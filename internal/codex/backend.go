@@ -72,6 +72,7 @@ func (b *Backend) Start(ctx context.Context, r domain.AgentRequest) (domain.Agen
 			return handoff != nil && handoff.MatchesSecret(candidate) || githubSession != nil && githubSession.MatchesSecret(candidate)
 		}
 	}
+	r.TurnSandboxPolicy = localCommitSandbox(r)
 	c, err := start(ctx, r, b.secretNames, secretMatcher, handoff, githubSession)
 	if err != nil {
 		return domain.AgentSession{}, nil, err
@@ -261,6 +262,55 @@ func start(ctx context.Context, r domain.AgentRequest, secrets []string, secretM
 		close(c.exited)
 	}()
 	return c, nil
+}
+
+// localCommitSandbox extends only workspace-write turns with the Git common
+// directory that Symphony validated for this linked worktree. The worker still
+// has no network or GitHub credential, while git commit can write its index and
+// object database outside the worktree directory.
+func localCommitSandbox(r domain.AgentRequest) any {
+	root := strings.TrimSpace(r.GitMetadataRoot)
+	if root == "" || r.ThreadSandbox != "workspace-write" {
+		return r.TurnSandboxPolicy
+	}
+	if r.TurnSandboxPolicy == nil {
+		return map[string]any{"type": "workspaceWrite", "writableRoots": []string{root}}
+	}
+	policy, ok := r.TurnSandboxPolicy.(map[string]any)
+	if !ok || policy["type"] != "workspaceWrite" {
+		return r.TurnSandboxPolicy
+	}
+	copy := make(map[string]any, len(policy)+1)
+	for key, value := range policy {
+		copy[key] = value
+	}
+	roots := []string{root}
+	if configured, ok := copy["writableRoots"].([]string); ok {
+		roots = append(configured, root)
+	} else if configured, ok := copy["writableRoots"].([]any); ok {
+		roots = roots[:0]
+		for _, value := range configured {
+			if path, ok := value.(string); ok && strings.TrimSpace(path) != "" {
+				roots = append(roots, path)
+			}
+		}
+		roots = append(roots, root)
+	}
+	copy["writableRoots"] = uniquePaths(roots)
+	return copy
+}
+
+func uniquePaths(paths []string) []string {
+	seen := make(map[string]bool, len(paths))
+	out := make([]string, 0, len(paths))
+	for _, path := range paths {
+		path = strings.TrimSpace(path)
+		if path != "" && !seen[path] {
+			seen[path] = true
+			out = append(out, path)
+		}
+	}
+	return out
 }
 func filteredEnv(names []string, secretMatcher func(string) bool) []string {
 	blocked := map[string]bool{}

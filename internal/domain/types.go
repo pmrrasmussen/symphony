@@ -68,7 +68,8 @@ type Tracker interface {
 }
 type AgentRequest struct {
 	Issue                         Issue
-	Workspace, Prompt, Command    string
+	Workspace, GitMetadataRoot    string
+	Prompt, Command               string
 	ApprovalPolicy, ThreadSandbox string
 	TurnSandboxPolicy             any
 	TurnTimeout, ReadTimeout      time.Duration
@@ -80,8 +81,8 @@ type AgentBackend interface {
 	Cancel(context.Context, AgentSession) error
 }
 type Workspace struct {
-	Path, Key  string
-	CreatedNow bool
+	Path, Key, GitMetadataRoot string
+	CreatedNow                 bool
 }
 type WorkspaceExecutor interface {
 	// ShouldRun reports whether an issue version has not already completed in its

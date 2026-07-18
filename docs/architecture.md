@@ -60,7 +60,10 @@ When `workspace.source_root` is configured, `LocalWorkspaceExecutor` creates a
 detached Git worktree for each issue. This isolates Codex changes from the
 checkout running Symphony; a human must review and integrate the resulting
 changes. The source root must already have a commit, and Git worktrees require
-the local repository to be trusted. Completion markers are held below the
+the local repository to be trusted. A workspace-write Codex turn receives the
+validated common Git directory for that linked worktree so it can create local
+commits; this does not grant network access or a GitHub credential. The host
+still owns all GitHub publishing authority. Completion markers are held below the
 configured workspace root and are keyed to the issue's Linear `updatedAt`
 value: a completed unchanged issue is not dispatched again, while a later
 issue edit is eligible for another bounded lifecycle. Invalid state and state

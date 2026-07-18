@@ -171,6 +171,9 @@ func TestPrepareUsesDetachedGitWorktree(t *testing.T) {
 	if err != nil || !found || state.BaseCommit == "" {
 		t.Fatalf("detached worktree base commit was not recorded: state=%+v found=%t err=%v", state, found, err)
 	}
+	if ws.GitMetadataRoot != state.GitCommonDir {
+		t.Fatalf("Git metadata root=%q, want recorded common directory %q", ws.GitMetadataRoot, state.GitCommonDir)
+	}
 	if err := l.Cleanup(context.Background(), issue); err != nil {
 		t.Fatal(err)
 	}

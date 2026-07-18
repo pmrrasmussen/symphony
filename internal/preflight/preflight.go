@@ -57,6 +57,15 @@ func Run(ctx context.Context, workflowPath, logRoot string) Result {
 	for _, warning := range settings.Warnings {
 		result.add("workflow_migration", StatusWarning, warning)
 	}
+	if settings.GitHub.Enabled && settings.Tracker.HandoffState != "" {
+		result.add("github_handoff", StatusPassed, "host-side pull request publishing is enabled for the configured handoff state")
+	} else if settings.GitHub.Enabled {
+		result.add("github_handoff", StatusWarning, "host-side pull request publishing is unavailable: configure tracker.provider.handoff_state")
+	} else if settings.Tracker.HandoffState != "" {
+		result.add("github_handoff", StatusWarning, "host-side pull request publishing is unavailable: configure the fixed github integration")
+	} else {
+		result.add("github_handoff", StatusWarning, "host-side pull request publishing is unavailable; workers will use manual delivery mode")
+	}
 
 	tracker := linear.New(func() config.Settings { return settings })
 	if err := tracker.Validate(); err != nil {

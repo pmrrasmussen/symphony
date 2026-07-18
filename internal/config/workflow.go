@@ -445,6 +445,30 @@ func (s Settings) Render(issue any, attempt int) (string, error) {
 	return out.String(), nil
 }
 
+// DeliveryInstructions describe the only PR delivery capability available to
+// a worker. Host-generated guidance prevents a stale repository prompt from
+// telling a restricted worker to publish directly to GitHub.
+func (s Settings) DeliveryInstructions() string {
+	if s.GitHub.Enabled && s.Tracker.HandoffState != "" {
+		return `Delivery mode: host-side publish is available for this run.
+
+- Make and validate the change in this workspace, then create a local commit.
+- Do not run gh, git push, or otherwise try to publish directly to GitHub.
+- When the worktree is clean and committed, call github_publish_pr with no arguments. It is bound to this issue, repository, and branch and will create or reuse the PR and hand the issue to review.`
+	}
+	requirements := "configure github.owner, github.repository, github.base_branch, and a repository-scoped GitHub token"
+	if s.GitHub.Enabled {
+		requirements = "configure tracker.provider.handoff_state in addition to the existing GitHub settings"
+	} else if s.Tracker.HandoffState != "" {
+		requirements = "configure the fixed github owner, repository, base branch, and repository-scoped token"
+	}
+	return `Delivery mode: manual. Host-side PR publishing is unavailable for this run.
+
+- Do not run gh, git push, or try to open a pull request directly.
+- You may make and commit local changes, but leave the issue active after reporting the ready work.
+- Report this actionable blocker: PR handoff is unavailable; ` + requirements + `.`
+}
+
 // RenderHandoffComment renders the repository-owned optional comment template.
 // It is never populated from a Codex tool argument, so a handoff comment has
 // the same reviewable policy source as the target state.
