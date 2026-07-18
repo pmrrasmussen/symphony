@@ -229,7 +229,7 @@ func TestHandoffBindsIssueProjectTeamAndFixedOperations(t *testing.T) {
 			}
 			writeJSON(t, w, map[string]any{"data": map[string]any{"issue": map[string]any{
 				"id": "active", "identifier": "PMR-5", "title": "Handoff", "description": "safe", "url": "https://linear.app/issue/PMR-5",
-				"project": map[string]string{"slugId": "project-1"}, "team": map[string]string{"id": "team-1"}, "state": map[string]string{"name": "Todo"},
+				"project": map[string]string{"slugId": "project-1"}, "team": map[string]string{"id": "team-1"}, "state": map[string]string{"id": "todo", "name": "Todo"},
 			}}})
 		case strings.Contains(query, "SymphonyLinearHandoffStates"):
 			if got := variables["teamID"]; got != "team-1" {
@@ -246,6 +246,8 @@ func TestHandoffBindsIssueProjectTeamAndFixedOperations(t *testing.T) {
 				t.Errorf("transition stateID=%v", got)
 			}
 			writeJSON(t, w, map[string]any{"data": map[string]any{"issueUpdate": map[string]bool{"success": true}}})
+		case strings.Contains(query, "SymphonyLinearHandoffComments"):
+			writeJSON(t, w, map[string]any{"data": map[string]any{"issue": map[string]any{"id": "active", "project": map[string]string{"slugId": "project-1"}, "team": map[string]string{"id": "team-1"}, "comments": map[string]any{"nodes": []any{}, "pageInfo": map[string]any{"hasNextPage": false, "endCursor": nil}}}}})
 		case strings.Contains(query, "SymphonyLinearHandoffComment"):
 			if got := variables["issueID"]; got != "active" {
 				t.Errorf("comment issueID=%v", got)
@@ -280,7 +282,7 @@ func TestHandoffBindsIssueProjectTeamAndFixedOperations(t *testing.T) {
 	if _, err := session.Call(context.Background(), json.RawMessage(`{"operation":"handoff","issueID":"other"}`)); err == nil {
 		t.Fatal("arbitrary issue argument was accepted")
 	}
-	if len(calls) != 8 { // prepare read+state; revalidate before each mutation
+	if len(calls) != 10 { // prepare read+state; handoff reconciliation; explicit comment validation
 		t.Fatalf("calls=%d", len(calls))
 	}
 }
@@ -299,7 +301,7 @@ func TestHandoffRejectsHumanTerminalChangeBeforeMutation(t *testing.T) {
 				state = "Done" // a human completed it after session setup
 			}
 			writeJSON(t, w, map[string]any{"data": map[string]any{"issue": map[string]any{
-				"id": "active", "identifier": "PMR-5", "title": "Handoff", "project": map[string]string{"slugId": "project-1"}, "team": map[string]string{"id": "team-1"}, "state": map[string]string{"name": state},
+				"id": "active", "identifier": "PMR-5", "title": "Handoff", "project": map[string]string{"slugId": "project-1"}, "team": map[string]string{"id": "team-1"}, "state": map[string]string{"id": strings.ToLower(strings.ReplaceAll(state, " ", "-")), "name": state},
 			}}})
 		case strings.Contains(query, "SymphonyLinearHandoffStates"):
 			writeJSON(t, w, map[string]any{"data": map[string]any{"team": map[string]any{"id": "team-1", "states": map[string]any{"nodes": []any{map[string]string{"id": "review", "name": "In Review"}}}}}})
@@ -325,7 +327,7 @@ func TestHandoffRejectsHumanTerminalChangeBeforeMutation(t *testing.T) {
 func TestHandoffRejectsIssueOutsideConfiguredProject(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(t, w, map[string]any{"data": map[string]any{"issue": map[string]any{
-			"id": "active", "identifier": "PMR-5", "title": "Handoff", "project": map[string]string{"slugId": "wrong"}, "team": map[string]string{"id": "team-1"}, "state": map[string]string{"name": "Todo"},
+			"id": "active", "identifier": "PMR-5", "title": "Handoff", "project": map[string]string{"slugId": "wrong"}, "team": map[string]string{"id": "team-1"}, "state": map[string]string{"id": "todo", "name": "Todo"},
 		}}})
 	}))
 	defer server.Close()
