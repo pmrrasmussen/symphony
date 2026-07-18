@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"sort"
@@ -71,7 +72,10 @@ func (t *Tracker) Validate() error {
 		if strings.TrimSpace(value) != "" {
 			u, err := url.Parse(value)
 			if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
-				return trackerError("invalid_tracker_config", "linear endpoint must be an absolute HTTP URL")
+				return trackerError("invalid_tracker_config", "linear endpoint must be an absolute HTTP(S) URL")
+			}
+			if u.Scheme == "http" && !isLocalHTTPHost(u.Hostname()) {
+				return trackerError("invalid_tracker_config", "linear endpoint must use HTTPS unless it is a local test host")
 			}
 		}
 	}
@@ -346,6 +350,9 @@ type linearIssue struct {
 				} `json:"state"`
 			} `json:"issue"`
 		} `json:"nodes"`
+		PageInfo *struct {
+			HasNextPage bool `json:"hasNextPage"`
+		} `json:"pageInfo"`
 	} `json:"inverseRelations"`
 	CreatedAt json.RawMessage `json:"createdAt"`
 	UpdatedAt json.RawMessage `json:"updatedAt"`
@@ -399,6 +406,7 @@ func normalizeIssue(record linearIssue, assignee string, terminalStates []string
 	if record.Assignee != nil {
 		assigneeID = strings.TrimSpace(record.Assignee.ID)
 	}
+	blockersComplete := record.InverseRelations.PageInfo != nil && !record.InverseRelations.PageInfo.HasNextPage
 	return domain.Issue{
 		ID:           id,
 		Identifier:   identifier,
@@ -411,13 +419,13 @@ func normalizeIssue(record linearIssue, assignee string, terminalStates []string
 		AssigneeID:   assigneeID,
 		Labels:       labels,
 		BlockedBy:    blockers,
-		Dispatchable: dispatchable(state, assigneeID, assignee, blockers, terminalStates),
+		Dispatchable: dispatchable(state, assigneeID, assignee, blockers, blockersComplete, terminalStates),
 		CreatedAt:    optionalTime(record.CreatedAt),
 		UpdatedAt:    optionalTime(record.UpdatedAt),
 	}, nil
 }
 
-func dispatchable(state, actualAssignee, configuredAssignee string, blockers []domain.Blocker, terminalStates []string) bool {
+func dispatchable(state, actualAssignee, configuredAssignee string, blockers []domain.Blocker, blockersComplete bool, terminalStates []string) bool {
 	if configuredAssignee != "" && actualAssignee != configuredAssignee {
 		return false
 	}
@@ -425,6 +433,11 @@ func dispatchable(state, actualAssignee, configuredAssignee string, blockers []d
 	// dispatch. An already in-progress issue remains visible for reconciliation.
 	if norm(state) != "todo" {
 		return true
+	}
+	// The relation query is bounded. Never dispatch a Todo issue when Linear
+	// indicates (or fails to disprove) that additional blockers exist.
+	if !blockersComplete {
+		return false
 	}
 	terminal := map[string]bool{}
 	for _, name := range terminalStates {
@@ -483,7 +496,15 @@ func retryAfter(value string) time.Duration {
 	return time.Duration(seconds) * time.Second
 }
 
-const issueFields = `id identifier title description priority state { name } branchName url assignee { id } labels { nodes { name } } inverseRelations(first: $relationFirst) { nodes { type issue { id identifier state { name } } } } createdAt updatedAt`
+func isLocalHTTPHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+const issueFields = `id identifier title description priority state { name } branchName url assignee { id } labels { nodes { name } } inverseRelations(first: $relationFirst) { nodes { type issue { id identifier state { name } } } pageInfo { hasNextPage } } createdAt updatedAt`
 
 const queryByStates = `query SymphonyLinearPoll($projectSlug: String!, $stateNames: [String!]!, $first: Int!, $relationFirst: Int!, $after: String) { issues(filter: {project: {slugId: {eq: $projectSlug}}, state: {name: {in: $stateNames}}}, first: $first, after: $after) { nodes { ` + issueFields + ` } pageInfo { hasNextPage endCursor } } }`
 const queryByIDs = `query SymphonyLinearIssuesByID($ids: [ID!]!, $projectSlug: String!, $first: Int!, $relationFirst: Int!) { issues(filter: {id: {in: $ids}, project: {slugId: {eq: $projectSlug}}}, first: $first) { nodes { ` + issueFields + ` } } }`

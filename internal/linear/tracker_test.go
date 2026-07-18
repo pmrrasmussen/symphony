@@ -173,6 +173,49 @@ func TestAssigneeMeAndFixedPolicy(t *testing.T) {
 	}
 }
 
+func TestTodoWithTruncatedBlockersIsNotDispatchable(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		item := issue("one", "PMR-1", "First", "Todo", "", nil, nil)
+		item["inverseRelations"] = map[string]any{
+			"nodes":    []any{},
+			"pageInfo": map[string]any{"hasNextPage": true},
+		}
+		writeJSON(t, w, issuePage([]any{item}, false, ""))
+	}))
+	defer server.Close()
+
+	issues, err := newTestTracker(server.URL, "").ListCandidates(context.Background(), []string{"Todo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(issues) != 1 || issues[0].Dispatchable {
+		t.Fatalf("truncated blockers must conservatively block dispatch: %#v", issues)
+	}
+}
+
+func TestEndpointRequiresHTTPSOutsideLocalTestHosts(t *testing.T) {
+	for _, endpoint := range []string{
+		"http://example.com/graphql",
+		"http://localhost.example.com/graphql",
+	} {
+		if err := newTestTracker(endpoint, "").Validate(); err == nil {
+			t.Fatalf("endpoint %q unexpectedly validated", endpoint)
+		} else {
+			assertCategory(t, err, "invalid_tracker_config")
+		}
+	}
+	for _, endpoint := range []string{
+		"https://example.com/graphql",
+		"http://localhost:8080/graphql",
+		"http://127.0.0.1:8080/graphql",
+		"http://[::1]:8080/graphql",
+	} {
+		if err := newTestTracker(endpoint, "").Validate(); err != nil {
+			t.Fatalf("endpoint %q validation failed: %v", endpoint, err)
+		}
+	}
+}
+
 func TestGraphQLErrorsAreClassifiedAndRedacted(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(t, w, map[string]any{"errors": []map[string]string{{"message": "test-token must never be exposed"}}})
@@ -241,7 +284,7 @@ func issue(id, identifier, title, state, assignee string, labels []string, relat
 	value := map[string]any{
 		"id": id, "identifier": identifier, "title": title, "description": " description ", "priority": 2,
 		"state": map[string]string{"name": state}, "branchName": " branch ", "url": " https://linear.app/issue ",
-		"labels": map[string]any{"nodes": labelNodes}, "inverseRelations": map[string]any{"nodes": relationNodes},
+		"labels": map[string]any{"nodes": labelNodes}, "inverseRelations": map[string]any{"nodes": relationNodes, "pageInfo": map[string]any{"hasNextPage": false}},
 		"createdAt": "invalid-timestamp", "updatedAt": time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC).Format(time.RFC3339),
 	}
 	if assignee == "" {

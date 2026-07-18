@@ -8,7 +8,7 @@
 | `project_slug` | yes | Linear project slug ID. Every read is restricted to this project. |
 | `api_key` | yes | Linear personal API key. `$VARNAME` expansion is supported by `WORKFLOW.md`; it is never logged. |
 | `api_key_file` | optional | Trusted local file containing the API key; it is resolved by configuration loading. |
-| `endpoint` | optional | Absolute HTTP(S) GraphQL endpoint; defaults to `https://api.linear.app/graphql`. Useful for tests only. |
+| `endpoint` | optional | Absolute HTTPS GraphQL endpoint; defaults to `https://api.linear.app/graphql`. HTTP is accepted only for `localhost`, `127.0.0.1`, or `::1` test hosts. |
 | `assignee` | optional | Unset permits all assignees. A non-empty ID permits only that assignee. `me` resolves the current Linear viewer ID for each read. |
 
 Invalid provider values produce `invalid_tracker_config`; a missing or empty key
@@ -27,7 +27,9 @@ additional provider ID is needed. Required `id`, `identifier`, `title`, and
 malformed records, while refresh reads fail. Labels are lowercase, blank labels
 are dropped, and duplicate labels are removed. Invalid optional timestamps and
 priority values normalize to null. `inverseRelations` with type `blocks` become
-best-effort `blocked_by` records.
+best-effort `blocked_by` records. The bounded relation query includes page info;
+a `Todo` issue is conservatively non-dispatchable if all blocker relations were
+not returned.
 
 An issue is dispatchable only when it matches the optional assignee policy and,
 while in `Todo`, has no blocker outside the workflow's terminal states. A
