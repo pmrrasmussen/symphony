@@ -63,8 +63,12 @@ changes. The source root must already have a commit, and Git worktrees require
 the local repository to be trusted. Completion markers are held below the
 configured workspace root and are keyed to the issue's Linear `updatedAt`
 value: a completed unchanged issue is not dispatched again, while a later
-issue edit is eligible for another turn. Cleanup refuses to remove a worktree
-with local changes or a commit that differs from its recorded base revision.
+issue edit is eligible for another bounded lifecycle. Invalid state and state
+missing beside an existing workspace fail closed. The schema, exact dispatch
+policy, and deliberate operator remediation procedure are documented in
+[completion markers and recovery](completion-markers.md). Cleanup refuses to
+remove a worktree with local changes or a commit that differs from its recorded
+base revision.
 
 Workspace containment is checked against canonical filesystem paths, including
 existing symlink ancestors. Service-owned workspace directories, the durable
@@ -88,8 +92,8 @@ continue on the same live Codex session, with a scheduler-controlled one-second
 delay between turns, until `agent.max_turns`. At that boundary this profile
 writes the durable completion marker for the refreshed issue version and does
 not schedule the upstream specification's separate one-second, new-worker
-continuation retry. This preserves restart suppression for unchanged work;
-PMR-15 owns any change to completion-marker recovery after a bounded run.
+continuation retry. This preserves restart suppression for unchanged work and
+makes a later Linear update the explicit redispatch boundary.
 
 The upstream workflow schema does not define a continuation-prompt setting.
 Accordingly, the workflow body remains the configured first-turn task prompt,

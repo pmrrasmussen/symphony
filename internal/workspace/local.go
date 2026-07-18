@@ -2,11 +2,13 @@
 package workspace
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -22,6 +24,8 @@ const maxHookOutput = 16 << 10
 
 const stateDirectory = ".symphony-state"
 
+const workspaceStateSchema = "symphony.workspace-state/v1"
+
 var unsafe = regexp.MustCompile(`[^A-Za-z0-9._-]`)
 
 type Local struct{ settings func() config.Settings }
@@ -31,6 +35,7 @@ type Local struct{ settings func() config.Settings }
 // service restart and includes the initial detached-worktree commit so cleanup
 // can refuse to delete work that was changed or committed locally.
 type workspaceState struct {
+	Schema             string     `json:"schema,omitempty"`
 	IssueID            string     `json:"issue_id"`
 	Identifier         string     `json:"identifier"`
 	BaseCommit         string     `json:"base_commit,omitempty"`
@@ -58,13 +63,37 @@ func (l *Local) ShouldRun(ctx context.Context, issue domain.Issue) (bool, error)
 		return false, err
 	}
 	state, found, err := l.loadState(issue)
-	if err != nil || !found {
-		return true, err
+	if err != nil {
+		return false, err
 	}
-	if state.IssueID != issue.ID || state.CompletedUpdatedAt == nil {
+	if !found {
+		path, pathErr := l.workspacePath(issue)
+		if pathErr != nil {
+			return false, pathErr
+		}
+		if _, statErr := os.Stat(path); statErr == nil {
+			return false, fmt.Errorf("workspace state is missing for existing workspace %q; manual recovery is required", path)
+		} else if !os.IsNotExist(statErr) {
+			return false, fmt.Errorf("inspect workspace without state: %w", statErr)
+		}
 		return true, nil
 	}
-	return !sameTime(state.CompletedUpdatedAt, issue.UpdatedAt), nil
+	if err := validateStateOwner(state, issue); err != nil {
+		return false, err
+	}
+	if state.CompletedUpdatedAt == nil {
+		return true, nil
+	}
+	if issue.UpdatedAt == nil {
+		return false, errors.New("completed workspace state cannot be compared with an issue missing updated_at")
+	}
+	if sameTime(state.CompletedUpdatedAt, issue.UpdatedAt) {
+		return false, nil
+	}
+	if issue.UpdatedAt.After(*state.CompletedUpdatedAt) {
+		return true, nil
+	}
+	return false, fmt.Errorf("issue updated_at %s predates completed workspace state %s; manual recovery is required", issue.UpdatedAt.Format(time.RFC3339Nano), state.CompletedUpdatedAt.Format(time.RFC3339Nano))
 }
 
 func (l *Local) Prepare(ctx context.Context, issue domain.Issue) (domain.Workspace, error) {
@@ -138,12 +167,15 @@ func (l *Local) MarkCompleted(ctx context.Context, ws domain.Workspace, issue do
 	if filepath.Clean(ws.Path) != expected {
 		return fmt.Errorf("completion workspace does not match issue workspace")
 	}
+	if issue.UpdatedAt == nil {
+		return errors.New("cannot mark completion for issue missing updated_at")
+	}
 	state, found, err := l.loadState(issue)
 	if err != nil {
 		return err
 	}
 	if !found {
-		state = workspaceState{IssueID: issue.ID, Identifier: issue.Identifier}
+		state = workspaceState{Schema: workspaceStateSchema, IssueID: issue.ID, Identifier: issue.Identifier}
 		if git, err := isGitWorkspace(ws.Path); err != nil {
 			return err
 		} else if git {
@@ -153,9 +185,10 @@ func (l *Local) MarkCompleted(ctx context.Context, ws domain.Workspace, issue do
 			}
 		}
 	}
-	if state.IssueID != "" && state.IssueID != issue.ID {
-		return fmt.Errorf("workspace state belongs to issue %q, not %q", state.IssueID, issue.ID)
+	if err := validateStateOwner(state, issue); err != nil {
+		return err
 	}
+	state.Schema = workspaceStateSchema
 	state.IssueID = issue.ID
 	state.Identifier = issue.Identifier
 	state.CompletedUpdatedAt = cloneTime(issue.UpdatedAt)
@@ -253,13 +286,44 @@ func (l *Local) loadState(issue domain.Issue) (workspaceState, bool, error) {
 		return workspaceState{}, false, nil
 	}
 	if err != nil {
-		return workspaceState{}, false, fmt.Errorf("read workspace state: %w", err)
+		return workspaceState{}, false, fmt.Errorf("read workspace state %q: %w", path, err)
 	}
 	var state workspaceState
-	if err := json.Unmarshal(b, &state); err != nil {
-		return workspaceState{}, false, fmt.Errorf("decode workspace state: %w", err)
+	decoder := json.NewDecoder(bytes.NewReader(b))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&state); err != nil {
+		return workspaceState{}, false, fmt.Errorf("decode workspace state %q: %w", path, err)
+	}
+	if err := ensureJSONEOF(decoder); err != nil {
+		return workspaceState{}, false, fmt.Errorf("decode workspace state %q: %w", path, err)
+	}
+	if state.Schema != "" && state.Schema != workspaceStateSchema {
+		return workspaceState{}, false, fmt.Errorf("workspace state %q uses unsupported schema %q; manual recovery is required", path, state.Schema)
+	}
+	if strings.TrimSpace(state.IssueID) == "" || strings.TrimSpace(state.Identifier) == "" {
+		return workspaceState{}, false, fmt.Errorf("workspace state %q is missing required ownership fields; manual recovery is required", path)
 	}
 	return state, true, nil
+}
+
+func ensureJSONEOF(decoder *json.Decoder) error {
+	var extra any
+	if err := decoder.Decode(&extra); err == io.EOF {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	return errors.New("workspace state contains multiple JSON values")
+}
+
+func validateStateOwner(state workspaceState, issue domain.Issue) error {
+	if state.IssueID != issue.ID {
+		return fmt.Errorf("workspace state belongs to issue %q, not %q; manual recovery is required", state.IssueID, issue.ID)
+	}
+	if state.Identifier != issue.Identifier {
+		return fmt.Errorf("workspace state identifier is %q, not %q; manual recovery is required", state.Identifier, issue.Identifier)
+	}
+	return nil
 }
 
 func (l *Local) writeState(issue domain.Issue, state workspaceState) error {
@@ -273,6 +337,7 @@ func (l *Local) writeState(issue domain.Issue, state workspaceState) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("create workspace state directory: %w", err)
 	}
+	state.Schema = workspaceStateSchema
 	b, err := json.Marshal(state)
 	if err != nil {
 		return fmt.Errorf("encode workspace state: %w", err)
@@ -316,11 +381,16 @@ func (l *Local) ensureState(ctx context.Context, ws domain.Workspace, issue doma
 	if err != nil {
 		return err
 	}
-	if found && state.IssueID != "" && state.IssueID != issue.ID {
-		return fmt.Errorf("workspace state belongs to issue %q, not %q", state.IssueID, issue.ID)
+	if found {
+		if err := validateStateOwner(state, issue); err != nil {
+			return err
+		}
 	}
 	if !found {
-		state = workspaceState{IssueID: issue.ID, Identifier: issue.Identifier}
+		if !ws.CreatedNow {
+			return errors.New("workspace state is missing for an existing workspace; manual recovery is required")
+		}
+		state = workspaceState{Schema: workspaceStateSchema, IssueID: issue.ID, Identifier: issue.Identifier}
 	}
 	git, err := isGitWorkspace(ws.Path)
 	if err != nil {

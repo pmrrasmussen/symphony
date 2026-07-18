@@ -84,7 +84,8 @@ Relative workspace and log paths are resolved from the workflow file; omitted
 `symphony_workspaces` path.
 
 See [docs/architecture.md](docs/architecture.md), the
-[Linear tracker profile](docs/linear-tracker.md), and
+[Linear tracker profile](docs/linear-tracker.md), the
+[completion-marker recovery guide](docs/completion-markers.md), and
 [WORKFLOW.example.md](WORKFLOW.example.md).
 
 For ongoing repository development, configure `workspace.source_root: .`.
@@ -93,6 +94,8 @@ Symphony then creates one detached Git worktree per issue beneath
 Create focused issues in the configured Linear project and move them to `Todo`
 or `In Progress` to make them eligible. Symphony records a completed turn and
 will not rerun an unchanged issue; editing the issue makes it eligible again.
+Invalid or missing state beside an existing workspace fails closed; follow the
+[marker recovery procedure](docs/completion-markers.md) before redispatch.
 Review each worktree's changes before merging or cherry-picking them into your
 development branch. Terminal cleanup preserves worktrees with uncommitted,
 untracked, or newly committed changes rather than deleting work that needs

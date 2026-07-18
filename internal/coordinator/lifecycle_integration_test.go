@@ -49,12 +49,13 @@ func (t *lifecycleTracker) setIssue(issue domain.Issue) {
 }
 
 type lifecycleAgent struct {
-	mu       sync.Mutex
-	starts   int
-	cancels  int
-	block    bool
-	requests chan domain.AgentRequest
-	sent     []domain.EventKind
+	mu        sync.Mutex
+	starts    int
+	continues int
+	cancels   int
+	block     bool
+	requests  chan domain.AgentRequest
+	sent      []domain.EventKind
 }
 
 func (a *lifecycleAgent) Start(_ context.Context, request domain.AgentRequest) (domain.AgentSession, <-chan domain.Event, error) {
@@ -83,8 +84,14 @@ func (a *lifecycleAgent) Start(_ context.Context, request domain.AgentRequest) (
 	return domain.AgentSession{ID: "session", ThreadID: "thread", TurnID: "turn"}, events, nil
 }
 
-func (*lifecycleAgent) Continue(context.Context, domain.AgentSession, string) (<-chan domain.Event, error) {
-	return nil, nil
+func (a *lifecycleAgent) Continue(context.Context, domain.AgentSession, string) (<-chan domain.Event, error) {
+	a.mu.Lock()
+	a.continues++
+	a.mu.Unlock()
+	events := make(chan domain.Event, 1)
+	events <- domain.Event{Kind: domain.EventCompleted, SessionID: "session"}
+	close(events)
+	return events, nil
 }
 
 func (a *lifecycleAgent) Cancel(context.Context, domain.AgentSession) error {
@@ -98,6 +105,12 @@ func (a *lifecycleAgent) counts() (starts, cancels int, sent []domain.EventKind)
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.starts, a.cancels, append([]domain.EventKind(nil), a.sent...)
+}
+
+func (a *lifecycleAgent) continuationCount() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.continues
 }
 
 type observingLocalWorkspace struct {
@@ -196,6 +209,72 @@ func TestLocalWorkspaceCompletionLifecycleIsDurable(t *testing.T) {
 	}
 	if starts, cancels, _ := agent.counts(); starts != 2 || cancels != 2 {
 		t.Fatalf("updated lifecycle starts=%d cancels=%d, want 2 each", starts, cancels)
+	}
+}
+
+func TestLocalWorkspaceMarkerIsWrittenAfterFullBoundedLifecycle(t *testing.T) {
+	root := t.TempDir()
+	updated := time.Date(2026, time.July, 18, 12, 0, 0, 0, time.UTC)
+	issue := lifecycleIssue(updated)
+	tracker := &lifecycleTracker{issue: issue}
+	agent := &lifecycleAgent{requests: make(chan domain.AgentRequest, 1)}
+	settings := lifecycleSettings(root, "")
+	settings.Agent.MaxTurns = 2
+	local := localworkspace.New(func() config.Settings { return settings })
+	workspaces := &observingLocalWorkspace{local: local, marked: make(chan struct{}, 1), afterRun: make(chan struct{}, 1)}
+	coordinator := New(tracker, agent, workspaces, func() config.Settings { return settings }, nil)
+	timer := &fakeTimer{signal: make(chan struct{}, 1)}
+	coordinator.timer = timer
+
+	coordinator.Tick(context.Background())
+	<-agent.requests
+	<-timer.signal
+	if shouldRun, err := local.ShouldRun(context.Background(), issue); err != nil || !shouldRun {
+		t.Fatalf("first bounded turn wrote marker early: shouldRun=%t err=%v", shouldRun, err)
+	}
+	timer.fire(0)
+	<-workspaces.marked
+	<-workspaces.afterRun
+	if got := agent.continuationCount(); got != 1 {
+		t.Fatalf("continuations=%d, want 1", got)
+	}
+	if shouldRun, err := local.ShouldRun(context.Background(), issue); err != nil || shouldRun {
+		t.Fatalf("full bounded lifecycle was not durably completed: shouldRun=%t err=%v", shouldRun, err)
+	}
+}
+
+func TestCorruptLocalCompletionStateNeverStartsAgent(t *testing.T) {
+	root := t.TempDir()
+	updated := time.Date(2026, time.July, 18, 12, 0, 0, 0, time.UTC)
+	issue := lifecycleIssue(updated)
+	settings := lifecycleSettings(root, "")
+	local := localworkspace.New(func() config.Settings { return settings })
+	ws, err := local.Prepare(context.Background(), issue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := local.MarkCompleted(context.Background(), ws, issue); err != nil {
+		t.Fatal(err)
+	}
+	markers, err := filepath.Glob(filepath.Join(root, ".symphony-state", "*.json"))
+	if err != nil || len(markers) != 1 {
+		t.Fatalf("markers=%v err=%v", markers, err)
+	}
+	if err := os.WriteFile(markers[0], []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	tracker := &lifecycleTracker{issue: issue}
+	agent := &lifecycleAgent{requests: make(chan domain.AgentRequest, 1)}
+	coordinator := New(tracker, agent, local, func() config.Settings { return settings }, nil)
+	coordinator.Tick(context.Background())
+	if starts, _, _ := agent.counts(); starts != 0 {
+		t.Fatalf("corrupt marker started agent %d times", starts)
+	}
+	select {
+	case request := <-agent.requests:
+		t.Fatalf("corrupt marker dispatched request for %s", request.Issue.Identifier)
+	default:
 	}
 }
 
