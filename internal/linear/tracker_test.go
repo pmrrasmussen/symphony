@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/pmrrasmussen/symphony/internal/config"
+	"github.com/pmrrasmussen/symphony/internal/domain"
 )
 
 func TestListCandidatesPaginatesScopesAndNormalizes(t *testing.T) {
@@ -69,6 +70,88 @@ func TestListCandidatesPaginatesScopesAndNormalizes(t *testing.T) {
 	if !issues[1].Dispatchable {
 		t.Fatalf("completed blocker must not prevent dispatch: %#v", issues[1])
 	}
+}
+
+func TestHandoffBindsIssueProjectTeamAndFixedOperations(t *testing.T) {
+	var calls []map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		request := decodeRequest(t, r)
+		calls = append(calls, request)
+		query := request["query"].(string)
+		variables := request["variables"].(map[string]any)
+		switch {
+		case strings.Contains(query, "SymphonyLinearHandoffIssue"):
+			if got := variables["issueID"]; got != "active" {
+				t.Errorf("read issueID=%v", got)
+			}
+			writeJSON(t, w, map[string]any{"data": map[string]any{"issue": map[string]any{
+				"id": "active", "identifier": "PMR-5", "title": "Handoff", "description": "safe", "url": "https://linear.app/issue/PMR-5",
+				"project": map[string]string{"slugId": "project-1"}, "team": map[string]string{"id": "team-1"}, "state": map[string]string{"name": "Todo"},
+			}}})
+		case strings.Contains(query, "SymphonyLinearHandoffStates"):
+			if got := variables["teamID"]; got != "team-1" {
+				t.Errorf("teamID=%v", got)
+			}
+			writeJSON(t, w, map[string]any{"data": map[string]any{"team": map[string]any{"id": "team-1", "states": map[string]any{"nodes": []any{
+				map[string]string{"id": "todo", "name": "Todo"}, map[string]string{"id": "review", "name": "In Review"},
+			}}}}})
+		case strings.Contains(query, "SymphonyLinearHandoffTransition"):
+			if got := variables["issueID"]; got != "active" {
+				t.Errorf("transition issueID=%v", got)
+			}
+			if got := variables["stateID"]; got != "review" {
+				t.Errorf("transition stateID=%v", got)
+			}
+			writeJSON(t, w, map[string]any{"data": map[string]any{"issueUpdate": map[string]bool{"success": true}}})
+		case strings.Contains(query, "SymphonyLinearHandoffComment"):
+			if got := variables["issueID"]; got != "active" {
+				t.Errorf("comment issueID=%v", got)
+			}
+			if got := variables["body"]; got != "Ready PMR-5" && got != "A bounded active issue comment" {
+				t.Errorf("unexpected comment=%v", got)
+			}
+			writeJSON(t, w, map[string]any{"data": map[string]any{"commentCreate": map[string]bool{"success": true}}})
+		default:
+			t.Errorf("unexpected query: %s", query)
+		}
+	}))
+	defer server.Close()
+	settings := config.Settings{Tracker: config.Tracker{
+		Provider:     map[string]any{"api_key": "test-token", "project_slug": "project-1", "endpoint": server.URL},
+		ActiveStates: []string{"todo"}, TerminalStates: []string{"done"}, HandoffState: "In Review", HandoffCommentTemplate: "Ready {{.issue.identifier}}",
+	}}
+	handoff := NewHandoff(func() config.Settings { return settings })
+	session, err := handoff.Prepare(context.Background(), domain.Issue{ID: "active"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := session.Call(context.Background(), json.RawMessage(`{"operation":"read"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := session.Call(context.Background(), json.RawMessage(`{"operation":"handoff"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := session.Call(context.Background(), json.RawMessage(`{"operation":"comment","body":"A bounded active issue comment"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := session.Call(context.Background(), json.RawMessage(`{"operation":"handoff","issueID":"other"}`)); err == nil {
+		t.Fatal("arbitrary issue argument was accepted")
+	}
+	if len(calls) != 5 { // prepare read+state, then transition+fixed comment+active comment
+		t.Fatalf("calls=%d", len(calls))
+	}
+}
+
+func TestHandoffRejectsIssueOutsideConfiguredProject(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(t, w, map[string]any{"data": map[string]any{"issue": map[string]any{
+			"id": "active", "identifier": "PMR-5", "title": "Handoff", "project": map[string]string{"slugId": "wrong"}, "team": map[string]string{"id": "team-1"}, "state": map[string]string{"name": "Todo"},
+		}}})
+	}))
+	defer server.Close()
+	settings := config.Settings{Tracker: config.Tracker{Provider: map[string]any{"api_key": "test-token", "project_slug": "project-1", "endpoint": server.URL}, HandoffState: "In Review"}}
+	_, err := NewHandoff(func() config.Settings { return settings }).Prepare(context.Background(), domain.Issue{ID: "active"})
+	assertCategory(t, err, "handoff_scope")
 }
 
 func TestListCandidatesRejectsBrokenPaginationAtomically(t *testing.T) {

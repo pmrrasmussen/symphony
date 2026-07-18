@@ -14,20 +14,44 @@ import (
 	"sync"
 	"time"
 
+	"github.com/pmrrasmussen/symphony/internal/config"
 	"github.com/pmrrasmussen/symphony/internal/domain"
+	"github.com/pmrrasmussen/symphony/internal/linear"
 )
 
 type Backend struct {
 	mu          sync.Mutex
 	sessions    map[string]*client
 	secretNames []string
+	handoff     *linear.Handoff
 }
 
 func New(secretNames ...string) *Backend {
 	return &Backend{sessions: map[string]*client{}, secretNames: secretNames}
 }
+
+// NewWithLinearHandoff enables the sole supported client-side tool. The
+// Linear adapter owns its configuration and HTTP transport; Codex sees only a
+// session-bound capability once the policy has been validated.
+func NewWithLinearHandoff(settings func() config.Settings, secretNames ...string) *Backend {
+	b := New(secretNames...)
+	b.handoff = linear.NewHandoff(settings)
+	return b
+}
 func (b *Backend) Start(ctx context.Context, r domain.AgentRequest) (domain.AgentSession, <-chan domain.Event, error) {
-	c, err := start(ctx, r, b.secretNames)
+	var handoff *linear.HandoffSession
+	var err error
+	if b.handoff != nil && b.handoff.Enabled() {
+		handoff, err = b.handoff.Prepare(ctx, r.Issue)
+		if err != nil {
+			return domain.AgentSession{}, nil, fmt.Errorf("prepare Linear handoff: %w", err)
+		}
+	}
+	secretValues := []string{}
+	if handoff != nil {
+		secretValues = append(secretValues, handoff.SecretValue())
+	}
+	c, err := start(ctx, r, b.secretNames, secretValues, handoff)
 	if err != nil {
 		return domain.AgentSession{}, nil, err
 	}
@@ -36,7 +60,11 @@ func (b *Backend) Start(ctx context.Context, r domain.AgentRequest) (domain.Agen
 		return domain.AgentSession{}, nil, err
 	}
 	c.notify("initialized", map[string]any{})
-	res, err := c.call(ctx, "thread/start", map[string]any{"cwd": r.Workspace, "approvalPolicy": r.ApprovalPolicy, "sandbox": r.ThreadSandbox})
+	threadParams := map[string]any{"cwd": r.Workspace, "approvalPolicy": r.ApprovalPolicy, "sandbox": r.ThreadSandbox}
+	if handoff != nil {
+		threadParams["dynamicTools"] = []map[string]any{linearGraphQLToolDefinition()}
+	}
+	res, err := c.call(ctx, "thread/start", threadParams)
 	if err != nil {
 		c.kill()
 		return domain.AgentSession{}, nil, err
@@ -85,6 +113,8 @@ type client struct {
 	policy              any
 	readTimeout         time.Duration
 	turnTimeout         time.Duration
+	ctx                 context.Context
+	handoff             *linear.HandoffSession
 	mu                  sync.Mutex
 	next                int
 	pending             map[int]chan rpc
@@ -102,14 +132,14 @@ type rpc struct {
 	} `json:"error"`
 }
 
-func start(ctx context.Context, r domain.AgentRequest, secrets []string) (*client, error) {
+func start(ctx context.Context, r domain.AgentRequest, secrets, secretValues []string, handoff *linear.HandoffSession) (*client, error) {
 	command := strings.TrimSpace(r.Command)
 	if command == "" {
 		command = "codex app-server"
 	}
 	cmd := exec.CommandContext(ctx, "sh", "-lc", "exec "+command)
 	cmd.Dir = r.Workspace
-	cmd.Env = filteredEnv(secrets)
+	cmd.Env = filteredEnv(secrets, secretValues)
 	in, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, err
@@ -125,13 +155,13 @@ func start(ctx context.Context, r domain.AgentRequest, secrets []string) (*clien
 	if err := cmd.Start(); err != nil {
 		return nil, err
 	}
-	c := &client{cmd: cmd, in: in, workspace: r.Workspace, approval: r.ApprovalPolicy, policy: r.TurnSandboxPolicy, readTimeout: r.ReadTimeout, turnTimeout: r.TurnTimeout, pending: map[int]chan rpc{}, done: make(chan struct{})}
+	c := &client{cmd: cmd, in: in, workspace: r.Workspace, approval: r.ApprovalPolicy, policy: r.TurnSandboxPolicy, readTimeout: r.ReadTimeout, turnTimeout: r.TurnTimeout, ctx: ctx, handoff: handoff, pending: map[int]chan rpc{}, done: make(chan struct{})}
 	go c.read(out)
 	go drain(stderr)
 	go func() { _ = cmd.Wait(); c.finish() }()
 	return c, nil
 }
-func filteredEnv(names []string) []string {
+func filteredEnv(names, secretValues []string) []string {
 	blocked := map[string]bool{}
 	for _, n := range names {
 		blocked[n] = true
@@ -139,11 +169,20 @@ func filteredEnv(names []string) []string {
 	out := []string{}
 	for _, v := range os.Environ() {
 		k := strings.SplitN(v, "=", 2)[0]
-		if !blocked[k] {
+		value := strings.TrimPrefix(v, k+"=")
+		if !blocked[k] && !containsSecret(secretValues, value) {
 			out = append(out, v)
 		}
 	}
 	return out
+}
+func containsSecret(values []string, candidate string) bool {
+	for _, value := range values {
+		if value != "" && candidate == value {
+			return true
+		}
+	}
+	return false
 }
 func (c *client) call(ctx context.Context, method string, params any) (map[string]any, error) {
 	if c.readTimeout > 0 {
@@ -259,8 +298,7 @@ func (c *client) handle(x rpc) {
 		return
 	}
 	if method == "item/tool/call" && x.ID != nil {
-		_ = c.send(map[string]any{"jsonrpc": "2.0", "id": x.ID, "result": map[string]any{"success": false, "output": "unsupported tool", "contentItems": []any{}}})
-		c.emit(domain.Event{Kind: domain.EventBlocked, At: time.Now(), Message: "Codex requested an unsupported client-side tool"})
+		c.handleToolCall(x)
 		return
 	}
 	if strings.Contains(method, "requestApproval") || method == "item/tool/requestUserInput" {
@@ -288,6 +326,52 @@ func (c *client) handle(x rpc) {
 		return
 	}
 	c.emit(domain.Event{Kind: domain.EventProgress, At: time.Now(), Message: method})
+}
+
+func linearGraphQLToolDefinition() map[string]any {
+	return map[string]any{
+		"type": "function", "name": "linear_graphql",
+		"description": "Read the active Linear issue, move only it to the workflow-configured handoff state, or add a bounded comment only to it.",
+		"inputSchema": map[string]any{
+			"type": "object", "additionalProperties": false,
+			"properties": map[string]any{
+				"operation": map[string]any{"type": "string", "enum": []string{"read", "handoff", "comment"}},
+				"body":      map[string]any{"type": "string", "maxLength": 8192},
+			},
+			"required": []string{"operation"},
+		},
+	}
+}
+
+func (c *client) handleToolCall(x rpc) {
+	var request struct {
+		Tool      string          `json:"tool"`
+		Arguments json.RawMessage `json:"arguments"`
+	}
+	if err := json.Unmarshal(x.Params, &request); err != nil || request.Tool != "linear_graphql" || c.handoff == nil {
+		c.unsupportedTool(x.ID)
+		return
+	}
+	result, err := c.handoff.Call(c.ctx, request.Arguments)
+	if err != nil {
+		// Do not return provider errors, issue data, or any credential-derived
+		// value to the child. The generic response is enough for the model to
+		// choose another path, while the normalized event informs the scheduler.
+		_ = c.send(map[string]any{"jsonrpc": "2.0", "id": x.ID, "result": map[string]any{"success": false, "contentItems": []any{map[string]any{"type": "inputText", "text": "Linear handoff request was rejected."}}}})
+		c.emit(domain.Event{Kind: domain.EventBlocked, At: time.Now(), Message: "Codex Linear handoff request was rejected"})
+		return
+	}
+	text, err := json.Marshal(result.Data)
+	if err != nil {
+		c.unsupportedTool(x.ID)
+		return
+	}
+	_ = c.send(map[string]any{"jsonrpc": "2.0", "id": x.ID, "result": map[string]any{"success": result.Success, "contentItems": []any{map[string]any{"type": "inputText", "text": string(text)}}}})
+}
+
+func (c *client) unsupportedTool(id any) {
+	_ = c.send(map[string]any{"jsonrpc": "2.0", "id": id, "result": map[string]any{"success": false, "contentItems": []any{map[string]any{"type": "inputText", "text": "Unsupported client-side tool."}}}})
+	c.emit(domain.Event{Kind: domain.EventBlocked, At: time.Now(), Message: "Codex requested an unsupported client-side tool"})
 }
 func (c *client) emit(e domain.Event) {
 	c.mu.Lock()

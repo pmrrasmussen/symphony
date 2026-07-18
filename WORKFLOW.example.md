@@ -6,6 +6,11 @@ tracker:
     api_key: $LINEAR_API_KEY
     # Optional: only dispatch issues assigned to this Linear user ID, or `me`.
     # assignee: me
+    # Optional, opt-in Codex client tool. It can only read/comment on the
+    # active issue or move it to this non-active state; it is never a GraphQL
+    # proxy. Configure a state from this project's issue team.
+    # handoff_state: In Review
+    # handoff_comment_template: "Ready for review: {{.issue.identifier}}"
   active_states: [Todo, In Progress]
   terminal_states: [Done, Canceled]
 polling:

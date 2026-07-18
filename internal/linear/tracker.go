@@ -67,7 +67,10 @@ func newHTTPClient(transport http.RoundTripper) *http.Client {
 // Validate checks the documented Linear profile. The token is deliberately
 // never returned in an error message.
 func (t *Tracker) Validate() error {
-	p := t.settings().Tracker.Provider
+	return validateProvider(t.settings().Tracker.Provider)
+}
+
+func validateProvider(p map[string]any) error {
 	token, tokenOK := p["api_key"].(string)
 	if !tokenOK || strings.TrimSpace(token) == "" {
 		return trackerError("missing_tracker_secret", "linear api_key is missing")
@@ -271,8 +274,15 @@ func (t *Tracker) requestIssues(ctx context.Context, query string, variables map
 
 func (t *Tracker) request(ctx context.Context, query string, variables map[string]any) ([]byte, error) {
 	s := t.settings()
+	return requestWithSettings(ctx, t.client, s, query, variables)
+}
+
+// requestWithSettings is shared with the session-bound handoff adapter. The
+// caller supplies a configuration snapshot so a reload cannot silently widen a
+// running Codex session's authority.
+func requestWithSettings(ctx context.Context, client *http.Client, s config.Settings, query string, variables map[string]any) ([]byte, error) {
 	p := s.Tracker.Provider
-	if err := t.Validate(); err != nil {
+	if err := validateProvider(p); err != nil {
 		return nil, err
 	}
 	payload, err := json.Marshal(map[string]any{"query": query, "variables": variables})
@@ -289,7 +299,7 @@ func (t *Tracker) request(ctx context.Context, query string, variables map[strin
 	}
 	req.Header.Set("Authorization", stringValue(p["api_key"]))
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := t.client.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, trackerError("tracker_request", "Linear request failed")
 	}
