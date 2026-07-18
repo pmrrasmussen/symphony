@@ -199,6 +199,10 @@ func TestCompletedMarkerSkipsOnlyUnchangedIssue(t *testing.T) {
 	if err := l.MarkCompleted(context.Background(), ws, issue); err != nil {
 		t.Fatal(err)
 	}
+	state, found, err := l.loadState(issue)
+	if err != nil || !found || state.Schema != workspaceStateSchema {
+		t.Fatalf("completed marker schema=%q found=%t err=%v", state.Schema, found, err)
+	}
 	shouldRun, err = l.ShouldRun(context.Background(), issue)
 	if err != nil || shouldRun {
 		t.Fatalf("unchanged completed issue should not run: shouldRun=%t err=%v", shouldRun, err)
@@ -217,6 +221,132 @@ func TestCompletedMarkerSkipsOnlyUnchangedIssue(t *testing.T) {
 	shouldRun, err = l.ShouldRun(context.Background(), issue)
 	if err != nil || !shouldRun {
 		t.Fatalf("terminal cleanup should remove completion state: shouldRun=%t err=%v", shouldRun, err)
+	}
+}
+
+func TestCompletionMarkerValidationFailsClosed(t *testing.T) {
+	root := t.TempDir()
+	s := config.Settings{Workspace: config.Workspace{Root: root}, Hooks: config.Hooks{}}
+	l := New(func() config.Settings { return s })
+	updated := time.Date(2026, time.July, 18, 12, 0, 0, 0, time.UTC)
+	issue := domain.Issue{ID: "issue-1", Identifier: "PMR-1", UpdatedAt: &updated}
+	marker, err := l.statePath(issue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(marker), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name string
+		body string
+		want string
+	}{
+		{name: "corrupt", body: `{`, want: "decode workspace state"},
+		{name: "unknown schema", body: `{"schema":"symphony.workspace-state/v2","issue_id":"issue-1","identifier":"PMR-1"}`, want: "unsupported schema"},
+		{name: "unknown field", body: `{"schema":"symphony.workspace-state/v1","issue_id":"issue-1","identifier":"PMR-1","surprise":true}`, want: "unknown field"},
+		{name: "missing owner", body: `{"schema":"symphony.workspace-state/v1","identifier":"PMR-1"}`, want: "required ownership fields"},
+		{name: "wrong owner", body: `{"schema":"symphony.workspace-state/v1","issue_id":"issue-2","identifier":"PMR-1"}`, want: "belongs to issue"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if err := os.WriteFile(marker, []byte(test.body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			shouldRun, err := l.ShouldRun(context.Background(), issue)
+			if err == nil || shouldRun || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("ShouldRun=%t err=%v, want fail-closed error containing %q", shouldRun, err, test.want)
+			}
+		})
+	}
+}
+
+func TestMissingStateForExistingWorkspaceRequiresManualRecovery(t *testing.T) {
+	root := t.TempDir()
+	s := config.Settings{Workspace: config.Workspace{Root: root}, Hooks: config.Hooks{}}
+	l := New(func() config.Settings { return s })
+	updated := time.Date(2026, time.July, 18, 12, 0, 0, 0, time.UTC)
+	issue := domain.Issue{ID: "issue-1", Identifier: "PMR-1", UpdatedAt: &updated}
+	path := filepath.Join(root, Key(issue.Identifier))
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	shouldRun, err := l.ShouldRun(context.Background(), issue)
+	if err == nil || shouldRun || !strings.Contains(err.Error(), "manual recovery") {
+		t.Fatalf("existing workspace without marker ShouldRun=%t err=%v", shouldRun, err)
+	}
+	if _, err := l.Prepare(context.Background(), issue); err == nil || !strings.Contains(err.Error(), "manual recovery") {
+		t.Fatalf("Prepare existing workspace without marker error=%v", err)
+	}
+
+	// The documented recovery is deliberate and external: after Symphony is
+	// stopped, the operator preserves the workspace outside the managed root.
+	quarantine := filepath.Join(t.TempDir(), "PMR-1")
+	if err := os.Rename(path, quarantine); err != nil {
+		t.Fatal(err)
+	}
+	shouldRun, err = l.ShouldRun(context.Background(), issue)
+	if err != nil || !shouldRun {
+		t.Fatalf("recovered issue ShouldRun=%t err=%v", shouldRun, err)
+	}
+	if _, err := os.Stat(quarantine); err != nil {
+		t.Fatalf("quarantined workspace was not preserved: %v", err)
+	}
+}
+
+func TestLegacyWorkspaceStateIsRecognizedAndUpgraded(t *testing.T) {
+	root := t.TempDir()
+	s := config.Settings{Workspace: config.Workspace{Root: root}, Hooks: config.Hooks{}}
+	l := New(func() config.Settings { return s })
+	updated := time.Date(2026, time.July, 18, 12, 0, 0, 0, time.UTC)
+	issue := domain.Issue{ID: "issue-1", Identifier: "PMR-1", UpdatedAt: &updated}
+	path := filepath.Join(root, Key(issue.Identifier))
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	marker, err := l.statePath(issue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(marker), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	legacy := `{"issue_id":"issue-1","identifier":"PMR-1","completed_updated_at":"2026-07-18T12:00:00Z"}`
+	if err := os.WriteFile(marker, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if shouldRun, err := l.ShouldRun(context.Background(), issue); err != nil || shouldRun {
+		t.Fatalf("legacy completion ShouldRun=%t err=%v", shouldRun, err)
+	}
+	if _, err := l.Prepare(context.Background(), issue); err != nil {
+		t.Fatal(err)
+	}
+	state, found, err := l.loadState(issue)
+	if err != nil || !found || state.Schema != workspaceStateSchema {
+		t.Fatalf("upgraded state=%+v found=%t err=%v", state, found, err)
+	}
+}
+
+func TestCompletionMarkerRejectsRegressedIssueVersion(t *testing.T) {
+	root := t.TempDir()
+	s := config.Settings{Workspace: config.Workspace{Root: root}, Hooks: config.Hooks{}}
+	l := New(func() config.Settings { return s })
+	updated := time.Date(2026, time.July, 18, 12, 0, 0, 0, time.UTC)
+	issue := domain.Issue{ID: "issue-1", Identifier: "PMR-1", UpdatedAt: &updated}
+	ws, err := l.Prepare(context.Background(), issue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := l.MarkCompleted(context.Background(), ws, issue); err != nil {
+		t.Fatal(err)
+	}
+	regressed := issue
+	regressedAt := updated.Add(-time.Second)
+	regressed.UpdatedAt = &regressedAt
+	shouldRun, err := l.ShouldRun(context.Background(), regressed)
+	if err == nil || shouldRun || !strings.Contains(err.Error(), "predates") {
+		t.Fatalf("regressed issue ShouldRun=%t err=%v", shouldRun, err)
 	}
 }
 
