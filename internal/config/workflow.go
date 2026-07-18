@@ -30,17 +30,18 @@ type Workflow struct {
 }
 
 type Settings struct {
-	Tracker      Tracker
-	Polling      Polling
-	Workspace    Workspace
-	Hooks        Hooks
-	Agent        Agent
-	Codex        Codex
-	GitHub       GitHub
-	WorkflowPath string
-	LogRoot      string
-	Prompt       string
-	Warnings     []string
+	Tracker            Tracker
+	Polling            Polling
+	Workspace          Workspace
+	Hooks              Hooks
+	Agent              Agent
+	Codex              Codex
+	GitHub             GitHub
+	HostSecretEnvNames []string
+	WorkflowPath       string
+	LogRoot            string
+	Prompt             string
+	Warnings           []string
 }
 
 // GitHub is an optional, fixed-repository host integration. Invalid optional
@@ -186,7 +187,7 @@ func decode(raw map[string]any, base, path, logRoot string, sources *sourceSnaps
 	if err != nil {
 		return Settings{}, err
 	}
-	requiredLabels, err := stringList(tr, "required_labels")
+	requiredLabels, err := requiredLabelList(tr, "required_labels")
 	if err != nil {
 		return Settings{}, err
 	}
@@ -302,7 +303,11 @@ func decode(raw map[string]any, base, path, logRoot string, sources *sourceSnaps
 		Agent:     Agent{MaxConcurrent: maxConcurrent, MaxTurns: maxTurns, MaxRetryBackoff: maxRetryBackoff, ByState: byState},
 		Codex:     Codex{Command: command, ApprovalPolicy: approvalPolicy, ThreadSandbox: threadSandbox, TurnSandboxPolicy: codex["turn_sandbox_policy"], TurnTimeout: turnTimeout, ReadTimeout: readTimeout, StallTimeout: stallTimeout},
 		GitHub:    githubSettings,
-		Warnings:  providerWarnings,
+		// Keep only the names of environment variables that carry host
+		// credentials. The Codex launcher uses this metadata to prevent those
+		// variables from crossing the child-process boundary.
+		HostSecretEnvNames: hostSecretEnvNames(provider, github),
+		Warnings:           providerWarnings,
 	}
 	if s.Tracker.Kind != "linear" {
 		return s, fmt.Errorf("invalid configuration: tracker.kind must be linear")
@@ -379,6 +384,44 @@ func decodeGitHub(raw map[string]any, objectValid bool, base string, sources *so
 		return GitHub{}
 	}
 	return GitHub{Enabled: true, Owner: owner, Repository: repository, BaseBranch: baseBranch, Token: token, Endpoint: strings.TrimRight(endpoint, "/"), PollInterval: time.Duration(pollMS) * time.Millisecond}
+}
+
+// hostSecretEnvNames extracts only environment variable names from credential
+// references. It deliberately inspects the repository-owned raw fields so an
+// optional GitHub integration that is currently disabled cannot accidentally
+// leak its credential into a future Codex child process.
+func hostSecretEnvNames(provider, github map[string]any) []string {
+	names := map[string]struct{}{}
+	collect := func(source map[string]any, keys ...string) {
+		for _, key := range keys {
+			value, ok := source[key].(string)
+			if !ok {
+				continue
+			}
+			if name, ok := environmentReferenceName(value); ok {
+				names[name] = struct{}{}
+			}
+		}
+	}
+	collect(provider, "api_key", "api_key_file")
+	collect(github, "token", "token_file")
+	if len(names) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(names))
+	for name := range names {
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func environmentReferenceName(value string) (string, bool) {
+	if !strings.HasPrefix(value, "$") {
+		return "", false
+	}
+	name := strings.TrimPrefix(value, "$")
+	return name, validEnvironmentName(name)
 }
 
 func isLocalConfigHost(host string) bool {
@@ -581,6 +624,7 @@ func cloneWorkflow(w Workflow) Workflow {
 	w.Config.Tracker.RequiredLabels = append([]string(nil), w.Config.Tracker.RequiredLabels...)
 	w.Config.Tracker.ActiveStates = append([]string(nil), w.Config.Tracker.ActiveStates...)
 	w.Config.Tracker.TerminalStates = append([]string(nil), w.Config.Tracker.TerminalStates...)
+	w.Config.HostSecretEnvNames = append([]string(nil), w.Config.HostSecretEnvNames...)
 	w.Config.Warnings = append([]string(nil), w.Config.Warnings...)
 	byState := w.Config.Agent.ByState
 	w.Config.Agent.ByState = make(map[string]int, len(byState))
@@ -671,6 +715,29 @@ func stringList(m map[string]any, key string) ([]string, error) {
 		if s = strings.TrimSpace(s); s != "" {
 			out = append(out, s)
 		}
+	}
+	return out, nil
+}
+
+// requiredLabelList deliberately preserves blank values. A blank required
+// label is a fail-closed routing policy: no Linear issue can have it, so no
+// issue may be dispatched until the workflow is corrected.
+func requiredLabelList(m map[string]any, key string) ([]string, error) {
+	v, exists := m[key]
+	if !exists {
+		return nil, nil
+	}
+	values, ok := v.([]any)
+	if !ok {
+		return nil, fmt.Errorf("invalid configuration: %s must be a list of strings", key)
+	}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		s, ok := value.(string)
+		if !ok {
+			return nil, fmt.Errorf("invalid configuration: %s must be a list of strings", key)
+		}
+		out = append(out, strings.TrimSpace(s))
 	}
 	return out, nil
 }

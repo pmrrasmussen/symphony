@@ -51,6 +51,85 @@ func TestLoadPreservesLinearStateFilterSpelling(t *testing.T) {
 		t.Fatalf("terminal states=%v want %v", got, want)
 	}
 }
+
+func TestRequiredLabelsPreserveNormalizedBlankValues(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "WORKFLOW.md")
+	content := "---\ntracker: {kind: linear, required_labels: [ Ready, '  ' ], active_states: [Todo], terminal_states: [Done]}\n---\nprompt"
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	workflow, err := Load(path, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := workflow.Config.Tracker.RequiredLabels, []string{"ready", ""}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("required labels=%v want %v", got, want)
+	}
+}
+
+func TestHostSecretEnvNamesIncludeCredentialReferencesEvenWhenGitHubIsDisabled(t *testing.T) {
+	d := t.TempDir()
+	linearFile := filepath.Join(d, "linear-key")
+	githubFile := filepath.Join(d, "github-token")
+	for path, value := range map[string]string{linearFile: "linear-file-secret", githubFile: "github-file-secret"} {
+		if err := os.WriteFile(path, []byte(value), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("PMR29_LINEAR_KEY", "linear-env-secret")
+	t.Setenv("PMR29_LINEAR_FILE", linearFile)
+	t.Setenv("PMR29_GITHUB_TOKEN", "github-env-secret")
+	t.Setenv("PMR29_GITHUB_FILE", githubFile)
+	workflow := filepath.Join(d, "WORKFLOW.md")
+	content := "---\ntracker: {kind: linear, provider: {project_slug_id: project, api_key: $PMR29_LINEAR_KEY, api_key_file: $PMR29_LINEAR_FILE}, active_states: [Todo], terminal_states: [Done]}\ngithub: {token: $PMR29_GITHUB_TOKEN, token_file: $PMR29_GITHUB_FILE}\n---\nprompt"
+	if err := os.WriteFile(workflow, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := Load(workflow, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Config.GitHub.Enabled {
+		t.Fatal("incomplete optional GitHub configuration was enabled")
+	}
+	want := []string{"PMR29_GITHUB_FILE", "PMR29_GITHUB_TOKEN", "PMR29_LINEAR_FILE", "PMR29_LINEAR_KEY"}
+	if got := loaded.Config.HostSecretEnvNames; !reflect.DeepEqual(got, want) {
+		t.Fatalf("secret environment names=%v want %v", got, want)
+	}
+	for _, value := range []string{"linear-env-secret", "linear-file-secret", "github-env-secret", "github-file-secret"} {
+		if strings.Contains(strings.Join(loaded.Config.HostSecretEnvNames, ","), value) {
+			t.Fatalf("secret metadata exposed resolved value %q", value)
+		}
+	}
+}
+
+func TestDifferentWorkflowFilesKeepProjectAndAssigneeSettings(t *testing.T) {
+	d := t.TempDir()
+	first := filepath.Join(d, "first.md")
+	second := filepath.Join(d, "second.md")
+	for path, content := range map[string]string{
+		first:  "---\ntracker: {kind: linear, provider: {project_slug_id: first-project, api_key: first-secret}, active_states: [Todo], terminal_states: [Done]}\n---\nprompt",
+		second: "---\ntracker: {kind: linear, provider: {project_slug_id: second-project, assignee: second-assignee, api_key: second-secret}, active_states: [Todo], terminal_states: [Done]}\n---\nprompt",
+	} {
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	firstWorkflow, err := Load(first, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondWorkflow, err := Load(second, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstWorkflow.Config.Tracker.Provider["project_slug_id"] != "first-project" || firstWorkflow.Config.Tracker.Provider["assignee"] != nil {
+		t.Fatalf("first provider=%#v", firstWorkflow.Config.Tracker.Provider)
+	}
+	if secondWorkflow.Config.Tracker.Provider["project_slug_id"] != "second-project" || secondWorkflow.Config.Tracker.Provider["assignee"] != "second-assignee" {
+		t.Fatalf("second provider=%#v", secondWorkflow.Config.Tracker.Provider)
+	}
+}
 func TestInvalidReloadKeepsLastValid(t *testing.T) {
 	d := t.TempDir()
 	p := filepath.Join(d, "WORKFLOW.md")
@@ -637,10 +716,44 @@ func TestReloadPublishesEveryDynamicSettingAsOneSnapshot(t *testing.T) {
 	}
 }
 
+func TestReloadAtomicallyReplacesTrackerScopeAndSecretMetadata(t *testing.T) {
+	d := t.TempDir()
+	t.Setenv("PMR29_FIRST_LINEAR", "first-linear-secret")
+	t.Setenv("PMR29_FIRST_GITHUB", "first-github-secret")
+	t.Setenv("PMR29_SECOND_LINEAR", "second-linear-secret")
+	t.Setenv("PMR29_SECOND_GITHUB", "second-github-secret")
+	workflow := filepath.Join(d, "WORKFLOW.md")
+	initial := "---\ntracker: {kind: linear, provider: {project_slug_id: first-project, assignee: first-assignee, api_key: $PMR29_FIRST_LINEAR}, active_states: [Todo], terminal_states: [Done]}\ngithub: {token: $PMR29_FIRST_GITHUB}\n---\nfirst"
+	if err := os.WriteFile(workflow, []byte(initial), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := NewStore(workflow, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated := "---\ntracker: {kind: linear, provider: {project_slug_id: second-project, assignee: second-assignee, api_key: $PMR29_SECOND_LINEAR}, active_states: [In Progress], terminal_states: [Closed]}\ngithub: {token: $PMR29_SECOND_GITHUB}\n---\nsecond"
+	if err := os.WriteFile(workflow, []byte(updated), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	changed, err := store.ReloadIfChanged()
+	if err != nil || !changed {
+		t.Fatalf("reload changed=%t err=%v", changed, err)
+	}
+	current := store.Current()
+	provider := current.Config.Tracker.Provider
+	if current.Prompt != "second" || provider["project_slug_id"] != "second-project" || provider["assignee"] != "second-assignee" || provider["api_key"] != "second-linear-secret" {
+		t.Fatalf("tracker scope snapshot=%#v prompt=%q", provider, current.Prompt)
+	}
+	if got, want := current.Config.HostSecretEnvNames, []string{"PMR29_SECOND_GITHUB", "PMR29_SECOND_LINEAR"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("secret metadata=%v want %v", got, want)
+	}
+}
+
 func TestCurrentReturnsAnImmutableSnapshotCopy(t *testing.T) {
 	d := t.TempDir()
 	workflow := filepath.Join(d, "WORKFLOW.md")
-	content := "---\nextension: {nested: [original]}\ntracker: {kind: linear, provider: {project_slug: project, api_key: secret, nested: {value: original}}, active_states: [Todo], terminal_states: [Done]}\nagent: {max_concurrent_agents_by_state: {Todo: 1}}\ncodex: {turn_sandbox_policy: {type: original}}\n---\nprompt"
+	t.Setenv("PMR29_IMMUTABLE_SECRET", "secret")
+	content := "---\nextension: {nested: [original]}\ntracker: {kind: linear, provider: {project_slug: project, api_key: $PMR29_IMMUTABLE_SECRET, nested: {value: original}}, active_states: [Todo], terminal_states: [Done]}\nagent: {max_concurrent_agents_by_state: {Todo: 1}}\ncodex: {turn_sandbox_policy: {type: original}}\n---\nprompt"
 	if err := os.WriteFile(workflow, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -654,10 +767,11 @@ func TestCurrentReturnsAnImmutableSnapshotCopy(t *testing.T) {
 	copy.Config.Tracker.ActiveStates[0] = "mutated"
 	copy.Config.Agent.ByState["todo"] = 99
 	copy.Config.Codex.TurnSandboxPolicy.(map[string]any)["type"] = "mutated"
+	copy.Config.HostSecretEnvNames[0] = "mutated"
 	copy.Config.Warnings[0] = "mutated"
 
 	current := store.Current()
-	if current.Raw["extension"].(map[string]any)["nested"].([]any)[0] != "original" || current.Config.Tracker.Provider["nested"].(map[string]any)["value"] != "original" || current.Config.Tracker.ActiveStates[0] != "Todo" || current.Config.Agent.ByState["todo"] != 1 || current.Config.Codex.TurnSandboxPolicy.(map[string]any)["type"] != "original" || current.Config.Warnings[0] != legacyProjectSlugWarning {
+	if current.Raw["extension"].(map[string]any)["nested"].([]any)[0] != "original" || current.Config.Tracker.Provider["nested"].(map[string]any)["value"] != "original" || current.Config.Tracker.ActiveStates[0] != "Todo" || current.Config.Agent.ByState["todo"] != 1 || current.Config.Codex.TurnSandboxPolicy.(map[string]any)["type"] != "original" || current.Config.HostSecretEnvNames[0] != "PMR29_IMMUTABLE_SECRET" || current.Config.Warnings[0] != legacyProjectSlugWarning {
 		t.Fatalf("published workflow was mutated through Current: %+v", current)
 	}
 }
