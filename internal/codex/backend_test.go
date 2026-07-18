@@ -40,11 +40,51 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"
 		t.Fatalf("session=%+v", session)
 	}
 	seen := map[domain.EventKind]bool{}
+	var started domain.Event
 	for event := range events {
 		seen[event.Kind] = true
+		if event.Kind == domain.EventSessionStarted {
+			started = event
+		}
 	}
 	if !seen[domain.EventSessionStarted] || !seen[domain.EventCompleted] {
 		t.Fatalf("events=%v", seen)
+	}
+	if started.SessionID != session.ID || started.ThreadID != session.ThreadID || started.TurnID != session.TurnID || started.PID <= 0 {
+		t.Fatalf("session-start event=%+v session=%+v", started, session)
+	}
+}
+
+func TestStartReportsBoundedRedactedStderr(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "fake-app-server.sh")
+	body := `#!/bin/sh
+IFS= read -r line
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'
+IFS= read -r line
+IFS= read -r line
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thread-1"}}}'
+IFS= read -r line
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn-1"}}}'
+printf '%s\n' 'token=do-not-log-this' >&2
+printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{}}'
+`
+	if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	b := New()
+	_, events, err := b.Start(context.Background(), domain.AgentRequest{Workspace: dir, Prompt: "work", Command: "sh " + script, ApprovalPolicy: "never", ThreadSandbox: "workspace-write", TurnTimeout: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var diagnostic string
+	for event := range events {
+		if event.Kind == domain.EventDiagnostic {
+			diagnostic = event.Message
+		}
+	}
+	if diagnostic == "" || strings.Contains(diagnostic, "do-not-log-this") || !strings.Contains(diagnostic, "[REDACTED]") {
+		t.Fatalf("stderr diagnostic=%q", diagnostic)
 	}
 }
 

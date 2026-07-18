@@ -17,6 +17,7 @@ import (
 	"github.com/pmrrasmussen/symphony/internal/config"
 	"github.com/pmrrasmussen/symphony/internal/domain"
 	"github.com/pmrrasmussen/symphony/internal/linear"
+	"github.com/pmrrasmussen/symphony/internal/observability"
 )
 
 type Backend struct {
@@ -120,6 +121,10 @@ type client struct {
 	pending             map[int]chan rpc
 	active              chan domain.Event
 	activeDone          chan struct{}
+	diagnostics         []domain.Event
+	activeReady         bool
+	pendingEvents       []domain.Event
+	pendingClose        bool
 	done                chan struct{}
 }
 type rpc struct {
@@ -157,8 +162,9 @@ func start(ctx context.Context, r domain.AgentRequest, secrets []string, secretM
 	}
 	c := &client{cmd: cmd, in: in, workspace: r.Workspace, approval: r.ApprovalPolicy, policy: r.TurnSandboxPolicy, readTimeout: r.ReadTimeout, turnTimeout: r.TurnTimeout, ctx: ctx, handoff: handoff, pending: map[int]chan rpc{}, done: make(chan struct{})}
 	go c.read(out)
-	go drain(stderr)
-	go func() { _ = cmd.Wait(); c.finish() }()
+	stderrDone := make(chan struct{})
+	go func() { drain(stderr, c.diagnostic); close(stderrDone) }()
+	go func() { _ = cmd.Wait(); <-stderrDone; c.finish() }()
 	return c, nil
 }
 func filteredEnv(names []string, secretMatcher func(string) bool) []string {
@@ -229,20 +235,40 @@ func (c *client) turn(ctx context.Context, thread, prompt string, r domain.Agent
 	c.mu.Lock()
 	c.active = events
 	c.activeDone = make(chan struct{})
+	c.activeReady = false
+	c.pendingEvents = append(c.pendingEvents, c.diagnostics...)
+	c.diagnostics = nil
 	turnDone := c.activeDone
 	c.mu.Unlock()
-	events <- domain.Event{Kind: domain.EventSessionStarted, At: time.Now(), ThreadID: thread}
 	res, err := c.call(ctx, "turn/start", params)
 	if err != nil {
-		c.closeActive()
+		c.forceCloseActive()
 		return domain.AgentSession{}, nil, err
 	}
 	turn, ok := nestedString(res, "turn", "id")
 	if !ok {
-		c.closeActive()
+		c.forceCloseActive()
 		return domain.AgentSession{}, nil, errors.New("codex malformed turn/start response")
 	}
 	s := domain.AgentSession{ID: thread + "-" + turn, ThreadID: thread, TurnID: turn}
+	pid := 0
+	if c.cmd.Process != nil {
+		pid = c.cmd.Process.Pid
+	}
+	c.mu.Lock()
+	c.activeReady = true
+	pending := c.pendingEvents
+	c.pendingEvents = nil
+	pendingClose := c.pendingClose
+	c.pendingClose = false
+	c.mu.Unlock()
+	c.emit(domain.Event{Kind: domain.EventSessionStarted, At: time.Now(), SessionID: s.ID, ThreadID: thread, TurnID: turn, PID: pid})
+	for _, event := range pending {
+		c.emit(event)
+	}
+	if pendingClose {
+		c.closeActive()
+	}
 	if r.TurnTimeout > 0 {
 		go func() {
 			timer := time.NewTimer(r.TurnTimeout)
@@ -309,7 +335,6 @@ func (c *client) handle(x rpc) {
 			c.emit(domain.Event{Kind: domain.EventUsage, At: time.Now(), Usage: usage})
 		}
 		c.emit(domain.Event{Kind: domain.EventCompleted, At: time.Now()})
-		c.closeActive()
 		return
 	}
 	if method == "turn/failed" || method == "turn/cancelled" {
@@ -370,25 +395,46 @@ func (c *client) emit(e domain.Event) {
 	defer c.mu.Unlock()
 	ch := c.active
 	if ch != nil {
+		if !c.activeReady {
+			if len(c.pendingEvents) < 32 {
+				c.pendingEvents = append(c.pendingEvents, e)
+			}
+			return
+		}
 		select {
 		case ch <- e:
 		default:
 		}
+	} else if e.Kind == domain.EventDiagnostic && len(c.diagnostics) < 16 {
+		c.diagnostics = append(c.diagnostics, e)
 	}
 }
 func (c *client) closeActive() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	ch := c.active
+	if ch != nil && !c.activeReady {
+		c.pendingClose = true
+		return
+	}
 	done := c.activeDone
 	c.active = nil
 	c.activeDone = nil
+	c.activeReady = false
+	c.pendingEvents = nil
+	c.pendingClose = false
 	if ch != nil {
 		close(ch)
 	}
 	if done != nil {
 		close(done)
 	}
+}
+func (c *client) forceCloseActive() {
+	c.mu.Lock()
+	c.activeReady = true
+	c.mu.Unlock()
+	c.closeActive()
 }
 func (c *client) finish() {
 	select {
@@ -403,9 +449,18 @@ func (c *client) kill() {
 		_ = c.cmd.Process.Kill()
 	}
 }
-func drain(r io.Reader) {
+func (c *client) diagnostic(message string) {
+	c.emit(domain.Event{Kind: domain.EventDiagnostic, At: time.Now(), Message: observability.Text(message)})
+}
+
+func drain(r io.Reader, report func(string)) {
 	s := bufio.NewScanner(r)
+	s.Buffer(make([]byte, 0, observability.MaxDiagnosticBytes), observability.MaxDiagnosticBytes)
 	for s.Scan() { /* diagnostics intentionally not mixed into JSON-RPC */
+		report(s.Text())
+	}
+	if err := s.Err(); err != nil {
+		report("stderr diagnostic exceeded limit")
 	}
 }
 func nestedString(m map[string]any, a, b string) (string, bool) {

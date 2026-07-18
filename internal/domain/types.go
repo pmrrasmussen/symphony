@@ -27,6 +27,7 @@ const (
 	EventProgress       EventKind = "progress"
 	EventUsage          EventKind = "usage"
 	EventRateLimit      EventKind = "rate_limit"
+	EventDiagnostic     EventKind = "diagnostic"
 	EventBlocked        EventKind = "blocked"
 	EventCompleted      EventKind = "completed"
 	EventFailed         EventKind = "failed"
@@ -36,6 +37,7 @@ type Event struct {
 	Kind                                 EventKind
 	At                                   time.Time
 	SessionID, ThreadID, TurnID, Message string
+	PID                                  int
 	Usage                                Usage
 	RateLimit                            map[string]any
 }
