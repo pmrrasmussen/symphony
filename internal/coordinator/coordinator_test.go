@@ -60,7 +60,7 @@ func TestRenderExplainsHostAndManualDeliveryModes(t *testing.T) {
 	settings.GitHub.Enabled = true
 	settings.Tracker.HandoffState = "In Review"
 	host, err := render(settings, issue, 0)
-	if err != nil || !strings.Contains(host, "Delivery mode: host-side publish") || !strings.Contains(host, "github_publish_pr with no arguments") {
+	if err != nil || !strings.Contains(host, "Delivery mode: host-side publish") || !strings.Contains(host, "github_publish_pr with why, what_changed, and on_call") || !strings.Contains(host, "github_pr_context") {
 		t.Fatalf("host prompt=%q err=%v", host, err)
 	}
 }

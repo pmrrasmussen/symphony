@@ -508,12 +508,21 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{}}'
 func TestRejectedLinearAndGitHubToolsDoNotBlockTheTurn(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer r.Body.Close()
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasPrefix(r.URL.Path, "/repos/") {
+			// github_pr_context resolves the bound pull request over REST
+			// before this test's tool call arrives; none has been published.
+			if r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/pulls" {
+				_, _ = w.Write([]byte(`[]`))
+				return
+			}
+			t.Fatalf("unexpected GitHub REST request %s %s", r.Method, r.URL.Path)
+		}
 		var request map[string]any
 		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 			t.Fatal(err)
 		}
 		query := request["query"].(string)
-		w.Header().Set("Content-Type", "application/json")
 		switch {
 		case strings.Contains(query, "SymphonyLinearHandoffIssue"):
 			_, _ = w.Write([]byte(`{"data":{"issue":{"id":"active","identifier":"PMR-5","title":"Handoff","description":"safe","url":"https://linear.app/issue/PMR-5","project":{"slugId":"project-1"},"team":{"id":"team-1"},"state":{"id":"todo","name":"Todo"}}}}`))
@@ -530,7 +539,7 @@ IFS= read -r line
 printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'
 IFS= read -r line
 IFS= read -r line
-case "$line" in *linear_graphql*github_publish_pr*) ;; *) exit 20;; esac
+case "$line" in *linear_graphql*github_publish_pr*github_pr_context*) ;; *) exit 20;; esac
 printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thread-1"}}}'
 IFS= read -r line
 printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn-1"}}}'
@@ -543,6 +552,15 @@ case "$line" in *'"success":false'*) ;; *) exit 22;; esac
 printf '%s\n' '{"jsonrpc":"2.0","id":101,"method":"item/tool/call","params":{"tool":"github_publish_pr","arguments":{}}}'
 IFS= read -r line
 case "$line" in *'"success":false'*) ;; *) exit 23;; esac
+printf '%s\n' '{"jsonrpc":"2.0","id":102,"method":"item/tool/call","params":{"tool":"github_publish_pr","arguments":{"why":"fix","what_changed":"code","on_call":"none","extra":"nope"}}}'
+IFS= read -r line
+case "$line" in *'"success":false'*) ;; *) exit 24;; esac
+printf '%s\n' '{"jsonrpc":"2.0","id":103,"method":"item/tool/call","params":{"tool":"github_pr_context","arguments":{}}}'
+IFS= read -r line
+case "$line" in *'"success":false'*) ;; *) exit 25;; esac
+printf '%s\n' '{"jsonrpc":"2.0","id":104,"method":"item/tool/call","params":{"tool":"github_pr_context","arguments":{"number":7}}}'
+IFS= read -r line
+case "$line" in *'"success":false'*) ;; *) exit 26;; esac
 printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{}}'
 `)
 	settings := config.Settings{
@@ -633,17 +651,50 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{}}'`
 	}
 }
 
-func TestGitHubToolHasNoCallerControlledScopeOrCredentialFields(t *testing.T) {
+func TestGitHubToolHasOnlyStructuredHandoffFieldsNoScopeOrCredentialInput(t *testing.T) {
 	definition := githubToolDefinition()
 	schema, ok := definition["inputSchema"].(map[string]any)
 	if !ok || schema["type"] != "object" || schema["additionalProperties"] != false {
 		t.Fatalf("schema=%#v", definition["inputSchema"])
 	}
+	properties, ok := schema["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("properties=%#v", schema["properties"])
+	}
+	allowed := map[string]bool{"why": true, "what_changed": true, "on_call": true}
+	for name := range properties {
+		if !allowed[name] {
+			t.Fatalf("GitHub tool unexpectedly accepts field %q: %#v", name, schema)
+		}
+	}
+	required, ok := schema["required"].([]string)
+	if !ok || len(required) != 3 {
+		t.Fatalf("required=%#v", schema["required"])
+	}
+	for _, name := range required {
+		if !allowed[name] {
+			t.Fatalf("required field %q is not a structured handoff field", name)
+		}
+	}
+	// The schema (not the free-text description) must never expose a
+	// scope-selection or credential field.
+	encoded, err := json.Marshal(schema)
+	if err != nil || strings.Contains(string(encoded), "token") || strings.Contains(string(encoded), "owner") || strings.Contains(string(encoded), "repository") || strings.Contains(string(encoded), "branch") || strings.Contains(string(encoded), "pull_number") {
+		t.Fatalf("tool schema exposed host scope: %s err=%v", encoded, err)
+	}
+}
+
+func TestGitHubContextToolHasNoInput(t *testing.T) {
+	definition := githubContextToolDefinition()
+	schema, ok := definition["inputSchema"].(map[string]any)
+	if !ok || schema["type"] != "object" || schema["additionalProperties"] != false {
+		t.Fatalf("schema=%#v", definition["inputSchema"])
+	}
 	if _, hasProperties := schema["properties"]; hasProperties {
-		t.Fatalf("GitHub tool unexpectedly accepts caller-controlled input: %#v", schema)
+		t.Fatalf("GitHub context tool unexpectedly accepts caller-controlled input: %#v", schema)
 	}
 	encoded, err := json.Marshal(definition)
-	if err != nil || strings.Contains(string(encoded), "token") || strings.Contains(string(encoded), "owner") || strings.Contains(string(encoded), "repository") {
+	if err != nil || strings.Contains(string(encoded), "token") || strings.Contains(string(encoded), "\"owner\"") || strings.Contains(string(encoded), "\"repository\"") {
 		t.Fatalf("tool definition exposed host scope: %s err=%v", encoded, err)
 	}
 }

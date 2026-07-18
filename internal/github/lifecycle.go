@@ -27,6 +27,22 @@ import (
 
 const maxResponse = 1 << 20
 
+// Structured-handoff input bounds. These mirror the maxLength values in the
+// github_publish_pr Codex tool schema (internal/codex/backend.go); both sides
+// must be kept in sync the same way the linear_graphql comment bound is.
+const (
+	maxPublishWhyBytes         = 4 << 10
+	maxPublishWhatChangedBytes = 8 << 10
+	maxPublishOnCallBytes      = 2 << 10
+)
+
+// Bounds applied to github_pr_context output so a large upstream history
+// cannot inflate the child-visible result.
+const (
+	contextMaxItems     = 20
+	contextExcerptRunes = 240
+)
+
 var unsafeBranch = regexp.MustCompile(`[^a-z0-9._-]+`)
 
 type gitRunner interface {
@@ -122,12 +138,65 @@ func (s *Session) MatchesSecret(candidate string) bool {
 type Result struct {
 	Branch, URL string
 	Number      int
+	// BodyUpdated is true only when this call created the pull request or
+	// changed its body to match newly supplied structured handoff fields.
+	BodyUpdated bool
+}
+
+// PublishInput is the bounded structured handoff content a Codex session
+// supplies for github_publish_pr. There is deliberately no repository,
+// issue, or branch field: the session already fixes those.
+type PublishInput struct {
+	Why, WhatChanged, OnCall string
+}
+
+// ParsePublishInput decodes and bounds-checks github_publish_pr tool
+// arguments. It rejects a non-object payload, unsupported fields, missing or
+// non-string values, and content outside the fixed size limits.
+func ParsePublishInput(arguments json.RawMessage) (PublishInput, error) {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(arguments, &raw); err != nil || raw == nil {
+		return PublishInput{}, errors.New("github publish arguments must be a JSON object")
+	}
+	for key := range raw {
+		if key != "why" && key != "what_changed" && key != "on_call" {
+			return PublishInput{}, errors.New("github publish arguments contain an unsupported field")
+		}
+	}
+	var input struct {
+		Why         *string `json:"why"`
+		WhatChanged *string `json:"what_changed"`
+		OnCall      *string `json:"on_call"`
+	}
+	if err := json.Unmarshal(arguments, &input); err != nil || input.Why == nil || input.WhatChanged == nil || input.OnCall == nil {
+		return PublishInput{}, errors.New("github publish requires why, what_changed, and on_call strings")
+	}
+	why := strings.TrimSpace(*input.Why)
+	whatChanged := strings.TrimSpace(*input.WhatChanged)
+	onCall := strings.TrimSpace(*input.OnCall)
+	if why == "" || len([]byte(why)) > maxPublishWhyBytes {
+		return PublishInput{}, errors.New("github publish why is empty or too large")
+	}
+	if whatChanged == "" || len([]byte(whatChanged)) > maxPublishWhatChangedBytes {
+		return PublishInput{}, errors.New("github publish what_changed is empty or too large")
+	}
+	if len([]byte(onCall)) > maxPublishOnCallBytes {
+		return PublishInput{}, errors.New("github publish on_call is too large")
+	}
+	return PublishInput{Why: why, WhatChanged: whatChanged, OnCall: onCall}, nil
+}
+
+// canonicalBody is the deterministic pull request body. Repeat publication
+// with the same structured fields must render byte-identical output so a
+// reused pull request is left untouched.
+func canonicalBody(input PublishInput, issueURL string) string {
+	return fmt.Sprintf("## Why\n%s\n\n## What changed\n%s\n\n## On Call\n%s\n\nLinear: %s\n", input.Why, input.WhatChanged, input.OnCall, strings.TrimSpace(issueURL))
 }
 
 // Publish verifies a clean committed worktree, publishes only HEAD to the
-// deterministic issue branch, creates/reuses its PR, and performs the bound
-// Linear link/review handoff.
-func (s *Session) Publish(ctx context.Context) (Result, error) {
+// deterministic issue branch, creates/reuses its PR with the canonical
+// structured body, and performs the bound Linear link/review handoff.
+func (s *Session) Publish(ctx context.Context, input PublishInput) (Result, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.linear.EnsureActive(ctx); err != nil {
@@ -159,17 +228,113 @@ func (s *Session) Publish(ctx context.Context) (Result, error) {
 		return Result{}, err
 	}
 	s.manager.logger.Info("GitHub issue branch published", "issue_id", s.issue.ID, "issue_identifier", s.issue.Identifier, "repository", s.settings.Owner+"/"+s.settings.Repository, "branch", s.branch)
-	pr, err := s.manager.findOrCreate(ctx, s.settings, s.branch, s.issue)
+	body := canonicalBody(input, s.issue.URL)
+	pr, updated, err := s.manager.publishPullRequest(ctx, s.settings, s.branch, s.issue, body)
 	if err != nil {
 		return Result{}, err
 	}
-	s.manager.logger.Info("GitHub pull request reconciled", "issue_id", s.issue.ID, "issue_identifier", s.issue.Identifier, "repository", s.settings.Owner+"/"+s.settings.Repository, "branch", s.branch, "pr_number", pr.Number)
+	s.manager.logger.Info("GitHub pull request reconciled", "issue_id", s.issue.ID, "issue_identifier", s.issue.Identifier, "repository", s.settings.Owner+"/"+s.settings.Repository, "branch", s.branch, "pr_number", pr.Number, "body_updated", updated)
 	if err := s.linear.LinkAndHandoff(ctx, pr.URL); err != nil {
 		return Result{}, err
 	}
 	s.manager.track(s.issue, pr, s.settings, s.linear)
 	s.manager.logger.Info("GitHub pull request handoff", "issue_id", s.issue.ID, "issue_identifier", s.issue.Identifier, "repository", s.settings.Owner+"/"+s.settings.Repository, "branch", s.branch, "pr_number", pr.Number)
-	return Result{Branch: s.branch, URL: pr.URL, Number: pr.Number}, nil
+	return Result{Branch: s.branch, URL: pr.URL, Number: pr.Number, BodyUpdated: updated}, nil
+}
+
+// ChecksResult is the bounded, redacted status of the commit under review.
+type ChecksResult struct {
+	OverallState string     `json:"overall_state"`
+	Runs         []CheckRun `json:"runs"`
+	Total        int        `json:"total"`
+	Truncated    bool       `json:"truncated"`
+}
+
+type CheckRun struct {
+	Name       string `json:"name"`
+	Status     string `json:"status"`
+	Conclusion string `json:"conclusion"`
+}
+
+type ReviewExcerpt struct {
+	Author      string `json:"author"`
+	State       string `json:"state"`
+	Body        string `json:"body_excerpt"`
+	SubmittedAt string `json:"submitted_at"`
+}
+
+type CommentExcerpt struct {
+	Author    string `json:"author"`
+	Body      string `json:"body_excerpt"`
+	CreatedAt string `json:"created_at"`
+}
+
+// ContextResult is the complete bounded, redacted github_pr_context payload.
+// Every field is either a fixed identifier already known to the session or a
+// size-capped, truncation-flagged summary of upstream GitHub state; it never
+// carries raw provider payloads or credentials.
+type ContextResult struct {
+	Branch      string `json:"branch"`
+	PullRequest string `json:"pull_request"`
+	Number      int    `json:"number"`
+	State       string `json:"state"`
+
+	Checks ChecksResult `json:"checks"`
+
+	ReviewState      string          `json:"review_state"`
+	Reviews          []ReviewExcerpt `json:"reviews"`
+	ReviewsTruncated bool            `json:"reviews_truncated"`
+
+	Comments          []CommentExcerpt `json:"comments"`
+	CommentsTruncated bool             `json:"comments_truncated"`
+
+	UnresolvedThreads int  `json:"unresolved_threads"`
+	ThreadsTotal      int  `json:"threads_total"`
+	ThreadsTruncated  bool `json:"threads_truncated"`
+}
+
+// Context reads bounded check, review, comment, and unresolved-thread state
+// for the pull request already bound to this issue, repository, and branch.
+// It performs no mutation: a closed or merged pull request is reported as
+// found rather than reopened or recreated.
+func (s *Session) Context(ctx context.Context) (ContextResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	pr, found, err := s.manager.findPull(ctx, s.settings, s.branch)
+	if err != nil {
+		return ContextResult{}, err
+	}
+	if !found {
+		return ContextResult{}, errors.New("no pull request has been published for this issue yet")
+	}
+	checks, err := s.manager.checks(ctx, s.settings, pr.Head.SHA)
+	if err != nil {
+		return ContextResult{}, err
+	}
+	reviewState, reviews, reviewsTruncated, err := s.manager.reviews(ctx, s.settings, pr.Number)
+	if err != nil {
+		return ContextResult{}, err
+	}
+	comments, commentsTruncated, err := s.manager.comments(ctx, s.settings, pr.Number)
+	if err != nil {
+		return ContextResult{}, err
+	}
+	unresolved, total, threadsTruncated, err := s.manager.reviewThreads(ctx, s.settings, pr.Number)
+	if err != nil {
+		return ContextResult{}, err
+	}
+	return ContextResult{
+		Branch: s.branch, PullRequest: pr.URL, Number: pr.Number, State: pr.State,
+		Checks:            checks,
+		ReviewState:       reviewState,
+		Reviews:           reviews,
+		ReviewsTruncated:  reviewsTruncated,
+		Comments:          comments,
+		CommentsTruncated: commentsTruncated,
+		UnresolvedThreads: unresolved,
+		ThreadsTotal:      total,
+		ThreadsTruncated:  threadsTruncated,
+	}, nil
 }
 
 func matchesRepository(remote, owner, repository string) bool {
@@ -211,38 +376,294 @@ type pull struct {
 	State    string `json:"state"`
 	Merged   bool   `json:"merged"`
 	MergedAt any    `json:"merged_at"`
+	Body     string `json:"body"`
+	Head     struct {
+		Ref string `json:"ref"`
+		SHA string `json:"sha"`
+	} `json:"head"`
+	Base struct {
+		Ref string `json:"ref"`
+	} `json:"base"`
 }
 
-func (m *Manager) findOrCreate(ctx context.Context, s config.GitHub, branch string, issue domain.Issue) (pull, error) {
+// findPull resolves at most the one deterministic pull request for the
+// bound branch. It performs no mutation and no creation; a mismatched head,
+// base, repository, or an ambiguous result is rejected rather than reused.
+func (m *Manager) findPull(ctx context.Context, s config.GitHub, branch string) (pull, bool, error) {
 	path := fmt.Sprintf("/repos/%s/%s/pulls?state=all&head=%s%%3A%s&base=%s", s.Owner, s.Repository, s.Owner, branch, s.BaseBranch)
 	var pulls []pull
 	if err := m.request(ctx, s, http.MethodGet, path, nil, &pulls); err != nil {
-		return pull{}, err
+		return pull{}, false, err
 	}
-	if len(pulls) > 0 {
-		if !validPull(s, pulls[0]) {
-			return pull{}, errors.New("github returned an invalid pull request")
-		}
-		return pulls[0], nil
+	if len(pulls) == 0 {
+		return pull{}, false, nil
 	}
-	body := map[string]any{"title": issue.Identifier + ": " + issue.Title, "head": branch, "base": s.BaseBranch, "body": issue.URL}
-	var created pull
-	if err := m.request(ctx, s, http.MethodPost, fmt.Sprintf("/repos/%s/%s/pulls", s.Owner, s.Repository), body, &created); err != nil {
-		return pull{}, err
+	if len(pulls) > 1 {
+		return pull{}, false, errors.New("github returned more than one pull request for the bound branch")
 	}
-	if !validPull(s, created) {
-		return pull{}, errors.New("github returned an invalid pull request")
+	pr := pulls[0]
+	if !validPull(s, branch, pr) {
+		return pull{}, false, errors.New("github returned a mismatched pull request")
 	}
-	return created, nil
+	return pr, true, nil
 }
 
-func validPull(settings config.GitHub, pr pull) bool {
+// publishPullRequest creates the deterministic pull request when none
+// exists, reopens an issue-bound pull request that was closed without being
+// merged, and updates the body only when the canonical structured fields
+// changed. A pull request already merged is irrecoverable and rejected.
+func (m *Manager) publishPullRequest(ctx context.Context, s config.GitHub, branch string, issue domain.Issue, body string) (pull, bool, error) {
+	existing, found, err := m.findPull(ctx, s, branch)
+	if err != nil {
+		return pull{}, false, err
+	}
+	if found {
+		if existing.Merged || existing.MergedAt != nil {
+			return pull{}, false, errors.New("github pull request for this issue was already merged and cannot be reused")
+		}
+		if strings.EqualFold(existing.State, "closed") {
+			reopened, err := m.setState(ctx, s, existing.Number, "open")
+			if err != nil {
+				return pull{}, false, errors.New("github pull request for this issue is closed and could not be reopened")
+			}
+			if !validPull(s, branch, reopened) {
+				return pull{}, false, errors.New("github returned a mismatched pull request")
+			}
+			existing = reopened
+		}
+		if existing.Body == body {
+			return existing, false, nil
+		}
+		updated, err := m.updateBody(ctx, s, existing.Number, body)
+		if err != nil {
+			return pull{}, false, err
+		}
+		if !validPull(s, branch, updated) {
+			return pull{}, false, errors.New("github returned a mismatched pull request")
+		}
+		return updated, true, nil
+	}
+	requestBody := map[string]any{"title": issue.Identifier + ": " + issue.Title, "head": branch, "base": s.BaseBranch, "body": body}
+	var created pull
+	if err := m.request(ctx, s, http.MethodPost, fmt.Sprintf("/repos/%s/%s/pulls", s.Owner, s.Repository), requestBody, &created); err != nil {
+		return pull{}, false, err
+	}
+	if !validPull(s, branch, created) {
+		return pull{}, false, errors.New("github returned an invalid pull request")
+	}
+	return created, true, nil
+}
+
+func (m *Manager) setState(ctx context.Context, s config.GitHub, number int, state string) (pull, error) {
+	var updated pull
+	if err := m.request(ctx, s, http.MethodPatch, fmt.Sprintf("/repos/%s/%s/pulls/%d", s.Owner, s.Repository, number), map[string]any{"state": state}, &updated); err != nil {
+		return pull{}, err
+	}
+	return updated, nil
+}
+
+func (m *Manager) updateBody(ctx context.Context, s config.GitHub, number int, body string) (pull, error) {
+	var updated pull
+	if err := m.request(ctx, s, http.MethodPatch, fmt.Sprintf("/repos/%s/%s/pulls/%d", s.Owner, s.Repository, number), map[string]any{"body": body}, &updated); err != nil {
+		return pull{}, err
+	}
+	return updated, nil
+}
+
+func validPull(settings config.GitHub, branch string, pr pull) bool {
 	parsed, err := url.Parse(pr.URL)
 	if err != nil || parsed.Scheme != "https" || !strings.EqualFold(parsed.Host, "github.com") || parsed.RawQuery != "" || parsed.Fragment != "" {
 		return false
 	}
 	want := fmt.Sprintf("/%s/%s/pull/%d", settings.Owner, settings.Repository, pr.Number)
-	return pr.Number > 0 && parsed.EscapedPath() == want
+	if pr.Number <= 0 || parsed.EscapedPath() != want {
+		return false
+	}
+	if strings.TrimSpace(pr.Head.Ref) != branch || strings.TrimSpace(pr.Base.Ref) != settings.BaseBranch {
+		return false
+	}
+	return true
+}
+
+// checks reads the combined commit status and check-run summary for the
+// pull request's head commit, bounded and redacted to name/status/conclusion.
+func (m *Manager) checks(ctx context.Context, s config.GitHub, sha string) (ChecksResult, error) {
+	if strings.TrimSpace(sha) == "" {
+		return ChecksResult{}, errors.New("github pull request has no evaluated commit")
+	}
+	var combined struct {
+		State    string `json:"state"`
+		Statuses []struct {
+			Context string `json:"context"`
+			State   string `json:"state"`
+		} `json:"statuses"`
+	}
+	if err := m.request(ctx, s, http.MethodGet, fmt.Sprintf("/repos/%s/%s/commits/%s/status", s.Owner, s.Repository, sha), nil, &combined); err != nil {
+		return ChecksResult{}, err
+	}
+	var runsResponse struct {
+		CheckRuns []struct {
+			Name       string `json:"name"`
+			Status     string `json:"status"`
+			Conclusion string `json:"conclusion"`
+		} `json:"check_runs"`
+	}
+	if err := m.request(ctx, s, http.MethodGet, fmt.Sprintf("/repos/%s/%s/commits/%s/check-runs", s.Owner, s.Repository, sha), nil, &runsResponse); err != nil {
+		return ChecksResult{}, err
+	}
+	total := len(combined.Statuses) + len(runsResponse.CheckRuns)
+	runs := make([]CheckRun, 0, total)
+	for _, status := range combined.Statuses {
+		runs = append(runs, CheckRun{Name: boundedText(status.Context), Status: "status", Conclusion: boundedText(status.State)})
+	}
+	for _, run := range runsResponse.CheckRuns {
+		runs = append(runs, CheckRun{Name: boundedText(run.Name), Status: boundedText(run.Status), Conclusion: boundedText(run.Conclusion)})
+	}
+	truncated := len(runs) > contextMaxItems
+	if truncated {
+		runs = runs[:contextMaxItems]
+	}
+	return ChecksResult{OverallState: boundedText(combined.State), Runs: runs, Total: total, Truncated: truncated}, nil
+}
+
+// reviews reads pull request reviews and computes the effective review state
+// from each reviewer's most recent review, mirroring GitHub's own
+// approve/changes-requested precedence.
+func (m *Manager) reviews(ctx context.Context, s config.GitHub, number int) (string, []ReviewExcerpt, bool, error) {
+	var raw []struct {
+		User struct {
+			Login string `json:"login"`
+		} `json:"user"`
+		State       string `json:"state"`
+		Body        string `json:"body"`
+		SubmittedAt string `json:"submitted_at"`
+	}
+	if err := m.request(ctx, s, http.MethodGet, fmt.Sprintf("/repos/%s/%s/pulls/%d/reviews?per_page=100", s.Owner, s.Repository, number), nil, &raw); err != nil {
+		return "", nil, false, err
+	}
+	latestIndex := map[string]int{}
+	order := make([]string, 0, len(raw))
+	for i, review := range raw {
+		login := strings.TrimSpace(review.User.Login)
+		if login == "" {
+			continue
+		}
+		if _, exists := latestIndex[login]; !exists {
+			order = append(order, login)
+		}
+		latestIndex[login] = i
+	}
+	changesRequested, approved := false, false
+	for _, login := range order {
+		switch strings.ToUpper(strings.TrimSpace(raw[latestIndex[login]].State)) {
+		case "CHANGES_REQUESTED":
+			changesRequested = true
+		case "APPROVED":
+			approved = true
+		}
+	}
+	state := "pending"
+	switch {
+	case changesRequested:
+		state = "changes_requested"
+	case approved:
+		state = "approved"
+	}
+	start := 0
+	truncated := len(raw) > contextMaxItems
+	if truncated {
+		start = len(raw) - contextMaxItems
+	}
+	excerpts := make([]ReviewExcerpt, 0, len(raw)-start)
+	for _, review := range raw[start:] {
+		excerpts = append(excerpts, ReviewExcerpt{
+			Author:      boundedText(review.User.Login),
+			State:       boundedText(review.State),
+			Body:        boundedText(review.Body),
+			SubmittedAt: boundedText(review.SubmittedAt),
+		})
+	}
+	return state, excerpts, truncated, nil
+}
+
+// comments reads issue-level pull request comments, bounded to the most
+// recent contextMaxItems with redacted, size-capped excerpts.
+func (m *Manager) comments(ctx context.Context, s config.GitHub, number int) ([]CommentExcerpt, bool, error) {
+	var raw []struct {
+		User struct {
+			Login string `json:"login"`
+		} `json:"user"`
+		Body      string `json:"body"`
+		CreatedAt string `json:"created_at"`
+	}
+	if err := m.request(ctx, s, http.MethodGet, fmt.Sprintf("/repos/%s/%s/issues/%d/comments?per_page=100", s.Owner, s.Repository, number), nil, &raw); err != nil {
+		return nil, false, err
+	}
+	start := 0
+	truncated := len(raw) > contextMaxItems
+	if truncated {
+		start = len(raw) - contextMaxItems
+	}
+	out := make([]CommentExcerpt, 0, len(raw)-start)
+	for _, comment := range raw[start:] {
+		out = append(out, CommentExcerpt{Author: boundedText(comment.User.Login), Body: boundedText(comment.Body), CreatedAt: boundedText(comment.CreatedAt)})
+	}
+	return out, truncated, nil
+}
+
+// reviewThreads reads unresolved review-thread metadata over the GitHub
+// GraphQL API, the only surface that exposes thread resolution state. The
+// query is fixed; owner, repository, and number always come from the bound
+// session, never from tool input.
+func (m *Manager) reviewThreads(ctx context.Context, s config.GitHub, number int) (unresolved, total int, truncated bool, err error) {
+	payload := map[string]any{
+		"query":     reviewThreadsQuery,
+		"variables": map[string]any{"owner": s.Owner, "repository": s.Repository, "number": number},
+	}
+	var response struct {
+		Data struct {
+			Repository struct {
+				PullRequest struct {
+					ReviewThreads struct {
+						TotalCount int `json:"totalCount"`
+						Nodes      []struct {
+							IsResolved bool `json:"isResolved"`
+						} `json:"nodes"`
+					} `json:"reviewThreads"`
+				} `json:"pullRequest"`
+			} `json:"repository"`
+		} `json:"data"`
+		Errors []struct {
+			Message string `json:"message"`
+		} `json:"errors"`
+	}
+	if err := m.request(ctx, s, http.MethodPost, "/graphql", payload, &response); err != nil {
+		return 0, 0, false, err
+	}
+	if len(response.Errors) > 0 {
+		return 0, 0, false, errors.New("github graphql request failed")
+	}
+	nodes := response.Data.Repository.PullRequest.ReviewThreads.Nodes
+	for _, node := range nodes {
+		if !node.IsResolved {
+			unresolved++
+		}
+	}
+	total = response.Data.Repository.PullRequest.ReviewThreads.TotalCount
+	return unresolved, total, total > len(nodes), nil
+}
+
+const reviewThreadsQuery = `query($owner: String!, $repository: String!, $number: Int!) { repository(owner: $owner, name: $repository) { pullRequest(number: $number) { reviewThreads(first: 100) { totalCount nodes { isResolved } } } } }`
+
+// boundedText trims and rune-caps a redacted excerpt so no single upstream
+// field can inflate the child-visible response.
+func boundedText(value string) string {
+	value = strings.TrimSpace(value)
+	runes := []rune(value)
+	if len(runes) <= contextExcerptRunes {
+		return value
+	}
+	return string(runes[:contextExcerptRunes]) + "…(truncated)"
 }
 
 func (m *Manager) request(ctx context.Context, s config.GitHub, method, path string, body any, out any) error {

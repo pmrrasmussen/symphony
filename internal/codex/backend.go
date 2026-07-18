@@ -108,7 +108,7 @@ func (b *Backend) Start(ctx context.Context, r domain.AgentRequest) (domain.Agen
 		tools = append(tools, linearGraphQLToolDefinition())
 	}
 	if githubSession != nil {
-		tools = append(tools, githubToolDefinition())
+		tools = append(tools, githubToolDefinition(), githubContextToolDefinition())
 	}
 	if len(tools) > 0 {
 		threadParams["dynamicTools"] = tools
@@ -587,7 +587,24 @@ func linearGraphQLToolDefinition() map[string]any {
 func githubToolDefinition() map[string]any {
 	return map[string]any{
 		"type": "function", "name": "github_publish_pr",
-		"description": "Publish the current committed clean worktree to its fixed issue branch, create or reuse its pull request, and hand the active Linear issue to review.",
+		"description": "Publish the current committed clean worktree to its fixed issue branch, create or reuse its pull request with a structured Why/What changed/On Call body, and hand the active Linear issue to review.",
+		"inputSchema": map[string]any{
+			"type": "object", "additionalProperties": false,
+			"properties": map[string]any{
+				// Bounds must match internal/github.maxPublishWhyBytes and friends.
+				"why":          map[string]any{"type": "string", "minLength": 1, "maxLength": 4096},
+				"what_changed": map[string]any{"type": "string", "minLength": 1, "maxLength": 8192},
+				"on_call":      map[string]any{"type": "string", "maxLength": 2048},
+			},
+			"required": []string{"why", "what_changed", "on_call"},
+		},
+	}
+}
+
+func githubContextToolDefinition() map[string]any {
+	return map[string]any{
+		"type": "function", "name": "github_pr_context",
+		"description": "Read bounded check status, effective review state, comment/review excerpts, and unresolved review-thread counts for the pull request already bound to this issue, repository, and branch. Read-only; it cannot select another repository, issue, branch, or pull request.",
 		"inputSchema": map[string]any{"type": "object", "additionalProperties": false},
 	}
 }
@@ -602,17 +619,36 @@ func (c *client) handleToolCall(x rpc) {
 		return
 	}
 	if request.Tool == "github_publish_pr" && c.github != nil {
+		input, err := githubhost.ParsePublishInput(request.Arguments)
+		if err != nil {
+			c.toolFailure(x.ID, "GitHub pull request publication arguments were rejected.")
+			return
+		}
+		result, err := c.github.Publish(c.ctx, input)
+		if err != nil {
+			c.toolFailure(x.ID, "GitHub pull request publication was rejected.")
+			return
+		}
+		content, _ := json.Marshal(map[string]any{"branch": result.Branch, "pull_request": result.URL, "number": result.Number, "body_updated": result.BodyUpdated})
+		c.sendServerResponse(x.ID, map[string]any{"success": true, "contentItems": []any{map[string]any{"type": "inputText", "text": string(content)}}})
+		return
+	}
+	if request.Tool == "github_pr_context" && c.github != nil {
 		var args map[string]json.RawMessage
 		if json.Unmarshal(request.Arguments, &args) != nil || len(args) != 0 {
 			c.unsupportedTool(x.ID)
 			return
 		}
-		result, err := c.github.Publish(c.ctx)
+		result, err := c.github.Context(c.ctx)
 		if err != nil {
-			c.toolFailure(x.ID, "GitHub pull request publication was rejected.")
+			c.toolFailure(x.ID, "GitHub pull request context request was rejected.")
 			return
 		}
-		content, _ := json.Marshal(map[string]any{"branch": result.Branch, "pull_request": result.URL, "number": result.Number})
+		content, err := json.Marshal(result)
+		if err != nil {
+			c.unsupportedTool(x.ID)
+			return
+		}
 		c.sendServerResponse(x.ID, map[string]any{"success": true, "contentItems": []any{map[string]any{"type": "inputText", "text": string(content)}}})
 		return
 	}

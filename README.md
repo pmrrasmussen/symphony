@@ -123,15 +123,25 @@ github:
 
 Use a fine-grained token restricted to that repository. Symphony removes the
 resolved token (including inherited environment values containing it) from the
-Codex child environment. The dynamic tool accepts no issue, repository,
-branch, or credential input: it verifies the worktree's credential-free GitHub
-origin and committed clean changes, pushes
-`symphony/<lowercase-issue-identifier>`, links the PR, and moves only the active
-issue to the configured review state. A confirmed human merge moves that
-linked issue to `Done`; closing without merge leaves it in review and emits a
-warning. Invalid or incomplete GitHub settings disable the tool, preserving
-the manual workflow. In host-publish mode, workers create local commits but do
-not use `gh` or `git push`; they invoke the zero-argument host capability.
-Without it, Symphony tells workers that PR delivery is unavailable and reports
-the missing configuration rather than asking them to publish directly.
-Symphony never merges pull requests.
+Codex child environment. The `github_publish_pr` dynamic tool accepts no
+repository, branch, issue, or credential input, only bounded `why`,
+`what_changed`, and `on_call` structured handoff fields: it verifies the
+worktree's credential-free GitHub origin and committed clean changes, pushes
+`symphony/<lowercase-issue-identifier>`, creates or reuses that branch's pull
+request with a deterministic `Why`/`What changed`/`On Call` body plus the
+bound Linear issue URL, links the PR, and moves only the active issue to the
+configured review state. Repeat publication with the same structured fields
+leaves an already-correct body untouched; changed fields update it in place. A
+pull request that was merged is irrecoverable and rejected; one that was
+closed without merging is reopened. A companion read-only `github_pr_context`
+dynamic tool, bound to the same issue, repository, branch, and pull request,
+reports bounded check status, effective review state, and redacted
+comment/review excerpts and unresolved review-thread counts, with no
+repository, issue, branch, or pull request selection of its own. A confirmed
+human merge moves the linked issue to `Done`; closing without merge leaves it
+in review and emits a warning. Invalid or incomplete GitHub settings disable
+both tools, preserving the manual workflow. In host-publish mode, workers
+create local commits but do not use `gh` or `git push`; they invoke these
+host capabilities instead. Without them, Symphony tells workers that PR
+delivery is unavailable and reports the missing configuration rather than
+asking them to publish directly. Symphony never merges pull requests.
