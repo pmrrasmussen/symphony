@@ -1,9 +1,9 @@
-# Completion markers and recovery
+# Workspace ownership and recovery
 
-Symphony stores durable workspace ownership and completion state below the
-configured `workspace.root` in `.symphony-state/`. The state file name is a
-SHA-256-derived key; use the warning's marker path or inspect the files in that
-directory instead of guessing a name.
+Symphony stores durable workspace ownership below the configured
+`workspace.root` in `.symphony-state/`. The state file name is a
+SHA-256-derived key; use the warning's marker path or inspect that directory
+instead of guessing a name.
 
 ## Schema and ownership
 
@@ -20,82 +20,62 @@ New writes use the `symphony.workspace-state/v2` schema:
   "git_common_dir": "/canonical/source/repository/.git",
   "git_worktree_dir": "/canonical/source/repository/.git/worktrees/PMR-15",
   "git_common_device": 16777230,
-  "git_common_inode": 12345678,
-  "completed_updated_at": "2026-07-18T19:00:00Z"
+  "git_common_inode": 12345678
 }
 ```
 
-`issue_id` and `identifier` bind the file to one Linear issue. `base_commit` is
-present for Git worktrees and makes terminal cleanup refuse locally changed or
-committed work. `preparation` advances through `creating`, `hook_pending`, and
-`ready`; an interrupted pre-ready workspace is discarded and recreated before
-the after-create hook is retried. The three source-worktree paths and the
-common-directory filesystem identity reject replaced/unowned repositories and
-support safe Git registration reconciliation.
-`completed_updated_at` is retained for existing state and for verified
-completion integrations. An active issue that merely exhausts its Codex turn
-budget never receives this field.
+`issue_id` and `identifier` bind the file to one Linear issue. `base_commit`
+keeps terminal cleanup from deleting locally changed or committed work.
+`preparation` advances through `creating`, `hook_pending`, and `ready`; an
+interrupted pre-ready workspace is discarded and recreated before the
+after-create hook is retried. The source-worktree paths and common-directory
+filesystem identity reject replaced or unowned repositories.
 
-Schema v1 and state without `schema`, written by older Symphony builds, remain
-readable and are rewritten as v2 on the next state write. Other schema values,
-unknown fields, malformed JSON, and missing or mismatched ownership fields are
-invalid and fail closed. A legacy Git marker without source-worktree identity
-cannot use source-loss recovery and requires the manual procedure below.
+Older releases may have written `completed_updated_at`. Symphony accepts that
+field while reading old state, ignores it for dispatch, and omits it on the
+next state write. Completion is authoritative in Linear and the host-side
+handoff lifecycle, not in a workspace timestamp.
 
-Symphony owns these files. Do not edit them while Symphony is running. Writes
-are atomic replacements with owner-only file permissions.
+Schema v1 and state without `schema` remain readable and are rewritten as v2
+on the next state write. Other schema values, unknown fields, malformed JSON,
+and missing or mismatched ownership fields are invalid and fail closed.
 
-## Suppression and redispatch
+## Dispatch, restart, and recovery
 
-The scheduler applies this policy before claiming an issue:
+The scheduler claims every active, routable tracker issue. It never suppresses
+an issue because a workspace state file contains an unchanged timestamp.
+`Prepare` owns the local safety boundary:
 
 | State | Result |
 | --- | --- |
-| No state and no existing workspace | Dispatch; this is a new lifecycle. |
-| Valid state without `completed_updated_at` | Dispatch; the workspace belongs to an incomplete lifecycle. |
-| Valid completion matching Linear `updatedAt` | Suppress, including after restart. |
-| Valid completion older than Linear `updatedAt` | Dispatch the updated issue as a new bounded lifecycle. |
-| Missing state beside an existing workspace | Suppress and require manual recovery. |
-| Corrupt, unknown, or ownership-mismatched state | Suppress and require manual recovery. |
-| Completion newer than Linear `updatedAt`, or Linear omits `updatedAt` | Suppress and require manual recovery. |
+| No state and no existing workspace | Create and own a fresh workspace. |
+| Valid ownership state | Reuse the existing workspace, including after restart. |
+| Legacy `completed_updated_at` state | Reuse the workspace and rewrite state without the legacy field. |
+| Missing state beside an existing workspace | Fail closed and require manual recovery. |
+| Corrupt, unknown, or ownership-mismatched state | Fail closed and require manual recovery. |
 
-An issue becomes eligible again only when Linear reports an `updatedAt` later
-than the completed marker, for example after a description or state edit that
-advances that field. Make an intentional edit only when it is safe for the
-issue to run again, and verify that `updatedAt` advanced. Symphony reuses the
-existing issue workspace for that new lifecycle.
-
-The coordinator never treats normal Codex turn completion as durable
-completion. In particular, it does not write `completed_updated_at` after the
-configured bounded continuation turns finish while the issue remains active.
-That outcome is logged as `turn_limit_exhausted` and retried with backoff.
-Durable completion is allowed only after a verified handoff or terminal
-tracker transition; cancellation, failure, an unchanged external blocker, or
-an intervening Linear edit cannot write a completion marker.
+After a restart, Symphony rediscovers active issues from Linear and prepares
+their owned workspaces. An active issue that reaches the Codex turn limit is
+recorded as an explicit blocked/exhausted run and retried with normal backoff;
+it remains dispatchable without a tracker edit. Terminal issues are cleaned up
+only when worktree safety checks allow it.
 
 ## Manual recovery
 
-An invalid marker never becomes an automatic rerun. The scheduler logs the
-validation error and leaves the issue unclaimed. To recover deliberately:
+State ownership errors require deliberate operator action:
 
 1. Stop Symphony and keep it stopped throughout recovery.
-2. Read the reported marker and inspect the matching issue workspace. For
-   Git workspaces, review `git status --short` and `git log` before deciding
-   whether the work is already complete or needs another run.
-3. If the marker is valid and the completed work is safe to redispatch, make a
-   description or state edit and verify that Linear advanced `updatedAt`. Do
-   not remove the marker; the later timestamp makes the new version eligible
-   while retaining ownership and cleanup data.
-4. If state is corrupt, unknown, or missing, move the existing workspace and
-   marker (when present) to an operator-owned quarantine directory outside
-   `workspace.root`. Preserve them together for review. Do not delete either
-   artifact and do not leave the old workspace at its managed path.
-5. Restart Symphony. With neither a managed workspace nor marker present, the
-   issue is treated as a deliberate clean lifecycle and receives a fresh
-   workspace. Remove the quarantined copy only after its work has been
-   reconciled manually.
+2. Read the reported marker and inspect the matching workspace. For Git
+   workspaces, review `git status --short` and `git log` first.
+3. Move the existing workspace and state marker (when present) to an
+   operator-owned quarantine directory outside `workspace.root`. Preserve them
+   together for review; do not delete either artifact or leave the old
+   workspace at its managed path.
+4. Restart Symphony. With neither managed workspace nor marker present, an
+   active issue receives a fresh workspace. Remove the quarantined copy only
+   after reconciling its work manually.
 
-For example, after replacing the paths with the exact values from the log and
+For example, after replacing the paths with exact values from the log and
 configuration:
 
 ```sh

@@ -85,15 +85,9 @@ type Workspace struct {
 	CreatedNow                 bool
 }
 type WorkspaceExecutor interface {
-	// ShouldRun reports whether an issue version has not already completed in its
-	// durable workspace state.
-	ShouldRun(context.Context, Issue) (bool, error)
 	Prepare(context.Context, Issue) (Workspace, error)
 	BeforeRun(context.Context, Workspace, Issue) error
 	AfterRun(context.Context, Workspace, Issue)
-	// MarkCompleted persists successful completion before the coordinator releases
-	// the issue. Implementations must keep this state inside configured roots.
-	MarkCompleted(context.Context, Workspace, Issue) error
 	Cleanup(context.Context, Issue) error
 	Execute(context.Context, Workspace, string, []string) ([]byte, error)
 }

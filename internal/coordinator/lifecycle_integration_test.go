@@ -115,12 +115,7 @@ func (a *lifecycleAgent) continuationCount() int {
 
 type observingLocalWorkspace struct {
 	local    *localworkspace.Local
-	marked   chan struct{}
 	afterRun chan struct{}
-}
-
-func (w *observingLocalWorkspace) ShouldRun(ctx context.Context, issue domain.Issue) (bool, error) {
-	return w.local.ShouldRun(ctx, issue)
 }
 
 func (w *observingLocalWorkspace) Prepare(ctx context.Context, issue domain.Issue) (domain.Workspace, error) {
@@ -134,14 +129,6 @@ func (w *observingLocalWorkspace) BeforeRun(ctx context.Context, workspace domai
 func (w *observingLocalWorkspace) AfterRun(ctx context.Context, workspace domain.Workspace, issue domain.Issue) {
 	w.local.AfterRun(ctx, workspace, issue)
 	w.afterRun <- struct{}{}
-}
-
-func (w *observingLocalWorkspace) MarkCompleted(ctx context.Context, workspace domain.Workspace, issue domain.Issue) error {
-	err := w.local.MarkCompleted(ctx, workspace, issue)
-	if err == nil {
-		w.marked <- struct{}{}
-	}
-	return err
 }
 
 func (w *observingLocalWorkspace) Cleanup(ctx context.Context, issue domain.Issue) error {
@@ -180,8 +167,8 @@ func TestLocalWorkspaceActiveTurnLimitRemainsEligibleAfterRestart(t *testing.T) 
 	if _, err := os.Stat(filepath.Join(workspacePath, ".after-run")); err != nil {
 		t.Fatalf("after_run hook did not use prepared workspace: %v", err)
 	}
-	if shouldRun, err := local.ShouldRun(context.Background(), issue); err != nil || !shouldRun {
-		t.Fatalf("active exhausted issue should remain eligible: shouldRun=%t err=%v", shouldRun, err)
+	if _, err := local.Prepare(context.Background(), issue); err != nil {
+		t.Fatalf("active exhausted issue should remain preparable: %v", err)
 	}
 	if starts, cancels, sent := agent.counts(); starts != 1 || cancels != 1 {
 		t.Fatalf("first lifecycle starts=%d cancels=%d, want 1 each", starts, cancels)
@@ -190,7 +177,7 @@ func TestLocalWorkspaceActiveTurnLimitRemainsEligibleAfterRestart(t *testing.T) 
 	}
 
 	// Restarting with the exact same active issue must dispatch it again because
-	// turn-limit exhaustion did not write a durable completion marker.
+	// turn-limit exhaustion keeps active work eligible for a future run.
 	restarted := New(tracker, agent, workspaces, func() config.Settings { return settings }, nil)
 	restarted.Tick(context.Background())
 	<-agent.requests
@@ -216,8 +203,8 @@ func TestLocalWorkspaceRemainsEligibleAfterTurnLimitExhaustion(t *testing.T) {
 	coordinator.Tick(context.Background())
 	<-agent.requests
 	<-timer.signal
-	if shouldRun, err := local.ShouldRun(context.Background(), issue); err != nil || !shouldRun {
-		t.Fatalf("first bounded turn wrote marker early: shouldRun=%t err=%v", shouldRun, err)
+	if _, err := local.Prepare(context.Background(), issue); err != nil {
+		t.Fatalf("first bounded turn should leave workspace preparable: %v", err)
 	}
 	timer.fire(0)
 	<-workspaces.afterRun
@@ -225,8 +212,8 @@ func TestLocalWorkspaceRemainsEligibleAfterTurnLimitExhaustion(t *testing.T) {
 	if got := agent.continuationCount(); got != 1 {
 		t.Fatalf("continuations=%d, want 1", got)
 	}
-	if shouldRun, err := local.ShouldRun(context.Background(), issue); err != nil || !shouldRun {
-		t.Fatalf("turn-limit exhaustion should leave the active issue eligible: shouldRun=%t err=%v", shouldRun, err)
+	if _, err := local.Prepare(context.Background(), issue); err != nil {
+		t.Fatalf("turn-limit exhaustion should leave the workspace preparable: %v", err)
 	}
 }
 
@@ -236,11 +223,7 @@ func TestCorruptLocalCompletionStateNeverStartsAgent(t *testing.T) {
 	issue := lifecycleIssue(updated)
 	settings := lifecycleSettings(root, "")
 	local := localworkspace.New(func() config.Settings { return settings })
-	ws, err := local.Prepare(context.Background(), issue)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := local.MarkCompleted(context.Background(), ws, issue); err != nil {
+	if _, err := local.Prepare(context.Background(), issue); err != nil {
 		t.Fatal(err)
 	}
 	markers, err := filepath.Glob(filepath.Join(root, ".symphony-state", "*.json"))
@@ -272,7 +255,7 @@ func TestLocalWorkspaceActiveRunShutdownCancelsAndDoesNotRetry(t *testing.T) {
 	agent := &lifecycleAgent{block: true, requests: make(chan domain.AgentRequest, 1)}
 	settings := lifecycleSettings(root, "printf shutdown > .after-run")
 	local := localworkspace.New(func() config.Settings { return settings })
-	workspaces := &observingLocalWorkspace{local: local, marked: make(chan struct{}, 1), afterRun: make(chan struct{}, 1)}
+	workspaces := &observingLocalWorkspace{local: local, afterRun: make(chan struct{}, 1)}
 	coordinator := New(tracker, agent, workspaces, func() config.Settings { return settings }, nil)
 	canonicalRoot, err := filepath.EvalSymlinks(root)
 	if err != nil {

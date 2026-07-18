@@ -45,16 +45,19 @@ type Local struct{ settings func() config.Settings }
 // service restart and includes the initial detached-worktree commit so cleanup
 // can refuse to delete work that was changed or committed locally.
 type workspaceState struct {
-	Schema             string     `json:"schema,omitempty"`
-	IssueID            string     `json:"issue_id"`
-	Identifier         string     `json:"identifier"`
-	BaseCommit         string     `json:"base_commit,omitempty"`
-	Preparation        string     `json:"preparation,omitempty"`
-	SourceRoot         string     `json:"source_root,omitempty"`
-	GitCommonDir       string     `json:"git_common_dir,omitempty"`
-	GitWorktreeDir     string     `json:"git_worktree_dir,omitempty"`
-	GitCommonDevice    uint64     `json:"git_common_device,omitempty"`
-	GitCommonInode     uint64     `json:"git_common_inode,omitempty"`
+	Schema          string `json:"schema,omitempty"`
+	IssueID         string `json:"issue_id"`
+	Identifier      string `json:"identifier"`
+	BaseCommit      string `json:"base_commit,omitempty"`
+	Preparation     string `json:"preparation,omitempty"`
+	SourceRoot      string `json:"source_root,omitempty"`
+	GitCommonDir    string `json:"git_common_dir,omitempty"`
+	GitWorktreeDir  string `json:"git_worktree_dir,omitempty"`
+	GitCommonDevice uint64 `json:"git_common_device,omitempty"`
+	GitCommonInode  uint64 `json:"git_common_inode,omitempty"`
+	// CompletedUpdatedAt is decoded only for compatibility with state written by
+	// older releases. Completion timestamps no longer affect dispatch and are
+	// removed whenever Symphony next writes this state.
 	CompletedUpdatedAt *time.Time `json:"completed_updated_at,omitempty"`
 }
 
@@ -69,46 +72,6 @@ func Key(identifier string) string {
 	}
 	h := sha256.Sum256([]byte(identifier))
 	return fmt.Sprintf("%s--%x", clean, h[:8])
-}
-
-// ShouldRun suppresses a completed issue only when Linear still reports the
-// exact version that completed. A later issue update makes it eligible again.
-func (l *Local) ShouldRun(ctx context.Context, issue domain.Issue) (bool, error) {
-	if err := ctx.Err(); err != nil {
-		return false, err
-	}
-	state, found, err := l.loadState(issue)
-	if err != nil {
-		return false, err
-	}
-	if !found {
-		path, pathErr := l.workspacePath(issue)
-		if pathErr != nil {
-			return false, pathErr
-		}
-		if _, statErr := os.Stat(path); statErr == nil {
-			return false, fmt.Errorf("workspace state is missing for existing workspace %q; manual recovery is required", path)
-		} else if !os.IsNotExist(statErr) {
-			return false, fmt.Errorf("inspect workspace without state: %w", statErr)
-		}
-		return true, nil
-	}
-	if err := validateStateOwner(state, issue); err != nil {
-		return false, err
-	}
-	if state.CompletedUpdatedAt == nil {
-		return true, nil
-	}
-	if issue.UpdatedAt == nil {
-		return false, errors.New("completed workspace state cannot be compared with an issue missing updated_at")
-	}
-	if sameTime(state.CompletedUpdatedAt, issue.UpdatedAt) {
-		return false, nil
-	}
-	if issue.UpdatedAt.After(*state.CompletedUpdatedAt) {
-		return true, nil
-	}
-	return false, fmt.Errorf("issue updated_at %s predates completed workspace state %s; manual recovery is required", issue.UpdatedAt.Format(time.RFC3339Nano), state.CompletedUpdatedAt.Format(time.RFC3339Nano))
 }
 
 func (l *Local) Prepare(ctx context.Context, issue domain.Issue) (domain.Workspace, error) {
@@ -146,6 +109,9 @@ func (l *Local) Prepare(ctx context.Context, issue domain.Issue) (domain.Workspa
 	}
 	if err != nil && !os.IsNotExist(err) {
 		return domain.Workspace{}, err
+	}
+	if !found && !created {
+		return domain.Workspace{}, fmt.Errorf("workspace state is missing for existing workspace %q; manual recovery is required", path)
 	}
 	settings := l.settings()
 	if created {
@@ -262,51 +228,6 @@ func (l *Local) AfterRun(ctx context.Context, ws domain.Workspace, issue domain.
 	if err := l.hook(ctx, ws, issue, "after_run", l.settings().Hooks.AfterRun); err != nil {
 		fmt.Fprintf(os.Stderr, "symphony after_run hook error issue=%s: %v\n", issue.Identifier, err)
 	}
-}
-
-// MarkCompleted records the exact Linear issue version that reached a normal
-// handoff. It intentionally does not alter the worktree: a later terminal
-// cleanup is subject to the same safety checks as every other removal.
-func (l *Local) MarkCompleted(ctx context.Context, ws domain.Workspace, issue domain.Issue) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	expected, err := l.workspacePath(issue)
-	if err != nil {
-		return err
-	}
-	if filepath.Clean(ws.Path) != expected {
-		return fmt.Errorf("completion workspace does not match issue workspace")
-	}
-	if issue.UpdatedAt == nil {
-		return errors.New("cannot mark completion for issue missing updated_at")
-	}
-	state, found, err := l.loadState(issue)
-	if err != nil {
-		return err
-	}
-	if !found {
-		state = workspaceState{Schema: workspaceStateSchema, IssueID: issue.ID, Identifier: issue.Identifier}
-		if git, err := isGitWorkspace(ws.Path); err != nil {
-			return err
-		} else if git {
-			state.BaseCommit, err = gitHead(ctx, ws.Path)
-			if err != nil {
-				return err
-			}
-		}
-	}
-	if err := validateStateOwner(state, issue); err != nil {
-		return err
-	}
-	state.Schema = workspaceStateSchema
-	state.IssueID = issue.ID
-	state.Identifier = issue.Identifier
-	if state.Preparation == "" {
-		state.Preparation = preparationReady
-	}
-	state.CompletedUpdatedAt = cloneTime(issue.UpdatedAt)
-	return l.writeState(issue, state)
 }
 
 func (l *Local) Cleanup(ctx context.Context, issue domain.Issue) error {
@@ -479,6 +400,7 @@ func (l *Local) writeState(issue domain.Issue, state workspaceState) error {
 		return fmt.Errorf("create workspace state directory: %w", err)
 	}
 	state.Schema = workspaceStateSchema
+	state.CompletedUpdatedAt = nil
 	b, err := json.Marshal(state)
 	if err != nil {
 		return fmt.Errorf("encode workspace state: %w", err)
@@ -594,20 +516,6 @@ func ensureGitWorkspaceUnchanged(ctx context.Context, path, baseCommit string) e
 	return nil
 }
 
-func sameTime(a, b *time.Time) bool {
-	if a == nil || b == nil {
-		return a == nil && b == nil
-	}
-	return a.Equal(*b)
-}
-
-func cloneTime(v *time.Time) *time.Time {
-	if v == nil {
-		return nil
-	}
-	c := *v
-	return &c
-}
 func (l *Local) hook(ctx context.Context, ws domain.Workspace, issue domain.Issue, name, script string) error {
 	if script == "" {
 		return nil

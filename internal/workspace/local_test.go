@@ -66,9 +66,6 @@ func TestWorkspaceOperationsRejectSymlinkedWorkspace(t *testing.T) {
 	if err := l.BeforeRun(context.Background(), ws, issue); err == nil || !strings.Contains(err.Error(), "must not be a symlink") {
 		t.Fatalf("BeforeRun error = %v, want symlink rejection", err)
 	}
-	if err := l.MarkCompleted(context.Background(), ws, issue); err == nil || !strings.Contains(err.Error(), "must not be a symlink") {
-		t.Fatalf("MarkCompleted error = %v, want symlink rejection", err)
-	}
 	if err := l.Cleanup(context.Background(), issue); err == nil || !strings.Contains(err.Error(), "must not be a symlink") {
 		t.Fatalf("Cleanup error = %v, want symlink rejection", err)
 	}
@@ -87,8 +84,8 @@ func TestStatePathsRejectSymlinkedDirectoryAndMarker(t *testing.T) {
 	if err := os.Symlink(target, stateDir); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := l.ShouldRun(context.Background(), issue); err == nil || !strings.Contains(err.Error(), "workspace state directory path must not be a symlink") {
-		t.Fatalf("ShouldRun directory error = %v, want state symlink rejection", err)
+	if _, err := l.Prepare(context.Background(), issue); err == nil || !strings.Contains(err.Error(), "workspace state directory path must not be a symlink") {
+		t.Fatalf("Prepare directory error = %v, want state symlink rejection", err)
 	}
 	if entries, err := os.ReadDir(target); err != nil || len(entries) != 0 {
 		t.Fatalf("state target must remain untouched: entries=%v err=%v", entries, err)
@@ -106,8 +103,8 @@ func TestStatePathsRejectSymlinkedDirectoryAndMarker(t *testing.T) {
 	if err := os.Symlink(filepath.Join(target, "marker.json"), marker); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := l.ShouldRun(context.Background(), issue); err == nil || !strings.Contains(err.Error(), "workspace state marker path must not be a symlink") {
-		t.Fatalf("ShouldRun marker error = %v, want state marker symlink rejection", err)
+	if _, err := l.Prepare(context.Background(), issue); err == nil || !strings.Contains(err.Error(), "workspace state marker path must not be a symlink") {
+		t.Fatalf("Prepare marker error = %v, want state marker symlink rejection", err)
 	}
 }
 
@@ -185,50 +182,7 @@ func TestPrepareUsesDetachedGitWorktree(t *testing.T) {
 	}
 }
 
-func TestCompletedMarkerSkipsOnlyUnchangedIssue(t *testing.T) {
-	root := t.TempDir()
-	s := config.Settings{Workspace: config.Workspace{Root: root}, Hooks: config.Hooks{}}
-	l := New(func() config.Settings { return s })
-	updated := time.Date(2026, time.July, 18, 12, 0, 0, 0, time.UTC)
-	issue := domain.Issue{ID: "1", Identifier: "PMR-1", UpdatedAt: &updated}
-
-	shouldRun, err := l.ShouldRun(context.Background(), issue)
-	if err != nil || !shouldRun {
-		t.Fatalf("new issue should run: shouldRun=%t err=%v", shouldRun, err)
-	}
-	ws, err := l.Prepare(context.Background(), issue)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := l.MarkCompleted(context.Background(), ws, issue); err != nil {
-		t.Fatal(err)
-	}
-	state, found, err := l.loadState(issue)
-	if err != nil || !found || state.Schema != workspaceStateSchema {
-		t.Fatalf("completed marker schema=%q found=%t err=%v", state.Schema, found, err)
-	}
-	shouldRun, err = l.ShouldRun(context.Background(), issue)
-	if err != nil || shouldRun {
-		t.Fatalf("unchanged completed issue should not run: shouldRun=%t err=%v", shouldRun, err)
-	}
-
-	changed := issue
-	changedAt := updated.Add(time.Second)
-	changed.UpdatedAt = &changedAt
-	shouldRun, err = l.ShouldRun(context.Background(), changed)
-	if err != nil || !shouldRun {
-		t.Fatalf("changed issue should run: shouldRun=%t err=%v", shouldRun, err)
-	}
-	if err := l.Cleanup(context.Background(), issue); err != nil {
-		t.Fatal(err)
-	}
-	shouldRun, err = l.ShouldRun(context.Background(), issue)
-	if err != nil || !shouldRun {
-		t.Fatalf("terminal cleanup should remove completion state: shouldRun=%t err=%v", shouldRun, err)
-	}
-}
-
-func TestCompletionMarkerValidationFailsClosed(t *testing.T) {
+func TestPrepareRejectsInvalidOwnershipState(t *testing.T) {
 	root := t.TempDir()
 	s := config.Settings{Workspace: config.Workspace{Root: root}, Hooks: config.Hooks{}}
 	l := New(func() config.Settings { return s })
@@ -258,9 +212,9 @@ func TestCompletionMarkerValidationFailsClosed(t *testing.T) {
 			if err := os.WriteFile(marker, []byte(test.body), 0o600); err != nil {
 				t.Fatal(err)
 			}
-			shouldRun, err := l.ShouldRun(context.Background(), issue)
-			if err == nil || shouldRun || !strings.Contains(err.Error(), test.want) {
-				t.Fatalf("ShouldRun=%t err=%v, want fail-closed error containing %q", shouldRun, err, test.want)
+			_, err := l.Prepare(context.Background(), issue)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Prepare error=%v, want fail-closed error containing %q", err, test.want)
 			}
 		})
 	}
@@ -276,10 +230,6 @@ func TestMissingStateForExistingWorkspaceRequiresManualRecovery(t *testing.T) {
 	if err := os.MkdirAll(path, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	shouldRun, err := l.ShouldRun(context.Background(), issue)
-	if err == nil || shouldRun || !strings.Contains(err.Error(), "manual recovery") {
-		t.Fatalf("existing workspace without marker ShouldRun=%t err=%v", shouldRun, err)
-	}
 	if _, err := l.Prepare(context.Background(), issue); err == nil || !strings.Contains(err.Error(), "manual recovery") {
 		t.Fatalf("Prepare existing workspace without marker error=%v", err)
 	}
@@ -290,9 +240,8 @@ func TestMissingStateForExistingWorkspaceRequiresManualRecovery(t *testing.T) {
 	if err := os.Rename(path, quarantine); err != nil {
 		t.Fatal(err)
 	}
-	shouldRun, err = l.ShouldRun(context.Background(), issue)
-	if err != nil || !shouldRun {
-		t.Fatalf("recovered issue ShouldRun=%t err=%v", shouldRun, err)
+	if _, err := l.Prepare(context.Background(), issue); err != nil {
+		t.Fatalf("recovered issue Prepare error=%v", err)
 	}
 	if _, err := os.Stat(quarantine); err != nil {
 		t.Fatalf("quarantined workspace was not preserved: %v", err)
@@ -320,37 +269,19 @@ func TestLegacyWorkspaceStateIsRecognizedAndUpgraded(t *testing.T) {
 	if err := os.WriteFile(marker, []byte(legacy), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if shouldRun, err := l.ShouldRun(context.Background(), issue); err != nil || shouldRun {
-		t.Fatalf("legacy completion ShouldRun=%t err=%v", shouldRun, err)
-	}
 	if _, err := l.Prepare(context.Background(), issue); err != nil {
 		t.Fatal(err)
 	}
 	state, found, err := l.loadState(issue)
-	if err != nil || !found || state.Schema != workspaceStateSchema {
+	if err != nil || !found || state.Schema != workspaceStateSchema || state.CompletedUpdatedAt != nil {
 		t.Fatalf("upgraded state=%+v found=%t err=%v", state, found, err)
 	}
-}
-
-func TestCompletionMarkerRejectsRegressedIssueVersion(t *testing.T) {
-	root := t.TempDir()
-	s := config.Settings{Workspace: config.Workspace{Root: root}, Hooks: config.Hooks{}}
-	l := New(func() config.Settings { return s })
-	updated := time.Date(2026, time.July, 18, 12, 0, 0, 0, time.UTC)
-	issue := domain.Issue{ID: "issue-1", Identifier: "PMR-1", UpdatedAt: &updated}
-	ws, err := l.Prepare(context.Background(), issue)
+	contents, err := os.ReadFile(marker)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := l.MarkCompleted(context.Background(), ws, issue); err != nil {
-		t.Fatal(err)
-	}
-	regressed := issue
-	regressedAt := updated.Add(-time.Second)
-	regressed.UpdatedAt = &regressedAt
-	shouldRun, err := l.ShouldRun(context.Background(), regressed)
-	if err == nil || shouldRun || !strings.Contains(err.Error(), "predates") {
-		t.Fatalf("regressed issue ShouldRun=%t err=%v", shouldRun, err)
+	if strings.Contains(string(contents), "completed_updated_at") {
+		t.Fatalf("rewritten state retained legacy completion timestamp: %s", contents)
 	}
 }
 
