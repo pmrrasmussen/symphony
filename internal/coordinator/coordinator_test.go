@@ -62,6 +62,14 @@ func TestRenderExplainsHostAndManualDeliveryModes(t *testing.T) {
 	}
 }
 
+func TestBlankRequiredLabelFailsClosed(t *testing.T) {
+	issue := domain.Issue{Dispatchable: true, Labels: []string{"ready"}}
+	settings := config.Settings{Tracker: config.Tracker{RequiredLabels: []string{"ready", ""}}}
+	if routable(issue, settings) {
+		t.Fatal("blank required label allowed an issue to be routed")
+	}
+}
+
 func TestSnapshotCopiesOnlySafeOperationalMetadata(t *testing.T) {
 	c := New(&fakeTracker{}, &fakeAgent{}, &fakeWorkspace{}, func() config.Settings { return config.Settings{} }, nil)
 	now := time.Now()
