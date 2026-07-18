@@ -259,6 +259,24 @@ func TestFinishDefersTerminalUntilTurnActivation(t *testing.T) {
 	}
 }
 
+func TestCompletedBeforeProcessExitRemainsTerminal(t *testing.T) {
+	c := bareClient(nopWriteCloser{Writer: io.Discard})
+	events := make(chan domain.Event, 32)
+	c.active = events
+	c.activeDone = make(chan struct{})
+	c.emit(domain.Event{Kind: domain.EventCompleted})
+	c.finish(errors.New("codex process exited after completion"))
+	session := domain.AgentSession{ID: "thread-turn", ThreadID: "thread", TurnID: "turn"}
+	c.activate(events, session, 123)
+	var kinds []domain.EventKind
+	for event := range events {
+		kinds = append(kinds, event.Kind)
+	}
+	if len(kinds) != 2 || kinds[0] != domain.EventSessionStarted || kinds[1] != domain.EventCompleted {
+		t.Fatalf("events=%v", kinds)
+	}
+}
+
 func TestDrainContinuesAfterOversizedDiagnostic(t *testing.T) {
 	var messages []string
 	err := drain(strings.NewReader(strings.Repeat("x", observability.MaxDiagnosticBytes*3)+"\ntoken=secret-value\n"), func(message string) {
@@ -392,7 +410,7 @@ func TestEnabledLinearHandoffIsAdvertisedAndUsesOnlyBoundIssue(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
 		case strings.Contains(query, "SymphonyLinearHandoffIssue"):
-			_, _ = w.Write([]byte(`{"data":{"issue":{"id":"active","identifier":"PMR-5","title":"Handoff","description":"safe","url":"https://linear.app/issue/PMR-5","project":{"slugId":"project-1"},"team":{"id":"team-1"},"state":{"name":"Todo"}}}}`))
+			_, _ = w.Write([]byte(`{"data":{"issue":{"id":"active","identifier":"PMR-5","title":"Handoff","description":"safe","url":"https://linear.app/issue/PMR-5","project":{"slugId":"project-1"},"team":{"id":"team-1"},"state":{"id":"todo","name":"Todo"}}}}`))
 		case strings.Contains(query, "SymphonyLinearHandoffStates"):
 			_, _ = w.Write([]byte(`{"data":{"team":{"id":"team-1","states":{"nodes":[{"id":"review","name":"In Review"}]}}}}`))
 		default:

@@ -229,7 +229,7 @@ func TestHandoffBindsIssueProjectTeamAndFixedOperations(t *testing.T) {
 			}
 			writeJSON(t, w, map[string]any{"data": map[string]any{"issue": map[string]any{
 				"id": "active", "identifier": "PMR-5", "title": "Handoff", "description": "safe", "url": "https://linear.app/issue/PMR-5",
-				"project": map[string]string{"slugId": "project-1"}, "team": map[string]string{"id": "team-1"}, "state": map[string]string{"name": "Todo"},
+				"project": map[string]string{"slugId": "project-1"}, "team": map[string]string{"id": "team-1"}, "state": map[string]string{"id": "todo", "name": "Todo"},
 			}}})
 		case strings.Contains(query, "SymphonyLinearHandoffStates"):
 			if got := variables["teamID"]; got != "team-1" {
@@ -246,6 +246,8 @@ func TestHandoffBindsIssueProjectTeamAndFixedOperations(t *testing.T) {
 				t.Errorf("transition stateID=%v", got)
 			}
 			writeJSON(t, w, map[string]any{"data": map[string]any{"issueUpdate": map[string]bool{"success": true}}})
+		case strings.Contains(query, "SymphonyLinearHandoffComments"):
+			writeJSON(t, w, map[string]any{"data": map[string]any{"issue": map[string]any{"id": "active", "project": map[string]string{"slugId": "project-1"}, "team": map[string]string{"id": "team-1"}, "comments": map[string]any{"nodes": []any{}, "pageInfo": map[string]any{"hasNextPage": false, "endCursor": nil}}}}})
 		case strings.Contains(query, "SymphonyLinearHandoffComment"):
 			if got := variables["issueID"]; got != "active" {
 				t.Errorf("comment issueID=%v", got)
@@ -280,7 +282,7 @@ func TestHandoffBindsIssueProjectTeamAndFixedOperations(t *testing.T) {
 	if _, err := session.Call(context.Background(), json.RawMessage(`{"operation":"handoff","issueID":"other"}`)); err == nil {
 		t.Fatal("arbitrary issue argument was accepted")
 	}
-	if len(calls) != 8 { // prepare read+state; revalidate before each mutation
+	if len(calls) != 10 { // prepare read+state; handoff reconciliation; explicit comment validation
 		t.Fatalf("calls=%d", len(calls))
 	}
 }
@@ -299,7 +301,7 @@ func TestHandoffRejectsHumanTerminalChangeBeforeMutation(t *testing.T) {
 				state = "Done" // a human completed it after session setup
 			}
 			writeJSON(t, w, map[string]any{"data": map[string]any{"issue": map[string]any{
-				"id": "active", "identifier": "PMR-5", "title": "Handoff", "project": map[string]string{"slugId": "project-1"}, "team": map[string]string{"id": "team-1"}, "state": map[string]string{"name": state},
+				"id": "active", "identifier": "PMR-5", "title": "Handoff", "project": map[string]string{"slugId": "project-1"}, "team": map[string]string{"id": "team-1"}, "state": map[string]string{"id": strings.ToLower(strings.ReplaceAll(state, " ", "-")), "name": state},
 			}}})
 		case strings.Contains(query, "SymphonyLinearHandoffStates"):
 			writeJSON(t, w, map[string]any{"data": map[string]any{"team": map[string]any{"id": "team-1", "states": map[string]any{"nodes": []any{map[string]string{"id": "review", "name": "In Review"}}}}}})
@@ -325,7 +327,7 @@ func TestHandoffRejectsHumanTerminalChangeBeforeMutation(t *testing.T) {
 func TestHandoffRejectsIssueOutsideConfiguredProject(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(t, w, map[string]any{"data": map[string]any{"issue": map[string]any{
-			"id": "active", "identifier": "PMR-5", "title": "Handoff", "project": map[string]string{"slugId": "wrong"}, "team": map[string]string{"id": "team-1"}, "state": map[string]string{"name": "Todo"},
+			"id": "active", "identifier": "PMR-5", "title": "Handoff", "project": map[string]string{"slugId": "wrong"}, "team": map[string]string{"id": "team-1"}, "state": map[string]string{"id": "todo", "name": "Todo"},
 		}}})
 	}))
 	defer server.Close()
@@ -420,8 +422,12 @@ func TestAssigneeMeAndFixedPolicy(t *testing.T) {
 	}))
 	defer server.Close()
 
-	issues, err := newTestTracker(server.URL, "me").ListCandidates(context.Background(), []string{"Todo"})
+	tracker := newTestTracker(server.URL, "me")
+	issues, err := tracker.ListCandidates(context.Background(), []string{"Todo"})
 	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tracker.ListCandidates(context.Background(), []string{"Todo"}); err != nil {
 		t.Fatal(err)
 	}
 	if viewerCalls != 1 || !issues[0].Dispatchable || issues[1].Dispatchable {
@@ -433,6 +439,154 @@ func TestAssigneeMeAndFixedPolicy(t *testing.T) {
 	}
 	if issues[0].Dispatchable || !issues[1].Dispatchable {
 		t.Fatalf("fixed assignee policy was not applied: %#v", issues)
+	}
+}
+
+func TestAssigneeMeInvalidatesViewerForTrackerAndPolicyChanges(t *testing.T) {
+	var viewerCalls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		request := decodeRequest(t, r)
+		if strings.Contains(request["query"].(string), "SymphonyLinearViewer") {
+			viewerCalls++
+			writeJSON(t, w, map[string]any{"data": map[string]any{"viewer": map[string]any{"id": r.Header.Get("Authorization") + "-viewer"}}})
+			return
+		}
+		writeJSON(t, w, issuePage([]any{issue("one", "PMR-1", "Mine", "Todo", r.Header.Get("Authorization")+"-viewer", nil, nil)}, false, ""))
+	}))
+	defer server.Close()
+
+	settings := config.Settings{Tracker: config.Tracker{
+		Provider:       map[string]any{"api_key": "first-token", "project_slug": "first-project", "endpoint": server.URL, "assignee": "me", "api_key_file": "first-key-file"},
+		ActiveStates:   []string{"Todo"},
+		TerminalStates: []string{"Done"},
+	}}
+	tracker := New(func() config.Settings { return settings })
+	assertPoll := func(wantDispatchable bool) {
+		t.Helper()
+		issues, err := tracker.ListCandidates(context.Background(), []string{"Todo"})
+		if err != nil || len(issues) != 1 || issues[0].Dispatchable != wantDispatchable {
+			t.Fatalf("issues=%#v err=%v want dispatchable=%v", issues, err, wantDispatchable)
+		}
+	}
+
+	assertPoll(true)
+	settings.Tracker.Provider = map[string]any{"api_key": "second-token", "project_slug": "second-project", "endpoint": server.URL, "assignee": "me", "api_key_file": "second-key-file"}
+	assertPoll(true)
+	if viewerCalls != 2 {
+		t.Fatalf("viewer calls after tracker change=%d want 2", viewerCalls)
+	}
+
+	settings.Tracker.Provider["assignee"] = "fixed-viewer"
+	assertPoll(false)
+	delete(settings.Tracker.Provider, "assignee")
+	assertPoll(true)
+	if viewerCalls != 2 {
+		t.Fatalf("fixed and absent assignee unexpectedly resolved viewer: %d", viewerCalls)
+	}
+
+	settings.Tracker.Provider["assignee"] = "me"
+	assertPoll(true)
+	if viewerCalls != 3 {
+		t.Fatalf("viewer calls after policy restoration=%d want 3", viewerCalls)
+	}
+
+	settings.Tracker.Provider["api_key"] = ""
+	if issues, err := tracker.ListCandidates(context.Background(), []string{"Todo"}); issues != nil {
+		t.Fatalf("invalid tracker configuration returned issues: %#v", issues)
+	} else {
+		assertCategory(t, err, "missing_tracker_secret")
+	}
+	settings.Tracker.Provider["api_key"] = "second-token"
+	assertPoll(true)
+	if viewerCalls != 4 {
+		t.Fatalf("viewer calls after invalid configuration recovery=%d want 4", viewerCalls)
+	}
+}
+
+func TestAssigneeMeViewerFailureIsNotCached(t *testing.T) {
+	var viewerCalls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		request := decodeRequest(t, r)
+		if strings.Contains(request["query"].(string), "SymphonyLinearViewer") {
+			viewerCalls++
+			viewerID := ""
+			if viewerCalls > 1 {
+				viewerID = "viewer-id"
+			}
+			writeJSON(t, w, map[string]any{"data": map[string]any{"viewer": map[string]any{"id": viewerID}}})
+			return
+		}
+		writeJSON(t, w, issuePage(nil, false, ""))
+	}))
+	defer server.Close()
+
+	tracker := newTestTracker(server.URL, "me")
+	if issues, err := tracker.ListCandidates(context.Background(), []string{"Todo"}); issues != nil {
+		t.Fatalf("failed viewer lookup returned issues: %#v", issues)
+	} else {
+		assertCategory(t, err, "tracker_response")
+	}
+	if _, err := tracker.ListCandidates(context.Background(), []string{"Todo"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tracker.ListCandidates(context.Background(), []string{"Todo"}); err != nil {
+		t.Fatal(err)
+	}
+	if viewerCalls != 2 {
+		t.Fatalf("viewer calls=%d want failed lookup plus one cached success", viewerCalls)
+	}
+}
+
+func TestAssigneeMeConcurrentPollsShareViewerResolution(t *testing.T) {
+	const polls = 8
+	var mu sync.Mutex
+	viewerCalls := 0
+	viewerStarted := make(chan struct{})
+	releaseViewer := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		request := decodeRequest(t, r)
+		if strings.Contains(request["query"].(string), "SymphonyLinearViewer") {
+			mu.Lock()
+			viewerCalls++
+			if viewerCalls == 1 {
+				close(viewerStarted)
+			}
+			mu.Unlock()
+			<-releaseViewer
+			writeJSON(t, w, map[string]any{"data": map[string]any{"viewer": map[string]any{"id": "viewer-id"}}})
+			return
+		}
+		writeJSON(t, w, issuePage(nil, false, ""))
+	}))
+	defer server.Close()
+
+	tracker := newTestTracker(server.URL, "me")
+	start := make(chan struct{})
+	errs := make(chan error, polls)
+	var workers sync.WaitGroup
+	for range polls {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			<-start
+			_, err := tracker.ListCandidates(context.Background(), []string{"Todo"})
+			errs <- err
+		}()
+	}
+	close(start)
+	<-viewerStarted
+	close(releaseViewer)
+	workers.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if viewerCalls != 1 {
+		t.Fatalf("viewer calls=%d want 1", viewerCalls)
 	}
 }
 
