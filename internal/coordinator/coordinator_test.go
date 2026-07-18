@@ -66,6 +66,39 @@ func TestSnapshotCopiesOnlySafeOperationalMetadata(t *testing.T) {
 	}
 }
 
+func TestSortIssuesUsesTotalDeterministicOrder(t *testing.T) {
+	older := time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC)
+	newer := older.Add(time.Hour)
+	tests := []struct {
+		name      string
+		createdAt map[string]*time.Time
+		want      []string
+	}{
+		{name: "both nil", createdAt: map[string]*time.Time{}, want: []string{"PMR-1", "PMR-2"}},
+		{name: "one nil", createdAt: map[string]*time.Time{"PMR-2": &older}, want: []string{"PMR-2", "PMR-1"}},
+		{name: "equal", createdAt: map[string]*time.Time{"PMR-1": &older, "PMR-2": &older}, want: []string{"PMR-1", "PMR-2"}},
+		{name: "distinct", createdAt: map[string]*time.Time{"PMR-1": &newer, "PMR-2": &older}, want: []string{"PMR-2", "PMR-1"}},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			for _, input := range [][]string{{"PMR-1", "PMR-2"}, {"PMR-2", "PMR-1"}} {
+				issues := []domain.Issue{
+					{Identifier: input[0], CreatedAt: test.createdAt[input[0]]},
+					{Identifier: input[1], CreatedAt: test.createdAt[input[1]]},
+				}
+
+				sortIssues(issues)
+
+				got := []string{issues[0].Identifier, issues[1].Identifier}
+				if !reflect.DeepEqual(got, test.want) {
+					t.Fatalf("sortIssues(%v) = %v, want %v", input, got, test.want)
+				}
+			}
+		})
+	}
+}
+
 type fakeTracker struct {
 	mu       sync.Mutex
 	issue    domain.Issue
