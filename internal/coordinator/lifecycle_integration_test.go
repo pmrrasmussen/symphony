@@ -212,7 +212,7 @@ func TestLocalWorkspaceCompletionLifecycleIsDurable(t *testing.T) {
 	}
 }
 
-func TestLocalWorkspaceMarkerIsWrittenAfterFullBoundedLifecycle(t *testing.T) {
+func TestLocalWorkspaceRemainsEligibleAfterTurnLimitExhaustion(t *testing.T) {
 	root := t.TempDir()
 	updated := time.Date(2026, time.July, 18, 12, 0, 0, 0, time.UTC)
 	issue := lifecycleIssue(updated)
@@ -221,9 +221,9 @@ func TestLocalWorkspaceMarkerIsWrittenAfterFullBoundedLifecycle(t *testing.T) {
 	settings := lifecycleSettings(root, "")
 	settings.Agent.MaxTurns = 2
 	local := localworkspace.New(func() config.Settings { return settings })
-	workspaces := &observingLocalWorkspace{local: local, marked: make(chan struct{}, 1), afterRun: make(chan struct{}, 1)}
+	workspaces := &observingLocalWorkspace{local: local, afterRun: make(chan struct{}, 1)}
 	coordinator := New(tracker, agent, workspaces, func() config.Settings { return settings }, nil)
-	timer := &fakeTimer{signal: make(chan struct{}, 1)}
+	timer := &fakeTimer{signal: make(chan struct{}, 2)}
 	coordinator.timer = timer
 
 	coordinator.Tick(context.Background())
@@ -233,13 +233,13 @@ func TestLocalWorkspaceMarkerIsWrittenAfterFullBoundedLifecycle(t *testing.T) {
 		t.Fatalf("first bounded turn wrote marker early: shouldRun=%t err=%v", shouldRun, err)
 	}
 	timer.fire(0)
-	<-workspaces.marked
 	<-workspaces.afterRun
+	<-timer.signal
 	if got := agent.continuationCount(); got != 1 {
 		t.Fatalf("continuations=%d, want 1", got)
 	}
-	if shouldRun, err := local.ShouldRun(context.Background(), issue); err != nil || shouldRun {
-		t.Fatalf("full bounded lifecycle was not durably completed: shouldRun=%t err=%v", shouldRun, err)
+	if shouldRun, err := local.ShouldRun(context.Background(), issue); err != nil || !shouldRun {
+		t.Fatalf("turn-limit exhaustion should leave the active issue eligible: shouldRun=%t err=%v", shouldRun, err)
 	}
 }
 

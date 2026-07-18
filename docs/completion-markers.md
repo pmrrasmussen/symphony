@@ -32,7 +32,9 @@ committed work. `preparation` advances through `creating`, `hook_pending`, and
 the after-create hook is retried. The three source-worktree paths and the
 common-directory filesystem identity reject replaced/unowned repositories and
 support safe Git registration reconciliation.
-`completed_updated_at` is present only after a successful full lifecycle.
+`completed_updated_at` is retained for existing state and for verified
+completion integrations. An active issue that merely exhausts its Codex turn
+budget never receives this field.
 
 Schema v1 and state without `schema`, written by older Symphony builds, remain
 readable and are rewritten as v2 on the next state write. Other schema values,
@@ -63,10 +65,13 @@ advances that field. Make an intentional edit only when it is safe for the
 issue to run again, and verify that `updatedAt` advanced. Symphony reuses the
 existing issue workspace for that new lifecycle.
 
-The coordinator writes `completed_updated_at` only after all configured
-bounded continuation turns complete normally and a final Linear refresh still
-shows the same active issue version. Handoff, cancellation, failure, terminal
-state, or an intervening Linear edit does not write a completion marker.
+The coordinator never treats normal Codex turn completion as durable
+completion. In particular, it does not write `completed_updated_at` after the
+configured bounded continuation turns finish while the issue remains active.
+That outcome is logged as `turn_limit_exhausted` and retried with backoff.
+Durable completion is allowed only after a verified handoff or terminal
+tracker transition; cancellation, failure, an unchanged external blocker, or
+an intervening Linear edit cannot write a completion marker.
 
 ## Manual recovery
 

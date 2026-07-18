@@ -398,29 +398,32 @@ func TestStartSchedulesRateLimitRecoveryWithInjectedTimer(t *testing.T) {
 	}
 }
 
-func TestCompletionIsRecordedAndDoesNotContinueOrRetry(t *testing.T) {
+func TestActiveIssueAtTurnLimitIsBlockedAndRetriedWithoutCompletionMarker(t *testing.T) {
 	w := testSettings(t)
 	issue := testIssue()
 	agent := &fakeAgent{events: completedEvents}
-	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{}, 1), marked: make(chan struct{}, 1)}
+	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{}, 1)}
 	c := testCoordinator(w.Config, &fakeTracker{issue: issue}, agent, ws)
-	timer := &fakeTimer{}
+	timer := &fakeTimer{signal: make(chan struct{}, 1)}
 	c.timer = timer
 
 	c.Tick(context.Background())
 	<-ws.after
-	<-ws.marked
+	<-timer.signal
 
 	starts, continues, cancels := agent.counts()
 	if starts != 1 || continues != 0 || cancels != 1 {
 		t.Fatalf("starts=%d continues=%d cancels=%d", starts, continues, cancels)
 	}
 	_, marks, _, _ := ws.counts()
-	if marks != 1 {
-		t.Fatalf("completed work marks=%d, want 1", marks)
+	if marks != 0 {
+		t.Fatalf("completion markers=%d, want 0 for an active exhausted issue", marks)
 	}
-	if timer.scheduled() != 0 {
-		t.Fatalf("completed run scheduled retries=%d", timer.scheduled())
+	c.mu.Lock()
+	retry := c.retries[issue.ID]
+	c.mu.Unlock()
+	if retry.kind != retryAgent || retry.reason != "turn_limit_exhausted" || retry.attempt != 1 {
+		t.Fatalf("retry=%+v", retry)
 	}
 }
 
@@ -440,9 +443,9 @@ func TestBoundedRunRefreshesAndContinuesSameSessionToExactMaxTurns(t *testing.T)
 			observedMu.Unlock()
 		},
 	}
-	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{}, 1), marked: make(chan struct{}, 1)}
+	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{}, 1)}
 	c := testCoordinator(w.Config, tracker, agent, ws)
-	timer := &fakeTimer{signal: make(chan struct{}, 2)}
+	timer := &fakeTimer{signal: make(chan struct{}, 3)}
 	c.timer = timer
 
 	c.Tick(context.Background())
@@ -451,7 +454,7 @@ func TestBoundedRunRefreshesAndContinuesSameSessionToExactMaxTurns(t *testing.T)
 		timer.fire(index)
 	}
 	<-ws.after
-	<-ws.marked
+	<-timer.signal
 
 	starts, continues, cancels := agent.counts()
 	if starts != 1 || continues != 2 || cancels != 1 {
@@ -474,12 +477,56 @@ func TestBoundedRunRefreshesAndContinuesSameSessionToExactMaxTurns(t *testing.T)
 	if !reflect.DeepEqual(refreshes, []int{1, 2}) {
 		t.Fatalf("tracker refresh counts at continuation=%v, want [1 2]", refreshes)
 	}
-	if tracker.getCount() != 4 {
-		t.Fatalf("tracker refreshes=%d, want one after each turn plus final marker revalidation", tracker.getCount())
+	if tracker.getCount() != 3 {
+		t.Fatalf("tracker refreshes=%d, want one after each turn", tracker.getCount())
 	}
 	_, marks, _, _ := ws.counts()
-	if marks != 1 {
-		t.Fatalf("completion markers=%d, want one only after the bounded lifecycle", marks)
+	if marks != 0 {
+		t.Fatalf("completion markers=%d, want 0 for an active exhausted issue", marks)
+	}
+	c.mu.Lock()
+	retry := c.retries[issue.ID]
+	c.mu.Unlock()
+	if retry.kind != retryAgent || retry.reason != "turn_limit_exhausted" || retry.attempt != 1 {
+		t.Fatalf("retry=%+v", retry)
+	}
+}
+
+func TestBlockedEventStopsContinuationAndLogsSafeRetryReason(t *testing.T) {
+	w := testSettings(t)
+	w.Config.Agent.MaxTurns = 3
+	issue := testIssue()
+	events := make(chan domain.Event, 1)
+	events <- domain.Event{Kind: domain.EventBlocked, At: time.Now(), Message: "Codex GitHub publication request was rejected"}
+	close(events)
+	agent := &fakeAgent{events: func() <-chan domain.Event { return events }}
+	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{}, 1)}
+	var logs bytes.Buffer
+	c := New(&fakeTracker{issue: issue}, agent, ws, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&logs, nil)))
+	c.clock = fakeClock{now: time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)}
+	timer := &fakeTimer{signal: make(chan struct{}, 1)}
+	c.timer = timer
+
+	c.Tick(context.Background())
+	<-ws.after
+	<-timer.signal
+
+	starts, continues, cancels := agent.counts()
+	if starts != 1 || continues != 0 || cancels != 1 {
+		t.Fatalf("starts=%d continues=%d cancels=%d", starts, continues, cancels)
+	}
+	c.mu.Lock()
+	retry := c.retries[issue.ID]
+	c.mu.Unlock()
+	if retry.kind != retryAgent || retry.reason != "agent_blocked" || retry.attempt != 1 {
+		t.Fatalf("retry=%+v", retry)
+	}
+	output := logs.String()
+	if !strings.Contains(output, `"blocker":"github_publication"`) {
+		t.Fatalf("blocked retry did not identify its safe category: %s", output)
+	}
+	if strings.Contains(output, "Codex GitHub publication request was rejected") {
+		t.Fatalf("blocked retry logged raw event text: %s", output)
 	}
 }
 
@@ -590,38 +637,6 @@ func TestClosedEventStreamSchedulesDeterministicAgentRetry(t *testing.T) {
 	c.mu.Unlock()
 	if retry.kind != retryAgent || retry.reason != "agent_event" || retry.attempt != 1 {
 		t.Fatalf("retry=%+v", retry)
-	}
-}
-
-func TestCompletionMarkerRetryDoesNotRerunCodex(t *testing.T) {
-	w := testSettings(t)
-	issue := testIssue()
-	agent := &fakeAgent{events: completedEvents}
-	ws := &fakeWorkspace{shouldRun: true, markErr: errors.New("disk full"), after: make(chan struct{}, 1)}
-	c := testCoordinator(w.Config, &fakeTracker{issue: issue}, agent, ws)
-	timer := &fakeTimer{signal: make(chan struct{}, 1)}
-	c.timer = timer
-
-	c.Tick(context.Background())
-	<-timer.signal
-	ws.mu.Lock()
-	ws.markErr = nil
-	ws.mu.Unlock()
-	timer.fire(0)
-
-	starts, _, _ := agent.counts()
-	if starts != 1 {
-		t.Fatalf("starts=%d, want one completed Codex turn", starts)
-	}
-	_, marks, _, _ := ws.counts()
-	if marks != 2 {
-		t.Fatalf("marker attempts=%d, want 2", marks)
-	}
-	c.mu.Lock()
-	claimed := c.claimed[issue.ID]
-	c.mu.Unlock()
-	if claimed {
-		t.Fatal("completion marker retry retained claim")
 	}
 }
 

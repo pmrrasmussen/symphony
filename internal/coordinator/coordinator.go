@@ -38,9 +38,40 @@ type retryKind string
 
 const (
 	retryAgent        retryKind = "agent"
-	retryCompletion   retryKind = "completion_marker"
 	continuationDelay           = time.Second
 )
+
+// turnLimitError means that the agent used its bounded session without
+// reaching a verified handoff or a terminal tracker state. It is deliberately
+// retriable: the issue remains active and no durable completion marker is
+// written for work that may still be incomplete.
+type turnLimitError struct{ limit int }
+
+func (e turnLimitError) Error() string {
+	return fmt.Sprintf("agent turn limit exhausted after %d turns while issue remains active", e.limit)
+}
+
+// blockedError carries only a normalized blocker category. Agent event text
+// can contain model or provider data and must not be copied into scheduler
+// logs or retry state.
+type blockedError struct{ category string }
+
+func (e blockedError) Error() string { return "agent blocked: " + e.category }
+
+func blockerCategory(message string) string {
+	switch {
+	case strings.Contains(message, "interactive approval or input"):
+		return "interactive_input"
+	case strings.Contains(message, "GitHub publication"):
+		return "github_publication"
+	case strings.Contains(message, "Linear handoff"):
+		return "linear_handoff"
+	case strings.Contains(message, "unsupported client-side tool"):
+		return "unsupported_tool"
+	default:
+		return "agent_reported"
+	}
+}
 
 // retryState is the coordinator's complete durable-in-process intent for a
 // claimed issue. Durable completion itself remains in the workspace; this
@@ -398,7 +429,7 @@ func (c *Coordinator) launch(parent context.Context, i domain.Issue, attempt int
 		}
 		c.running[i.ID] = r
 		c.mu.Unlock()
-		ended, shouldMark, current, consumeErr := c.runTurns(ctx, r, events, s)
+		ended, _, consumeErr := c.runTurns(ctx, r, events, s)
 		c.mu.Lock()
 		delete(c.running, i.ID)
 		stopped := r.stopped
@@ -418,11 +449,7 @@ func (c *Coordinator) launch(parent context.Context, i domain.Issue, attempt int
 		}
 		c.workspaces.AfterRun(context.Background(), ws, i)
 		if ended {
-			if shouldMark {
-				c.recordCompletion(parent, r, ws, current, attempt, s)
-			} else {
-				c.release(i.ID)
-			}
+			c.release(i.ID)
 			return
 		}
 		if stopped != "" || ctx.Err() != nil {
@@ -430,23 +457,23 @@ func (c *Coordinator) launch(parent context.Context, i domain.Issue, attempt int
 			c.release(i.ID)
 			return
 		}
-		c.finishFailure(parent, i, attempt, "agent_event", consumeErr)
+		c.finishFailure(parent, i, attempt, agentFailureReason(consumeErr), consumeErr)
 	}()
 }
 
-func (c *Coordinator) runTurns(ctx context.Context, r *running, events <-chan domain.Event, settings config.Settings) (ended, shouldMark bool, current domain.Issue, err error) {
+func (c *Coordinator) runTurns(ctx context.Context, r *running, events <-chan domain.Event, settings config.Settings) (ended bool, current domain.Issue, err error) {
 	current = r.issue
 	for {
 		completed, err := c.consume(ctx, r, events)
 		if !completed {
-			return false, false, current, err
+			return false, current, err
 		}
 		fresh, err := c.tracker.GetIssues(ctx, []string{current.ID})
 		if err != nil {
-			return false, false, current, fmt.Errorf("refresh issue after turn: %w", err)
+			return false, current, fmt.Errorf("refresh issue after turn: %w", err)
 		}
 		if len(fresh) != 1 || fresh[0].ID != current.ID {
-			return true, false, current, nil
+			return true, current, nil
 		}
 		current = fresh[0]
 		c.mu.Lock()
@@ -458,23 +485,35 @@ func (c *Coordinator) runTurns(ctx context.Context, r *running, events <-chan do
 					c.log.Warn("terminal workspace cleanup failed", "issue_id", current.ID, "issue_identifier", current.Identifier, "error", err)
 				}
 			}
-			return true, false, current, nil
+			return true, current, nil
 		}
 		if turnCount >= settings.Agent.MaxTurns {
-			return true, true, current, nil
+			return false, current, turnLimitError{limit: settings.Agent.MaxTurns}
 		}
 		if err := c.waitForContinuation(ctx); err != nil {
-			return false, false, current, err
+			return false, current, err
 		}
 		guidance := continuationGuidance(turnCount+1, settings.Agent.MaxTurns)
 		events, err = c.agent.Continue(ctx, r.session, guidance)
 		if err != nil {
-			return false, false, current, fmt.Errorf("continue agent session: %w", err)
+			return false, current, fmt.Errorf("continue agent session: %w", err)
 		}
 		c.mu.Lock()
 		r.run.TurnCount++
 		c.mu.Unlock()
 	}
+}
+
+func agentFailureReason(err error) string {
+	var blocked blockedError
+	if errors.As(err, &blocked) {
+		return "agent_blocked"
+	}
+	var exhausted turnLimitError
+	if errors.As(err, &exhausted) {
+		return "turn_limit_exhausted"
+	}
+	return "agent_event"
 }
 
 func (c *Coordinator) waitForContinuation(ctx context.Context) error {
@@ -511,7 +550,7 @@ func (c *Coordinator) finishRun(r *running, completed bool, stopped stopReason, 
 		r.run.Status = domain.RunCanceled
 	case completed:
 		r.run.Status = domain.RunSucceeded
-	case err != nil && strings.Contains(err.Error(), "agent blocked"):
+	case agentFailureReason(err) == "agent_blocked", agentFailureReason(err) == "turn_limit_exhausted":
 		r.run.Status = domain.RunBlocked
 	case err != nil && strings.Contains(strings.ToLower(err.Error()), "timeout"):
 		r.run.Status = domain.RunTimedOut
@@ -524,68 +563,6 @@ func (c *Coordinator) finishRun(r *running, completed bool, stopped stopReason, 
 	run := r.run
 	c.mu.Unlock()
 	c.log.Info("agent logical run finished", "issue_id", run.IssueID, "issue_identifier", run.IssueIdentifier, "session_id", run.SessionID, "status", string(run.Status), "attempt", run.Attempt, "turn_count", run.TurnCount)
-}
-
-// recordCompletion performs one final tracker read after an event stream says
-// the turn completed. Reconciliation can have taken a snapshot just before the
-// worker removes itself from running; without this read, that interleaving can
-// write a stale completion marker for a terminal or rerouted issue.
-func (c *Coordinator) recordCompletion(parent context.Context, r *running, ws domain.Workspace, issue domain.Issue, attempt int, settings config.Settings) {
-	if !c.completionAllowed(parent, r) {
-		c.log.Info("agent run cancelled", "issue_id", issue.ID, "issue_identifier", issue.Identifier, "session_id", r.session.ID, "reason", cancellationReason(r.stopped, parent))
-		c.release(issue.ID)
-		return
-	}
-	fresh, err := c.tracker.GetIssues(parent, []string{issue.ID})
-	if err != nil {
-		if parent.Err() != nil {
-			c.release(issue.ID)
-			return
-		}
-		c.log.Warn("completion issue refresh failed", "issue_id", issue.ID, "issue_identifier", issue.Identifier, "session_id", r.session.ID, "error", err)
-		c.scheduleRetry(parent, issue, ws, attempt+1, retryCompletion, "completion_reconcile", backoff(attempt+1, settings.Agent.MaxRetryBackoff))
-		return
-	}
-	if len(fresh) != 1 || fresh[0].ID != issue.ID {
-		c.log.Warn("completion issue refresh returned no matching issue", "issue_id", issue.ID, "issue_identifier", issue.Identifier, "session_id", r.session.ID)
-		c.release(issue.ID)
-		return
-	}
-	current := fresh[0]
-	if !eligible(current, settings) {
-		if terminal(current, settings) {
-			if err := c.workspaces.Cleanup(parent, current); err != nil {
-				c.log.Warn("terminal workspace cleanup failed", "issue_id", current.ID, "issue_identifier", current.Identifier, "error", err)
-			}
-		}
-		c.release(issue.ID)
-		return
-	}
-	if !sameIssueVersion(issue, current) {
-		c.log.Info("completion marker skipped for updated issue", "issue_id", issue.ID, "issue_identifier", issue.Identifier, "session_id", r.session.ID)
-		c.release(issue.ID)
-		return
-	}
-	if !c.completionAllowed(parent, r) {
-		c.log.Info("agent run cancelled", "issue_id", issue.ID, "issue_identifier", issue.Identifier, "session_id", r.session.ID, "reason", cancellationReason(r.stopped, parent))
-		c.release(issue.ID)
-		return
-	}
-	if err := c.workspaces.MarkCompleted(parent, ws, current); err != nil {
-		c.log.Error("record completed work failed", "issue_id", issue.ID, "issue_identifier", issue.Identifier, "session_id", r.session.ID, "error", err)
-		c.scheduleRetry(parent, issue, ws, attempt+1, retryCompletion, "completion_marker", backoff(attempt+1, settings.Agent.MaxRetryBackoff))
-		return
-	}
-	c.release(issue.ID)
-}
-
-func (c *Coordinator) completionAllowed(parent context.Context, r *running) bool {
-	if parent.Err() != nil {
-		return false
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return !c.stopping && r.stopped == ""
 }
 
 func (c *Coordinator) consume(ctx context.Context, r *running, events <-chan domain.Event) (bool, error) {
@@ -607,7 +584,7 @@ func (c *Coordinator) consume(ctx context.Context, r *running, events <-chan dom
 			c.logEvent(r, e)
 			switch e.Kind {
 			case domain.EventBlocked:
-				return false, fmt.Errorf("agent blocked: %s", e.Message)
+				return false, blockedError{category: blockerCategory(e.Message)}
 			case domain.EventFailed:
 				return false, fmt.Errorf("agent failed: %s", e.Message)
 			case domain.EventCompleted:
@@ -782,6 +759,10 @@ func (c *Coordinator) finishFailure(ctx context.Context, i domain.Issue, attempt
 	}
 	c.scheduleRetry(ctx, i, domain.Workspace{}, attempt+1, retryAgent, reason, backoff(attempt+1, c.settings().Agent.MaxRetryBackoff))
 	attrs := []any{"issue_id", i.ID, "issue_identifier", i.Identifier, "reason", reason, "attempt", attempt + 1}
+	var blocked blockedError
+	if errors.As(err, &blocked) {
+		attrs = append(attrs, "blocker", blocked.category)
+	}
 	if err != nil && reason != "prompt_render" && reason != "agent_event" {
 		attrs = append(attrs, "error", err)
 	}
@@ -859,32 +840,7 @@ func (c *Coordinator) runRetry(id string, generation uint64) {
 		c.release(id)
 		return
 	}
-	if retry.kind == retryCompletion {
-		// A completion marker may only be written for the exact issue version
-		// that Codex completed. A later update is a new run, not a marker retry.
-		if !sameIssueVersion(retry.issue, issue) {
-			c.release(id)
-			return
-		}
-		if err := c.workspaces.MarkCompleted(ctx, retry.workspace, issue); err != nil {
-			c.log.Error("record completed work retry failed", "issue_id", issue.ID, "issue_identifier", issue.Identifier, "error", err)
-			c.scheduleRetry(ctx, issue, retry.workspace, retry.attempt+1, retryCompletion, "completion_marker", backoff(retry.attempt+1, s.Agent.MaxRetryBackoff))
-			return
-		}
-		c.release(id)
-		return
-	}
 	c.launch(ctx, issue, retry.attempt)
-}
-
-func sameIssueVersion(a, b domain.Issue) bool {
-	if a.ID != b.ID {
-		return false
-	}
-	if a.UpdatedAt == nil || b.UpdatedAt == nil {
-		return a.UpdatedAt == nil && b.UpdatedAt == nil
-	}
-	return a.UpdatedAt.Equal(*b.UpdatedAt)
 }
 
 func (c *Coordinator) stopRun(id string, reason stopReason) bool {
