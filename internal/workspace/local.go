@@ -72,8 +72,7 @@ func Key(identifier string) string {
 }
 
 // ShouldRun suppresses a completed issue only when Linear still reports the
-// exact version that completed. Any update, including a reopen or new comment,
-// makes the issue eligible again.
+// exact version that completed. A later issue update makes it eligible again.
 func (l *Local) ShouldRun(ctx context.Context, issue domain.Issue) (bool, error) {
 	if err := ctx.Err(); err != nil {
 		return false, err
