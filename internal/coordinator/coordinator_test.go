@@ -34,6 +34,9 @@ func TestObservabilityNormalizesEventsAndProtectsSensitiveMessages(t *testing.T)
 	c := New(&fakeTracker{issue: issue}, agent, ws, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&logs, nil)))
 	c.Tick(context.Background())
 	<-ws.after
+	if err := c.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	output := logs.String()
 	for _, secret := range []string{"do-not-log-this", "prompt=do-not-log-this", issue.Description} {
 		if secret != "" && strings.Contains(output, secret) {
@@ -425,6 +428,9 @@ func TestActiveIssueAtTurnLimitIsBlockedAndRetriedWithoutCompletionMarker(t *tes
 	if retry.kind != retryAgent || retry.reason != "turn_limit_exhausted" || retry.attempt != 1 {
 		t.Fatalf("retry=%+v", retry)
 	}
+	if err := c.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestBoundedRunRefreshesAndContinuesSameSessionToExactMaxTurns(t *testing.T) {
@@ -520,6 +526,9 @@ func TestBlockedEventStopsContinuationAndLogsSafeRetryReason(t *testing.T) {
 	c.mu.Unlock()
 	if retry.kind != retryAgent || retry.reason != "agent_blocked" || retry.attempt != 1 {
 		t.Fatalf("retry=%+v", retry)
+	}
+	if err := c.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
 	}
 	output := logs.String()
 	if !strings.Contains(output, `"blocker":"github_publication"`) {
