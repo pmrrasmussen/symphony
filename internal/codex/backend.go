@@ -511,7 +511,7 @@ func (c *client) emit(e domain.Event) {
 	ch := c.active
 	if ch != nil {
 		if !c.activeReady {
-			if terminal(e.Kind) {
+			if terminal(e.Kind) && c.pendingTerminal == nil {
 				copy := e
 				c.pendingTerminal = &copy
 			} else if c.pendingTerminal == nil && len(c.pendingEvents) < cap(ch)-2 {

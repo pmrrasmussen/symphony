@@ -259,6 +259,24 @@ func TestFinishDefersTerminalUntilTurnActivation(t *testing.T) {
 	}
 }
 
+func TestCompletedBeforeProcessExitRemainsTerminal(t *testing.T) {
+	c := bareClient(nopWriteCloser{Writer: io.Discard})
+	events := make(chan domain.Event, 32)
+	c.active = events
+	c.activeDone = make(chan struct{})
+	c.emit(domain.Event{Kind: domain.EventCompleted})
+	c.finish(errors.New("codex process exited after completion"))
+	session := domain.AgentSession{ID: "thread-turn", ThreadID: "thread", TurnID: "turn"}
+	c.activate(events, session, 123)
+	var kinds []domain.EventKind
+	for event := range events {
+		kinds = append(kinds, event.Kind)
+	}
+	if len(kinds) != 2 || kinds[0] != domain.EventSessionStarted || kinds[1] != domain.EventCompleted {
+		t.Fatalf("events=%v", kinds)
+	}
+}
+
 func TestDrainContinuesAfterOversizedDiagnostic(t *testing.T) {
 	var messages []string
 	err := drain(strings.NewReader(strings.Repeat("x", observability.MaxDiagnosticBytes*3)+"\ntoken=secret-value\n"), func(message string) {
