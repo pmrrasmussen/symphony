@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"syscall"
@@ -513,6 +514,66 @@ func TestGitHubToolHasNoCallerControlledScopeOrCredentialFields(t *testing.T) {
 	encoded, err := json.Marshal(definition)
 	if err != nil || strings.Contains(string(encoded), "token") || strings.Contains(string(encoded), "owner") || strings.Contains(string(encoded), "repository") {
 		t.Fatalf("tool definition exposed host scope: %s err=%v", encoded, err)
+	}
+}
+
+func TestStartGrantsLinkedWorktreeMetadataOnlyToWorkspaceWriteTurns(t *testing.T) {
+	dir := t.TempDir()
+	gitMetadata := filepath.Join(t.TempDir(), "git-common")
+	policyPath := filepath.Join(dir, "turn.json")
+	script := writeAppServer(t, dir, `
+IFS= read -r line
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'
+IFS= read -r line
+IFS= read -r line
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thread-1"}}}'
+IFS= read -r line
+printf '%s' "$line" > turn.json
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn-1"}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{}}'
+`)
+	b := New()
+	_, events, err := b.Start(context.Background(), domain.AgentRequest{Workspace: dir, GitMetadataRoot: gitMetadata, Prompt: "work", Command: "sh " + script, ApprovalPolicy: "never", ThreadSandbox: "workspace-write", TurnTimeout: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range events {
+	}
+	data, err := os.ReadFile(policyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var request struct {
+		Params struct {
+			SandboxPolicy map[string]any `json:"sandboxPolicy"`
+		} `json:"params"`
+	}
+	if err := json.Unmarshal(data, &request); err != nil {
+		t.Fatal(err)
+	}
+	if request.Params.SandboxPolicy["type"] != "workspaceWrite" {
+		t.Fatalf("sandbox policy=%v", request.Params.SandboxPolicy)
+	}
+	roots, ok := request.Params.SandboxPolicy["writableRoots"].([]any)
+	if !ok || len(roots) != 1 || roots[0] != gitMetadata {
+		t.Fatalf("writable roots=%v", request.Params.SandboxPolicy["writableRoots"])
+	}
+}
+
+func TestLocalCommitSandboxPreservesStricterConfiguredPolicies(t *testing.T) {
+	root := "/trusted/git-common"
+	readOnly := map[string]any{"type": "readOnly"}
+	if got := localCommitSandbox(domain.AgentRequest{GitMetadataRoot: root, ThreadSandbox: "workspace-write", TurnSandboxPolicy: readOnly}); !reflect.DeepEqual(got, readOnly) {
+		t.Fatalf("read-only policy changed to %#v", got)
+	}
+	configured := map[string]any{"type": "workspaceWrite", "writableRoots": []any{"/extra", root}}
+	got, ok := localCommitSandbox(domain.AgentRequest{GitMetadataRoot: root, ThreadSandbox: "workspace-write", TurnSandboxPolicy: configured}).(map[string]any)
+	if !ok {
+		t.Fatalf("policy type=%T", got)
+	}
+	roots, ok := got["writableRoots"].([]string)
+	if !ok || !reflect.DeepEqual(roots, []string{"/extra", root}) {
+		t.Fatalf("roots=%#v", got["writableRoots"])
 	}
 }
 

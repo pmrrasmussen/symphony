@@ -47,6 +47,21 @@ func TestObservabilityNormalizesEventsAndProtectsSensitiveMessages(t *testing.T)
 	}
 }
 
+func TestRenderExplainsHostAndManualDeliveryModes(t *testing.T) {
+	settings := config.Settings{Prompt: "Work on {{.issue.identifier}}"}
+	issue := domain.Issue{Identifier: "PMR-40"}
+	manual, err := render(settings, issue, 0)
+	if err != nil || !strings.Contains(manual, "Delivery mode: manual") || !strings.Contains(manual, "Do not run gh, git push") {
+		t.Fatalf("manual prompt=%q err=%v", manual, err)
+	}
+	settings.GitHub.Enabled = true
+	settings.Tracker.HandoffState = "In Review"
+	host, err := render(settings, issue, 0)
+	if err != nil || !strings.Contains(host, "Delivery mode: host-side publish") || !strings.Contains(host, "github_publish_pr with no arguments") {
+		t.Fatalf("host prompt=%q err=%v", host, err)
+	}
+}
+
 func TestSnapshotCopiesOnlySafeOperationalMetadata(t *testing.T) {
 	c := New(&fakeTracker{}, &fakeAgent{}, &fakeWorkspace{}, func() config.Settings { return config.Settings{} }, nil)
 	now := time.Now()

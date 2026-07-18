@@ -130,4 +130,8 @@ origin and committed clean changes, pushes
 issue to the configured review state. A confirmed human merge moves that
 linked issue to `Done`; closing without merge leaves it in review and emits a
 warning. Invalid or incomplete GitHub settings disable the tool, preserving
-the manual workflow. Symphony never merges pull requests.
+the manual workflow. In host-publish mode, workers create local commits but do
+not use `gh` or `git push`; they invoke the zero-argument host capability.
+Without it, Symphony tells workers that PR delivery is unavailable and reports
+the missing configuration rather than asking them to publish directly.
+Symphony never merges pull requests.

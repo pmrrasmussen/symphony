@@ -48,5 +48,5 @@ Work on {{.issue.identifier}}: {{.issue.title}}
 
 {{.issue.description}}
 
-Follow the repository instructions, validate your changes, and leave the issue
-in its workflow-defined handoff state.
+Follow the repository instructions, validate your changes, and follow the
+delivery-mode instructions supplied by Symphony.

@@ -19,7 +19,7 @@ func TestRunExercisesLifecycleWithoutCreatingConfiguredState(t *testing.T) {
 	if !result.OK() {
 		t.Fatalf("result=%+v", result)
 	}
-	for _, check := range []string{"workflow", "tracker", "workspace_root", "workspace_source", "log_root", "codex_command", "hooks", "scheduler_lifecycle"} {
+	for _, check := range []string{"workflow", "github_handoff", "tracker", "workspace_root", "workspace_source", "log_root", "codex_command", "hooks", "scheduler_lifecycle"} {
 		if !hasCheck(result, check) {
 			t.Fatalf("missing %s check: %+v", check, result)
 		}

@@ -371,7 +371,7 @@ func (c *Coordinator) launch(parent context.Context, i domain.Issue, attempt int
 			c.finishFailure(parent, i, attempt, "prompt_render", err)
 			return
 		}
-		session, events, err := c.agent.Start(ctx, domain.AgentRequest{Issue: i, Workspace: ws.Path, Prompt: prompt, Command: s.Codex.Command, ApprovalPolicy: s.Codex.ApprovalPolicy, ThreadSandbox: s.Codex.ThreadSandbox, TurnSandboxPolicy: s.Codex.TurnSandboxPolicy, TurnTimeout: s.Codex.TurnTimeout, ReadTimeout: s.Codex.ReadTimeout})
+		session, events, err := c.agent.Start(ctx, domain.AgentRequest{Issue: i, Workspace: ws.Path, GitMetadataRoot: ws.GitMetadataRoot, Prompt: prompt, Command: s.Codex.Command, ApprovalPolicy: s.Codex.ApprovalPolicy, ThreadSandbox: s.Codex.ThreadSandbox, TurnSandboxPolicy: s.Codex.TurnSandboxPolicy, TurnTimeout: s.Codex.TurnTimeout, ReadTimeout: s.Codex.ReadTimeout})
 		if err != nil {
 			c.workspaces.AfterRun(context.Background(), ws, i)
 			c.finishFailure(parent, i, attempt, "session_start", err)
@@ -1043,5 +1043,9 @@ func backoff(a int, max time.Duration) time.Duration {
 	return d
 }
 func render(s config.Settings, i domain.Issue, attempt int) (string, error) {
-	return s.Render(i, attempt)
+	prompt, err := s.Render(i, attempt)
+	if err != nil {
+		return "", err
+	}
+	return prompt + "\n\n" + s.DeliveryInstructions(), nil
 }

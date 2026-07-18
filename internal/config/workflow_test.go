@@ -343,6 +343,17 @@ func TestEmptyPromptUsesFallback(t *testing.T) {
 	}
 }
 
+func TestDeliveryInstructionsReportExactAvailableMode(t *testing.T) {
+	manual := (Settings{}).DeliveryInstructions()
+	if !strings.Contains(manual, "Delivery mode: manual") || !strings.Contains(manual, "github.owner") {
+		t.Fatalf("manual instructions=%q", manual)
+	}
+	host := (Settings{GitHub: GitHub{Enabled: true}, Tracker: Tracker{HandoffState: "In Review"}}).DeliveryInstructions()
+	if !strings.Contains(host, "host-side publish") || !strings.Contains(host, "github_publish_pr") || strings.Contains(host, "manual") {
+		t.Fatalf("host instructions=%q", host)
+	}
+}
+
 func TestReloadAppliesValidChangesAndRetainsLastValidWorkflow(t *testing.T) {
 	d := t.TempDir()
 	p := filepath.Join(d, "WORKFLOW.md")

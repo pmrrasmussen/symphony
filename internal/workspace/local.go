@@ -222,7 +222,38 @@ func (l *Local) Prepare(ctx context.Context, issue domain.Issue) (domain.Workspa
 	if err := l.ensureState(ctx, ws, issue); err != nil {
 		return domain.Workspace{}, err
 	}
+	if err := l.setGitMetadataRoot(ctx, &ws, issue); err != nil {
+		return domain.Workspace{}, err
+	}
 	return ws, nil
+}
+
+// setGitMetadataRoot grants the agent the Git boundary that a linked worktree
+// needs for local commits. Git stores a linked worktree's index and objects
+// outside the worktree, so workspace-write alone cannot create a commit.
+func (l *Local) setGitMetadataRoot(ctx context.Context, ws *domain.Workspace, issue domain.Issue) error {
+	state, found, err := l.loadState(issue)
+	if err != nil {
+		return err
+	}
+	if !found || state.SourceRoot == "" {
+		return nil
+	}
+	if err := validateStateOwner(state, issue); err != nil {
+		return err
+	}
+	if err := validateWorktreeIdentity(ws.Path, state); err != nil {
+		return fmt.Errorf("validate Git workspace for local commits: %w", err)
+	}
+	available, err := gitRepositoryAvailable(ctx, state)
+	if err != nil {
+		return fmt.Errorf("validate Git workspace repository: %w", err)
+	}
+	if !available {
+		return errors.New("recorded Git workspace repository is unavailable; cannot grant local commit access")
+	}
+	ws.GitMetadataRoot = state.GitCommonDir
+	return nil
 }
 func (l *Local) BeforeRun(ctx context.Context, ws domain.Workspace, issue domain.Issue) error {
 	return l.hook(ctx, ws, issue, "before_run", l.settings().Hooks.BeforeRun)
