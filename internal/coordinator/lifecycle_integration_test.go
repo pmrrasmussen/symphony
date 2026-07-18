@@ -174,8 +174,10 @@ func TestLocalWorkspaceCompletionLifecycleIsDurable(t *testing.T) {
 		t.Fatalf("success event sequence=%v, want %v", sent, want)
 	}
 
-	// The persisted marker suppresses the exact completed Linear version.
-	coordinator.Tick(context.Background())
+	// The persisted marker suppresses the exact completed Linear version after
+	// an orchestrator restart, when in-memory claims are empty again.
+	restarted := New(tracker, agent, workspaces, func() config.Settings { return settings }, nil)
+	restarted.Tick(context.Background())
 	if starts, _, _ := agent.counts(); starts != 1 {
 		t.Fatalf("unchanged completed issue restarted %d times", starts)
 	}
@@ -185,7 +187,7 @@ func TestLocalWorkspaceCompletionLifecycleIsDurable(t *testing.T) {
 	changedAt := updated.Add(time.Second)
 	changed.UpdatedAt = &changedAt
 	tracker.setIssue(changed)
-	coordinator.Tick(context.Background())
+	restarted.Tick(context.Background())
 	<-agent.requests
 	<-workspaces.marked
 	<-workspaces.afterRun
@@ -239,7 +241,7 @@ func lifecycleSettings(root, afterRun string) config.Settings {
 		Polling:   config.Polling{Interval: time.Hour},
 		Workspace: config.Workspace{Root: root},
 		Hooks:     config.Hooks{AfterRun: afterRun, Timeout: time.Second},
-		Agent:     config.Agent{MaxConcurrent: 1, MaxRetryBackoff: time.Second},
+		Agent:     config.Agent{MaxConcurrent: 1, MaxTurns: 1, MaxRetryBackoff: time.Second},
 		Codex:     config.Codex{Command: "test", TurnTimeout: time.Second, ReadTimeout: time.Second},
 		Prompt:    "Work on {{.issue.identifier}}",
 	}
