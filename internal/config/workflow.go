@@ -48,7 +48,8 @@ type Settings struct {
 // GitHub is an optional, fixed-repository host integration. Invalid optional
 // settings remain disabled so they cannot affect the manual workflow.
 //
-// MergeState, MergeMethod, and RequiredChecks are the landing policy (PMR-37)
+// MergeState, MergeMethod, RequiredChecks, and UpdateStaleBranch are the
+// landing policy (PMR-37/PMR-45)
 // and deliberately do not follow that same fail-open-to-disabled rule: unlike
 // owner/repository/token/etc, which silently disable the whole optional
 // integration on any invalid value, an invalid landing field is rejected as a
@@ -70,6 +71,10 @@ type GitHub struct {
 	// present and successful (or neutral) before github_land_pr will merge.
 	// Non-empty whenever MergeState is configured.
 	RequiredChecks []string
+	// UpdateStaleBranch permits github_land_pr to ask GitHub to merge the
+	// current base into a clean, stale pull-request branch. It is opt-in and
+	// disabled by default.
+	UpdateStaleBranch bool
 }
 
 const legacyProjectSlugWarning = "tracker.provider.project_slug is deprecated; migrate to project_slug_id"
@@ -240,7 +245,7 @@ func decode(raw map[string]any, base, path, logRoot string, sources *sourceSnaps
 	if err != nil {
 		return Settings{}, err
 	}
-	mergeState, mergeMethod, requiredChecks, err := githubLandingPolicy(github, activeStates, terminalStates, handoffState)
+	mergeState, mergeMethod, requiredChecks, updateStaleBranch, err := githubLandingPolicy(github, activeStates, terminalStates, handoffState)
 	if err != nil {
 		return Settings{}, err
 	}
@@ -324,6 +329,7 @@ func decode(raw map[string]any, base, path, logRoot string, sources *sourceSnaps
 	githubSettings.MergeState = mergeState
 	githubSettings.MergeMethod = mergeMethod
 	githubSettings.RequiredChecks = requiredChecks
+	githubSettings.UpdateStaleBranch = updateStaleBranch
 
 	s := Settings{
 		WorkflowPath: path,
@@ -613,20 +619,29 @@ func childIssueCreationPolicy(provider map[string]any) (bool, error) {
 var validMergeMethods = map[string]bool{"merge": true, "squash": true, "rebase": true}
 
 // githubLandingPolicy parses and strictly validates the optional
-// github.merge_state, github.merge_method, and github.required_checks
+// github.merge_state, github.merge_method, github.required_checks, and
+// github.update_stale_branch
 // fields. Unlike the rest of the github: block, any malformed or ambiguous
 // value here is a hard configuration error (see the GitHub struct doc
 // comment) rather than a silently-disabled optional feature.
-func githubLandingPolicy(github map[string]any, activeStates, terminalStates []string, handoffState string) (string, string, []string, error) {
+func githubLandingPolicy(github map[string]any, activeStates, terminalStates []string, handoffState string) (string, string, []string, bool, error) {
 	if github == nil {
-		return "", "", nil, nil
+		return "", "", nil, false, nil
+	}
+	updateStaleBranch := false
+	if value, exists := github["update_stale_branch"]; exists {
+		enabled, ok := value.(bool)
+		if !ok {
+			return "", "", nil, false, errors.New("invalid configuration: github.update_stale_branch must be a boolean")
+		}
+		updateStaleBranch = enabled
 	}
 	mergeMethod := "merge"
 	if value, exists := github["merge_method"]; exists {
 		method, ok := value.(string)
 		method = strings.ToLower(strings.TrimSpace(method))
 		if !ok || !validMergeMethods[method] {
-			return "", "", nil, errors.New("invalid configuration: github.merge_method must be one of merge, squash, rebase")
+			return "", "", nil, false, errors.New("invalid configuration: github.merge_method must be one of merge, squash, rebase")
 		}
 		mergeMethod = method
 	}
@@ -635,18 +650,18 @@ func githubLandingPolicy(github map[string]any, activeStates, terminalStates []s
 	if hasRequiredChecks {
 		list, ok := requiredChecksValue.([]any)
 		if !ok || len(list) == 0 {
-			return "", "", nil, errors.New("invalid configuration: github.required_checks must be a non-empty list of strings")
+			return "", "", nil, false, errors.New("invalid configuration: github.required_checks must be a non-empty list of strings")
 		}
 		seen := make(map[string]struct{}, len(list))
 		for _, item := range list {
 			name, ok := item.(string)
 			name = strings.TrimSpace(name)
 			if !ok || name == "" {
-				return "", "", nil, errors.New("invalid configuration: github.required_checks entries must be non-empty strings")
+				return "", "", nil, false, errors.New("invalid configuration: github.required_checks entries must be non-empty strings")
 			}
 			key := strings.ToLower(name)
 			if _, duplicate := seen[key]; duplicate {
-				return "", "", nil, errors.New("invalid configuration: github.required_checks must not contain duplicate entries")
+				return "", "", nil, false, errors.New("invalid configuration: github.required_checks must not contain duplicate entries")
 			}
 			seen[key] = struct{}{}
 			requiredChecks = append(requiredChecks, name)
@@ -655,17 +670,20 @@ func githubLandingPolicy(github map[string]any, activeStates, terminalStates []s
 	stateValue, hasState := github["merge_state"]
 	if !hasState {
 		if hasRequiredChecks {
-			return "", "", nil, errors.New("invalid configuration: github.required_checks requires github.merge_state")
+			return "", "", nil, false, errors.New("invalid configuration: github.required_checks requires github.merge_state")
 		}
 		if _, hasMethod := github["merge_method"]; hasMethod {
-			return "", "", nil, errors.New("invalid configuration: github.merge_method requires github.merge_state")
+			return "", "", nil, false, errors.New("invalid configuration: github.merge_method requires github.merge_state")
 		}
-		return "", "", nil, nil
+		if _, hasUpdate := github["update_stale_branch"]; hasUpdate {
+			return "", "", nil, false, errors.New("invalid configuration: github.update_stale_branch requires github.merge_state")
+		}
+		return "", "", nil, false, nil
 	}
 	state, ok := stateValue.(string)
 	state = strings.TrimSpace(state)
 	if !ok || state == "" {
-		return "", "", nil, errors.New("invalid configuration: github.merge_state must be a non-empty string")
+		return "", "", nil, false, errors.New("invalid configuration: github.merge_state must be a non-empty string")
 	}
 	// merge_state must be an active/dispatchable state (the canonical
 	// lifecycle's Merging): a session must actually be dispatched for that
@@ -674,18 +692,18 @@ func githubLandingPolicy(github map[string]any, activeStates, terminalStates []s
 	// coincide with handoff_state, either of which would make the landing gate
 	// unreachable or ambiguous.
 	if !stateInList(state, activeStates) {
-		return "", "", nil, errors.New("invalid configuration: github.merge_state must be an active state")
+		return "", "", nil, false, errors.New("invalid configuration: github.merge_state must be an active state")
 	}
 	if stateInList(state, terminalStates) {
-		return "", "", nil, errors.New("invalid configuration: github.merge_state must not be a terminal state")
+		return "", "", nil, false, errors.New("invalid configuration: github.merge_state must not be a terminal state")
 	}
 	if handoffState != "" && strings.EqualFold(handoffState, state) {
-		return "", "", nil, errors.New("invalid configuration: github.merge_state must differ from tracker.provider.handoff_state")
+		return "", "", nil, false, errors.New("invalid configuration: github.merge_state must differ from tracker.provider.handoff_state")
 	}
 	if len(requiredChecks) == 0 {
-		return "", "", nil, errors.New("invalid configuration: github.merge_state requires a non-empty github.required_checks list")
+		return "", "", nil, false, errors.New("invalid configuration: github.merge_state requires a non-empty github.required_checks list")
 	}
-	return state, mergeMethod, requiredChecks, nil
+	return state, mergeMethod, requiredChecks, updateStaleBranch, nil
 }
 
 func stateInList(state string, states []string) bool {

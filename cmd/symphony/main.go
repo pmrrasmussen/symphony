@@ -116,6 +116,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "symphony startup configuration error:", err)
 		return 2
 	}
+	logStartupCredentialStatus(log, s)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	ws := workspace.New(settings)
@@ -144,6 +145,17 @@ func run(args []string, stdout, stderr io.Writer) int {
 		log.Error("graceful shutdown timed out", "error", err)
 	}
 	return 0
+}
+
+// logStartupCredentialStatus records whether startup resolved the credentials
+// needed for Symphony's configured host integrations. It deliberately reports
+// only booleans: successful configuration resolution is not a remote
+// authentication check, and credentials must never appear in logs.
+func logStartupCredentialStatus(log *observability.Logger, settings config.Settings) {
+	log.Info("startup credential configuration",
+		"linear_credentials_configured", true,
+		"github_credentials_configured", settings.GitHub.Enabled,
+	)
 }
 
 // parseLogLevel accepts the two documented, operator-facing levels. The

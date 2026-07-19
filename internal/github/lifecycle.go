@@ -134,7 +134,12 @@ type Session struct {
 	workspace string
 	branch    string
 	linear    linearLifecycle
-	mu        sync.Mutex
+	// staleBaseUpdated permits one deterministic GitHub update-branch request
+	// during this landing session. A later base movement remains a hard gate.
+	staleBaseUpdated         bool
+	staleBaseOriginalHeadSHA string
+	updatedHeadSHA           string
+	mu                       sync.Mutex
 }
 
 func (s *Session) MatchesSecret(candidate string) bool {
@@ -378,7 +383,9 @@ type LandResult struct {
 // thread, a stale base, a merge conflict, or a closed/mismatched pull
 // request) refuses landing and attempts the configured Merging -> In Review
 // fallback transition, which is itself a no-op once the issue is no longer
-// exactly in the configured Merging state. Pending checks or undetermined
+// exactly in the configured Merging state. When UpdateStaleBranch is enabled,
+// a clean stale base instead gets one deterministic update-branch attempt and
+// then waits for checks on its new head. Pending checks or undetermined
 // mergeability return a non-terminal LandWaiting result without mutating
 // Linear. A pull request GitHub already reports merged -- discovered up
 // front, immediately before the merge call, or because the merge call itself
@@ -402,6 +409,14 @@ func (s *Session) Land(ctx context.Context) (LandResult, error) {
 	}
 	if !strings.EqualFold(pr.State, "open") {
 		return s.refuse(ctx, "github pull request for this issue is closed")
+	}
+	if s.staleBaseUpdated && s.updatedHeadSHA == "" {
+		// GitHub's update-branch endpoint is asynchronous. Do not merge the
+		// old head while its accepted merge-from-base commit is still pending.
+		if pr.Head.SHA == s.staleBaseOriginalHeadSHA {
+			return LandResult{Status: LandWaiting, Number: pr.Number, URL: pr.URL, Reason: "pull request branch update is pending"}, nil
+		}
+		s.recordUpdatedHead(pr.Number, pr.Head.SHA)
 	}
 
 	origin, err := s.manager.git.Run(ctx, s.workspace, []string{"remote", "get-url", "origin"}, nil)
@@ -429,16 +444,24 @@ func (s *Session) Land(ctx context.Context) (LandResult, error) {
 	// once it has been pushed to the deterministic issue branch.
 	expectedHead := pr.Head.SHA
 	if head != expectedHead {
-		if _, err := s.manager.git.Run(ctx, s.workspace, []string{"merge-base", "--is-ancestor", expectedHead, head}, nil); err != nil {
-			return s.refuse(ctx, "github land worktree head diverged from the published pull request")
+		if s.staleBaseUpdated && s.updatedHeadSHA == expectedHead {
+			// GitHub created the approved merge-from-base commit, so the local
+			// worktree intentionally remains at its former (now ancestor) HEAD.
+			if _, err := s.manager.git.Run(ctx, s.workspace, []string{"merge-base", "--is-ancestor", head, expectedHead}, nil); err != nil {
+				return s.refuse(ctx, "github pull request head changed before landing")
+			}
+		} else {
+			if _, err := s.manager.git.Run(ctx, s.workspace, []string{"merge-base", "--is-ancestor", expectedHead, head}, nil); err != nil {
+				return s.refuse(ctx, "github land worktree head diverged from the published pull request")
+			}
+			auth := base64.StdEncoding.EncodeToString([]byte("x-access-token:" + s.settings.Token))
+			env := []string{"GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=http.https://github.com/.extraheader", "GIT_CONFIG_VALUE_0=AUTHORIZATION: basic " + auth}
+			remote := "https://github.com/" + s.settings.Owner + "/" + s.settings.Repository + ".git"
+			if _, err := s.manager.git.Run(ctx, s.workspace, []string{"push", remote, "HEAD:refs/heads/" + s.branch}, env); err != nil {
+				return LandResult{}, err
+			}
+			expectedHead = head
 		}
-		auth := base64.StdEncoding.EncodeToString([]byte("x-access-token:" + s.settings.Token))
-		env := []string{"GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=http.https://github.com/.extraheader", "GIT_CONFIG_VALUE_0=AUTHORIZATION: basic " + auth}
-		remote := "https://github.com/" + s.settings.Owner + "/" + s.settings.Repository + ".git"
-		if _, err := s.manager.git.Run(ctx, s.workspace, []string{"push", remote, "HEAD:refs/heads/" + s.branch}, env); err != nil {
-			return LandResult{}, err
-		}
-		expectedHead = head
 	}
 
 	if err := s.linear.EnsureMergeState(ctx, s.settings.MergeState); err != nil {
@@ -518,6 +541,9 @@ func (s *Session) Land(ctx context.Context) (LandResult, error) {
 		return LandResult{}, errors.New("github land requires the configured base branch")
 	}
 	if base2 != base1 {
+		if s.settings.UpdateStaleBranch && !s.staleBaseUpdated {
+			return s.updateStaleBranch(ctx, fresh)
+		}
 		return s.refuse(ctx, "github land configured base branch changed before landing")
 	}
 
@@ -533,6 +559,39 @@ func (s *Session) Land(ctx context.Context) (LandResult, error) {
 	}
 	s.manager.logger.Info("GitHub pull request merged", "issue_id", s.issue.ID, "issue_identifier", s.issue.Identifier, "repository", s.settings.Owner+"/"+s.settings.Repository, "pr_number", fresh.Number, "merge_method", s.settings.MergeMethod)
 	return s.completeLanding(ctx, fresh)
+}
+
+// updateStaleBranch asks GitHub to create exactly one merge-from-base commit
+// on the already-approved pull-request branch. GitHub pins the mutation to
+// fresh.Head.SHA, so a concurrent head change is rejected rather than merged.
+func (s *Session) updateStaleBranch(ctx context.Context, fresh pull) (LandResult, error) {
+	if strings.TrimSpace(fresh.Head.SHA) == "" {
+		return s.refuse(ctx, "github returned a pull request without a head commit")
+	}
+	if err := s.manager.updatePullBranch(ctx, s.settings, fresh.Number, fresh.Head.SHA); err != nil {
+		return s.refuse(ctx, "github land could not update stale pull request branch")
+	}
+	s.staleBaseUpdated = true
+	s.staleBaseOriginalHeadSHA = fresh.Head.SHA
+	updated, err := s.manager.getPull(ctx, s.settings, fresh.Number)
+	if err != nil {
+		return LandResult{}, err
+	}
+	if !validPull(s.settings, s.branch, updated) || !strings.EqualFold(updated.State, "open") || strings.TrimSpace(updated.Head.SHA) == "" {
+		return s.refuse(ctx, "github returned an invalid pull request after branch update")
+	}
+	if updated.Head.SHA != fresh.Head.SHA {
+		s.recordUpdatedHead(fresh.Number, updated.Head.SHA)
+	}
+	return LandResult{Status: LandWaiting, Number: fresh.Number, URL: fresh.URL, Reason: "pull request branch was updated; required checks are pending"}, nil
+}
+
+func (s *Session) recordUpdatedHead(number int, sha string) {
+	if strings.TrimSpace(sha) == "" || s.updatedHeadSHA != "" {
+		return
+	}
+	s.updatedHeadSHA = sha
+	s.manager.logger.Info("GitHub pull request branch updated", "issue_identifier", s.issue.Identifier, "pr_number", number, "head_sha", sha)
 }
 
 // completeLanding reconciles the bound Linear issue to Done for an already
@@ -718,6 +777,13 @@ func (m *Manager) mergePull(ctx context.Context, s config.GitHub, number int, me
 		return false, err
 	}
 	return response.Merged, nil
+}
+
+// updatePullBranch invokes GitHub's deterministic update-branch API. The
+// endpoint merges the current base into the PR head and accepts only when the
+// branch still points at sha.
+func (m *Manager) updatePullBranch(ctx context.Context, s config.GitHub, number int, sha string) error {
+	return m.request(ctx, s, http.MethodPut, fmt.Sprintf("/repos/%s/%s/pulls/%d/update-branch", s.Owner, s.Repository, number), map[string]any{"expected_head_sha": sha}, nil)
 }
 
 // checkOutcome classifies one required check's state for github_land_pr

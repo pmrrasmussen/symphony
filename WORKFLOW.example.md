@@ -88,6 +88,11 @@ codex:
 #   # Use the exact GitHub check names your CI reports (often the job names
 #   # from your CI workflow file).
 #   required_checks: [ci/build, ci/test]
+#   # Opt in to GitHub's deterministic update-branch operation when the base
+#   # moves during landing but all other landing gates pass. It creates only a
+#   # merge-from-base commit, then github_land_pr waits for checks on that new
+#   # head. Disabled by default; a later base move still refuses landing.
+#   update_stale_branch: true
 ---
 Work on {{.issue.identifier}}: {{.issue.title}}
 

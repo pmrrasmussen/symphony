@@ -90,10 +90,12 @@ non-dismissed review; moving the issue to `merge_state` is itself the human
 approval, so no separate approving review is required), unresolved review
 threads, the pull request's state and mergeability, and the base commit
 again. Missing or pending required checks, or undetermined mergeability,
-return a non-terminal waiting result without mutating Linear. Any other hard
-gate -- a failing check, an effective changes-requested review, an unresolved
-thread, a stale base, a merge conflict, or a closed/mismatched pull request --
-refuses landing and attempts the configured `merge_state -> In Review`
+return a non-terminal waiting result without mutating Linear. With
+`github.update_stale_branch: true`, one clean stale-base update waits for
+checks on its new head. Any other hard gate -- a failing check, an effective
+changes-requested review, an unresolved thread, a stale base, a merge
+conflict, or a closed/mismatched pull request -- refuses landing and attempts
+the configured `merge_state -> In Review`
 fallback transition, itself a safe no-op once the issue is no longer exactly
 in `merge_state`. A successful merge transitions the bound issue to `Done`
 exactly once; a pull request GitHub already reports merged, discovered at any

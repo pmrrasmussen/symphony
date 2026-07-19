@@ -231,9 +231,10 @@ pull request, required checks, effective review state (moving the issue to
 approval; no separate approving review is required), unresolved review
 threads, mergeability, and current base immediately before merging, and
 transitions only the bound issue to `Done` on success. Pending checks wait
-without changing Linear state; any other hard gate refuses landing and falls
-back to the configured `merge_state -> In Review` transition. Duplicate
-landing calls, and a GitHub merge that succeeds despite a failed Linear
+without changing Linear state. With `github.update_stale_branch: true`, one
+clean stale-base update also waits for checks on its new head; any other hard
+gate falls back to the configured `merge_state -> In Review` transition.
+Duplicate landing calls, and a GitHub merge that succeeds despite a failed Linear
 completion, are reconciled idempotently rather than merging or transitioning
 twice. Symphony never merges a pull request outside this narrow, explicitly
 configured capability.
