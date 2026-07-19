@@ -95,7 +95,23 @@ type linearLifecycle interface {
 	EnsureMergeState(context.Context, string) error
 	RefuseLanding(context.Context, string) (bool, error)
 	CompleteLanding(context.Context, string) (bool, error)
+	// LandComment adds a bounded, host-generated audit comment to the bound
+	// issue (pushed commit SHAs during a fix turn, and the last failed gate
+	// when landing is finally refused). The body is never Codex-supplied.
+	LandComment(context.Context, string) error
 }
+
+// LandGateError is returned by Land for a retryable hard gate when the
+// bounded-fix feature is enabled and attempts remain. It is non-terminal: the
+// backend surfaces Reason to Codex so it can fix, push, and call github_land_pr
+// again within the same turn. Every Reason is a fixed or repository-config
+// derived, bounded, secret-free string.
+type LandGateError struct {
+	Reason    string
+	Retryable bool
+}
+
+func (e *LandGateError) Error() string { return e.Reason }
 
 func New(settings func() config.Settings, logger *slog.Logger) *Manager {
 	if logger == nil {
@@ -143,7 +159,19 @@ type Session struct {
 	staleBaseUpdated         bool
 	staleBaseOriginalHeadSHA string
 	updatedHeadSHA           string
-	mu                       sync.Mutex
+	// Bounded-fix state (PMR-46), all guarded by mu. landAttempts counts the
+	// non-terminal fix requests already granted this session; retryableGateHit
+	// records that at least one retryable gate deferred its Merging -> In
+	// Review transition; lastFailedGate is the fixed reason of the most recent
+	// retryable gate; landed is set once the pull request is merged; and
+	// deferredFired guards the deferred transition + comment so it happens at
+	// most once.
+	landAttempts     int
+	retryableGateHit bool
+	lastFailedGate   string
+	landed           bool
+	deferredFired    bool
+	mu               sync.Mutex
 }
 
 func (s *Session) MatchesSecret(candidate string) bool {
@@ -465,6 +493,13 @@ func (s *Session) Land(ctx context.Context) (LandResult, error) {
 				return LandResult{}, err
 			}
 			expectedHead = head
+			// A fix turn pushed new commits: record the delta on both the Linear
+			// issue and the GitHub PR before the merge so it is inspectable. The
+			// audit trail is part of the bounded-fix feature; with it off, landing
+			// stays byte-for-byte as before and posts no comment.
+			if s.settings.LandFixEnabled {
+				s.auditPushedCommits(ctx, pr.Number, head)
+			}
 		}
 	}
 
@@ -507,7 +542,7 @@ func (s *Session) Land(ctx context.Context) (LandResult, error) {
 		}
 	}
 	if len(failing) > 0 {
-		return s.refuse(ctx, "github required checks failed: "+strings.Join(failing, ", "))
+		return s.gate(ctx, "github required checks failed: "+strings.Join(failing, ", "), true)
 	}
 	if waiting {
 		return LandResult{Status: LandWaiting, Number: fresh.Number, URL: fresh.URL, Reason: "required checks are pending"}, nil
@@ -528,13 +563,15 @@ func (s *Session) Land(ctx context.Context) (LandResult, error) {
 		return LandResult{}, err
 	}
 	if unresolved > 0 {
-		return s.refuse(ctx, "github pull request has unresolved review threads")
+		return s.gate(ctx, "github pull request has unresolved review threads", true)
 	}
 	if fresh.Mergeable == nil {
 		return LandResult{Status: LandWaiting, Number: fresh.Number, URL: fresh.URL, Reason: "github has not yet computed mergeability"}, nil
 	}
 	if !*fresh.Mergeable {
-		return s.refuse(ctx, "github pull request has merge conflicts")
+		// A merge conflict is retryable only when conflict resolution is opted
+		// in; otherwise it refuses immediately exactly as before.
+		return s.gate(ctx, "github pull request has merge conflicts", s.settings.AllowConflictResolution)
 	}
 
 	if _, err := s.manager.git.Run(ctx, s.workspace, []string{"fetch", "origin", s.settings.BaseBranch}, nil); err != nil {
@@ -603,6 +640,10 @@ func (s *Session) recordUpdatedHead(number int, sha string) {
 // path for duplicate landing calls and for a GitHub merge that succeeded but
 // whose Linear completion previously failed.
 func (s *Session) completeLanding(ctx context.Context, pr pull) (LandResult, error) {
+	// Reaching completeLanding means the pull request is merged, so no deferred
+	// Merging -> In Review refusal must fire even if the Linear completion call
+	// below fails and is retried.
+	s.landed = true
 	if _, err := s.linear.CompleteLanding(ctx, s.settings.MergeState); err != nil {
 		return LandResult{}, err
 	}
@@ -611,12 +652,102 @@ func (s *Session) completeLanding(ctx context.Context, pr pull) (LandResult, err
 
 // refuse attempts the configured Merging -> In Review fallback transition
 // (best effort: a failure here does not override the substantive hard-gate
-// reason) and returns the hard-gate refusal as a structured tool failure.
+// reason) and returns the hard-gate refusal as a structured tool failure. An
+// immediate refusal supersedes any deferred transition, so deferredFired is set
+// to keep FinalizeLanding a no-op.
 func (s *Session) refuse(ctx context.Context, reason string) (LandResult, error) {
+	s.deferredFired = true
 	if _, err := s.linear.RefuseLanding(ctx, s.settings.MergeState); err != nil {
 		s.manager.logger.Warn("GitHub land Merging fallback transition failed", "issue_id", s.issue.ID, "issue_identifier", s.issue.Identifier, "reason", reason)
 	}
 	return LandResult{}, errors.New(reason)
+}
+
+// gate handles a hard gate. When the bounded-fix feature is enabled, the gate
+// is retryable, and a fix attempt remains, it defers the Merging -> In Review
+// transition and returns a non-terminal LandGateError so the same Codex turn
+// can fix, push, and retry. When attempts are exhausted it fires the deferred
+// transition plus the comment naming the gate. In every other case (feature
+// off, non-retryable gate) it refuses immediately, byte-for-byte as before.
+func (s *Session) gate(ctx context.Context, reason string, retryable bool) (LandResult, error) {
+	if !retryable || !s.settings.LandFixEnabled {
+		return s.refuse(ctx, reason)
+	}
+	s.retryableGateHit = true
+	s.lastFailedGate = reason
+	if s.landAttempts >= s.settings.MaxLandAttempts {
+		s.fireDeferredRefusal(ctx)
+		return LandResult{}, errors.New(reason)
+	}
+	s.landAttempts++
+	return LandResult{}, &LandGateError{Reason: reason, Retryable: true}
+}
+
+// fireDeferredRefusal performs the deferred Merging -> In Review transition and
+// the comment naming the last failed gate at most once per session. It assumes
+// s.mu is held.
+func (s *Session) fireDeferredRefusal(ctx context.Context) {
+	if s.deferredFired || s.landed {
+		return
+	}
+	s.deferredFired = true
+	if _, err := s.linear.RefuseLanding(ctx, s.settings.MergeState); err != nil {
+		s.manager.logger.Warn("GitHub land deferred Merging fallback transition failed", "issue_id", s.issue.ID, "issue_identifier", s.issue.Identifier)
+	}
+	if err := s.linear.LandComment(ctx, landingRefusalComment(s.lastFailedGate)); err != nil {
+		s.manager.logger.Warn("GitHub land refusal comment failed", "issue_id", s.issue.ID, "issue_identifier", s.issue.Identifier)
+	}
+}
+
+// FinalizeLanding fires the deferred Merging -> In Review transition (and its
+// comment) once when the Codex turn ends after a retryable landing gate was hit
+// but landing neither succeeded nor was already refused. It is a safe no-op
+// when the feature is off, when no retryable gate was hit, when landing
+// succeeded, or when the deferred transition already fired.
+func (s *Session) FinalizeLanding(ctx context.Context) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.settings.LandFixEnabled || !s.retryableGateHit || s.landed {
+		return
+	}
+	s.fireDeferredRefusal(ctx)
+}
+
+// auditPushedCommits records a fix turn's just-pushed head on both the Linear
+// issue and the GitHub pull request. It is best-effort: a comment failure is
+// logged but never blocks landing.
+func (s *Session) auditPushedCommits(ctx context.Context, prNumber int, sha string) {
+	body := landingPushComment(s.issue.Identifier, sha)
+	if err := s.linear.LandComment(ctx, body); err != nil {
+		s.manager.logger.Warn("GitHub land push audit Linear comment failed", "issue_id", s.issue.ID, "issue_identifier", s.issue.Identifier, "pr_number", prNumber)
+	}
+	if err := s.manager.commentPR(ctx, s.settings, prNumber, body); err != nil {
+		s.manager.logger.Warn("GitHub land push audit PR comment failed", "issue_id", s.issue.ID, "issue_identifier", s.issue.Identifier, "pr_number", prNumber)
+	}
+}
+
+// landingPushComment and landingRefusalComment are the fixed, bounded audit
+// bodies. They contain only the bound issue identifier, a short head SHA, and
+// the fixed/config-derived gate reason -- never a credential or provider
+// payload.
+func landingPushComment(identifier, sha string) string {
+	return "Symphony landing pushed new commit(s) for " + strings.TrimSpace(identifier) + ". New pull request head: " + shortSHA(sha) + "."
+}
+
+func landingRefusalComment(gate string) string {
+	gate = strings.TrimSpace(gate)
+	if gate == "" {
+		gate = "a landing gate"
+	}
+	return "Symphony returned this issue to review after exhausting landing fix attempts. Last failed gate: " + gate + "."
+}
+
+func shortSHA(sha string) string {
+	sha = strings.TrimSpace(sha)
+	if len(sha) > 12 {
+		return sha[:12]
+	}
+	return sha
 }
 
 func matchesRepository(remote, owner, repository string) bool {
@@ -755,6 +886,13 @@ func (m *Manager) updateBody(ctx context.Context, s config.GitHub, number int, b
 		return pull{}, err
 	}
 	return updated, nil
+}
+
+// commentPR posts a bounded, host-generated issue-level comment on the pull
+// request. It is used only for the github_land_pr fix-turn audit trail; the
+// body is never Codex-supplied.
+func (m *Manager) commentPR(ctx context.Context, s config.GitHub, number int, body string) error {
+	return m.request(ctx, s, http.MethodPost, fmt.Sprintf("/repos/%s/%s/issues/%d/comments", s.Owner, s.Repository, number), map[string]any{"body": body}, nil)
 }
 
 // getPull reads the single pull request by number. Unlike findPull (which

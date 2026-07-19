@@ -93,6 +93,22 @@ codex:
 #   # merge-from-base commit, then github_land_pr waits for checks on that new
 #   # head. Disabled by default; a later base move still refuses landing.
 #   update_stale_branch: true
+#   # Opt in to bounded fix attempts within the Merging turn (PMR-46). When
+#   # enabled, a retryable hard gate (failing required checks or unresolved
+#   # review threads -- plus merge conflicts only when allow_conflict_resolution
+#   # is set) returns a non-terminal failure naming the gate so the same Codex
+#   # turn can fix, push, and call github_land_pr again, instead of immediately
+#   # refusing. The Merging -> In Review transition is deferred until the fix
+#   # budget is exhausted or the turn ends without landing. All three fields are
+#   # fail-closed and default off, so leaving them unset preserves today's
+#   # immediate per-gate refusal exactly.
+#   land_fix_enabled: true
+#   # Number of non-terminal fix requests granted before landing refuses and
+#   # returns the issue to review. Must be a positive integer; defaults to 2.
+#   max_land_attempts: 2
+#   # Make a merge conflict a retryable gate too (off by default, so a conflict
+#   # otherwise refuses immediately exactly as before).
+#   allow_conflict_resolution: false
 ---
 Work on {{.issue.identifier}}: {{.issue.title}}
 

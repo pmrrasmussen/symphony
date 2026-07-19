@@ -547,6 +547,19 @@ func (s *HandoffSession) ReconcileMerged(ctx context.Context, mergeState string)
 	return true, nil
 }
 
+// LandComment adds a bounded, host-generated comment to the bound issue. It
+// backs the github_land_pr fix-turn audit trail (pushed commit SHAs) and the
+// deferred landing-refusal note naming the last failed gate. The body is
+// composed by the trusted GitHub adapter, never supplied by Codex.
+func (s *HandoffSession) LandComment(ctx context.Context, body string) error {
+	s.handoffMu.Lock()
+	defer s.handoffMu.Unlock()
+	if err := validateComment(body); err != nil {
+		return err
+	}
+	return s.comment(ctx, body)
+}
+
 // LinkAndHandoff adds the fixed PR URL exactly once, then reconciles the
 // repository-owned review handoff. The URL is supplied by the trusted GitHub
 // adapter, never by Codex.

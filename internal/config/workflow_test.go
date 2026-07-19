@@ -666,6 +666,13 @@ func TestGitHubLandingPolicyIsStrictAndFailsClosed(t *testing.T) {
 		{name: "required_checks without merge_state", github: "github: {owner: pmrrasmussen, repository: symphony, base_branch: main, token: $PMR37_GITHUB_TOKEN, required_checks: [ci]}"},
 		{name: "update_stale_branch is not a boolean", github: full + "merge_state: Merging, required_checks: [ci], update_stale_branch: yes}"},
 		{name: "update_stale_branch without merge_state", github: "github: {owner: pmrrasmussen, repository: symphony, base_branch: main, token: $PMR37_GITHUB_TOKEN, update_stale_branch: true}"},
+		{name: "land_fix_enabled is not a boolean", github: full + "merge_state: Merging, required_checks: [ci], land_fix_enabled: maybe}"},
+		{name: "max_land_attempts is not an integer", github: full + `merge_state: Merging, required_checks: [ci], max_land_attempts: "two"}`},
+		{name: "max_land_attempts is not positive", github: full + "merge_state: Merging, required_checks: [ci], max_land_attempts: 0}"},
+		{name: "allow_conflict_resolution is not a boolean", github: full + "merge_state: Merging, required_checks: [ci], allow_conflict_resolution: sometimes}"},
+		{name: "land_fix_enabled without merge_state", github: "github: {owner: pmrrasmussen, repository: symphony, base_branch: main, token: $PMR37_GITHUB_TOKEN, land_fix_enabled: true}"},
+		{name: "max_land_attempts without merge_state", github: "github: {owner: pmrrasmussen, repository: symphony, base_branch: main, token: $PMR37_GITHUB_TOKEN, max_land_attempts: 3}"},
+		{name: "allow_conflict_resolution without merge_state", github: "github: {owner: pmrrasmussen, repository: symphony, base_branch: main, token: $PMR37_GITHUB_TOKEN, allow_conflict_resolution: true}"},
 		{name: "merge_state without a fully configured github integration", github: "github: {owner: pmrrasmussen, merge_state: Merging, required_checks: [ci]}"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -695,6 +702,11 @@ func TestGitHubLandingPolicyParsesValidConfiguration(t *testing.T) {
 	if !got.Enabled || got.MergeState != "Merging" || got.MergeMethod != "merge" || got.UpdateStaleBranch || len(got.RequiredChecks) != 2 || got.RequiredChecks[0] != "ci/build" || got.RequiredChecks[1] != "ci/test" {
 		t.Fatalf("github=%+v", got)
 	}
+	// Bounded-fix fields default off (feature disabled) with a positive attempt
+	// budget so an enabled feature always has a valid bound.
+	if got.LandFixEnabled || got.AllowConflictResolution || got.MaxLandAttempts != 2 {
+		t.Fatalf("bounded-fix defaults=%+v", got)
+	}
 
 	content = strings.Replace(content, "merge_state: Merging, required_checks", "merge_state: Merging, merge_method: squash, required_checks", 1)
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
@@ -718,6 +730,18 @@ func TestGitHubLandingPolicyParsesValidConfiguration(t *testing.T) {
 	}
 	if !w.Config.GitHub.UpdateStaleBranch {
 		t.Fatal("update_stale_branch was not enabled")
+	}
+
+	content = strings.Replace(content, "update_stale_branch: true", "update_stale_branch: true, land_fix_enabled: true, max_land_attempts: 3, allow_conflict_resolution: true", 1)
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	w, err = Load(path, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fix := w.Config.GitHub; !fix.LandFixEnabled || fix.MaxLandAttempts != 3 || !fix.AllowConflictResolution {
+		t.Fatalf("bounded-fix fields=%+v", fix)
 	}
 }
 

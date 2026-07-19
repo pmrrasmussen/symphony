@@ -48,8 +48,9 @@ type Settings struct {
 // GitHub is an optional, fixed-repository host integration. Invalid optional
 // settings remain disabled so they cannot affect the manual workflow.
 //
-// MergeState, MergeMethod, RequiredChecks, and UpdateStaleBranch are the
-// landing policy (PMR-37/PMR-45)
+// MergeState, MergeMethod, RequiredChecks, UpdateStaleBranch, and the
+// bounded-fix fields (LandFixEnabled, MaxLandAttempts, AllowConflictResolution)
+// are the landing policy (PMR-37/PMR-45/PMR-46)
 // and deliberately do not follow that same fail-open-to-disabled rule: unlike
 // owner/repository/token/etc, which silently disable the whole optional
 // integration on any invalid value, an invalid landing field is rejected as a
@@ -75,6 +76,20 @@ type GitHub struct {
 	// current base into a clean, stale pull-request branch. It is opt-in and
 	// disabled by default.
 	UpdateStaleBranch bool
+	// LandFixEnabled permits github_land_pr, for a retryable hard gate, to
+	// return a non-terminal fix request (naming the gate) so the same Codex
+	// turn can fix, push, and retry, instead of immediately refusing. It is
+	// opt-in and disabled by default; with it off, every gate refuses exactly
+	// as before (PMR-46).
+	LandFixEnabled bool
+	// MaxLandAttempts bounds how many non-terminal fix requests a single
+	// session may hand back before it refuses and returns the issue to review.
+	// It defaults to 2 and is only meaningful when LandFixEnabled is true.
+	MaxLandAttempts int
+	// AllowConflictResolution makes a merge conflict a retryable gate (only
+	// when LandFixEnabled is true). Off by default, so a merge conflict refuses
+	// immediately exactly as before.
+	AllowConflictResolution bool
 }
 
 const legacyProjectSlugWarning = "tracker.provider.project_slug is deprecated; migrate to project_slug_id"
@@ -245,7 +260,7 @@ func decode(raw map[string]any, base, path, logRoot string, sources *sourceSnaps
 	if err != nil {
 		return Settings{}, err
 	}
-	mergeState, mergeMethod, requiredChecks, updateStaleBranch, err := githubLandingPolicy(github, activeStates, terminalStates, handoffState)
+	landing, err := githubLandingPolicy(github, activeStates, terminalStates, handoffState)
 	if err != nil {
 		return Settings{}, err
 	}
@@ -323,13 +338,16 @@ func decode(raw map[string]any, base, path, logRoot string, sources *sourceSnaps
 		return Settings{}, err
 	}
 	githubSettings := decodeGitHub(github, githubObjectValid, base, sources)
-	if mergeState != "" && !githubSettings.Enabled {
+	if landing.mergeState != "" && !githubSettings.Enabled {
 		return Settings{}, errors.New("invalid configuration: github.merge_state requires a fully configured github integration")
 	}
-	githubSettings.MergeState = mergeState
-	githubSettings.MergeMethod = mergeMethod
-	githubSettings.RequiredChecks = requiredChecks
-	githubSettings.UpdateStaleBranch = updateStaleBranch
+	githubSettings.MergeState = landing.mergeState
+	githubSettings.MergeMethod = landing.mergeMethod
+	githubSettings.RequiredChecks = landing.requiredChecks
+	githubSettings.UpdateStaleBranch = landing.updateStaleBranch
+	githubSettings.LandFixEnabled = landing.landFixEnabled
+	githubSettings.MaxLandAttempts = landing.maxLandAttempts
+	githubSettings.AllowConflictResolution = landing.allowConflictResolution
 
 	s := Settings{
 		WorkflowPath: path,
@@ -618,30 +636,67 @@ func childIssueCreationPolicy(provider map[string]any) (bool, error) {
 // strategies and nothing else.
 var validMergeMethods = map[string]bool{"merge": true, "squash": true, "rebase": true}
 
+// githubLanding is the strictly-validated optional landing policy. Every field
+// is meaningful only when mergeState is non-empty.
+type githubLanding struct {
+	mergeState              string
+	mergeMethod             string
+	requiredChecks          []string
+	updateStaleBranch       bool
+	landFixEnabled          bool
+	maxLandAttempts         int
+	allowConflictResolution bool
+}
+
 // githubLandingPolicy parses and strictly validates the optional
-// github.merge_state, github.merge_method, github.required_checks, and
-// github.update_stale_branch
-// fields. Unlike the rest of the github: block, any malformed or ambiguous
-// value here is a hard configuration error (see the GitHub struct doc
-// comment) rather than a silently-disabled optional feature.
-func githubLandingPolicy(github map[string]any, activeStates, terminalStates []string, handoffState string) (string, string, []string, bool, error) {
+// github.merge_state, github.merge_method, github.required_checks,
+// github.update_stale_branch, github.land_fix_enabled,
+// github.max_land_attempts, and github.allow_conflict_resolution fields.
+// Unlike the rest of the github: block, any malformed or ambiguous value here
+// is a hard configuration error (see the GitHub struct doc comment) rather
+// than a silently-disabled optional feature.
+func githubLandingPolicy(github map[string]any, activeStates, terminalStates []string, handoffState string) (githubLanding, error) {
 	if github == nil {
-		return "", "", nil, false, nil
+		return githubLanding{}, nil
 	}
 	updateStaleBranch := false
 	if value, exists := github["update_stale_branch"]; exists {
 		enabled, ok := value.(bool)
 		if !ok {
-			return "", "", nil, false, errors.New("invalid configuration: github.update_stale_branch must be a boolean")
+			return githubLanding{}, errors.New("invalid configuration: github.update_stale_branch must be a boolean")
 		}
 		updateStaleBranch = enabled
+	}
+	landFixEnabled := false
+	if value, exists := github["land_fix_enabled"]; exists {
+		enabled, ok := value.(bool)
+		if !ok {
+			return githubLanding{}, errors.New("invalid configuration: github.land_fix_enabled must be a boolean")
+		}
+		landFixEnabled = enabled
+	}
+	maxLandAttempts := 2
+	if value, exists := github["max_land_attempts"]; exists {
+		attempts, ok := value.(int)
+		if !ok || attempts <= 0 {
+			return githubLanding{}, errors.New("invalid configuration: github.max_land_attempts must be a positive integer")
+		}
+		maxLandAttempts = attempts
+	}
+	allowConflictResolution := false
+	if value, exists := github["allow_conflict_resolution"]; exists {
+		enabled, ok := value.(bool)
+		if !ok {
+			return githubLanding{}, errors.New("invalid configuration: github.allow_conflict_resolution must be a boolean")
+		}
+		allowConflictResolution = enabled
 	}
 	mergeMethod := "merge"
 	if value, exists := github["merge_method"]; exists {
 		method, ok := value.(string)
 		method = strings.ToLower(strings.TrimSpace(method))
 		if !ok || !validMergeMethods[method] {
-			return "", "", nil, false, errors.New("invalid configuration: github.merge_method must be one of merge, squash, rebase")
+			return githubLanding{}, errors.New("invalid configuration: github.merge_method must be one of merge, squash, rebase")
 		}
 		mergeMethod = method
 	}
@@ -650,18 +705,18 @@ func githubLandingPolicy(github map[string]any, activeStates, terminalStates []s
 	if hasRequiredChecks {
 		list, ok := requiredChecksValue.([]any)
 		if !ok || len(list) == 0 {
-			return "", "", nil, false, errors.New("invalid configuration: github.required_checks must be a non-empty list of strings")
+			return githubLanding{}, errors.New("invalid configuration: github.required_checks must be a non-empty list of strings")
 		}
 		seen := make(map[string]struct{}, len(list))
 		for _, item := range list {
 			name, ok := item.(string)
 			name = strings.TrimSpace(name)
 			if !ok || name == "" {
-				return "", "", nil, false, errors.New("invalid configuration: github.required_checks entries must be non-empty strings")
+				return githubLanding{}, errors.New("invalid configuration: github.required_checks entries must be non-empty strings")
 			}
 			key := strings.ToLower(name)
 			if _, duplicate := seen[key]; duplicate {
-				return "", "", nil, false, errors.New("invalid configuration: github.required_checks must not contain duplicate entries")
+				return githubLanding{}, errors.New("invalid configuration: github.required_checks must not contain duplicate entries")
 			}
 			seen[key] = struct{}{}
 			requiredChecks = append(requiredChecks, name)
@@ -670,20 +725,29 @@ func githubLandingPolicy(github map[string]any, activeStates, terminalStates []s
 	stateValue, hasState := github["merge_state"]
 	if !hasState {
 		if hasRequiredChecks {
-			return "", "", nil, false, errors.New("invalid configuration: github.required_checks requires github.merge_state")
+			return githubLanding{}, errors.New("invalid configuration: github.required_checks requires github.merge_state")
 		}
 		if _, hasMethod := github["merge_method"]; hasMethod {
-			return "", "", nil, false, errors.New("invalid configuration: github.merge_method requires github.merge_state")
+			return githubLanding{}, errors.New("invalid configuration: github.merge_method requires github.merge_state")
 		}
 		if _, hasUpdate := github["update_stale_branch"]; hasUpdate {
-			return "", "", nil, false, errors.New("invalid configuration: github.update_stale_branch requires github.merge_state")
+			return githubLanding{}, errors.New("invalid configuration: github.update_stale_branch requires github.merge_state")
 		}
-		return "", "", nil, false, nil
+		if _, has := github["land_fix_enabled"]; has {
+			return githubLanding{}, errors.New("invalid configuration: github.land_fix_enabled requires github.merge_state")
+		}
+		if _, has := github["max_land_attempts"]; has {
+			return githubLanding{}, errors.New("invalid configuration: github.max_land_attempts requires github.merge_state")
+		}
+		if _, has := github["allow_conflict_resolution"]; has {
+			return githubLanding{}, errors.New("invalid configuration: github.allow_conflict_resolution requires github.merge_state")
+		}
+		return githubLanding{}, nil
 	}
 	state, ok := stateValue.(string)
 	state = strings.TrimSpace(state)
 	if !ok || state == "" {
-		return "", "", nil, false, errors.New("invalid configuration: github.merge_state must be a non-empty string")
+		return githubLanding{}, errors.New("invalid configuration: github.merge_state must be a non-empty string")
 	}
 	// merge_state must be an active/dispatchable state (the canonical
 	// lifecycle's Merging): a session must actually be dispatched for that
@@ -692,18 +756,26 @@ func githubLandingPolicy(github map[string]any, activeStates, terminalStates []s
 	// coincide with handoff_state, either of which would make the landing gate
 	// unreachable or ambiguous.
 	if !stateInList(state, activeStates) {
-		return "", "", nil, false, errors.New("invalid configuration: github.merge_state must be an active state")
+		return githubLanding{}, errors.New("invalid configuration: github.merge_state must be an active state")
 	}
 	if stateInList(state, terminalStates) {
-		return "", "", nil, false, errors.New("invalid configuration: github.merge_state must not be a terminal state")
+		return githubLanding{}, errors.New("invalid configuration: github.merge_state must not be a terminal state")
 	}
 	if handoffState != "" && strings.EqualFold(handoffState, state) {
-		return "", "", nil, false, errors.New("invalid configuration: github.merge_state must differ from tracker.provider.handoff_state")
+		return githubLanding{}, errors.New("invalid configuration: github.merge_state must differ from tracker.provider.handoff_state")
 	}
 	if len(requiredChecks) == 0 {
-		return "", "", nil, false, errors.New("invalid configuration: github.merge_state requires a non-empty github.required_checks list")
+		return githubLanding{}, errors.New("invalid configuration: github.merge_state requires a non-empty github.required_checks list")
 	}
-	return state, mergeMethod, requiredChecks, updateStaleBranch, nil
+	return githubLanding{
+		mergeState:              state,
+		mergeMethod:             mergeMethod,
+		requiredChecks:          requiredChecks,
+		updateStaleBranch:       updateStaleBranch,
+		landFixEnabled:          landFixEnabled,
+		maxLandAttempts:         maxLandAttempts,
+		allowConflictResolution: allowConflictResolution,
+	}, nil
 }
 
 func stateInList(state string, states []string) bool {
