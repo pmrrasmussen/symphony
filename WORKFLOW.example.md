@@ -49,6 +49,19 @@ codex:
 #   token_file: $SYMPHONY_GITHUB_TOKEN_FILE
 #   # Alternatively: token: $SYMPHONY_GITHUB_TOKEN
 #   poll_interval_ms: 30000
+#   # Optional landing capability (PMR-37). Configuring merge_state grants a
+#   # zero-argument github_land_pr tool, but only to a session whose bound
+#   # issue is currently in this exact Linear state; it must differ from
+#   # handoff_state and from every active/terminal state. required_checks is
+#   # then mandatory: every named check must be present and successful (or
+#   # neutral) immediately before the merge call, or the tool waits. Unlike
+#   # the rest of this github: block, an invalid merge_state, merge_method, or
+#   # required_checks value fails workflow validation instead of silently
+#   # disabling the integration.
+#   merge_state: Merging
+#   # Bounded enum: merge, squash, or rebase. Defaults to merge.
+#   merge_method: merge
+#   required_checks: [ci/build, ci/test]
 ---
 Work on {{.issue.identifier}}: {{.issue.title}}
 

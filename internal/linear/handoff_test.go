@@ -333,6 +333,93 @@ func TestAgentTransitionPolicyIsFrozenForSession(t *testing.T) {
 	}
 }
 
+// The following tests exercise the PMR-37 github_land_pr Linear surface:
+// EnsureMergeState (exact-state preflight/postflight gate), RefuseLanding
+// (the Merging -> In Review hard-gate fallback), and CompleteLanding (the
+// Merging -> Done landing completion).
+
+func mergingSession(t *testing.T, f *handoffFixture, agentTransitions map[string]string) *HandoffSession {
+	t.Helper()
+	f.stateID, f.stateName = "merging", "Merging"
+	settings := f.settings()
+	settings.Tracker.HandoffState = ""
+	settings.Tracker.AgentTransitions = agentTransitions
+	session, err := NewHandoff(func() config.Settings { return settings }).Prepare(context.Background(), domain.Issue{ID: "active"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return session
+}
+
+func TestEnsureMergeStateRequiresExactCurrentState(t *testing.T) {
+	f := newHandoffFixture(t)
+	session := mergingSession(t, f, map[string]string{"Merging": "In Review"})
+	if err := session.EnsureMergeState(context.Background(), "Merging"); err != nil {
+		t.Fatalf("still in Merging: %v", err)
+	}
+	f.stateID, f.stateName = "review", "In Review"
+	if err := session.EnsureMergeState(context.Background(), "Merging"); err == nil {
+		t.Fatal("human state change away from Merging was not detected")
+	}
+}
+
+func TestRefuseLandingAppliesConfiguredFallbackOnlyFromExactMergeState(t *testing.T) {
+	f := newHandoffFixture(t)
+	session := mergingSession(t, f, map[string]string{"Merging": "In Review"})
+	changed, err := session.RefuseLanding(context.Background(), "Merging")
+	if err != nil || !changed || f.stateName != "In Review" || f.transitionAttempts != 1 {
+		t.Fatalf("changed=%v err=%v state=%s transitions=%d", changed, err, f.stateName, f.transitionAttempts)
+	}
+	// The issue is no longer exactly in Merging (a prior call already moved
+	// it, or a human did): a retry must be a safe no-op, not another edge.
+	changed, err = session.RefuseLanding(context.Background(), "Merging")
+	if err != nil || changed || f.transitionAttempts != 1 {
+		t.Fatalf("second call changed=%v err=%v transitions=%d", changed, err, f.transitionAttempts)
+	}
+}
+
+func TestRefuseLandingIsANoOpWithoutAConfiguredFallbackEdge(t *testing.T) {
+	f := newHandoffFixture(t)
+	// No "Merging" source configured: only an unrelated edge exists.
+	session := mergingSession(t, f, map[string]string{"Todo": "In Progress"})
+	changed, err := session.RefuseLanding(context.Background(), "Merging")
+	if err != nil || changed || f.transitionAttempts != 0 {
+		t.Fatalf("changed=%v err=%v transitions=%d", changed, err, f.transitionAttempts)
+	}
+	if f.stateName != "Merging" {
+		t.Fatalf("state changed without a configured edge: %s", f.stateName)
+	}
+}
+
+func TestCompleteLandingTransitionsMergingToDoneIdempotently(t *testing.T) {
+	f := newHandoffFixture(t)
+	session := mergingSession(t, f, map[string]string{"Merging": "In Review"})
+	changed, err := session.CompleteLanding(context.Background(), "Merging")
+	if err != nil || !changed || f.stateName != "Done" || f.transitionAttempts != 1 {
+		t.Fatalf("changed=%v err=%v state=%s transitions=%d", changed, err, f.stateName, f.transitionAttempts)
+	}
+	// Duplicate landing / GitHub-success-then-Linear-failure recovery: a
+	// retry once already Done must not attempt another mutation.
+	changed, err = session.CompleteLanding(context.Background(), "Merging")
+	if err != nil || changed || f.transitionAttempts != 1 {
+		t.Fatalf("duplicate completion changed=%v err=%v transitions=%d", changed, err, f.transitionAttempts)
+	}
+}
+
+func TestCompleteLandingRejectsIssueNoLongerInTheMergingState(t *testing.T) {
+	f := newHandoffFixture(t)
+	session := mergingSession(t, f, map[string]string{"Merging": "In Review"})
+	// A human (or an earlier hard-gate refusal) already moved the issue away
+	// from Merging before this completion call arrives.
+	f.stateID, f.stateName = "review", "In Review"
+	if _, err := session.CompleteLanding(context.Background(), "Merging"); err == nil {
+		t.Fatal("completion from an unexpected state was not rejected")
+	}
+	if f.transitionAttempts != 0 {
+		t.Fatalf("mutation attempts=%d", f.transitionAttempts)
+	}
+}
+
 func TestHandoffSuccessAndDuplicateDeliveryAreIdempotent(t *testing.T) {
 	f := newHandoffFixture(t)
 	session := f.session(t, nil)

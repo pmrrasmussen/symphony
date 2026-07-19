@@ -47,10 +47,29 @@ type Settings struct {
 
 // GitHub is an optional, fixed-repository host integration. Invalid optional
 // settings remain disabled so they cannot affect the manual workflow.
+//
+// MergeState, MergeMethod, and RequiredChecks are the landing policy (PMR-37)
+// and deliberately do not follow that same fail-open-to-disabled rule: unlike
+// owner/repository/token/etc, which silently disable the whole optional
+// integration on any invalid value, an invalid landing field is rejected as a
+// hard configuration error the same way tracker.provider.agent_transitions
+// is. Granting an irreversible merge capability from an ambiguous or
+// partially-invalid configuration is never an acceptable fallback.
 type GitHub struct {
 	Enabled                                        bool
 	Owner, Repository, BaseBranch, Token, Endpoint string
 	PollInterval                                   time.Duration
+	// MergeState is the exact Linear state that grants the zero-argument
+	// github_land_pr capability to a session bound to an issue currently in
+	// that state. Empty means landing is not configured.
+	MergeState string
+	// MergeMethod is one of "merge", "squash", or "rebase" and defaults to
+	// "merge" when MergeState is configured.
+	MergeMethod string
+	// RequiredChecks are the exact check/status names that must all be
+	// present and successful (or neutral) before github_land_pr will merge.
+	// Non-empty whenever MergeState is configured.
+	RequiredChecks []string
 }
 
 const legacyProjectSlugWarning = "tracker.provider.project_slug is deprecated; migrate to project_slug_id"
@@ -221,6 +240,10 @@ func decode(raw map[string]any, base, path, logRoot string, sources *sourceSnaps
 	if err != nil {
 		return Settings{}, err
 	}
+	mergeState, mergeMethod, requiredChecks, err := githubLandingPolicy(github, activeStates, terminalStates, handoffState)
+	if err != nil {
+		return Settings{}, err
+	}
 
 	pollInterval, err := durationMS(polling, "interval_ms", 30_000)
 	if err != nil {
@@ -295,6 +318,12 @@ func decode(raw map[string]any, base, path, logRoot string, sources *sourceSnaps
 		return Settings{}, err
 	}
 	githubSettings := decodeGitHub(github, githubObjectValid, base, sources)
+	if mergeState != "" && !githubSettings.Enabled {
+		return Settings{}, errors.New("invalid configuration: github.merge_state requires a fully configured github integration")
+	}
+	githubSettings.MergeState = mergeState
+	githubSettings.MergeMethod = mergeMethod
+	githubSettings.RequiredChecks = requiredChecks
 
 	s := Settings{
 		WorkflowPath: path,
@@ -578,6 +607,81 @@ func childIssueCreationPolicy(provider map[string]any) (bool, error) {
 	return enabled, nil
 }
 
+// validMergeMethods is the bounded merge-method enum accepted by
+// github.merge_method. It intentionally mirrors GitHub's own three merge
+// strategies and nothing else.
+var validMergeMethods = map[string]bool{"merge": true, "squash": true, "rebase": true}
+
+// githubLandingPolicy parses and strictly validates the optional
+// github.merge_state, github.merge_method, and github.required_checks
+// fields. Unlike the rest of the github: block, any malformed or ambiguous
+// value here is a hard configuration error (see the GitHub struct doc
+// comment) rather than a silently-disabled optional feature.
+func githubLandingPolicy(github map[string]any, activeStates, terminalStates []string, handoffState string) (string, string, []string, error) {
+	if github == nil {
+		return "", "", nil, nil
+	}
+	mergeMethod := "merge"
+	if value, exists := github["merge_method"]; exists {
+		method, ok := value.(string)
+		method = strings.ToLower(strings.TrimSpace(method))
+		if !ok || !validMergeMethods[method] {
+			return "", "", nil, errors.New("invalid configuration: github.merge_method must be one of merge, squash, rebase")
+		}
+		mergeMethod = method
+	}
+	requiredChecksValue, hasRequiredChecks := github["required_checks"]
+	var requiredChecks []string
+	if hasRequiredChecks {
+		list, ok := requiredChecksValue.([]any)
+		if !ok || len(list) == 0 {
+			return "", "", nil, errors.New("invalid configuration: github.required_checks must be a non-empty list of strings")
+		}
+		seen := make(map[string]struct{}, len(list))
+		for _, item := range list {
+			name, ok := item.(string)
+			name = strings.TrimSpace(name)
+			if !ok || name == "" {
+				return "", "", nil, errors.New("invalid configuration: github.required_checks entries must be non-empty strings")
+			}
+			key := strings.ToLower(name)
+			if _, duplicate := seen[key]; duplicate {
+				return "", "", nil, errors.New("invalid configuration: github.required_checks must not contain duplicate entries")
+			}
+			seen[key] = struct{}{}
+			requiredChecks = append(requiredChecks, name)
+		}
+	}
+	stateValue, hasState := github["merge_state"]
+	if !hasState {
+		if hasRequiredChecks {
+			return "", "", nil, errors.New("invalid configuration: github.required_checks requires github.merge_state")
+		}
+		if _, hasMethod := github["merge_method"]; hasMethod {
+			return "", "", nil, errors.New("invalid configuration: github.merge_method requires github.merge_state")
+		}
+		return "", "", nil, nil
+	}
+	state, ok := stateValue.(string)
+	state = strings.TrimSpace(state)
+	if !ok || state == "" {
+		return "", "", nil, errors.New("invalid configuration: github.merge_state must be a non-empty string")
+	}
+	if stateInList(state, activeStates) {
+		return "", "", nil, errors.New("invalid configuration: github.merge_state must not be an active state")
+	}
+	if stateInList(state, terminalStates) {
+		return "", "", nil, errors.New("invalid configuration: github.merge_state must not be a terminal state")
+	}
+	if handoffState != "" && strings.EqualFold(handoffState, state) {
+		return "", "", nil, errors.New("invalid configuration: github.merge_state must differ from tracker.provider.handoff_state")
+	}
+	if len(requiredChecks) == 0 {
+		return "", "", nil, errors.New("invalid configuration: github.merge_state requires a non-empty github.required_checks list")
+	}
+	return state, mergeMethod, requiredChecks, nil
+}
+
 func stateInList(state string, states []string) bool {
 	for _, candidate := range states {
 		if strings.EqualFold(strings.TrimSpace(state), strings.TrimSpace(candidate)) {
@@ -752,6 +856,7 @@ func cloneWorkflow(w Workflow) Workflow {
 	w.Config.Tracker.ActiveStates = append([]string(nil), w.Config.Tracker.ActiveStates...)
 	w.Config.Tracker.TerminalStates = append([]string(nil), w.Config.Tracker.TerminalStates...)
 	w.Config.Tracker.AgentTransitions = cloneStringMap(w.Config.Tracker.AgentTransitions)
+	w.Config.GitHub.RequiredChecks = append([]string(nil), w.Config.GitHub.RequiredChecks...)
 	w.Config.HostSecretEnvNames = append([]string(nil), w.Config.HostSecretEnvNames...)
 	w.Config.HostSecretValues = append([]string(nil), w.Config.HostSecretValues...)
 	w.Config.Warnings = append([]string(nil), w.Config.Warnings...)

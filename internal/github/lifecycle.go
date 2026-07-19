@@ -85,6 +85,12 @@ type linearLifecycle interface {
 	EnsureActive(context.Context) error
 	LinkAndHandoff(context.Context, string) error
 	Complete(context.Context) (bool, error)
+	// EnsureMergeState, RefuseLanding, and CompleteLanding back the
+	// github_land_pr capability (PMR-37). See internal/linear.HandoffSession
+	// for their exact scope and idempotency guarantees.
+	EnsureMergeState(context.Context, string) error
+	RefuseLanding(context.Context, string) (bool, error)
+	CompleteLanding(context.Context, string) (bool, error)
 }
 
 func New(settings func() config.Settings, logger *slog.Logger) *Manager {
@@ -337,6 +343,219 @@ func (s *Session) Context(ctx context.Context) (ContextResult, error) {
 	}, nil
 }
 
+// LandStatus is the closed set of non-error outcomes for one github_land_pr
+// call.
+type LandStatus string
+
+const (
+	// LandMerged reports that the pull request is merged (by this call or a
+	// prior one) and the bound Linear issue has been reconciled to Done.
+	LandMerged LandStatus = "merged"
+	// LandWaiting reports that required checks or GitHub's own mergeability
+	// computation have not yet settled. It is non-terminal: the issue stays
+	// in the configured Merging state and a later call can retry.
+	LandWaiting LandStatus = "waiting"
+)
+
+// LandResult is the bounded github_land_pr response.
+type LandResult struct {
+	Status LandStatus `json:"status"`
+	Number int        `json:"number"`
+	URL    string     `json:"pull_request"`
+	Method string     `json:"merge_method,omitempty"`
+	Reason string     `json:"reason,omitempty"`
+}
+
+// Land merges the pull request already bound to this issue, repository,
+// base, and branch, using the configured merge method, once required checks
+// pass, the effective review state is not changes_requested, no review
+// thread is unresolved, the pull request is open and mergeable, and the
+// configured base has not moved. It accepts no input: repository, branch,
+// PR, method, and Linear state are all fixed by the bound session and
+// configuration, never by tool arguments.
+//
+// A hard gate (failing checks, a changes-requested review, an unresolved
+// thread, a stale base, a merge conflict, or a closed/mismatched pull
+// request) refuses landing and attempts the configured Merging -> In Review
+// fallback transition, which is itself a no-op once the issue is no longer
+// exactly in the configured Merging state. Pending checks or undetermined
+// mergeability return a non-terminal LandWaiting result without mutating
+// Linear. A pull request GitHub already reports merged -- discovered up
+// front, immediately before the merge call, or because the merge call itself
+// raced with a concurrent merge -- reconciles the bound issue to Done
+// idempotently instead of attempting another merge.
+func (s *Session) Land(ctx context.Context) (LandResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if strings.TrimSpace(s.settings.MergeState) == "" {
+		return LandResult{}, errors.New("github landing is not configured for this repository")
+	}
+	pr, found, err := s.manager.findPull(ctx, s.settings, s.branch)
+	if err != nil {
+		return LandResult{}, err
+	}
+	if !found {
+		return LandResult{}, errors.New("github land requires an existing pull request for this issue")
+	}
+	if pr.Merged || pr.MergedAt != nil {
+		return s.completeLanding(ctx, pr)
+	}
+	if !strings.EqualFold(pr.State, "open") {
+		return s.refuse(ctx, "github pull request for this issue is closed")
+	}
+
+	origin, err := s.manager.git.Run(ctx, s.workspace, []string{"remote", "get-url", "origin"}, nil)
+	if err != nil || !matchesRepository(origin, s.settings.Owner, s.settings.Repository) {
+		return LandResult{}, errors.New("github land worktree origin does not match the configured repository")
+	}
+	status, err := s.manager.git.Run(ctx, s.workspace, []string{"status", "--porcelain"}, nil)
+	if err != nil || status != "" {
+		return LandResult{}, errors.New("github land requires a clean worktree")
+	}
+	head, err := s.manager.git.Run(ctx, s.workspace, []string{"rev-parse", "HEAD"}, nil)
+	if err != nil {
+		return LandResult{}, errors.New("github land requires a committed HEAD")
+	}
+	if _, err := s.manager.git.Run(ctx, s.workspace, []string{"fetch", "origin", s.settings.BaseBranch}, nil); err != nil {
+		return LandResult{}, errors.New("github land could not fetch the configured base branch")
+	}
+	base1, err := s.manager.git.Run(ctx, s.workspace, []string{"rev-parse", "refs/remotes/origin/" + s.settings.BaseBranch}, nil)
+	if err != nil {
+		return LandResult{}, errors.New("github land requires the configured base branch")
+	}
+
+	// "Expected head" is the commit that must land: either the worktree's
+	// already-pushed HEAD, or (when new local commits exist) HEAD itself
+	// once it has been pushed to the deterministic issue branch.
+	expectedHead := pr.Head.SHA
+	if head != expectedHead {
+		if _, err := s.manager.git.Run(ctx, s.workspace, []string{"merge-base", "--is-ancestor", expectedHead, head}, nil); err != nil {
+			return s.refuse(ctx, "github land worktree head diverged from the published pull request")
+		}
+		auth := base64.StdEncoding.EncodeToString([]byte("x-access-token:" + s.settings.Token))
+		env := []string{"GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=http.https://github.com/.extraheader", "GIT_CONFIG_VALUE_0=AUTHORIZATION: basic " + auth}
+		remote := "https://github.com/" + s.settings.Owner + "/" + s.settings.Repository + ".git"
+		if _, err := s.manager.git.Run(ctx, s.workspace, []string{"push", remote, "HEAD:refs/heads/" + s.branch}, env); err != nil {
+			return LandResult{}, err
+		}
+		expectedHead = head
+	}
+
+	if err := s.linear.EnsureMergeState(ctx, s.settings.MergeState); err != nil {
+		return s.refuse(ctx, "github land active issue is no longer in the configured Merging state")
+	}
+
+	// Immediate pre-merge reads: required checks, effective review state,
+	// unresolved threads, PR state, mergeability, and current base, all
+	// re-read right before the irreversible merge call.
+	fresh, err := s.manager.getPull(ctx, s.settings, pr.Number)
+	if err != nil {
+		return LandResult{}, err
+	}
+	if fresh.Merged || fresh.MergedAt != nil {
+		return s.completeLanding(ctx, fresh)
+	}
+	if !strings.EqualFold(fresh.State, "open") {
+		return s.refuse(ctx, "github pull request for this issue is closed")
+	}
+	if !validPull(s.settings, s.branch, fresh) {
+		return s.refuse(ctx, "github returned a mismatched pull request")
+	}
+	if strings.TrimSpace(fresh.Head.SHA) != expectedHead {
+		return s.refuse(ctx, "github pull request head changed before landing")
+	}
+
+	outcomes, err := s.manager.requiredCheckOutcomes(ctx, s.settings, fresh.Head.SHA, s.settings.RequiredChecks)
+	if err != nil {
+		return LandResult{}, err
+	}
+	waiting := false
+	var failing []string
+	for _, name := range s.settings.RequiredChecks {
+		switch outcomes[strings.ToLower(strings.TrimSpace(name))] {
+		case checkMissing, checkPending:
+			waiting = true
+		case checkFailed:
+			failing = append(failing, name)
+		}
+	}
+	if len(failing) > 0 {
+		return s.refuse(ctx, "github required checks failed: "+strings.Join(failing, ", "))
+	}
+	if waiting {
+		return LandResult{Status: LandWaiting, Number: fresh.Number, URL: fresh.URL, Reason: "required checks are pending"}, nil
+	}
+
+	// Moving the issue to Merging is the human approval to land (see policy
+	// in the issue): no additional approving review is required here, only
+	// the absence of an effective changes-requested review.
+	reviewState, _, _, err := s.manager.reviews(ctx, s.settings, fresh.Number)
+	if err != nil {
+		return LandResult{}, err
+	}
+	if reviewState == "changes_requested" {
+		return s.refuse(ctx, "github pull request has an effective changes-requested review")
+	}
+	unresolved, _, _, err := s.manager.reviewThreads(ctx, s.settings, fresh.Number)
+	if err != nil {
+		return LandResult{}, err
+	}
+	if unresolved > 0 {
+		return s.refuse(ctx, "github pull request has unresolved review threads")
+	}
+	if fresh.Mergeable == nil {
+		return LandResult{Status: LandWaiting, Number: fresh.Number, URL: fresh.URL, Reason: "github has not yet computed mergeability"}, nil
+	}
+	if !*fresh.Mergeable {
+		return s.refuse(ctx, "github pull request has merge conflicts")
+	}
+
+	if _, err := s.manager.git.Run(ctx, s.workspace, []string{"fetch", "origin", s.settings.BaseBranch}, nil); err != nil {
+		return LandResult{}, errors.New("github land could not fetch the configured base branch")
+	}
+	base2, err := s.manager.git.Run(ctx, s.workspace, []string{"rev-parse", "refs/remotes/origin/" + s.settings.BaseBranch}, nil)
+	if err != nil {
+		return LandResult{}, errors.New("github land requires the configured base branch")
+	}
+	if base2 != base1 {
+		return s.refuse(ctx, "github land configured base branch changed before landing")
+	}
+
+	merged, err := s.manager.mergePull(ctx, s.settings, fresh.Number, s.settings.MergeMethod, expectedHead)
+	if err != nil {
+		if recheck, recheckErr := s.manager.getPull(ctx, s.settings, fresh.Number); recheckErr == nil && (recheck.Merged || recheck.MergedAt != nil) {
+			return s.completeLanding(ctx, recheck)
+		}
+		return LandResult{}, err
+	}
+	if !merged {
+		return s.refuse(ctx, "github merge request was not accepted")
+	}
+	s.manager.logger.Info("GitHub pull request merged", "issue_id", s.issue.ID, "issue_identifier", s.issue.Identifier, "repository", s.settings.Owner+"/"+s.settings.Repository, "pr_number", fresh.Number, "merge_method", s.settings.MergeMethod)
+	return s.completeLanding(ctx, fresh)
+}
+
+// completeLanding reconciles the bound Linear issue to Done for an already
+// (or just-now) merged pull request. It is the single idempotent recovery
+// path for duplicate landing calls and for a GitHub merge that succeeded but
+// whose Linear completion previously failed.
+func (s *Session) completeLanding(ctx context.Context, pr pull) (LandResult, error) {
+	if _, err := s.linear.CompleteLanding(ctx, s.settings.MergeState); err != nil {
+		return LandResult{}, err
+	}
+	return LandResult{Status: LandMerged, Number: pr.Number, URL: pr.URL, Method: s.settings.MergeMethod}, nil
+}
+
+// refuse attempts the configured Merging -> In Review fallback transition
+// (best effort: a failure here does not override the substantive hard-gate
+// reason) and returns the hard-gate refusal as a structured tool failure.
+func (s *Session) refuse(ctx context.Context, reason string) (LandResult, error) {
+	if _, err := s.linear.RefuseLanding(ctx, s.settings.MergeState); err != nil {
+		s.manager.logger.Warn("GitHub land Merging fallback transition failed", "issue_id", s.issue.ID, "issue_identifier", s.issue.Identifier, "reason", reason)
+	}
+	return LandResult{}, errors.New(reason)
+}
+
 func matchesRepository(remote, owner, repository string) bool {
 	remote = strings.TrimSpace(remote)
 	if strings.HasPrefix(remote, "git@github.com:") {
@@ -377,7 +596,12 @@ type pull struct {
 	Merged   bool   `json:"merged"`
 	MergedAt any    `json:"merged_at"`
 	Body     string `json:"body"`
-	Head     struct {
+	// Mergeable and MergeableState are only ever populated by the single
+	// pull-request GET used by github_land_pr; GitHub's list endpoint never
+	// returns them, so they stay nil/zero everywhere else.
+	Mergeable      *bool  `json:"mergeable"`
+	MergeableState string `json:"mergeable_state"`
+	Head           struct {
 		Ref string `json:"ref"`
 		SHA string `json:"sha"`
 	} `json:"head"`
@@ -470,6 +694,97 @@ func (m *Manager) updateBody(ctx context.Context, s config.GitHub, number int, b
 	return updated, nil
 }
 
+// getPull reads the single pull request by number. Unlike findPull (which
+// lists by head/base to resolve the one deterministic PR), this is the only
+// GitHub endpoint that reports mergeable/mergeable_state, so github_land_pr
+// uses it for its immediate pre-merge read.
+func (m *Manager) getPull(ctx context.Context, s config.GitHub, number int) (pull, error) {
+	var pr pull
+	if err := m.request(ctx, s, http.MethodGet, fmt.Sprintf("/repos/%s/%s/pulls/%d", s.Owner, s.Repository, number), nil, &pr); err != nil {
+		return pull{}, err
+	}
+	return pr, nil
+}
+
+// mergePull performs the one irreversible landing mutation: merging the pull
+// request with the configured method, pinned to the exact expected head
+// commit so GitHub rejects the call if the head changed underneath it.
+func (m *Manager) mergePull(ctx context.Context, s config.GitHub, number int, method, sha string) (bool, error) {
+	var response struct {
+		Merged  bool   `json:"merged"`
+		Message string `json:"message"`
+	}
+	if err := m.request(ctx, s, http.MethodPut, fmt.Sprintf("/repos/%s/%s/pulls/%d/merge", s.Owner, s.Repository, number), map[string]any{"merge_method": method, "sha": sha}, &response); err != nil {
+		return false, err
+	}
+	return response.Merged, nil
+}
+
+// checkOutcome classifies one required check's state for github_land_pr
+// gating: missing (never reported), pending (queued/in-progress/pending),
+// passed (success/neutral), or failed (anything else, including a
+// cancelled, timed-out, or action-required check run).
+type checkOutcome int
+
+const (
+	checkMissing checkOutcome = iota
+	checkPending
+	checkPassed
+	checkFailed
+)
+
+func statusStateOutcome(state string) checkOutcome {
+	switch strings.ToLower(strings.TrimSpace(state)) {
+	case "success":
+		return checkPassed
+	case "pending":
+		return checkPending
+	default:
+		return checkFailed
+	}
+}
+
+func checkRunOutcome(status, conclusion string) checkOutcome {
+	if !strings.EqualFold(strings.TrimSpace(status), "completed") {
+		return checkPending
+	}
+	switch strings.ToLower(strings.TrimSpace(conclusion)) {
+	case "success", "neutral":
+		return checkPassed
+	default:
+		return checkFailed
+	}
+}
+
+// requiredCheckOutcomes reads the exact-named required checks configured by
+// github.required_checks and classifies each by name (case-insensitively)
+// against both the combined-status and check-run tables. A required name
+// that never appears in either table stays checkMissing (treated the same
+// as pending: github_land_pr waits rather than refuses).
+func (m *Manager) requiredCheckOutcomes(ctx context.Context, s config.GitHub, sha string, required []string) (map[string]checkOutcome, error) {
+	outcomes := make(map[string]checkOutcome, len(required))
+	for _, name := range required {
+		outcomes[strings.ToLower(strings.TrimSpace(name))] = checkMissing
+	}
+	combined, runsResponse, err := m.fetchChecks(ctx, s, sha)
+	if err != nil {
+		return nil, err
+	}
+	for _, status := range combined.Statuses {
+		key := strings.ToLower(strings.TrimSpace(status.Context))
+		if _, wanted := outcomes[key]; wanted {
+			outcomes[key] = statusStateOutcome(status.State)
+		}
+	}
+	for _, run := range runsResponse.CheckRuns {
+		key := strings.ToLower(strings.TrimSpace(run.Name))
+		if _, wanted := outcomes[key]; wanted {
+			outcomes[key] = checkRunOutcome(run.Status, run.Conclusion)
+		}
+	}
+	return outcomes, nil
+}
+
 func validPull(settings config.GitHub, branch string, pr pull) bool {
 	parsed, err := url.Parse(pr.URL)
 	if err != nil || parsed.Scheme != "https" || !strings.EqualFold(parsed.Host, "github.com") || parsed.RawQuery != "" || parsed.Fragment != "" {
@@ -485,30 +800,46 @@ func validPull(settings config.GitHub, branch string, pr pull) bool {
 	return true
 }
 
+type combinedStatus struct {
+	State    string `json:"state"`
+	Statuses []struct {
+		Context string `json:"context"`
+		State   string `json:"state"`
+	} `json:"statuses"`
+}
+
+type checkRunsResponse struct {
+	CheckRuns []struct {
+		Name       string `json:"name"`
+		Status     string `json:"status"`
+		Conclusion string `json:"conclusion"`
+	} `json:"check_runs"`
+}
+
+// fetchChecks reads the combined commit status and check-run tables for one
+// commit. Both github_pr_context (bounded/redacted display) and
+// github_land_pr (exact-name required-check gating) build on this single
+// fetch.
+func (m *Manager) fetchChecks(ctx context.Context, s config.GitHub, sha string) (combinedStatus, checkRunsResponse, error) {
+	if strings.TrimSpace(sha) == "" {
+		return combinedStatus{}, checkRunsResponse{}, errors.New("github pull request has no evaluated commit")
+	}
+	var combined combinedStatus
+	if err := m.request(ctx, s, http.MethodGet, fmt.Sprintf("/repos/%s/%s/commits/%s/status", s.Owner, s.Repository, sha), nil, &combined); err != nil {
+		return combinedStatus{}, checkRunsResponse{}, err
+	}
+	var runsResponse checkRunsResponse
+	if err := m.request(ctx, s, http.MethodGet, fmt.Sprintf("/repos/%s/%s/commits/%s/check-runs", s.Owner, s.Repository, sha), nil, &runsResponse); err != nil {
+		return combinedStatus{}, checkRunsResponse{}, err
+	}
+	return combined, runsResponse, nil
+}
+
 // checks reads the combined commit status and check-run summary for the
 // pull request's head commit, bounded and redacted to name/status/conclusion.
 func (m *Manager) checks(ctx context.Context, s config.GitHub, sha string) (ChecksResult, error) {
-	if strings.TrimSpace(sha) == "" {
-		return ChecksResult{}, errors.New("github pull request has no evaluated commit")
-	}
-	var combined struct {
-		State    string `json:"state"`
-		Statuses []struct {
-			Context string `json:"context"`
-			State   string `json:"state"`
-		} `json:"statuses"`
-	}
-	if err := m.request(ctx, s, http.MethodGet, fmt.Sprintf("/repos/%s/%s/commits/%s/status", s.Owner, s.Repository, sha), nil, &combined); err != nil {
-		return ChecksResult{}, err
-	}
-	var runsResponse struct {
-		CheckRuns []struct {
-			Name       string `json:"name"`
-			Status     string `json:"status"`
-			Conclusion string `json:"conclusion"`
-		} `json:"check_runs"`
-	}
-	if err := m.request(ctx, s, http.MethodGet, fmt.Sprintf("/repos/%s/%s/commits/%s/check-runs", s.Owner, s.Repository, sha), nil, &runsResponse); err != nil {
+	combined, runsResponse, err := m.fetchChecks(ctx, s, sha)
+	if err != nil {
 		return ChecksResult{}, err
 	}
 	total := len(combined.Statuses) + len(runsResponse.CheckRuns)
@@ -733,9 +1064,8 @@ func (m *Manager) pollOne(ctx context.Context, linked *link) {
 		return
 	}
 	m.mu.Unlock()
-	var pr pull
-	path := fmt.Sprintf("/repos/%s/%s/pulls/%d", linked.settings.Owner, linked.settings.Repository, linked.prNumber)
-	if err := m.request(ctx, linked.settings, http.MethodGet, path, nil, &pr); err != nil {
+	pr, err := m.getPull(ctx, linked.settings, linked.prNumber)
+	if err != nil {
 		m.logger.Warn("GitHub pull request poll failed", "issue_id", linked.issueID, "issue_identifier", linked.identifier, "pr_number", linked.prNumber)
 		return
 	}

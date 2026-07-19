@@ -167,4 +167,34 @@ both tools, preserving the manual workflow. In host-publish mode, workers
 create local commits but do not use `gh` or `git push`; they invoke these
 host capabilities instead. Without them, Symphony tells workers that PR
 delivery is unavailable and reports the missing configuration rather than
-asking them to publish directly. Symphony never merges pull requests.
+asking them to publish directly.
+
+Symphony can also land an already-approved pull request itself once
+`github.merge_state`, a bounded `github.merge_method` (`merge`, `squash`, or
+`rebase`; defaults to `merge`), and a non-empty `github.required_checks` list
+are configured:
+
+```yaml
+github:
+  # ...owner/repository/base_branch/token as above...
+  merge_state: Merging
+  merge_method: merge
+  required_checks: [ci/build, ci/test]
+```
+
+Unlike the rest of the `github:` block, an invalid `merge_state`,
+`merge_method`, or `required_checks` value rejects the whole workflow instead
+of silently disabling the feature, the same fail-closed treatment as
+`tracker.provider.agent_transitions`. A session bound to an issue currently in
+the exact configured `merge_state` receives a zero-argument `github_land_pr`
+tool: it re-verifies the worktree, branch, pull request, required checks,
+effective review state (moving the issue to `merge_state` is itself the human
+approval; no separate approving review is required), unresolved review
+threads, mergeability, and current base immediately before merging, and
+transitions only the bound issue to `Done` on success. Pending checks wait
+without changing Linear state; any other hard gate refuses landing and falls
+back to the configured `merge_state -> In Review` transition. Duplicate
+landing calls, and a GitHub merge that succeeds despite a failed Linear
+completion, are reconciled idempotently rather than merging or transitioning
+twice. Symphony never merges a pull request outside this narrow, explicitly
+configured capability.

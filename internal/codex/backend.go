@@ -112,6 +112,13 @@ func (b *Backend) Start(ctx context.Context, r domain.AgentRequest) (domain.Agen
 	}
 	if githubSession != nil {
 		tools = append(tools, githubToolDefinition(), githubContextToolDefinition())
+		// github_land_pr is advertised only for a session bound to an issue
+		// currently in the exact configured Merging state; Land itself
+		// re-validates that Linear state immediately before any mutation, so
+		// this is a coarse dispatch-time filter, not the authority.
+		if mergeState := strings.TrimSpace(settings.GitHub.MergeState); mergeState != "" && strings.EqualFold(strings.TrimSpace(r.Issue.State), mergeState) {
+			tools = append(tools, githubLandToolDefinition())
+		}
 	}
 	if len(tools) > 0 {
 		threadParams["dynamicTools"] = tools
@@ -675,6 +682,14 @@ func githubContextToolDefinition() map[string]any {
 	}
 }
 
+func githubLandToolDefinition() map[string]any {
+	return map[string]any{
+		"type": "function", "name": "github_land_pr",
+		"description": "Merge the pull request already bound to this issue, repository, base, and branch using the configured merge method, once required checks pass, reviews have no effective changes-requested state, and no review thread is unresolved. Returns a non-terminal waiting result while required checks or GitHub's mergeability computation are still pending; a hard gate (failing checks, requested changes, unresolved threads, a stale base, conflicts, or a closed/mismatched PR) refuses landing. No repository, issue, branch, PR, method, state, or credential input.",
+		"inputSchema": map[string]any{"type": "object", "additionalProperties": false},
+	}
+}
+
 func (c *client) handleToolCall(x rpc) {
 	var request struct {
 		Tool      string          `json:"tool"`
@@ -724,6 +739,30 @@ func (c *client) handleToolCall(x rpc) {
 			return
 		}
 		c.emitCallFinished(callID, "github_pr_context", domain.ItemCompleted, started)
+		c.sendServerResponse(x.ID, map[string]any{"success": true, "contentItems": []any{map[string]any{"type": "inputText", "text": string(content)}}})
+		return
+	}
+	if request.Tool == "github_land_pr" && c.github != nil {
+		var args map[string]json.RawMessage
+		if json.Unmarshal(request.Arguments, &args) != nil || len(args) != 0 {
+			c.unsupportedTool(x.ID)
+			return
+		}
+		callID := callIDText(x.ID)
+		started := c.emitCallStarted(callID, "github_land_pr")
+		result, err := c.github.Land(c.ctx)
+		if err != nil {
+			c.emitCallFinished(callID, "github_land_pr", domain.ItemFailed, started)
+			c.toolFailure(x.ID, "GitHub pull request landing was rejected.")
+			return
+		}
+		content, err := json.Marshal(result)
+		if err != nil {
+			c.emitCallFinished(callID, "github_land_pr", domain.ItemFailed, started)
+			c.unsupportedTool(x.ID)
+			return
+		}
+		c.emitCallFinished(callID, "github_land_pr", domain.ItemCompleted, started)
 		c.sendServerResponse(x.ID, map[string]any{"success": true, "contentItems": []any{map[string]any{"type": "inputText", "text": string(content)}}})
 		return
 	}

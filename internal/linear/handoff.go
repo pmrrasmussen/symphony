@@ -395,6 +395,110 @@ func (s *HandoffSession) EnsureActive(ctx context.Context) error {
 	return nil
 }
 
+// EnsureMergeState re-reads the bound issue and requires it still be in the
+// exact configured Merging state (mergeState). Unlike EnsureActive, this
+// requires an exact match rather than "initial or handoff-target" state: a
+// GitHub landing capability must never proceed once a human, an earlier
+// hard-gate refusal, or a completed landing has moved the issue elsewhere.
+func (s *HandoffSession) EnsureMergeState(ctx context.Context, mergeState string) error {
+	s.handoffMu.Lock()
+	defer s.handoffMu.Unlock()
+	current, err := s.readScopedIssue(ctx)
+	if err != nil {
+		return err
+	}
+	if !strings.EqualFold(strings.TrimSpace(current.State.Name), strings.TrimSpace(mergeState)) {
+		return trackerError("handoff_scope", "active issue is no longer in the configured Merging state")
+	}
+	return nil
+}
+
+// RefuseLanding attempts the configured mergeState -> In Review fallback
+// transition (tracker.provider.agent_transitions), used only after a GitHub
+// landing hard gate refuses to merge. It is deliberately narrower than the
+// general agentTransition: it only ever moves the issue when its freshly
+// read current state is exactly mergeState, so a human (or an earlier call)
+// that already moved the issue elsewhere is never overridden. A missing or
+// stale configured edge is reported by returning (false, nil): the caller's
+// hard-gate refusal must still be honored even when no fallback transition
+// is available or currently valid.
+func (s *HandoffSession) RefuseLanding(ctx context.Context, mergeState string) (bool, error) {
+	s.handoffMu.Lock()
+	defer s.handoffMu.Unlock()
+	current, err := s.readScopedIssue(ctx)
+	if err != nil {
+		return false, err
+	}
+	if !strings.EqualFold(strings.TrimSpace(current.State.Name), strings.TrimSpace(mergeState)) {
+		return false, nil
+	}
+	target, ok := s.agentTransitions[strings.ToLower(strings.TrimSpace(mergeState))]
+	if !ok {
+		return false, nil
+	}
+	states, err := s.resolveTeamStates(ctx, current.TeamID())
+	if err != nil {
+		return false, err
+	}
+	sourceID, sourceOK := states[strings.ToLower(strings.TrimSpace(mergeState))]
+	targetID, targetOK := states[strings.ToLower(strings.TrimSpace(target))]
+	if !sourceOK || sourceID != current.StateID() || !targetOK {
+		return false, nil
+	}
+	if err := s.transitionTo(ctx, targetID); err != nil {
+		return false, err
+	}
+	updated, err := s.readScopedIssue(ctx)
+	if err != nil {
+		return false, err
+	}
+	if !s.isState(updated, targetID, target) {
+		return false, trackerError("handoff_response", "Linear did not apply the configured Merging fallback transition")
+	}
+	s.issue = updated
+	s.log("github_land_refused_to_review")
+	return true, nil
+}
+
+// CompleteLanding moves the bound issue from the configured Merging state to
+// Done after a successful GitHub merge. It is idempotent: already-Done
+// returns (false, nil) so a retry after a successful merge but a failed
+// completion call reconciles Done without error, and it never transitions an
+// issue that has moved to a state other than Done or the exact mergeState.
+func (s *HandoffSession) CompleteLanding(ctx context.Context, mergeState string) (bool, error) {
+	s.handoffMu.Lock()
+	defer s.handoffMu.Unlock()
+	current, err := s.readScopedIssue(ctx)
+	if err != nil {
+		return false, err
+	}
+	if strings.EqualFold(strings.TrimSpace(current.State.Name), "Done") {
+		return false, nil
+	}
+	if !strings.EqualFold(strings.TrimSpace(current.State.Name), strings.TrimSpace(mergeState)) {
+		return false, trackerError("handoff_scope", "linked issue is no longer in the configured Merging state")
+	}
+	doneName := ""
+	for _, state := range s.settings.Tracker.TerminalStates {
+		if strings.EqualFold(strings.TrimSpace(state), "Done") {
+			doneName = strings.TrimSpace(state)
+			break
+		}
+	}
+	if doneName == "" {
+		return false, trackerError("invalid_handoff_config", "terminal state Done is required for GitHub landing completion")
+	}
+	doneID, err := (&Handoff{client: s.client}).resolveStateAllowTerminal(ctx, s.settings, s.issue.TeamID(), doneName)
+	if err != nil {
+		return false, err
+	}
+	if err := s.transitionTo(ctx, doneID); err != nil {
+		return false, err
+	}
+	s.log("github_land_completed")
+	return true, nil
+}
+
 // LinkAndHandoff adds the fixed PR URL exactly once, then reconciles the
 // repository-owned review handoff. The URL is supplied by the trusted GitHub
 // adapter, never by Codex.
