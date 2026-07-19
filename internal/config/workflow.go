@@ -100,6 +100,14 @@ type Tracker struct {
 	RequiredLabels, ActiveStates, TerminalStates []string
 	HandoffState, HandoffCommentTemplate         string
 	AgentTransitions                             map[string]string
+	// StartTransitions are the host-owned dispatch-time state edges the
+	// coordinator applies deterministically when it launches an issue (the
+	// canonical lifecycle's Todo -> In Progress). They are distinct from
+	// AgentTransitions: the coordinator performs them with the host credential
+	// before the session starts, so the agent is never asked to self-start an
+	// issue. Keys are lowercased for direct comparison against a normalized
+	// issue state; both source and target must be active, non-terminal states.
+	StartTransitions map[string]string
 	// ChildIssueCreation enables the session-bound Codex create_child_issue
 	// tool. It is opt-in and disabled by default; see child_issue_creation in
 	// tracker.provider.
@@ -256,6 +264,10 @@ func decode(raw map[string]any, base, path, logRoot string, sources *sourceSnaps
 	if err != nil {
 		return Settings{}, err
 	}
+	startTransitions, err := startTransitionPolicy(resolvedProvider, activeStates, terminalStates)
+	if err != nil {
+		return Settings{}, err
+	}
 	childIssueCreation, err := childIssueCreationPolicy(resolvedProvider)
 	if err != nil {
 		return Settings{}, err
@@ -364,6 +376,7 @@ func decode(raw map[string]any, base, path, logRoot string, sources *sourceSnaps
 			HandoffState:           handoffState,
 			HandoffCommentTemplate: handoffCommentTemplate,
 			AgentTransitions:       agentTransitions,
+			StartTransitions:       startTransitions,
 			ChildIssueCreation:     childIssueCreation,
 		},
 		Polling:   Polling{Interval: pollInterval},
@@ -610,6 +623,50 @@ func agentTransitionPolicy(provider map[string]any, terminalStates []string) (ma
 			return nil, errors.New("invalid configuration: tracker.provider.agent_transitions must not contain terminal states")
 		}
 		result[source] = target
+	}
+	return result, nil
+}
+
+// startTransitionPolicy parses the repository-owned dispatch-time state edges
+// the coordinator applies with the host credential when it launches an issue.
+// Unlike agent_transitions, these are never exposed to a Codex session; they
+// exist so the coordinator can deterministically move a freshly dispatched
+// issue into its started state (Todo -> In Progress) without asking the agent.
+// Both the source and target of every edge must be active, non-terminal states,
+// since the coordinator only dispatches active issues and the issue must remain
+// eligible for reconciliation after the move. Source keys are lowercased so the
+// coordinator can compare them against a normalized issue state directly.
+func startTransitionPolicy(provider map[string]any, activeStates, terminalStates []string) (map[string]string, error) {
+	value, exists := provider["start_transitions"]
+	if !exists {
+		return nil, nil
+	}
+	edges, ok := value.(map[string]any)
+	if !ok || len(edges) == 0 {
+		return nil, errors.New("invalid configuration: tracker.provider.start_transitions must be a non-empty object")
+	}
+	result := make(map[string]string, len(edges))
+	for sourceValue, targetValue := range edges {
+		source := strings.TrimSpace(sourceValue)
+		target, ok := targetValue.(string)
+		target = strings.TrimSpace(target)
+		if source == "" || !ok || target == "" {
+			return nil, errors.New("invalid configuration: tracker.provider.start_transitions entries must map non-empty state names to non-empty state names")
+		}
+		key := strings.ToLower(source)
+		if _, duplicate := result[key]; duplicate {
+			return nil, errors.New("invalid configuration: tracker.provider.start_transitions has duplicate source states")
+		}
+		if strings.EqualFold(source, target) {
+			return nil, errors.New("invalid configuration: tracker.provider.start_transitions must not contain same-state edges")
+		}
+		if !stateInList(source, activeStates) || !stateInList(target, activeStates) {
+			return nil, errors.New("invalid configuration: tracker.provider.start_transitions source and target must both be active states")
+		}
+		if stateInList(source, terminalStates) || stateInList(target, terminalStates) {
+			return nil, errors.New("invalid configuration: tracker.provider.start_transitions must not contain terminal states")
+		}
+		result[key] = target
 	}
 	return result, nil
 }
@@ -952,6 +1009,7 @@ func cloneWorkflow(w Workflow) Workflow {
 	w.Config.Tracker.ActiveStates = append([]string(nil), w.Config.Tracker.ActiveStates...)
 	w.Config.Tracker.TerminalStates = append([]string(nil), w.Config.Tracker.TerminalStates...)
 	w.Config.Tracker.AgentTransitions = cloneStringMap(w.Config.Tracker.AgentTransitions)
+	w.Config.Tracker.StartTransitions = cloneStringMap(w.Config.Tracker.StartTransitions)
 	w.Config.GitHub.RequiredChecks = append([]string(nil), w.Config.GitHub.RequiredChecks...)
 	w.Config.HostSecretEnvNames = append([]string(nil), w.Config.HostSecretEnvNames...)
 	w.Config.HostSecretValues = append([]string(nil), w.Config.HostSecretValues...)

@@ -535,6 +535,7 @@ func (c *Coordinator) launch(parent context.Context, i domain.Issue, attempt int
 			return
 		}
 		s := c.settings()
+		c.transitionToStarted(ctx, i, s)
 		prompt, err := render(s, i, attempt)
 		if err != nil {
 			c.workspaces.AfterRun(context.Background(), ws, i)
@@ -608,6 +609,34 @@ func (c *Coordinator) launch(parent context.Context, i domain.Issue, attempt int
 		c.finishFailure(parent, i, attempt, agentFailureReason(consumeErr), consumeErr)
 	}()
 	return true
+}
+
+// transitionToStarted deterministically moves a freshly dispatched issue from
+// its configured unstarted active state into the started active state (the
+// canonical lifecycle's Todo -> In Progress) using the host tracker
+// credential, so the board reflects in-progress work without relying on the
+// agent to self-transition. It is:
+//   - idempotent: an issue whose current state has no configured start edge, or
+//     that is already in the target state, is left untouched. The adapter also
+//     re-reads and no-ops if the live state already matches, so a run
+//     re-dispatched after a restart or turn-limit exhaustion (already In
+//     Progress) is never re-transitioned;
+//   - fail-safe: a failed transition is logged and never blocks the run or
+//     causes a double dispatch — the session starts regardless, and the poll
+//     loop retries or reconciles the tracker state on a later tick.
+func (c *Coordinator) transitionToStarted(ctx context.Context, i domain.Issue, s config.Settings) {
+	target, ok := s.Tracker.StartTransitions[norm(i.State)]
+	if !ok || strings.TrimSpace(target) == "" {
+		return
+	}
+	if strings.EqualFold(strings.TrimSpace(i.State), strings.TrimSpace(target)) {
+		return
+	}
+	if err := c.tracker.Transition(ctx, i, target); err != nil {
+		c.log.Warn("dispatch start transition failed", "issue_id", i.ID, "issue_identifier", i.Identifier, "from_state", norm(i.State), "to_state", norm(target), "error", err)
+		return
+	}
+	c.log.Info("issue moved to started state", "issue_id", i.ID, "issue_identifier", i.Identifier, "from_state", norm(i.State), "to_state", norm(target))
 }
 
 func (c *Coordinator) runTurns(ctx context.Context, r *running, events <-chan domain.Event, settings config.Settings) (ended bool, current domain.Issue, err error) {

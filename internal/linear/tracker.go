@@ -194,6 +194,64 @@ func (t *Tracker) GetIssues(ctx context.Context, ids []string) ([]domain.Issue, 
 	return out, nil
 }
 
+// Transition moves the issue into the named workflow state using the host
+// Linear credential. It re-reads the issue (scoped to the configured project)
+// so a stale caller-supplied state cannot drive a wrong write, and it is
+// idempotent: an issue already in toState is a no-op. It reuses the same bound
+// GraphQL primitives as the session handoff path (scoped read, team state
+// resolution, and the fixed issueUpdate mutation), and never resolves a
+// terminal target. It is the host-side counterpart to the agent's bounded
+// linear_graphql transition and does not widen a running session's authority.
+func (t *Tracker) Transition(ctx context.Context, issue domain.Issue, toState string) error {
+	toState = strings.TrimSpace(toState)
+	if strings.TrimSpace(issue.ID) == "" {
+		return trackerError("invalid_transition_request", "issue ID is missing")
+	}
+	if toState == "" {
+		return trackerError("invalid_transition_request", "target state is required")
+	}
+	s := trackerSnapshot(t.settings())
+	if err := validateProvider(s.Tracker.Provider); err != nil {
+		t.invalidateViewer()
+		return err
+	}
+	projectSlug := strings.TrimSpace(stringValue(s.Tracker.Provider["project_slug_id"]))
+	if projectSlug == "" {
+		return trackerError("invalid_tracker_config", "linear project_slug_id is missing")
+	}
+	current, err := readHandoffIssue(ctx, t.client, s, issue.ID)
+	if err != nil {
+		return err
+	}
+	if current.ID != issue.ID || current.ProjectSlug() != projectSlug || current.TeamID() == "" {
+		return trackerError("transition_scope", "issue is outside the configured Linear project")
+	}
+	if strings.EqualFold(strings.TrimSpace(current.State.Name), toState) {
+		return nil // Idempotent: the issue is already in the started state.
+	}
+	stateID, err := (&Handoff{client: t.client}).resolveState(ctx, s, current.TeamID(), toState)
+	if err != nil {
+		return err
+	}
+	response, err := requestWithSettings(ctx, t.client, s, handoffTransitionQuery, map[string]any{
+		"issueID": current.ID, "stateID": stateID,
+	})
+	if err != nil {
+		return err
+	}
+	var payload struct {
+		Data struct {
+			IssueUpdate struct {
+				Success bool `json:"success"`
+			} `json:"issueUpdate"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(response, &payload); err != nil || !payload.Data.IssueUpdate.Success {
+		return trackerError("transition_response", "Linear did not accept the transition")
+	}
+	return nil
+}
+
 func (t *Tracker) listByStates(ctx context.Context, states []string) ([]domain.Issue, error) {
 	states = uniqueNonEmpty(states)
 	if len(states) == 0 {

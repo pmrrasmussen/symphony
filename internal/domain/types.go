@@ -90,6 +90,14 @@ type Tracker interface {
 	ListCandidates(context.Context, []string) ([]Issue, error)
 	GetIssues(context.Context, []string) ([]Issue, error)
 	ListTerminal(context.Context, []string) ([]Issue, error)
+	// Transition moves an issue into the named workflow state using the host
+	// tracker credential. It backs the coordinator's deterministic
+	// dispatch-time start transition (Todo -> In Progress). The adapter
+	// re-reads the issue inside the call, so a stale caller-supplied state
+	// cannot drive a wrong transition, and it is idempotent: an issue already
+	// in the target state is a no-op. It never widens the running agent's
+	// capability surface.
+	Transition(ctx context.Context, issue Issue, toState string) error
 }
 type AgentRequest struct {
 	Issue                         Issue

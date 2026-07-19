@@ -42,6 +42,10 @@ func (*lifecycleTracker) ListTerminal(context.Context, []string) ([]domain.Issue
 	return nil, nil
 }
 
+func (*lifecycleTracker) Transition(context.Context, domain.Issue, string) error {
+	return nil
+}
+
 func (t *lifecycleTracker) setIssue(issue domain.Issue) {
 	t.mu.Lock()
 	t.issue = issue

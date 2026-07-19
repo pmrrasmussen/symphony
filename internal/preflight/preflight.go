@@ -216,16 +216,17 @@ func lifecycle(ctx context.Context, settings config.Settings) error {
 }
 
 type fakeBoundaries struct {
-	mu       sync.Mutex
-	issue    domain.Issue
-	afterRun chan struct{}
-	lists    int
-	gets     int
-	prepares int
-	before   int
-	starts   int
-	after    int
-	cancels  int
+	mu          sync.Mutex
+	issue       domain.Issue
+	afterRun    chan struct{}
+	lists       int
+	gets        int
+	prepares    int
+	before      int
+	starts      int
+	after       int
+	cancels     int
+	transitions int
 }
 
 func (f *fakeBoundaries) ListCandidates(context.Context, []string) ([]domain.Issue, error) {
@@ -242,6 +243,12 @@ func (f *fakeBoundaries) GetIssues(context.Context, []string) ([]domain.Issue, e
 }
 func (*fakeBoundaries) ListTerminal(context.Context, []string) ([]domain.Issue, error) {
 	return nil, nil
+}
+func (f *fakeBoundaries) Transition(context.Context, domain.Issue, string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.transitions++
+	return nil
 }
 func (f *fakeBoundaries) Prepare(context.Context, domain.Issue) (domain.Workspace, error) {
 	f.mu.Lock()
