@@ -19,11 +19,11 @@ for an issue in any of them; `In Review` is deliberately excluded so it stays
 the single, fixed, human-controlled review state
 (`tracker.provider.handoff_state`) that is never dispatched. When the
 coordinator dispatches an issue whose state matches a configured
-`tracker.provider.start_transitions` source (the canonical `Todo -> In
+`tracker.provider.transitions.start` source (the canonical `Todo -> In
 Progress`), it performs that move itself, host-side, with the Linear
 credential before the session starts, so board-level observability does not
 depend on the agent self-starting. The move reuses the same read-and-verify,
-resolve-state, and `issueUpdate` primitives as the agent handoff path but is
+resolve-state, and `issueUpdate` primitives as the host handoff path but is
 never exposed to Codex; it is idempotent (an already-started or restart-
 re-observed issue is untouched) and fail-safe (a failed move is logged and
 never blocks or double-dispatches the run). Resuming in
@@ -88,7 +88,7 @@ Linear state receives a zero-argument `github_land_pr` tool. Unlike the rest
 of the GitHub adapter's optional settings, `merge_state`, the bounded
 `merge_method` enum (merge, squash, or rebase), and the non-empty
 `required_checks` list it requires are validated the same strict, fail-closed
-way as `tracker.provider.agent_transitions`: an invalid value rejects the
+way as `tracker.provider.transitions`: an invalid value rejects the
 whole workflow rather than silently disabling the feature. Landing re-fetches
 the configured base, verifies the credential-free origin, a clean committed
 worktree, the one deterministic open PR for the bound branch, and the current

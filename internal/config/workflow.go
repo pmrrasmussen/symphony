@@ -54,8 +54,8 @@ type Settings struct {
 // and deliberately do not follow that same fail-open-to-disabled rule: unlike
 // owner/repository/token/etc, which silently disable the whole optional
 // integration on any invalid value, an invalid landing field is rejected as a
-// hard configuration error the same way tracker.provider.agent_transitions
-// is. Granting an irreversible merge capability from an ambiguous or
+// hard configuration error the same way tracker.provider.transitions is.
+// Granting an irreversible merge capability from an ambiguous or
 // partially-invalid configuration is never an acceptable fallback.
 type GitHub struct {
 	Enabled                                        bool
@@ -99,19 +99,38 @@ type Tracker struct {
 	Provider                                     map[string]any
 	RequiredLabels, ActiveStates, TerminalStates []string
 	HandoffState, HandoffCommentTemplate         string
-	AgentTransitions                             map[string]string
-	// StartTransitions are the host-owned dispatch-time state edges the
-	// coordinator applies deterministically when it launches an issue (the
-	// canonical lifecycle's Todo -> In Progress). They are distinct from
-	// AgentTransitions: the coordinator performs them with the host credential
-	// before the session starts, so the agent is never asked to self-start an
-	// issue. Keys are lowercased for direct comparison against a normalized
-	// issue state; both source and target must be active, non-terminal states.
-	StartTransitions map[string]string
+	// HostTransitions is the single host-owned tracker transition policy
+	// (tracker.provider.transitions). Symphony applies every edge in it itself,
+	// with the host Linear credential; none is ever exposed to a Codex session.
+	// The agent has no tracker-write capability.
+	HostTransitions HostTransitions
 	// ChildIssueCreation enables the session-bound Codex create_child_issue
 	// tool. It is opt-in and disabled by default; see child_issue_creation in
 	// tracker.provider.
 	ChildIssueCreation bool
+}
+
+// HostTransitions holds the two host-applied tracker transition edge sets.
+// They are kept structurally distinct on purpose and must NOT be folded into
+// one flat source->target map: Merging is both a dispatchable/active state and
+// the land-fallback source, so a flat map consumed at dispatch would wrongly
+// move a freshly dispatched Merging landing agent's issue to In Review. Start
+// is keyed by the issue's current state and applied only at dispatch;
+// RefuseLanding is keyed by github.merge_state and applied only when
+// github_land_pr hits a hard gate. Both maps use lowercased source keys for
+// direct comparison against a normalized issue state.
+type HostTransitions struct {
+	// Start are the dispatch-time edges the coordinator applies when it
+	// launches an issue (the canonical lifecycle's Todo -> In Progress). Both
+	// endpoints of every edge must be active, non-terminal states. The move is
+	// idempotent (an already-started issue is untouched) and fail-safe (a
+	// failed move is logged and never blocks or double-dispatches the run).
+	Start map[string]string
+	// RefuseLanding are the edges RefuseLanding uses after a github_land_pr
+	// hard gate refuses to merge (the canonical lifecycle's Merging -> In
+	// Review), keyed by github.merge_state. They are never applied at dispatch.
+	// Terminal and same-state edges are rejected.
+	RefuseLanding map[string]string
 }
 
 type Polling struct{ Interval time.Duration }
@@ -266,11 +285,7 @@ func decode(raw map[string]any, base, path, logRoot string, sources *sourceSnaps
 	if err != nil {
 		return Settings{}, err
 	}
-	agentTransitions, err := agentTransitionPolicy(resolvedProvider, terminalStates)
-	if err != nil {
-		return Settings{}, err
-	}
-	startTransitions, err := startTransitionPolicy(resolvedProvider, activeStates, terminalStates)
+	hostTransitions, err := hostTransitionPolicy(resolvedProvider, activeStates, terminalStates)
 	if err != nil {
 		return Settings{}, err
 	}
@@ -389,8 +404,7 @@ func decode(raw map[string]any, base, path, logRoot string, sources *sourceSnaps
 			TerminalStates:         terminalStates,
 			HandoffState:           handoffState,
 			HandoffCommentTemplate: handoffCommentTemplate,
-			AgentTransitions:       agentTransitions,
-			StartTransitions:       startTransitions,
+			HostTransitions:        hostTransitions,
 			ChildIssueCreation:     childIssueCreation,
 		},
 		Polling:   Polling{Interval: pollInterval},
@@ -604,60 +618,98 @@ func handoffPolicy(provider map[string]any, activeStates, terminalStates []strin
 	return state, comment, nil
 }
 
-// agentTransitionPolicy parses the repository-owned exact state edges exposed
-// to a Codex session. A mapping deliberately expresses one destination per
-// source; it is not a destination allowlist that could permit reverse edges.
-func agentTransitionPolicy(provider map[string]any, terminalStates []string) (map[string]string, error) {
-	value, exists := provider["agent_transitions"]
+// hostTransitionPolicy parses the single repository-owned, host-applied
+// transition policy under tracker.provider.transitions. Symphony applies every
+// edge itself with the host credential; none is exposed to a Codex session, so
+// the agent has no tracker-write capability at all. The two edge sets are
+// parsed and validated separately and never flattened into one map: the
+// canonical Merging state is both a dispatchable active state and the
+// land-fallback source, so a flat source->target map consumed at dispatch
+// would wrongly move a freshly dispatched Merging landing agent's issue to In
+// Review.
+//
+//   - transitions.start: dispatch-time edges the coordinator applies when it
+//     launches an issue (Todo -> In Progress). Both endpoints of every edge
+//     must be active, non-terminal states, since the coordinator only
+//     dispatches active issues and the issue must remain eligible for
+//     reconciliation after the move.
+//   - transitions.refuse_landing: the edges RefuseLanding applies after a
+//     github_land_pr hard gate (Merging -> In Review), keyed by
+//     github.merge_state. Never applied at dispatch; terminal and same-state
+//     edges are rejected.
+//
+// Source keys in both maps are lowercased so callers can compare them against a
+// normalized issue state directly.
+func hostTransitionPolicy(provider map[string]any, activeStates, terminalStates []string) (HostTransitions, error) {
+	value, exists := provider["transitions"]
 	if !exists {
-		return nil, nil
+		return HostTransitions{}, nil
 	}
-	edges, ok := value.(map[string]any)
-	if !ok || len(edges) == 0 {
-		return nil, errors.New("invalid configuration: tracker.provider.agent_transitions must be a non-empty object")
+	object, ok := value.(map[string]any)
+	if !ok || len(object) == 0 {
+		return HostTransitions{}, errors.New("invalid configuration: tracker.provider.transitions must be a non-empty object")
 	}
-	result := make(map[string]string, len(edges))
-	seen := make(map[string]struct{}, len(edges))
-	for sourceValue, targetValue := range edges {
-		source := strings.TrimSpace(sourceValue)
-		target, ok := targetValue.(string)
-		target = strings.TrimSpace(target)
-		if source == "" || !ok || target == "" {
-			return nil, errors.New("invalid configuration: tracker.provider.agent_transitions entries must map non-empty state names to non-empty state names")
+	for key := range object {
+		if key != "start" && key != "refuse_landing" {
+			return HostTransitions{}, fmt.Errorf("invalid configuration: tracker.provider.transitions has an unsupported key %q", key)
 		}
-		key := strings.ToLower(source)
-		if _, duplicate := seen[key]; duplicate {
-			return nil, errors.New("invalid configuration: tracker.provider.agent_transitions has duplicate source states")
-		}
-		seen[key] = struct{}{}
-		if strings.EqualFold(source, target) {
-			return nil, errors.New("invalid configuration: tracker.provider.agent_transitions must not contain same-state edges")
+	}
+	start, err := startTransitionEdges(object["start"])
+	if err != nil {
+		return HostTransitions{}, err
+	}
+	refuseLanding, err := refuseLandingEdges(object["refuse_landing"], terminalStates)
+	if err != nil {
+		return HostTransitions{}, err
+	}
+	// Every declared start endpoint must be an active, non-terminal state.
+	for source, target := range start {
+		if !stateInList(source, activeStates) || !stateInList(target, activeStates) {
+			return HostTransitions{}, errors.New("invalid configuration: tracker.provider.transitions.start source and target must both be active states")
 		}
 		if stateInList(source, terminalStates) || stateInList(target, terminalStates) {
-			return nil, errors.New("invalid configuration: tracker.provider.agent_transitions must not contain terminal states")
+			return HostTransitions{}, errors.New("invalid configuration: tracker.provider.transitions.start must not contain terminal states")
 		}
-		result[source] = target
+	}
+	return HostTransitions{Start: start, RefuseLanding: refuseLanding}, nil
+}
+
+// startTransitionEdges parses transitions.start into a lowercased source->target
+// map. Terminal/active membership is validated by the caller, which has the
+// state lists. A present but empty or malformed value is rejected.
+func startTransitionEdges(value any) (map[string]string, error) {
+	if value == nil {
+		return nil, nil
+	}
+	return transitionEdges(value, "tracker.provider.transitions.start")
+}
+
+// refuseLandingEdges parses transitions.refuse_landing into a lowercased
+// source->target map and rejects any terminal endpoint. It is the land-fallback
+// edge (Merging -> In Review) applied only by RefuseLanding.
+func refuseLandingEdges(value any, terminalStates []string) (map[string]string, error) {
+	if value == nil {
+		return nil, nil
+	}
+	result, err := transitionEdges(value, "tracker.provider.transitions.refuse_landing")
+	if err != nil {
+		return nil, err
+	}
+	for source, target := range result {
+		if stateInList(source, terminalStates) || stateInList(target, terminalStates) {
+			return nil, errors.New("invalid configuration: tracker.provider.transitions.refuse_landing must not contain terminal states")
+		}
 	}
 	return result, nil
 }
 
-// startTransitionPolicy parses the repository-owned dispatch-time state edges
-// the coordinator applies with the host credential when it launches an issue.
-// Unlike agent_transitions, these are never exposed to a Codex session; they
-// exist so the coordinator can deterministically move a freshly dispatched
-// issue into its started state (Todo -> In Progress) without asking the agent.
-// Both the source and target of every edge must be active, non-terminal states,
-// since the coordinator only dispatches active issues and the issue must remain
-// eligible for reconciliation after the move. Source keys are lowercased so the
-// coordinator can compare them against a normalized issue state directly.
-func startTransitionPolicy(provider map[string]any, activeStates, terminalStates []string) (map[string]string, error) {
-	value, exists := provider["start_transitions"]
-	if !exists {
-		return nil, nil
-	}
+// transitionEdges is the shared parser for one transition edge map. It rejects
+// a non-object, an empty object, non-string endpoints, duplicate source states,
+// and same-state edges, and returns lowercased source keys.
+func transitionEdges(value any, field string) (map[string]string, error) {
 	edges, ok := value.(map[string]any)
 	if !ok || len(edges) == 0 {
-		return nil, errors.New("invalid configuration: tracker.provider.start_transitions must be a non-empty object")
+		return nil, fmt.Errorf("invalid configuration: %s must be a non-empty object", field)
 	}
 	result := make(map[string]string, len(edges))
 	for sourceValue, targetValue := range edges {
@@ -665,20 +717,14 @@ func startTransitionPolicy(provider map[string]any, activeStates, terminalStates
 		target, ok := targetValue.(string)
 		target = strings.TrimSpace(target)
 		if source == "" || !ok || target == "" {
-			return nil, errors.New("invalid configuration: tracker.provider.start_transitions entries must map non-empty state names to non-empty state names")
+			return nil, fmt.Errorf("invalid configuration: %s entries must map non-empty state names to non-empty state names", field)
 		}
 		key := strings.ToLower(source)
 		if _, duplicate := result[key]; duplicate {
-			return nil, errors.New("invalid configuration: tracker.provider.start_transitions has duplicate source states")
+			return nil, fmt.Errorf("invalid configuration: %s has duplicate source states", field)
 		}
 		if strings.EqualFold(source, target) {
-			return nil, errors.New("invalid configuration: tracker.provider.start_transitions must not contain same-state edges")
-		}
-		if !stateInList(source, activeStates) || !stateInList(target, activeStates) {
-			return nil, errors.New("invalid configuration: tracker.provider.start_transitions source and target must both be active states")
-		}
-		if stateInList(source, terminalStates) || stateInList(target, terminalStates) {
-			return nil, errors.New("invalid configuration: tracker.provider.start_transitions must not contain terminal states")
+			return nil, fmt.Errorf("invalid configuration: %s must not contain same-state edges", field)
 		}
 		result[key] = target
 	}
@@ -686,10 +732,9 @@ func startTransitionPolicy(provider map[string]any, activeStates, terminalStates
 }
 
 // childIssueCreationPolicy is deliberately a single boolean: unlike
-// handoff_state or agent_transitions, the scope of the create_child_issue
-// tool (project, team, and parent issue) is entirely derived from the active
-// issue at session start, so there is no separate destination value to
-// validate here.
+// handoff_state, the scope of the create_child_issue tool (project, team, and
+// parent issue) is entirely derived from the active issue at session start, so
+// there is no separate destination value to validate here.
 func childIssueCreationPolicy(provider map[string]any) (bool, error) {
 	value, exists := provider["child_issue_creation"]
 	if !exists {
@@ -877,12 +922,15 @@ func (s Settings) Render(issue any, attempt int) (string, error) {
 	return out.String(), nil
 }
 
-// LinearSessionCapabilityEnabled reports whether any optional session-bound
-// Linear capability is configured. Codex only receives a bound Linear session
-// (and therefore any of the linear_graphql or create_child_issue tools) when
-// at least one of these capabilities is enabled.
+// LinearSessionCapabilityEnabled reports whether a bound Linear session must be
+// prepared for a Codex run. The agent has NO tracker-write tool: the only
+// things that still require a bound session are the host-owned review handoff
+// object (handoff_state; used by github_publish_pr's LinkAndHandoff and by the
+// landing/reconciliation host methods) and the opt-in create_child_issue tool.
+// Every board-affecting transition is applied host-side, so no model-invokable
+// path can write the tracker.
 func (s Settings) LinearSessionCapabilityEnabled() bool {
-	return strings.TrimSpace(s.Tracker.HandoffState) != "" || len(s.Tracker.AgentTransitions) > 0 || s.Tracker.ChildIssueCreation
+	return strings.TrimSpace(s.Tracker.HandoffState) != "" || s.Tracker.ChildIssueCreation
 }
 
 // DeliveryInstructions describe the only PR delivery capability available to
@@ -1022,8 +1070,8 @@ func cloneWorkflow(w Workflow) Workflow {
 	w.Config.Tracker.RequiredLabels = append([]string(nil), w.Config.Tracker.RequiredLabels...)
 	w.Config.Tracker.ActiveStates = append([]string(nil), w.Config.Tracker.ActiveStates...)
 	w.Config.Tracker.TerminalStates = append([]string(nil), w.Config.Tracker.TerminalStates...)
-	w.Config.Tracker.AgentTransitions = cloneStringMap(w.Config.Tracker.AgentTransitions)
-	w.Config.Tracker.StartTransitions = cloneStringMap(w.Config.Tracker.StartTransitions)
+	w.Config.Tracker.HostTransitions.Start = cloneStringMap(w.Config.Tracker.HostTransitions.Start)
+	w.Config.Tracker.HostTransitions.RefuseLanding = cloneStringMap(w.Config.Tracker.HostTransitions.RefuseLanding)
 	w.Config.GitHub.RequiredChecks = append([]string(nil), w.Config.GitHub.RequiredChecks...)
 	w.Config.HostSecretEnvNames = append([]string(nil), w.Config.HostSecretEnvNames...)
 	w.Config.HostSecretValues = append([]string(nil), w.Config.HostSecretValues...)

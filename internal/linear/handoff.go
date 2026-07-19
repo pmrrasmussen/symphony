@@ -74,7 +74,7 @@ func (h *Handoff) PrepareWithSettings(ctx context.Context, s config.Settings, is
 	if active.ID != issue.ID || active.ProjectSlug() != projectSlug || active.TeamID() == "" {
 		return nil, trackerError("handoff_scope", "active issue is outside the configured Linear project")
 	}
-	if strings.TrimSpace(s.Tracker.HandoffState) != "" && !stateAllowed(active.State.Name, s.Tracker.ActiveStates) && len(s.Tracker.AgentTransitions) == 0 {
+	if strings.TrimSpace(s.Tracker.HandoffState) != "" && !stateAllowed(active.State.Name, s.Tracker.ActiveStates) {
 		return nil, trackerError("handoff_scope", "active issue is not in a workflow active state")
 	}
 	if s.Tracker.ChildIssueCreation && active.ProjectID() == "" {
@@ -99,20 +99,25 @@ func (h *Handoff) PrepareWithSettings(ctx context.Context, s config.Settings, is
 	}
 	return &HandoffSession{
 		client: h.client, settings: s, issue: active, targetStateID: stateID,
-		handoffComment: comment, agentTransitions: copyTransitions(s.Tracker.AgentTransitions),
+		handoffComment: comment, refuseLanding: copyTransitions(s.Tracker.HostTransitions.RefuseLanding),
 		childIssueCreationEnabled: s.Tracker.ChildIssueCreation, logger: h.logger,
 	}, nil
 }
 
-// HandoffSession is the fixed authority granted to one app-server session.
+// HandoffSession is the fixed authority granted to one app-server session. It
+// has no method invocable by Codex that writes the tracker: every state change
+// here is driven host-side (github_publish_pr's LinkAndHandoff, the landing
+// host methods, and the poll-loop reconciliation), never by a model tool call.
 // It has no method that accepts an issue, project, endpoint, or credential.
 type HandoffSession struct {
-	client                    *http.Client
-	settings                  config.Settings
-	issue                     handoffIssue
-	targetStateID             string
-	handoffComment            string
-	agentTransitions          map[string]string
+	client         *http.Client
+	settings       config.Settings
+	issue          handoffIssue
+	targetStateID  string
+	handoffComment string
+	// refuseLanding is the lowercased-source Merging -> In Review fallback map
+	// (tracker.provider.transitions.refuse_landing) used only by RefuseLanding.
+	refuseLanding             map[string]string
 	childIssueCreationEnabled bool
 	createdChildren           map[string]childIssueRef
 	logger                    *slog.Logger
@@ -141,168 +146,6 @@ func copyTransitions(source map[string]string) map[string]string {
 		copy[strings.ToLower(strings.TrimSpace(from))] = strings.TrimSpace(to)
 	}
 	return copy
-}
-
-// Call accepts only the four typed tool operations. json.RawMessage exists so
-// Codex protocol decoding stays in its adapter; this function never accepts a
-// GraphQL document or arbitrary target identifiers.
-func (s *HandoffSession) Call(ctx context.Context, arguments json.RawMessage) (ToolResult, error) {
-	var raw map[string]json.RawMessage
-	if err := json.Unmarshal(arguments, &raw); err != nil || raw == nil {
-		return ToolResult{}, trackerError("handoff_request", "tool arguments must be a JSON object")
-	}
-	for key := range raw {
-		if key != "operation" && key != "body" && key != "destination" {
-			return ToolResult{}, trackerError("handoff_request", "tool arguments contain an unsupported field")
-		}
-	}
-	var input struct {
-		Operation   string `json:"operation"`
-		Body        string `json:"body"`
-		Destination string `json:"destination"`
-	}
-	if err := json.Unmarshal(arguments, &input); err != nil || strings.TrimSpace(input.Operation) == "" {
-		return ToolResult{}, trackerError("handoff_request", "tool arguments have invalid field types")
-	}
-	operation := strings.TrimSpace(input.Operation)
-	switch operation {
-	case "read":
-		if strings.TrimSpace(input.Body) != "" || strings.TrimSpace(input.Destination) != "" {
-			return ToolResult{}, trackerError("handoff_request", "read does not accept input")
-		}
-		return ToolResult{Success: true, Data: s.issue.metadata()}, nil
-	case "handoff":
-		if strings.TrimSpace(input.Body) != "" || strings.TrimSpace(input.Destination) != "" {
-			return ToolResult{}, trackerError("handoff_request", "handoff does not accept input")
-		}
-		if err := s.handoff(ctx); err != nil {
-			s.log("handoff_failed")
-			return ToolResult{}, err
-		}
-		s.log("handoff_complete")
-		return ToolResult{Success: true, Data: map[string]any{"issue": s.issue.metadata(), "handoff_state": s.settings.Tracker.HandoffState}}, nil
-	case "comment":
-		if strings.TrimSpace(input.Destination) != "" {
-			return ToolResult{}, trackerError("handoff_request", "comment does not accept destination")
-		}
-		body := strings.TrimSpace(input.Body)
-		if err := validateComment(body); err != nil {
-			return ToolResult{}, err
-		}
-		if err := s.ensureMutable(ctx); err != nil {
-			return ToolResult{}, err
-		}
-		if err := s.comment(ctx, body); err != nil {
-			return ToolResult{}, err
-		}
-		return ToolResult{Success: true, Data: map[string]any{"issue": s.issue.metadata(), "commented": true}}, nil
-	case "transition":
-		if strings.TrimSpace(input.Body) != "" {
-			return ToolResult{}, trackerError("handoff_request", "transition does not accept body")
-		}
-		destination := strings.TrimSpace(input.Destination)
-		if destination == "" {
-			return ToolResult{}, trackerError("handoff_request", "transition destination is required")
-		}
-		issue, err := s.agentTransition(ctx, destination)
-		if err != nil {
-			return ToolResult{}, err
-		}
-		return ToolResult{Success: true, Data: map[string]any{"issue": issue.metadata(), "transition_state": issue.State.Name}}, nil
-	default:
-		return ToolResult{}, trackerError("handoff_request", "unsupported linear handoff operation")
-	}
-}
-
-// agentTransition performs one configured exact edge. It deliberately has no
-// issue, project, team, endpoint, or credential input: the session owns all
-// of those values and refreshes the bound issue before and after the mutation.
-// Linear has no cross-system transaction with the worker, so an ambiguous
-// result is reconciled by the next bounded call.
-func (s *HandoffSession) agentTransition(ctx context.Context, destination string) (handoffIssue, error) {
-	s.handoffMu.Lock()
-	defer s.handoffMu.Unlock()
-	current, err := s.readScopedIssue(ctx)
-	if err != nil {
-		return handoffIssue{}, err
-	}
-	if s.isTransitionDestination(current, destination) {
-		s.issue = current
-		s.logSkip("transition", current.State.Name)
-		return current, nil
-	}
-	if _, err := s.validateTransition(ctx, current, destination); err != nil {
-		return handoffIssue{}, err
-	}
-
-	// The second read closes the human-change window as far as Linear's API
-	// permits. It cannot be atomic with the mutation, which is why successful
-	// writes are always followed by another scoped read below.
-	current, err = s.readScopedIssue(ctx)
-	if err != nil {
-		return handoffIssue{}, err
-	}
-	if s.isTransitionDestination(current, destination) {
-		s.issue = current
-		s.logSkip("transition", current.State.Name)
-		return current, nil
-	}
-	targetID, err := s.validateTransition(ctx, current, destination)
-	if err != nil {
-		return handoffIssue{}, err
-	}
-	fromState := current.State.Name
-	if err := s.transitionTo(ctx, targetID); err != nil {
-		return handoffIssue{}, err
-	}
-	updated, err := s.readScopedIssue(ctx)
-	if err != nil {
-		return handoffIssue{}, err
-	}
-	if !s.isState(updated, targetID, destination) {
-		return handoffIssue{}, trackerError("handoff_response", "Linear did not apply the configured transition")
-	}
-	s.issue = updated
-	s.logEdge("transition", fromState, updated.State.Name)
-	return updated, nil
-}
-
-func (s *HandoffSession) isTransitionDestination(issue handoffIssue, destination string) bool {
-	if !strings.EqualFold(strings.TrimSpace(issue.State.Name), strings.TrimSpace(destination)) {
-		return false
-	}
-	for _, configured := range s.agentTransitions {
-		if strings.EqualFold(strings.TrimSpace(configured), strings.TrimSpace(destination)) {
-			return true
-		}
-	}
-	return false
-}
-
-// validateTransition resolves both current and target states in the active
-// issue's team on every call. Matching names alone is insufficient because a
-// stale or cross-team state ID must never be sent to Linear.
-func (s *HandoffSession) validateTransition(ctx context.Context, current handoffIssue, destination string) (string, error) {
-	if stateAllowed(current.State.Name, s.settings.Tracker.TerminalStates) {
-		return "", trackerError("handoff_scope", "active issue is in a terminal state")
-	}
-	target, ok := s.agentTransitions[strings.ToLower(strings.TrimSpace(current.State.Name))]
-	if !ok || !strings.EqualFold(target, destination) {
-		return "", trackerError("handoff_scope", "requested Linear transition is not configured for the active issue state")
-	}
-	if stateAllowed(target, s.settings.Tracker.TerminalStates) {
-		return "", trackerError("handoff_scope", "configured Linear transition targets a terminal state")
-	}
-	states, err := s.resolveTeamStates(ctx, current.TeamID())
-	if err != nil {
-		return "", err
-	}
-	sourceID, sourceOK := states[strings.ToLower(strings.TrimSpace(current.State.Name))]
-	targetID, targetOK := states[strings.ToLower(strings.TrimSpace(target))]
-	if !sourceOK || sourceID != current.StateID() || !targetOK {
-		return "", trackerError("handoff_scope", "configured Linear transition is stale or outside the active issue team")
-	}
-	return targetID, nil
 }
 
 func (s *HandoffSession) resolveTeamStates(ctx context.Context, teamID string) (map[string]string, error) {
@@ -340,15 +183,11 @@ func (s *HandoffSession) resolveTeamStates(ctx context.Context, teamID string) (
 	return states, nil
 }
 
-// handoff coordinates the repository-owned completion comment and transition.
-// The exact comment is durable reconciliation state in Linear: retries first
-// discover it, so a failed or ambiguous transition never duplicates delivery.
-func (s *HandoffSession) handoff(ctx context.Context) error {
-	s.handoffMu.Lock()
-	defer s.handoffMu.Unlock()
-	return s.handoffLocked(ctx)
-}
-
+// handoffLocked coordinates the repository-owned completion comment and
+// transition. The exact comment is durable reconciliation state in Linear:
+// retries first discover it, so a failed or ambiguous transition never
+// duplicates delivery. It is host-driven only, via LinkAndHandoff below; the
+// caller already holds handoffMu.
 func (s *HandoffSession) handoffLocked(ctx context.Context) error {
 
 	current, err := s.readScopedIssue(ctx)
@@ -433,14 +272,13 @@ func (s *HandoffSession) EnsureMergeState(ctx context.Context, mergeState string
 }
 
 // RefuseLanding attempts the configured mergeState -> In Review fallback
-// transition (tracker.provider.agent_transitions), used only after a GitHub
-// landing hard gate refuses to merge. It is deliberately narrower than the
-// general agentTransition: it only ever moves the issue when its freshly
-// read current state is exactly mergeState, so a human (or an earlier call)
-// that already moved the issue elsewhere is never overridden. A missing or
-// stale configured edge is reported by returning (false, nil): the caller's
-// hard-gate refusal must still be honored even when no fallback transition
-// is available or currently valid.
+// transition (tracker.provider.transitions.refuse_landing), used only after a
+// GitHub landing hard gate refuses to merge. It is host-driven and deliberately
+// narrow: it only ever moves the issue when its freshly read current state is
+// exactly mergeState, so a human (or an earlier call) that already moved the
+// issue elsewhere is never overridden. A missing or stale configured edge is
+// reported by returning (false, nil): the caller's hard-gate refusal must still
+// be honored even when no fallback transition is available or currently valid.
 func (s *HandoffSession) RefuseLanding(ctx context.Context, mergeState string) (bool, error) {
 	s.handoffMu.Lock()
 	defer s.handoffMu.Unlock()
@@ -451,7 +289,7 @@ func (s *HandoffSession) RefuseLanding(ctx context.Context, mergeState string) (
 	if !strings.EqualFold(strings.TrimSpace(current.State.Name), strings.TrimSpace(mergeState)) {
 		return false, nil
 	}
-	target, ok := s.agentTransitions[strings.ToLower(strings.TrimSpace(mergeState))]
+	target, ok := s.refuseLanding[strings.ToLower(strings.TrimSpace(mergeState))]
 	if !ok {
 		return false, nil
 	}

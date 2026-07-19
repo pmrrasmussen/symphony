@@ -541,10 +541,10 @@ func TestHandoffPolicyIsOptInAndInvalidReloadRetainsLastKnownGood(t *testing.T) 
 	}
 }
 
-func TestAgentTransitionPolicyIsExactAndReloadSafe(t *testing.T) {
+func TestHostTransitionPolicyIsExactAndReloadSafe(t *testing.T) {
 	d := t.TempDir()
 	p := filepath.Join(d, "WORKFLOW.md")
-	good := "---\ntracker: {kind: linear, provider: {agent_transitions: {Todo: \"In Progress\", Merging: \"In Review\"}}, active_states: [Todo, In Progress], terminal_states: [Done]}\n---\nprompt"
+	good := "---\ntracker: {kind: linear, provider: {transitions: {start: {Todo: \"In Progress\"}, refuse_landing: {Merging: \"In Review\"}}}, active_states: [Todo, In Progress, Merging, In Review], terminal_states: [Done]}\n---\nprompt"
 	if err := os.WriteFile(p, []byte(good), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -552,64 +552,38 @@ func TestAgentTransitionPolicyIsExactAndReloadSafe(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	policy := s.Current().Config.Tracker.AgentTransitions
-	if len(policy) != 2 || policy["Todo"] != "In Progress" || policy["Merging"] != "In Review" {
-		t.Fatalf("agent transition policy=%#v", policy)
+	policy := s.Current().Config.Tracker.HostTransitions
+	if len(policy.Start) != 1 || policy.Start["todo"] != "In Progress" {
+		t.Fatalf("start policy=%#v, want lowercased todo -> In Progress", policy.Start)
 	}
-	for _, invalid := range []string{
-		"tracker: {kind: linear, provider: {agent_transitions: []}, active_states: [Todo], terminal_states: [Done]}",
-		"tracker: {kind: linear, provider: {agent_transitions: {Todo: Todo}}, active_states: [Todo], terminal_states: [Done]}",
-		"tracker: {kind: linear, provider: {agent_transitions: {Done: \"In Review\"}}, active_states: [Todo], terminal_states: [Done]}",
-		"tracker: {kind: linear, provider: {agent_transitions: {Todo: Done}}, active_states: [Todo], terminal_states: [Done]}",
-	} {
-		if err := os.WriteFile(p, []byte("---\n"+invalid+"\n---\nprompt"), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		if err := s.Reload(); err == nil {
-			t.Fatalf("invalid agent transition policy reloaded: %s", invalid)
-		}
-		if got := s.Current().Config.Tracker.AgentTransitions["Todo"]; got != "In Progress" {
-			t.Fatalf("invalid reload replaced agent transition policy: %#v", s.Current().Config.Tracker.AgentTransitions)
-		}
+	if len(policy.RefuseLanding) != 1 || policy.RefuseLanding["merging"] != "In Review" {
+		t.Fatalf("refuse_landing policy=%#v, want lowercased merging -> In Review", policy.RefuseLanding)
 	}
-}
-
-func TestStartTransitionPolicyIsHostOwnedAndValidated(t *testing.T) {
-	d := t.TempDir()
-	p := filepath.Join(d, "WORKFLOW.md")
-	good := "---\ntracker: {kind: linear, provider: {start_transitions: {Todo: \"In Progress\"}}, active_states: [Todo, In Progress], terminal_states: [Done]}\n---\nprompt"
-	if err := os.WriteFile(p, []byte(good), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	s, err := NewStore(p, "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	policy := s.Current().Config.Tracker.StartTransitions
-	if len(policy) != 1 || policy["todo"] != "In Progress" {
-		t.Fatalf("start transition policy=%#v, want lowercased source todo -> In Progress", policy)
-	}
-	// A host-owned start transition must not enable the agent's Linear session
-	// on its own: it narrows agent capability rather than widening it.
+	// The host transition policy is never an agent capability: it narrows the
+	// agent's authority rather than widening it.
 	if s.Current().Config.LinearSessionCapabilityEnabled() {
-		t.Fatal("start_transitions alone must not enable the agent Linear session capability")
+		t.Fatal("transitions alone must not enable the agent Linear session capability")
 	}
 	for _, invalid := range []string{
-		"tracker: {kind: linear, provider: {start_transitions: []}, active_states: [Todo, In Progress], terminal_states: [Done]}",
-		"tracker: {kind: linear, provider: {start_transitions: {Todo: Todo}}, active_states: [Todo, In Progress], terminal_states: [Done]}",
-		// Target must be an active state.
-		"tracker: {kind: linear, provider: {start_transitions: {Todo: \"In Progress\"}}, active_states: [Todo], terminal_states: [Done]}",
-		// Neither endpoint may be terminal.
-		"tracker: {kind: linear, provider: {start_transitions: {Todo: Done}}, active_states: [Todo, Done], terminal_states: [Done]}",
+		// Empty / unknown keys.
+		"tracker: {kind: linear, provider: {transitions: {}}, active_states: [Todo], terminal_states: [Done]}",
+		"tracker: {kind: linear, provider: {transitions: {bogus: {Todo: \"In Progress\"}}}, active_states: [Todo, In Progress], terminal_states: [Done]}",
+		// start: same-state, target not active, terminal endpoint.
+		"tracker: {kind: linear, provider: {transitions: {start: {Todo: Todo}}}, active_states: [Todo], terminal_states: [Done]}",
+		"tracker: {kind: linear, provider: {transitions: {start: {Todo: \"In Progress\"}}}, active_states: [Todo], terminal_states: [Done]}",
+		"tracker: {kind: linear, provider: {transitions: {start: {Todo: Done}}}, active_states: [Todo, Done], terminal_states: [Done]}",
+		// refuse_landing: terminal endpoints.
+		"tracker: {kind: linear, provider: {transitions: {refuse_landing: {Done: \"In Review\"}}}, active_states: [In Review], terminal_states: [Done]}",
+		"tracker: {kind: linear, provider: {transitions: {refuse_landing: {Merging: Done}}}, active_states: [Merging], terminal_states: [Done]}",
 	} {
 		if err := os.WriteFile(p, []byte("---\n"+invalid+"\n---\nprompt"), 0o600); err != nil {
 			t.Fatal(err)
 		}
 		if err := s.Reload(); err == nil {
-			t.Fatalf("invalid start transition policy reloaded: %s", invalid)
+			t.Fatalf("invalid host transition policy reloaded: %s", invalid)
 		}
-		if got := s.Current().Config.Tracker.StartTransitions["todo"]; got != "In Progress" {
-			t.Fatalf("invalid reload replaced start transition policy: %#v", s.Current().Config.Tracker.StartTransitions)
+		if got := s.Current().Config.Tracker.HostTransitions.Start["todo"]; got != "In Progress" {
+			t.Fatalf("invalid reload replaced host transition policy: %#v", s.Current().Config.Tracker.HostTransitions)
 		}
 	}
 }

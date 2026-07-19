@@ -12,7 +12,7 @@ review handoff, rework, landing, and completion instructions. Read it, and
 - `cmd/symphony` — the CLI entry point (`--workflow`, `--dry-run`, `--logs-root`, `--log-level`).
 - `internal/config` — loads and validates `WORKFLOW.md`.
 - `internal/coordinator` — the scheduling core: polling, capacity, retries, and reconciliation.
-- `internal/linear` — the Linear GraphQL tracker adapter and the bounded `linear_graphql` handoff/transition tool.
+- `internal/linear` — the Linear GraphQL tracker adapter and the host-side review handoff, transitions, and `create_child_issue` tooling.
 - `internal/github` — the optional, fixed-repository GitHub PR publish/context/land adapter.
 - `internal/codex` — the Codex app-server JSON-RPC backend and dynamic tool wiring.
 - `internal/workspace` — local Git worktree lifecycle, ownership, and recovery.

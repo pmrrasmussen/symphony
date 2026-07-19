@@ -625,7 +625,7 @@ func (c *Coordinator) launch(parent context.Context, i domain.Issue, attempt int
 //     causes a double dispatch — the session starts regardless, and the poll
 //     loop retries or reconciles the tracker state on a later tick.
 func (c *Coordinator) transitionToStarted(ctx context.Context, i domain.Issue, s config.Settings) {
-	target, ok := s.Tracker.StartTransitions[norm(i.State)]
+	target, ok := s.Tracker.HostTransitions.Start[norm(i.State)]
 	if !ok || strings.TrimSpace(target) == "" {
 		return
 	}

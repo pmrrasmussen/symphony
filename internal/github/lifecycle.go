@@ -29,7 +29,7 @@ const maxResponse = 1 << 20
 
 // Structured-handoff input bounds. These mirror the maxLength values in the
 // github_publish_pr Codex tool schema (internal/codex/backend.go); both sides
-// must be kept in sync the same way the linear_graphql comment bound is.
+// must be kept in sync.
 const (
 	maxPublishWhyBytes         = 4 << 10
 	maxPublishWhatChangedBytes = 8 << 10

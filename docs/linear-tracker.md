@@ -11,10 +11,9 @@
 | `api_key_file` | recommended | Trusted local file containing the API key. Prefer `$SYMPHONY_LINEAR_API_KEY_FILE`, whose value is the absolute file path; file contents and path dependencies are tracked by configuration loading. When both credential fields exist, this file takes precedence. |
 | `endpoint` | optional | Absolute HTTPS GraphQL endpoint; defaults to `https://api.linear.app/graphql`. HTTP is accepted only for `localhost`, `127.0.0.1`, or `::1` test hosts. |
 | `assignee` | optional | Unset permits all assignees. A non-empty ID permits only that assignee. `me` resolves the current Linear viewer ID for each read. |
-| `handoff_state` | optional | Enables the tightly scoped Codex `linear_graphql` compatibility tool. The name must be a non-active workflow state in the active issue's Linear team. |
-| `handoff_comment_template` | optional | A repository-owned Go template for the comment made by the tool's `handoff` operation. It requires `handoff_state` and receives only `issue`. |
-| `agent_transitions` | optional | A non-empty mapping of exact source state names to destination state names for the bounded Codex `transition` operation. Terminal and same-state edges are rejected. |
-| `start_transitions` | optional | A non-empty mapping of exact source to destination state names the coordinator applies host-side, with the host credential, when it dispatches an issue (the canonical `Todo -> In Progress`). Both endpoints of every edge must be active, non-terminal states. Unlike `agent_transitions`, it is never exposed to a Codex session; it narrows agent capability rather than widening it, so it does not by itself enable the `linear_graphql` tool. The move is idempotent (an already-started issue is untouched) and fail-safe (a failed move is logged and never blocks or double-dispatches the run). Terminal and same-state edges are rejected. |
+| `handoff_state` | optional | The single human-controlled review state `github_publish_pr` hands a bound issue off to, host-side. The name must be a non-active workflow state in the active issue's Linear team. It binds a Linear session and enables the scoped GitHub handoff tools, but is not itself a model-invokable tool. |
+| `handoff_comment_template` | optional | A repository-owned Go template for the comment Symphony posts when it performs the host-side review handoff. It requires `handoff_state` and receives only `issue`. |
+| `transitions` | optional | The single host-owned tracker transition policy. A structured object with two independent edge sets, both applied host-side with the host credential and never exposed to a Codex session: `start` (dispatch-time edges keyed by the issue's current state — the canonical `Todo -> In Progress`; both endpoints must be active, non-terminal states) and `refuse_landing` (the `Merging -> In Review` fallback `github_land_pr` applies on a hard gate, keyed by `github.merge_state`). The two sets are kept structurally distinct — never flattened into one map — because `Merging` is both a dispatchable state and the land-fallback source. Terminal and same-state edges are rejected; `start` moves are idempotent and fail-safe. |
 | `child_issue_creation` | optional | Boolean. Enables the session-bound Codex `create_child_issue` tool, described below. Disabled by default. |
 
 Invalid provider values produce `invalid_tracker_config`; a missing or empty key
@@ -66,59 +65,60 @@ sleeps or immediately hot-loops. 5xx status errors are retryable. GraphQL
 response bodies and transport details are intentionally not included in public
 error text or logs.
 
-## Optional Codex handoff capability
+## Host-owned review handoff and transitions
 
-When both `handoff_state` and `agent_transitions` are absent, Symphony does not
-advertise a client-side Linear tool and all such requests remain unsupported.
-When either is configured, the service validates the active issue's project and
-team and freezes the policy for the Codex session before the child process
+The agent has no tool that writes the active issue's tracker state. Every state
+change except the human review gates is performed host-side, with the host
+Linear credential, so no model-invokable path can transition the board:
+
+- `transitions.start` is applied by the coordinator at dispatch (`Todo -> In
+  Progress`), before the Codex session starts.
+- `github_publish_pr` performs the review handoff (`In Progress`/`Rework ->
+  handoff_state`) host-side after it publishes the pull request.
+- `github_land_pr` completes landing (`Merging -> Done`) or, on a hard gate,
+  applies the `transitions.refuse_landing` fallback (`Merging -> In Review`).
+- The poll loop reconciles an externally merged pull request to `Done`.
+
+When neither `handoff_state` nor `child_issue_creation` is configured, Symphony
+binds no Linear session for the Codex child and advertises no session-bound
+Linear tool. When either is configured, the service validates the active issue's
+project and team and freezes the policy for the session before the child process
 starts. A workflow reload affects later sessions only; an invalid reload retains
 the last valid policy.
 
-Before every handoff transition or comment mutation, Symphony re-reads the
-bound issue and rejects the action if its project, team, or state changed, or
-if it is no longer in an active workflow state. A human terminal transition
-therefore wins without any agent mutation.
+Before every host handoff or transition mutation, Symphony re-reads the bound
+issue and rejects the action if its project, team, or state changed, or if it is
+no longer in an active workflow state, so a human terminal transition wins
+without any agent involvement.
 
-The typed `handoff` operation trims and validates the repository-rendered
-comment, checks the bound issue's existing comments, and then applies the
-comment before the configured state transition. The exact configured comment
-is the reconciliation record: if either mutation returns an ambiguous or
-retryable failure, a retry observes the comment and current state before doing
-more work. A completed transition is accepted only when that comment already
-exists (or no comment is configured), and a target-state issue missing its
-comment is repaired without another transition. This makes repeated delivery
-idempotent without storing an agent-supplied key or exposing a broader Linear
-write API.
+The host review handoff trims and validates the repository-rendered comment,
+checks the bound issue's existing comments, and applies the comment before the
+configured state transition. The exact configured comment is the reconciliation
+record: if either mutation returns an ambiguous or retryable failure, a retry
+observes the comment and current state before doing more work. A completed
+transition is accepted only when that comment already exists (or no comment is
+configured), and a target-state issue missing its comment is repaired without
+another transition. This makes repeated delivery idempotent without storing a
+key or exposing a broader Linear write API. Handoff and transition logs contain
+only the operation, the from/to state names, and the bound issue ID/identifier;
+comment bodies, credentials, and agent arguments are never logged.
 
-The compatibility name is `linear_graphql`, but it is not a GraphQL proxy. Its
-only typed operations are `read`, `handoff`, `comment`, and `transition`. They are bound to
-the active issue and configured project; callers cannot supply a query, issue
-ID, project, endpoint, credential, or state. `handoff` may only use the
-configured state and the optional fixed comment template. `comment` can only
-write a bounded comment to the active issue. Tool failures return generic
-responses and never reveal the Linear credential or provider payload.
-Handoff logs contain only the outcome and bound issue ID/identifier; comment
-bodies, credentials, and full agent arguments are not logged.
-
-`transition` accepts only a destination state name. On every call Symphony
-refreshes the active issue, resolves its current team states, and permits the
-mutation only when the refreshed source and requested destination match one
-configured `agent_transitions` edge. It refreshes once more immediately before
-the mutation and again afterwards, adopting the confirmed resulting state in
-the session snapshot. A call already at a configured destination is idempotent;
-reversed, terminal, stale, cross-project, cross-team, and unconfigured edges
-are rejected. Transition calls are serialized per session. Linear cannot make
-the worker's worktree and its own mutation one atomic transaction, so a race or
-ambiguous provider result is reconciled by the next scoped call.
+The `refuse_landing` fallback accepts no agent input. On a refused landing
+Symphony refreshes the bound issue, permits the mutation only when the refreshed
+source matches the configured `github.merge_state`, and moves it to the mapped
+state. A call already off the merge state is an idempotent no-op; reversed,
+terminal, stale, cross-project, and cross-team states are rejected. Host
+transitions are serialized per session, so a race or ambiguous provider result
+is reconciled by the next scoped call.
 
 ## Optional child issue creation capability
 
-`tracker.provider.child_issue_creation: true` enables a second, independent
-session-bound tool, `create_child_issue`. It is gated the same way as
-`handoff_state` and `agent_transitions`: any one of the three is enough to
-bind a Linear session for the Codex child process, but each tool is only
-advertised when its own setting is configured. `create_child_issue` requires
+`tracker.provider.child_issue_creation: true` enables the only session-bound
+Codex Linear tool, `create_child_issue`. Either `handoff_state` or
+`child_issue_creation` is enough to bind a Linear session for the Codex child
+process, but the tool is advertised only when its own setting is configured.
+Unlike the removed `linear_graphql` tool, it never transitions the active
+issue; it only creates a scoped sub-issue. `create_child_issue` requires
 no separate project or team configuration: it always creates the new issue in
 the active issue's already-configured Linear project and team, and always
 records the active issue as the new issue's Linear parent (a native Linear
