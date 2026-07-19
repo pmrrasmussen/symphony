@@ -44,9 +44,9 @@ hooks:
   timeout_ms: 60000
 agent:
   # Two-agent operation (PMR-38): one implementation/rework agent may run
-  # concurrently with one landing agent, without either occupying the other's
-  # capacity. max_concurrent_agents_by_state additionally caps Merging at
-  # exactly one landing agent even though two agents are allowed overall.
+  # concurrently with one landing agent. max_concurrent_agents_by_state caps
+  # Merging at exactly one landing agent even though two agents are allowed
+  # overall.
   max_concurrent_agents: 2
   max_concurrent_agents_by_state:
     Merging: 1

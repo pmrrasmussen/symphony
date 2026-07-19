@@ -240,7 +240,7 @@ func decode(raw map[string]any, base, path, logRoot string, sources *sourceSnaps
 	if err != nil {
 		return Settings{}, err
 	}
-	mergeState, mergeMethod, requiredChecks, err := githubLandingPolicy(github, terminalStates, handoffState)
+	mergeState, mergeMethod, requiredChecks, err := githubLandingPolicy(github, activeStates, terminalStates, handoffState)
 	if err != nil {
 		return Settings{}, err
 	}
@@ -617,7 +617,7 @@ var validMergeMethods = map[string]bool{"merge": true, "squash": true, "rebase":
 // fields. Unlike the rest of the github: block, any malformed or ambiguous
 // value here is a hard configuration error (see the GitHub struct doc
 // comment) rather than a silently-disabled optional feature.
-func githubLandingPolicy(github map[string]any, terminalStates []string, handoffState string) (string, string, []string, error) {
+func githubLandingPolicy(github map[string]any, activeStates, terminalStates []string, handoffState string) (string, string, []string, error) {
 	if github == nil {
 		return "", "", nil, nil
 	}
@@ -667,12 +667,15 @@ func githubLandingPolicy(github map[string]any, terminalStates []string, handoff
 	if !ok || state == "" {
 		return "", "", nil, errors.New("invalid configuration: github.merge_state must be a non-empty string")
 	}
-	// merge_state is deliberately allowed to be an active/dispatchable state
-	// (the canonical lifecycle's Merging): a session must actually be
-	// dispatched for that issue before it can be bound and receive the
-	// zero-argument github_land_pr tool (see codex/backend.go). It still must
-	// never be a terminal state or coincide with handoff_state, either of
-	// which would make the landing gate unreachable or ambiguous.
+	// merge_state must be an active/dispatchable state (the canonical
+	// lifecycle's Merging): a session must actually be dispatched for that
+	// issue before it can be bound and receive the zero-argument
+	// github_land_pr tool (see codex/backend.go). It must never be terminal or
+	// coincide with handoff_state, either of which would make the landing gate
+	// unreachable or ambiguous.
+	if !stateInList(state, activeStates) {
+		return "", "", nil, errors.New("invalid configuration: github.merge_state must be an active state")
+	}
 	if stateInList(state, terminalStates) {
 		return "", "", nil, errors.New("invalid configuration: github.merge_state must not be a terminal state")
 	}

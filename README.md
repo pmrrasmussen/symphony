@@ -33,9 +33,8 @@ the single, fixed, human-controlled review state and is never dispatched;
 
 Two-agent operation: one implementation/rework agent may run concurrently
 with one landing agent (`agent.max_concurrent_agents: 2`,
-`agent.max_concurrent_agents_by_state: {Merging: 1}`), so a `Merging` landing
-session never blocks, or is blocked by, unrelated implementation work, and a
-delayed retry never occupies a concurrency slot while it waits.
+`agent.max_concurrent_agents_by_state: {Merging: 1}`), while a delayed retry
+never occupies a concurrency slot as it waits.
 
 See `WORKFLOW.md`'s prompt body for the full per-state start, implementation,
 validation, review handoff, rework, landing, and completion playbook, and
@@ -221,12 +220,11 @@ github:
 Unlike the rest of the `github:` block, an invalid `merge_state`,
 `merge_method`, or `required_checks` value rejects the whole workflow instead
 of silently disabling the feature, the same fail-closed treatment as
-`tracker.provider.agent_transitions`. `merge_state` must differ from
-`handoff_state` and from every terminal state, but -- unlike
-`handoff_state` -- it is normally one of `active_states` (`Merging` in the
-canonical lifecycle above): a session only receives the tool once actually
-dispatched for an issue currently in that exact state. A session bound to an
-issue currently in the exact configured `merge_state` receives a
+`tracker.provider.agent_transitions`. `merge_state` must be an
+`active_state` and differ from `handoff_state` and every terminal state
+(`Merging` in the canonical lifecycle above): a session only receives the
+tool once actually dispatched for an issue currently in that exact state. A
+session bound to an issue currently in the exact configured `merge_state` receives a
 zero-argument `github_land_pr` tool: it re-verifies the worktree, branch,
 pull request, required checks, effective review state (moving the issue to
 `merge_state` is itself the human

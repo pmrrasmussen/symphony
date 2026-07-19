@@ -49,8 +49,7 @@ agent:
   # Two-agent operation: one implementation/rework agent may run concurrently
   # with one landing agent. max_concurrent_agents_by_state additionally caps
   # Merging at exactly one landing agent even though more agents are allowed
-  # overall, so a landing session never blocks (or is blocked by) unrelated
-  # implementation work.
+  # overall.
   max_concurrent_agents: 2
   max_concurrent_agents_by_state:
     Merging: 1
@@ -75,9 +74,8 @@ codex:
 #   # this exact Linear state receives a zero-argument github_land_pr tool;
 #   # moving the issue to this state (Merging in the canonical lifecycle
 #   # above) is itself the human approval to land, so no separate approving
-#   # review is required. It must differ from handoff_state and from every
-#   # terminal state, but -- unlike earlier bootstrap configurations -- it is
-#   # expected to be one of active_states, since a session only receives the
+#   # review is required. It must be one of active_states and differ from
+#   # handoff_state and every terminal state, since a session only receives the
 #   # tool once actually dispatched for an issue in that state. required_checks
 #   # is then mandatory: every named check must be present and successful (or
 #   # neutral) immediately before the merge call, or the tool waits. Unlike

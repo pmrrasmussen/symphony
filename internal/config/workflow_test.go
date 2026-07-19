@@ -654,6 +654,7 @@ func TestGitHubLandingPolicyIsStrictAndFailsClosed(t *testing.T) {
 		name   string
 		github string
 	}{
+		{name: "merge_state is not an active state", github: full + "merge_state: Merging, required_checks: [ci]}"},
 		{name: "merge_state is a terminal state", github: full + "merge_state: Done, required_checks: [ci]}"},
 		{name: "merge_state equals handoff_state", github: full + `merge_state: "In Review", required_checks: [ci]}`},
 		{name: "merge_state missing required_checks", github: full + "merge_state: Merging}"},
@@ -680,7 +681,7 @@ func TestGitHubLandingPolicyIsStrictAndFailsClosed(t *testing.T) {
 func TestGitHubLandingPolicyParsesValidConfiguration(t *testing.T) {
 	t.Setenv("PMR37_GITHUB_TOKEN", "github-secret")
 	path := filepath.Join(t.TempDir(), "WORKFLOW.md")
-	content := "---\ntracker: {kind: linear, provider: {handoff_state: \"In Review\"}, active_states: [Todo, \"In Progress\"], terminal_states: [Done, Canceled]}\ngithub: {owner: pmrrasmussen, repository: symphony, base_branch: main, token: $PMR37_GITHUB_TOKEN, merge_state: Merging, required_checks: [ci/build, ci/test]}\n---\nprompt"
+	content := "---\ntracker: {kind: linear, provider: {handoff_state: \"In Review\"}, active_states: [Todo, \"In Progress\", Merging], terminal_states: [Done, Canceled]}\ngithub: {owner: pmrrasmussen, repository: symphony, base_branch: main, token: $PMR37_GITHUB_TOKEN, merge_state: Merging, required_checks: [ci/build, ci/test]}\n---\nprompt"
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}

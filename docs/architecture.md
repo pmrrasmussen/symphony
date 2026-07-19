@@ -32,8 +32,8 @@ optional `agent.max_concurrent_agents_by_state` map additionally bounds
 concurrency within one normalized state name (for example, at most one
 concurrent `Merging` landing session even when overall capacity allows more).
 A queued retry timer never occupies this capacity -- only a live session or a
-launch already in flight does -- so a landing session and an unrelated
-implementation session admit and run independently of one another.
+launch already in flight does -- so one landing session and one unrelated
+implementation session can run concurrently when global capacity permits.
 
 The optional `create_child_issue` capability follows the same model: it is
 disabled unless `tracker.provider.child_issue_creation` is configured, and it
