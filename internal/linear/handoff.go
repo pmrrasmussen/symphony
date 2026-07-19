@@ -32,8 +32,7 @@ func NewHandoff(settings func() config.Settings) *Handoff {
 }
 
 func (h *Handoff) Enabled() bool {
-	settings := h.settings()
-	return strings.TrimSpace(settings.Tracker.HandoffState) != "" || len(settings.Tracker.AgentTransitions) > 0
+	return h.settings().LinearSessionCapabilityEnabled()
 }
 
 // Prepare verifies that the issue is still in the configured project, finds
@@ -46,7 +45,7 @@ func (h *Handoff) Prepare(ctx context.Context, issue domain.Issue) (*HandoffSess
 // PrepareWithSettings binds a single repository settings snapshot to the
 // session. The Codex backend calls this once before it launches the child.
 func (h *Handoff) PrepareWithSettings(ctx context.Context, s config.Settings, issue domain.Issue) (*HandoffSession, error) {
-	if strings.TrimSpace(s.Tracker.HandoffState) == "" && len(s.Tracker.AgentTransitions) == 0 {
+	if !s.LinearSessionCapabilityEnabled() {
 		return nil, nil
 	}
 	if err := validateProvider(s.Tracker.Provider); err != nil {
@@ -69,6 +68,9 @@ func (h *Handoff) PrepareWithSettings(ctx context.Context, s config.Settings, is
 	if strings.TrimSpace(s.Tracker.HandoffState) != "" && !stateAllowed(active.State.Name, s.Tracker.ActiveStates) && len(s.Tracker.AgentTransitions) == 0 {
 		return nil, trackerError("handoff_scope", "active issue is not in a workflow active state")
 	}
+	if s.Tracker.ChildIssueCreation && active.ProjectID() == "" {
+		return nil, trackerError("invalid_tracker_config", "linear active issue project could not be resolved for child issue creation")
+	}
 	stateID, comment := "", ""
 	if strings.TrimSpace(s.Tracker.HandoffState) != "" {
 		stateID, err = h.resolveState(ctx, s, active.TeamID(), s.Tracker.HandoffState)
@@ -88,21 +90,24 @@ func (h *Handoff) PrepareWithSettings(ctx context.Context, s config.Settings, is
 	}
 	return &HandoffSession{
 		client: h.client, settings: s, issue: active, targetStateID: stateID,
-		handoffComment: comment, agentTransitions: copyTransitions(s.Tracker.AgentTransitions), logger: h.logger,
+		handoffComment: comment, agentTransitions: copyTransitions(s.Tracker.AgentTransitions),
+		childIssueCreationEnabled: s.Tracker.ChildIssueCreation, logger: h.logger,
 	}, nil
 }
 
 // HandoffSession is the fixed authority granted to one app-server session.
 // It has no method that accepts an issue, project, endpoint, or credential.
 type HandoffSession struct {
-	client           *http.Client
-	settings         config.Settings
-	issue            handoffIssue
-	targetStateID    string
-	handoffComment   string
-	agentTransitions map[string]string
-	logger           *slog.Logger
-	handoffMu        sync.Mutex
+	client                    *http.Client
+	settings                  config.Settings
+	issue                     handoffIssue
+	targetStateID             string
+	handoffComment            string
+	agentTransitions          map[string]string
+	childIssueCreationEnabled bool
+	createdChildren           map[string]childIssueRef
+	logger                    *slog.Logger
+	handoffMu                 sync.Mutex
 }
 
 // MatchesSecret lets the Codex launcher remove inherited values containing the
@@ -492,7 +497,7 @@ func (s *HandoffSession) readScopedIssue(ctx context.Context) (handoffIssue, err
 	if err != nil {
 		return handoffIssue{}, err
 	}
-	if current.ID != s.issue.ID || current.ProjectSlug() != s.issue.ProjectSlug() || current.TeamID() != s.issue.TeamID() {
+	if current.ID != s.issue.ID || current.ProjectSlug() != s.issue.ProjectSlug() || current.ProjectID() != s.issue.ProjectID() || current.TeamID() != s.issue.TeamID() {
 		return handoffIssue{}, trackerError("handoff_scope", "active issue scope changed after session setup")
 	}
 	return current, nil
@@ -715,6 +720,7 @@ type handoffIssue struct {
 	Description string `json:"description"`
 	URL         string `json:"url"`
 	Project     *struct {
+		ID     string `json:"id"`
 		SlugID string `json:"slugId"`
 	} `json:"project"`
 	Team *struct {
@@ -733,6 +739,7 @@ func (i handoffIssue) valid() error {
 	return nil
 }
 func (i handoffIssue) ProjectSlug() string { return strings.TrimSpace(i.Project.SlugID) }
+func (i handoffIssue) ProjectID() string   { return strings.TrimSpace(i.Project.ID) }
 func (i handoffIssue) TeamID() string      { return strings.TrimSpace(i.Team.ID) }
 func (i handoffIssue) StateID() string     { return strings.TrimSpace(i.State.ID) }
 func (i handoffIssue) toDomain() domain.Issue {
@@ -744,7 +751,7 @@ func (i handoffIssue) metadata() map[string]string {
 
 // Keep every GraphQL operation fixed and intentionally small. Variables are
 // generated solely from the already-bound session, never from tool input.
-const handoffReadQuery = `query SymphonyLinearHandoffIssue($issueID: String!) { issue(id: $issueID) { id identifier title description url project { slugId } team { id } state { id name } } }`
+const handoffReadQuery = `query SymphonyLinearHandoffIssue($issueID: String!) { issue(id: $issueID) { id identifier title description url project { id slugId } team { id } state { id name } } }`
 const handoffStatesQuery = `query SymphonyLinearHandoffStates($teamID: String!) { team(id: $teamID) { id states { nodes { id name } } } }`
 const handoffTransitionQuery = `mutation SymphonyLinearHandoffTransition($issueID: String!, $stateID: String!) { issueUpdate(id: $issueID, input: {stateId: $stateID}) { success } }`
 const handoffCommentQuery = `mutation SymphonyLinearHandoffComment($issueID: String!, $body: String!) { commentCreate(input: {issueId: $issueID, body: $body}) { success } }`

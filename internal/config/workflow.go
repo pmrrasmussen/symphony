@@ -61,6 +61,10 @@ type Tracker struct {
 	RequiredLabels, ActiveStates, TerminalStates []string
 	HandoffState, HandoffCommentTemplate         string
 	AgentTransitions                             map[string]string
+	// ChildIssueCreation enables the session-bound Codex create_child_issue
+	// tool. It is opt-in and disabled by default; see child_issue_creation in
+	// tracker.provider.
+	ChildIssueCreation bool
 }
 
 type Polling struct{ Interval time.Duration }
@@ -213,6 +217,10 @@ func decode(raw map[string]any, base, path, logRoot string, sources *sourceSnaps
 	if err != nil {
 		return Settings{}, err
 	}
+	childIssueCreation, err := childIssueCreationPolicy(resolvedProvider)
+	if err != nil {
+		return Settings{}, err
+	}
 
 	pollInterval, err := durationMS(polling, "interval_ms", 30_000)
 	if err != nil {
@@ -303,6 +311,7 @@ func decode(raw map[string]any, base, path, logRoot string, sources *sourceSnaps
 			HandoffState:           handoffState,
 			HandoffCommentTemplate: handoffCommentTemplate,
 			AgentTransitions:       agentTransitions,
+			ChildIssueCreation:     childIssueCreation,
 		},
 		Polling:   Polling{Interval: pollInterval},
 		Workspace: Workspace{Root: workspaceRoot, SourceRoot: sourceRoot},
@@ -552,6 +561,23 @@ func agentTransitionPolicy(provider map[string]any, terminalStates []string) (ma
 	return result, nil
 }
 
+// childIssueCreationPolicy is deliberately a single boolean: unlike
+// handoff_state or agent_transitions, the scope of the create_child_issue
+// tool (project, team, and parent issue) is entirely derived from the active
+// issue at session start, so there is no separate destination value to
+// validate here.
+func childIssueCreationPolicy(provider map[string]any) (bool, error) {
+	value, exists := provider["child_issue_creation"]
+	if !exists {
+		return false, nil
+	}
+	enabled, ok := value.(bool)
+	if !ok {
+		return false, errors.New("invalid configuration: tracker.provider.child_issue_creation must be a boolean")
+	}
+	return enabled, nil
+}
+
 func stateInList(state string, states []string) bool {
 	for _, candidate := range states {
 		if strings.EqualFold(strings.TrimSpace(state), strings.TrimSpace(candidate)) {
@@ -578,6 +604,14 @@ func (s Settings) Render(issue any, attempt int) (string, error) {
 		return "", fmt.Errorf("template_render_error: %w", err)
 	}
 	return out.String(), nil
+}
+
+// LinearSessionCapabilityEnabled reports whether any optional session-bound
+// Linear capability is configured. Codex only receives a bound Linear session
+// (and therefore any of the linear_graphql or create_child_issue tools) when
+// at least one of these capabilities is enabled.
+func (s Settings) LinearSessionCapabilityEnabled() bool {
+	return strings.TrimSpace(s.Tracker.HandoffState) != "" || len(s.Tracker.AgentTransitions) > 0 || s.Tracker.ChildIssueCreation
 }
 
 // DeliveryInstructions describe the only PR delivery capability available to

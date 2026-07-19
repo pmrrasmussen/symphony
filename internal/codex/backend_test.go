@@ -830,6 +830,101 @@ func TestLinearTransitionToolHasOnlyBoundDestinationInput(t *testing.T) {
 	}
 }
 
+func TestCreateChildIssueToolHasNoCallerControlledScopeFields(t *testing.T) {
+	definition := createChildIssueToolDefinition()
+	schema, ok := definition["inputSchema"].(map[string]any)
+	if !ok || schema["type"] != "object" || schema["additionalProperties"] != false {
+		t.Fatalf("schema=%#v", definition["inputSchema"])
+	}
+	properties, ok := schema["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("properties=%#v", schema["properties"])
+	}
+	for _, forbidden := range []string{"issue", "issue_id", "project", "project_id", "team", "team_id", "endpoint", "credential", "token", "parent_id"} {
+		if _, exists := properties[forbidden]; exists {
+			t.Fatalf("create_child_issue tool exposed caller-controlled %q: %#v", forbidden, properties)
+		}
+	}
+	for _, allowed := range []string{"title", "description", "priority", "labels", "depends_on"} {
+		if _, exists := properties[allowed]; !exists {
+			t.Fatalf("create_child_issue tool is missing bounded field %q: %#v", allowed, properties)
+		}
+	}
+	required, _ := schema["required"].([]string)
+	if len(required) != 1 || required[0] != "title" {
+		t.Fatalf("required=%#v", schema["required"])
+	}
+}
+
+// TestChildIssueCreationIsGatedIndependentlyOfHandoffAndCreatesABoundChild
+// enables only tracker.provider.child_issue_creation (no handoff_state or
+// agent_transitions) and verifies: the linear_graphql tool is not advertised,
+// the create_child_issue tool is, and a call is bound to the active issue's
+// project/team/parent without any caller-supplied scope.
+func TestChildIssueCreationIsGatedIndependentlyOfHandoffAndCreatesABoundChild(t *testing.T) {
+	var graphQLCalls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		var request map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		graphQLCalls++
+		query := request["query"].(string)
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.Contains(query, "SymphonyLinearHandoffIssue"):
+			_, _ = w.Write([]byte(`{"data":{"issue":{"id":"active","identifier":"PMR-41","title":"Decompose","description":"safe","url":"https://linear.app/issue/PMR-41","project":{"id":"project-id-1","slugId":"project-1"},"team":{"id":"team-1"},"state":{"id":"todo","name":"Todo"}}}}`))
+		case strings.Contains(query, "SymphonyLinearCreateChildIssue"):
+			variables, _ := request["variables"].(map[string]any)
+			if variables["teamID"] != "team-1" || variables["projectID"] != "project-id-1" || variables["parentID"] != "active" {
+				t.Fatalf("unexpected create variables: %#v", variables)
+			}
+			_, _ = w.Write([]byte(`{"data":{"issueCreate":{"success":true,"issue":{"id":"child-1","identifier":"PMR-41-1","url":"https://linear.app/issue/child-1"}}}}`))
+		default:
+			t.Fatalf("unexpected query: %s", query)
+		}
+	}))
+	defer server.Close()
+	dir := t.TempDir()
+	script := filepath.Join(dir, "fake-app-server.sh")
+	body := `#!/bin/sh
+IFS= read -r line
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'
+IFS= read -r line
+IFS= read -r line
+case "$line" in *create_child_issue*) ;; *) exit 20;; esac
+case "$line" in *linear_graphql*) exit 22;; *) ;; esac
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thread-1"}}}'
+IFS= read -r line
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn-1"}}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":99,"method":"item/tool/call","params":{"threadId":"thread-1","turnId":"turn-1","callId":"call-1","tool":"create_child_issue","arguments":{"title":"Split off the client change"}}}'
+IFS= read -r line
+case "$line" in *'"success":true'*PMR-41-1*) ;; *) exit 21;; esac
+printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{}}'
+`
+	if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	settings := config.Settings{Tracker: config.Tracker{
+		Provider:           map[string]any{"api_key": "test-token", "project_slug_id": "project-1", "endpoint": server.URL},
+		ActiveStates:       []string{"todo"},
+		ChildIssueCreation: true,
+	}}
+	b := NewWithLinearHandoff(func() config.Settings { return settings }, "LINEAR_API_KEY")
+	_, events, err := b.Start(context.Background(), domain.AgentRequest{Issue: domain.Issue{ID: "active"}, Workspace: dir, Prompt: "work", Command: "sh " + script, ApprovalPolicy: "never", ThreadSandbox: "workspace-write", TurnTimeout: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range events {
+	}
+	// One read to bind the session, one re-read before the mutation
+	// (ensureMutable), and the create mutation itself.
+	if graphQLCalls != 3 {
+		t.Fatalf("GraphQL calls=%d want prepare+ensure+create=3", graphQLCalls)
+	}
+}
+
 func TestStartGrantsLinkedWorktreeMetadataOnlyToWorkspaceWriteTurns(t *testing.T) {
 	dir := t.TempDir()
 	gitMetadata := filepath.Join(t.TempDir(), "git-common")

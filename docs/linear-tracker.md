@@ -14,6 +14,7 @@
 | `handoff_state` | optional | Enables the tightly scoped Codex `linear_graphql` compatibility tool. The name must be a non-active workflow state in the active issue's Linear team. |
 | `handoff_comment_template` | optional | A repository-owned Go template for the comment made by the tool's `handoff` operation. It requires `handoff_state` and receives only `issue`. |
 | `agent_transitions` | optional | A non-empty mapping of exact source state names to destination state names for the bounded Codex `transition` operation. Terminal and same-state edges are rejected. |
+| `child_issue_creation` | optional | Boolean. Enables the session-bound Codex `create_child_issue` tool, described below. Disabled by default. |
 
 Invalid provider values produce `invalid_tracker_config`; a missing or empty key
 produces `missing_tracker_secret`. `api_key_file` loading errors are reported by
@@ -109,3 +110,40 @@ reversed, terminal, stale, cross-project, cross-team, and unconfigured edges
 are rejected. Transition calls are serialized per session. Linear cannot make
 the worker's worktree and its own mutation one atomic transaction, so a race or
 ambiguous provider result is reconciled by the next scoped call.
+
+## Optional child issue creation capability
+
+`tracker.provider.child_issue_creation: true` enables a second, independent
+session-bound tool, `create_child_issue`. It is gated the same way as
+`handoff_state` and `agent_transitions`: any one of the three is enough to
+bind a Linear session for the Codex child process, but each tool is only
+advertised when its own setting is configured. `create_child_issue` requires
+no separate project or team configuration: it always creates the new issue in
+the active issue's already-configured Linear project and team, and always
+records the active issue as the new issue's Linear parent (a native Linear
+sub-issue relationship, visible in the Linear UI).
+
+The tool's only accepted fields are `title` (required), `description`,
+`priority` (0-4), `labels` (resolved only against label names that already
+exist on the active issue's team; an unrecognized name fails the whole call
+rather than creating a new label or silently dropping it), and `depends_on`.
+There is no field for an issue ID, project, team, endpoint, or credential.
+
+`depends_on` is deliberately bounded to this session's own lineage: each entry
+must be the `id` or `identifier` returned by an earlier `create_child_issue`
+call in the same session, and is applied as a Linear `blocks` relation (the
+referenced child blocks the new one). A reference to any other issue,
+including the active issue itself or a child issue created by a different
+session, is rejected before any mutation is attempted; the tool cannot create
+a relation against an issue it did not itself create.
+
+Before creating an issue, Symphony re-reads the active issue and rejects the
+call if its project, team, or state changed since session setup, using the
+same scope check as the `comment` operation above. A completed child issue
+creation is logged with only the parent and child issue IDs/identifiers
+(never title, description, or label content) as the audit record.
+
+The intended pattern is to decompose one task into several independently
+reviewable pull requests: normally create one `create_child_issue` call per
+unit of work, and each resulting issue produces its own isolated Symphony
+worktree and its own pull request once it reaches an eligible state.

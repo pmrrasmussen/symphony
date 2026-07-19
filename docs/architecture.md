@@ -12,6 +12,15 @@ configured approval and sandbox policy; this service does not provide Docker,
 VM, SSH, distributed execution, or a database.  Linear credentials stay in
 the host process and are removed from Codex's environment.
 
+The optional `create_child_issue` capability follows the same model: it is
+disabled unless `tracker.provider.child_issue_creation` is configured, and it
+derives its entire scope (project, team, and parent issue) from the same
+bound active-issue read used by the handoff and transition operations. It
+never accepts a project, team, issue, or credential from Codex, and a
+dependency between two child issues can only reference issues already created
+by that same session, never an arbitrary Linear issue. See the
+[Linear tracker profile](linear-tracker.md) for the exact bounded fields.
+
 The optional GitHub adapter follows the same capability model. Configuration
 fixes one owner, repository, base branch, and host-only fine-grained token.
 Each Codex session can receive only two capabilities bound to its active

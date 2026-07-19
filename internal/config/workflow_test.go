@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -532,6 +533,56 @@ func TestAgentTransitionPolicyIsExactAndReloadSafe(t *testing.T) {
 		if got := s.Current().Config.Tracker.AgentTransitions["Todo"]; got != "In Progress" {
 			t.Fatalf("invalid reload replaced agent transition policy: %#v", s.Current().Config.Tracker.AgentTransitions)
 		}
+	}
+}
+
+func TestChildIssueCreationPolicyIsOptInBooleanAndReloadSafe(t *testing.T) {
+	d := t.TempDir()
+	p := filepath.Join(d, "WORKFLOW.md")
+	base := "tracker: {kind: linear, provider: {%s}, active_states: [Todo, In Progress], terminal_states: [Done]}"
+	write := func(provider string) {
+		t.Helper()
+		if err := os.WriteFile(p, []byte("---\n"+fmt.Sprintf(base, provider)+"\n---\nprompt"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("")
+	s, err := NewStore(p, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Current().Config.Tracker.ChildIssueCreation {
+		t.Fatal("child issue creation must default to disabled")
+	}
+	if s.Current().Config.LinearSessionCapabilityEnabled() {
+		t.Fatal("no Linear session capability should be enabled by default")
+	}
+
+	write("child_issue_creation: true")
+	if err := s.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	if !s.Current().Config.Tracker.ChildIssueCreation {
+		t.Fatal("child issue creation was not enabled")
+	}
+	if !s.Current().Config.LinearSessionCapabilityEnabled() {
+		t.Fatal("child issue creation alone should enable the Linear session capability")
+	}
+
+	write("child_issue_creation: \"true\"")
+	if err := s.Reload(); err == nil {
+		t.Fatal("non-boolean child_issue_creation reloaded")
+	}
+	if !s.Current().Config.Tracker.ChildIssueCreation {
+		t.Fatal("invalid reload replaced child issue creation policy")
+	}
+
+	write("child_issue_creation: false")
+	if err := s.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	if s.Current().Config.Tracker.ChildIssueCreation {
+		t.Fatal("explicit false did not disable child issue creation")
 	}
 }
 
