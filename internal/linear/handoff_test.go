@@ -420,6 +420,69 @@ func TestCompleteLandingRejectsIssueNoLongerInTheMergingState(t *testing.T) {
 	}
 }
 
+// The following tests exercise the PMR-44 poll reconciliation surface:
+// ReconcileMerged moves a poll-observed merged pull request's issue to Done
+// from either the review handoff target or the configured Merging state,
+// idempotently and human-wins.
+
+func TestReconcileMergedFromMergeStateTransitionsToDone(t *testing.T) {
+	f := newHandoffFixture(t)
+	session := mergingSession(t, f, map[string]string{"Merging": "In Review"})
+	changed, err := session.ReconcileMerged(context.Background(), "Merging")
+	if err != nil || !changed || f.stateName != "Done" || f.transitionAttempts != 1 {
+		t.Fatalf("changed=%v err=%v state=%s transitions=%d", changed, err, f.stateName, f.transitionAttempts)
+	}
+	// Idempotent: a second poll once the issue is already Done is a quiet no-op.
+	changed, err = session.ReconcileMerged(context.Background(), "Merging")
+	if err != nil || changed || f.transitionAttempts != 1 {
+		t.Fatalf("duplicate reconcile changed=%v err=%v transitions=%d", changed, err, f.transitionAttempts)
+	}
+}
+
+func TestReconcileMergedFromReviewStateTransitionsToDone(t *testing.T) {
+	f := newHandoffFixture(t)
+	session := f.session(t, nil)
+	// The issue has already been handed off to the review target state.
+	f.stateID, f.stateName = "review", "In Review"
+	// The review-target path is independent of landing configuration, so it
+	// reconciles even when no Merging state is passed (landing unconfigured).
+	changed, err := session.ReconcileMerged(context.Background(), "")
+	if err != nil || !changed || f.stateName != "Done" || f.transitionAttempts != 1 {
+		t.Fatalf("changed=%v err=%v state=%s transitions=%d", changed, err, f.stateName, f.transitionAttempts)
+	}
+}
+
+func TestReconcileMergedIsANoOpWhenAHumanMovedTheIssue(t *testing.T) {
+	for name, mutate := range map[string]func(*handoffFixture){
+		"already done": func(f *handoffFixture) { f.stateID, f.stateName = "done", "Done" },
+		"other state":  func(f *handoffFixture) { f.stateID, f.stateName = "in-progress", "In Progress" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newHandoffFixture(t)
+			session := mergingSession(t, f, map[string]string{"Merging": "In Review"})
+			mutate(f)
+			changed, err := session.ReconcileMerged(context.Background(), "Merging")
+			if err != nil || changed || f.transitionAttempts != 0 {
+				t.Fatalf("changed=%v err=%v transitions=%d", changed, err, f.transitionAttempts)
+			}
+		})
+	}
+}
+
+func TestReconcileMergedIsFailClosedForMergeStateWhenLandingUnconfigured(t *testing.T) {
+	f := newHandoffFixture(t)
+	// The issue sits in Merging, but no merge state is passed (landing is not
+	// configured): the Merging path must not fire.
+	session := mergingSession(t, f, map[string]string{"Merging": "In Review"})
+	changed, err := session.ReconcileMerged(context.Background(), "")
+	if err != nil || changed || f.transitionAttempts != 0 {
+		t.Fatalf("changed=%v err=%v transitions=%d", changed, err, f.transitionAttempts)
+	}
+	if f.stateName != "Merging" {
+		t.Fatalf("fail-closed reconcile moved the issue: state=%s", f.stateName)
+	}
+}
+
 func TestHandoffSuccessAndDuplicateDeliveryAreIdempotent(t *testing.T) {
 	f := newHandoffFixture(t)
 	session := f.session(t, nil)

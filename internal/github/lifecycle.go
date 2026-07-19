@@ -85,6 +85,10 @@ type linearLifecycle interface {
 	EnsureActive(context.Context) error
 	LinkAndHandoff(context.Context, string) error
 	Complete(context.Context) (bool, error)
+	// ReconcileMerged reconciles a poll-observed merged PR to Done from either
+	// the review handoff target or the configured Merging state, idempotently
+	// and human-wins. See internal/linear.HandoffSession for its exact scope.
+	ReconcileMerged(context.Context, string) (bool, error)
 	// EnsureMergeState, RefuseLanding, and CompleteLanding back the
 	// github_land_pr capability (PMR-37). See internal/linear.HandoffSession
 	// for their exact scope and idempotency guarantees.
@@ -1136,7 +1140,11 @@ func (m *Manager) pollOne(ctx context.Context, linked *link) {
 		return
 	}
 	if pr.Merged || pr.MergedAt != nil {
-		changed, err := linked.linear.Complete(ctx)
+		// Reconcile to Done from either the review handoff target or, when
+		// landing is configured, the Merging state. The Merging path is
+		// fail-closed: an unconfigured landing block (empty MergeState) keeps
+		// the reconciliation to the review-target state alone.
+		changed, err := linked.linear.ReconcileMerged(ctx, linked.settings.MergeState)
 		if err != nil {
 			m.logger.Warn("GitHub merge Linear completion failed", "issue_id", linked.issueID, "issue_identifier", linked.identifier, "pr_number", linked.prNumber)
 			return

@@ -499,6 +499,54 @@ func (s *HandoffSession) CompleteLanding(ctx context.Context, mergeState string)
 	return true, nil
 }
 
+// ReconcileMerged reconciles the bound issue to Done after a linked pull
+// request is observed merged by the poll loop rather than by github_land_pr
+// (a human merged it directly on GitHub). It is the poll-loop counterpart to
+// Complete and CompleteLanding, and is idempotent with human-wins semantics:
+// it moves the issue to Done only when its freshly read current state is the
+// configured review handoff target OR the configured Merging state. An
+// already-Done issue, or one a human has since moved anywhere else, is a quiet
+// no-op returning (false, nil) rather than an error. mergeState is the
+// configured Merging state, or empty when GitHub landing is not configured for
+// the repository, in which case only the review-target path is eligible.
+func (s *HandoffSession) ReconcileMerged(ctx context.Context, mergeState string) (bool, error) {
+	s.handoffMu.Lock()
+	defer s.handoffMu.Unlock()
+	current, err := s.readScopedIssue(ctx)
+	if err != nil {
+		return false, err
+	}
+	if strings.EqualFold(strings.TrimSpace(current.State.Name), "Done") {
+		return false, nil
+	}
+	eligible := s.isTargetState(current)
+	if !eligible && strings.TrimSpace(mergeState) != "" && strings.EqualFold(strings.TrimSpace(current.State.Name), strings.TrimSpace(mergeState)) {
+		eligible = true
+	}
+	if !eligible {
+		return false, nil
+	}
+	doneName := ""
+	for _, state := range s.settings.Tracker.TerminalStates {
+		if strings.EqualFold(strings.TrimSpace(state), "Done") {
+			doneName = strings.TrimSpace(state)
+			break
+		}
+	}
+	if doneName == "" {
+		return false, trackerError("invalid_handoff_config", "terminal state Done is required for GitHub completion")
+	}
+	doneID, err := (&Handoff{client: s.client}).resolveStateAllowTerminal(ctx, s.settings, s.issue.TeamID(), doneName)
+	if err != nil {
+		return false, err
+	}
+	if err := s.transitionTo(ctx, doneID); err != nil {
+		return false, err
+	}
+	s.log("github_merge_reconciled")
+	return true, nil
+}
+
 // LinkAndHandoff adds the fixed PR URL exactly once, then reconciles the
 // repository-owned review handoff. The URL is supplied by the trusted GitHub
 // adapter, never by Codex.

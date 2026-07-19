@@ -68,6 +68,13 @@ type fakeLinear struct {
 	refusedDestState string
 	completeErr      error
 	landCompleted    int
+
+	// Poll reconciliation (PMR-44) fake state. reconcileErr simulates the
+	// Linear completion call itself failing; reconciledState records the
+	// mergeState the poll loop passed, so a test can assert fail-closed gating.
+	reconcileErr    error
+	reconciled      int
+	reconciledState string
 }
 
 func (l *fakeLinear) EnsureActive(context.Context) error { return l.activeErr }
@@ -89,6 +96,20 @@ func (l *fakeLinear) Complete(context.Context) (bool, error) {
 		return false, nil
 	}
 	l.completed++
+	return true, nil
+}
+
+func (l *fakeLinear) ReconcileMerged(_ context.Context, mergeState string) (bool, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.reconciledState = mergeState
+	if l.reconcileErr != nil {
+		return false, l.reconcileErr
+	}
+	if l.reconciled > 0 {
+		return false, nil
+	}
+	l.reconciled++
 	return true, nil
 }
 
@@ -684,8 +705,11 @@ func TestPollMergedCompletesOnceAndClosedUnmergedOnlyWarns(t *testing.T) {
 	api.mu.Unlock()
 	m.Poll(context.Background())
 	m.Poll(context.Background())
-	if linear.completed != 1 {
-		t.Fatalf("completions=%d", linear.completed)
+	if linear.reconciled != 1 {
+		t.Fatalf("reconciliations=%d", linear.reconciled)
+	}
+	if strings.Count(logs.String(), "GitHub merge completed Linear issue") != 1 {
+		t.Fatalf("merge completion log=%s", logs.String())
 	}
 
 	api2, linear2 := newAPI(t), &fakeLinear{}
@@ -699,11 +723,57 @@ func TestPollMergedCompletesOnceAndClosedUnmergedOnlyWarns(t *testing.T) {
 	api2.mu.Unlock()
 	m2.Poll(context.Background())
 	m2.Poll(context.Background())
-	if linear2.completed != 0 || strings.Count(closedLogs.String(), "closed without merge") != 1 {
-		t.Fatalf("completed=%d logs=%s", linear2.completed, closedLogs.String())
+	if linear2.reconciled != 0 || strings.Count(closedLogs.String(), "closed without merge") != 1 {
+		t.Fatalf("reconciled=%d logs=%s", linear2.reconciled, closedLogs.String())
 	}
 	if strings.Contains(logs.String()+closedLogs.String(), "private-token") {
 		t.Fatal("logs exposed credential")
+	}
+}
+
+func TestPollMergedReconcilesWithConfiguredMergeStateAndFailsClosedWithout(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		mergeState string
+	}{
+		{name: "landing configured", mergeState: "Merging"},
+		{name: "landing not configured", mergeState: ""},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			api, git, linear := newAPI(t), &fakeGit{}, &fakeLinear{}
+			m, session := testSession(t, api, git, linear, nil)
+			// The link snapshots the session settings, so configuring MergeState
+			// here is what the fail-closed poll branch reads.
+			session.settings.MergeState = test.mergeState
+			if _, err := session.Publish(context.Background(), testInput()); err != nil {
+				t.Fatal(err)
+			}
+			api.mu.Lock()
+			api.prMerged = true
+			api.mu.Unlock()
+			m.Poll(context.Background())
+			m.Poll(context.Background())
+			if linear.reconciled != 1 {
+				t.Fatalf("reconciliations=%d", linear.reconciled)
+			}
+			if linear.reconciledState != test.mergeState {
+				t.Fatalf("poll passed mergeState=%q want %q", linear.reconciledState, test.mergeState)
+			}
+		})
+	}
+}
+
+func TestPollStillOpenPullRequestDoesNotReconcile(t *testing.T) {
+	api, git, linear := newAPI(t), &fakeGit{}, &fakeLinear{}
+	m, session := testSession(t, api, git, linear, nil)
+	if _, err := session.Publish(context.Background(), testInput()); err != nil {
+		t.Fatal(err)
+	}
+	// The pull request stays open (default fixture state): no merge observed.
+	m.Poll(context.Background())
+	m.Poll(context.Background())
+	if linear.reconciled != 0 {
+		t.Fatalf("open pull request reconciled: reconciliations=%d", linear.reconciled)
 	}
 }
 
