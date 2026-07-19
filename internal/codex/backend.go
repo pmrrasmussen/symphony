@@ -60,6 +60,9 @@ func NewWithLinearHandoff(settings func() config.Settings, secretNames ...string
 // capabilities and returns the GitHub manager so the host can poll linked PRs.
 func NewWithIntegrations(settings func() config.Settings, logger *slog.Logger, secretNames ...string) (*Backend, *githubhost.Manager) {
 	b := NewWithLinearHandoff(settings, secretNames...)
+	if b.handoff != nil {
+		b.handoff.SetLogger(logger)
+	}
 	manager := githubhost.New(settings, logger)
 	b.github = manager
 	return b, manager

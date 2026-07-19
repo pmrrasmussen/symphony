@@ -1558,6 +1558,31 @@ func TestDispatchMovesTodoIssueToInProgress(t *testing.T) {
 	}
 }
 
+func TestDispatchStartTransitionLogsOperationAndEdge(t *testing.T) {
+	s := startTransitionSettings(t)
+	issue := testIssue()
+	tracker := &fakeTracker{issue: issue}
+	agent := &fakeAgent{events: completedEvents}
+	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{}, 1)}
+	var logs bytes.Buffer
+	c := New(tracker, agent, ws, func() config.Settings { return s }, slog.New(slog.NewJSONHandler(&logs, nil)))
+	c.clock = fakeClock{now: time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)}
+
+	c.Tick(context.Background())
+	<-ws.after
+	if err := c.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	output := logs.String()
+	if !strings.Contains(output, `"msg":"issue moved to started state"`) ||
+		!strings.Contains(output, `"operation":"start_transition"`) ||
+		!strings.Contains(output, `"from_state":"todo"`) ||
+		!strings.Contains(output, `"to_state":"in progress"`) {
+		t.Fatalf("host-side start transition edge not reconstructable from log: %s", output)
+	}
+}
+
 func TestDispatchDoesNotTransitionAlreadyStartedIssue(t *testing.T) {
 	s := startTransitionSettings(t)
 	// An issue re-observed already In Progress (a restart or turn-limit

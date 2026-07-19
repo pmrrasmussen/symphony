@@ -112,6 +112,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return store.Current().Config
 	}
 	tracker := linear.New(settings)
+	tracker.SetLogger(slog.New(log.Handler()))
 	if err := tracker.Validate(); err != nil {
 		fmt.Fprintln(stderr, "symphony startup configuration error:", err)
 		return 2
