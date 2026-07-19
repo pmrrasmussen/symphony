@@ -654,7 +654,6 @@ func TestGitHubLandingPolicyIsStrictAndFailsClosed(t *testing.T) {
 		name   string
 		github string
 	}{
-		{name: "merge_state is an active state", github: full + "merge_state: Todo, required_checks: [ci]}"},
 		{name: "merge_state is a terminal state", github: full + "merge_state: Done, required_checks: [ci]}"},
 		{name: "merge_state equals handoff_state", github: full + `merge_state: "In Review", required_checks: [ci]}`},
 		{name: "merge_state missing required_checks", github: full + "merge_state: Merging}"},
@@ -704,6 +703,31 @@ func TestGitHubLandingPolicyParsesValidConfiguration(t *testing.T) {
 	}
 	if w.Config.GitHub.MergeMethod != "squash" {
 		t.Fatalf("merge_method=%q", w.Config.GitHub.MergeMethod)
+	}
+}
+
+// TestGitHubLandingPolicyAllowsMergeStateAsAnActiveState exercises the
+// canonical lifecycle rollout (PMR-38): Merging must be able to be a
+// dispatchable active state, because a session only receives the
+// github_land_pr tool once it has actually been dispatched for an issue
+// currently in that exact state (see codex/backend.go). It remains rejected
+// as a terminal state or as the configured handoff_state.
+func TestGitHubLandingPolicyAllowsMergeStateAsAnActiveState(t *testing.T) {
+	t.Setenv("PMR38_GITHUB_TOKEN", "github-secret")
+	path := filepath.Join(t.TempDir(), "WORKFLOW.md")
+	content := "---\ntracker: {kind: linear, provider: {handoff_state: \"In Review\"}, active_states: [Todo, \"In Progress\", Rework, Merging], terminal_states: [Done, Canceled]}\ngithub: {owner: pmrrasmussen, repository: symphony, base_branch: main, token: $PMR38_GITHUB_TOKEN, merge_state: Merging, required_checks: [ci]}\n---\nprompt"
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	w, err := Load(path, "")
+	if err != nil {
+		t.Fatalf("merge_state as an active state must be accepted: %v", err)
+	}
+	if !w.Config.GitHub.Enabled || w.Config.GitHub.MergeState != "Merging" {
+		t.Fatalf("github=%+v", w.Config.GitHub)
+	}
+	if got := w.Config.Tracker.ActiveStates; len(got) != 4 || got[3] != "Merging" {
+		t.Fatalf("active_states=%v", got)
 	}
 }
 

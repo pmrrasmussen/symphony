@@ -9,18 +9,33 @@ tracker:
     # api_key: $LINEAR_API_KEY
     # Optional: only dispatch issues assigned to this Linear user ID, or `me`.
     # assignee: me
-    # Optional, opt-in Codex client tool. It can only read/comment on the
-    # active issue or move it to this non-active state; it is never a GraphQL
-    # proxy. Configure a state from this project's issue team.
-    # handoff_state: In Review
-    # handoff_comment_template: "Ready for review: {{.issue.identifier}}"
+    # The canonical lifecycle's exact agent-requested state edges. Todo -> In
+    # Progress starts implementation; Merging -> In Review is the fallback a
+    # refused github_land_pr call uses (see github.merge_state below). These
+    # are not a general destination allowlist: only these exact edges are ever
+    # honored, regardless of what a Codex session requests.
+    agent_transitions:
+      Todo: In Progress
+      Merging: In Review
+    # Enables the scoped github_publish_pr/github_pr_context Codex tools
+    # below. Configure a non-active, non-terminal state from this project's
+    # Linear team; it is the single human-controlled review state and the
+    # only state a Codex session can move an issue into.
+    handoff_state: In Review
     # Optional, opt-in Codex client tool. It creates a new issue only in this
     # project/team and records the active issue as its parent; it cannot
     # select an arbitrary project, team, or issue. Intended for decomposing
     # one task into several independently reviewable pull requests: normally
     # one child issue per isolated worktree and PR.
     # child_issue_creation: true
-  active_states: [Todo, In Progress]
+  # The canonical lifecycle: Todo -> In Progress -> In Review <-> Rework ->
+  # Merging -> Done. Rework and Merging are active/dispatchable so a human can
+  # resume implementation, or dispatch a landing agent, from the same
+  # worktree and branch; In Review is deliberately excluded so it stays
+  # human-controlled and is never dispatched. Configure Rework and Merging as
+  # Started states in this project's Linear team before enabling them here;
+  # until then, keep only [Todo, In Progress] active.
+  active_states: [Todo, In Progress, Rework, Merging]
   terminal_states: [Done, Canceled]
 polling:
   interval_ms: 30000
@@ -31,7 +46,14 @@ workspace:
 hooks:
   timeout_ms: 60000
 agent:
+  # Two-agent operation: one implementation/rework agent may run concurrently
+  # with one landing agent. max_concurrent_agents_by_state additionally caps
+  # Merging at exactly one landing agent even though more agents are allowed
+  # overall, so a landing session never blocks (or is blocked by) unrelated
+  # implementation work.
   max_concurrent_agents: 2
+  max_concurrent_agents_by_state:
+    Merging: 1
   max_turns: 20
 codex:
   command: codex app-server
@@ -49,11 +71,15 @@ codex:
 #   token_file: $SYMPHONY_GITHUB_TOKEN_FILE
 #   # Alternatively: token: $SYMPHONY_GITHUB_TOKEN
 #   poll_interval_ms: 30000
-#   # Optional landing capability (PMR-37). Configuring merge_state grants a
-#   # zero-argument github_land_pr tool, but only to a session whose bound
-#   # issue is currently in this exact Linear state; it must differ from
-#   # handoff_state and from every active/terminal state. required_checks is
-#   # then mandatory: every named check must be present and successful (or
+#   # Optional landing capability. A session bound to an issue currently in
+#   # this exact Linear state receives a zero-argument github_land_pr tool;
+#   # moving the issue to this state (Merging in the canonical lifecycle
+#   # above) is itself the human approval to land, so no separate approving
+#   # review is required. It must differ from handoff_state and from every
+#   # terminal state, but -- unlike earlier bootstrap configurations -- it is
+#   # expected to be one of active_states, since a session only receives the
+#   # tool once actually dispatched for an issue in that state. required_checks
+#   # is then mandatory: every named check must be present and successful (or
 #   # neutral) immediately before the merge call, or the tool waits. Unlike
 #   # the rest of this github: block, an invalid merge_state, merge_method, or
 #   # required_checks value fails workflow validation instead of silently
@@ -61,11 +87,18 @@ codex:
 #   merge_state: Merging
 #   # Bounded enum: merge, squash, or rebase. Defaults to merge.
 #   merge_method: merge
+#   # Use the exact GitHub check names your CI reports (often the job names
+#   # from your CI workflow file).
 #   required_checks: [ci/build, ci/test]
 ---
 Work on {{.issue.identifier}}: {{.issue.title}}
 
 {{.issue.description}}
 
+Current Linear state: {{.issue.state}}
+
 Follow the repository instructions, validate your changes, and follow the
-delivery-mode instructions supplied by Symphony.
+delivery-mode instructions supplied by Symphony. See this repository's own
+WORKFLOW.md for a complete worked example of state-specific start,
+implementation, validation, review handoff, rework, landing, and completion
+instructions written as one executable policy document.
