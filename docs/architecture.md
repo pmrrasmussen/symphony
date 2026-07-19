@@ -14,14 +14,32 @@ the host process and are removed from Codex's environment.
 
 The optional GitHub adapter follows the same capability model. Configuration
 fixes one owner, repository, base branch, and host-only fine-grained token.
-Each Codex session can receive only a zero-argument publish capability bound to
-its active Linear issue and managed worktree. The host verifies a clean,
-committed descendant of the configured base, pushes a deterministic issue
-branch, creates or reuses that branch's PR, and records the PR/issue pair for
-polling. Polling can transition that one review issue to `Done` after GitHub
-confirms a human merge; it has no merge operation. Closed-unmerged PRs only
-produce an operator warning. The linked-pair and completion guard are
-process-local, while retries reconcile durable GitHub PRs and Linear comments.
+Each Codex session can receive only two capabilities bound to its active
+Linear issue and managed worktree: a publish capability that accepts bounded
+`why`, `what_changed`, and `on_call` structured fields (no repository, issue,
+or branch selection), and a read-only `github_pr_context` capability with no
+input at all. The host verifies a clean, committed descendant of the
+configured base, pushes a deterministic issue branch, and creates or reuses
+that branch's PR with a deterministic `Why`/`What changed`/`On Call` body
+built from the structured fields plus the bound Linear issue URL; repeat
+publication with unchanged fields leaves the body untouched, while changed
+fields update it in place. A merged PR is irrecoverable and rejected; a
+closed-unmerged PR is reopened; a PR whose head, base, or repository no
+longer matches the bound branch is rejected rather than reused. The context
+capability performs no mutation: it resolves the same bound PR and returns
+bounded, redacted check status, an effective review state computed from each
+reviewer's latest review, capped comment/review excerpts, and unresolved
+review-thread counts read over the GitHub GraphQL API, never raw provider
+payloads or credentials. Invalid arguments, provider failures, and
+unsupported states (a merged or unrecoverably closed PR, an ambiguous or
+mismatched pull request list, a missing PR for `github_pr_context`) are
+returned as structured tool failures so a rejected call never ends an
+otherwise recoverable Codex turn. The host records the PR/issue pair for
+polling once publication succeeds. Polling can transition that one review
+issue to `Done` after GitHub confirms a human merge; it has no merge
+operation. Closed-unmerged PRs only produce an operator warning. The
+linked-pair and completion guard are process-local, while retries reconcile
+durable GitHub PRs and Linear comments.
 
 The loader validates the supported core front-matter fields but preserves
 unknown extension keys for forward compatibility. It applies documented

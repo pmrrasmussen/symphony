@@ -589,7 +589,8 @@ func (s Settings) DeliveryInstructions() string {
 
 - Make and validate the change in this workspace, then create a local commit.
 - Do not run gh, git push, or otherwise try to publish directly to GitHub.
-- When the worktree is clean and committed, call github_publish_pr with no arguments. It is bound to this issue, repository, and branch and will create or reuse the PR and hand the issue to review.`
+- When the worktree is clean and committed, call github_publish_pr with why, what_changed, and on_call. It is bound to this issue, repository, and branch and will create or update the PR body from those fields and hand the issue to review.
+- Call github_pr_context (no arguments) to read bounded check status, review state, and unresolved feedback for that same pull request.`
 	}
 	requirements := "configure github.owner, github.repository, github.base_branch, and a repository-scoped GitHub token"
 	if s.GitHub.Enabled {
