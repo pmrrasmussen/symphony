@@ -685,7 +685,7 @@ func githubContextToolDefinition() map[string]any {
 func githubLandToolDefinition() map[string]any {
 	return map[string]any{
 		"type": "function", "name": "github_land_pr",
-		"description": "Merge the pull request already bound to this issue, repository, base, and branch using the configured merge method, once required checks pass, reviews have no effective changes-requested state, and no review thread is unresolved. Returns a non-terminal waiting result while required checks or GitHub's mergeability computation are still pending; a hard gate (failing checks, requested changes, unresolved threads, a stale base, conflicts, or a closed/mismatched PR) refuses landing. No repository, issue, branch, PR, method, state, or credential input.",
+		"description": "Merge the pull request already bound to this issue, repository, base, and branch using the configured merge method, once required checks pass, reviews have no effective changes-requested state, and no review thread is unresolved. Returns a non-terminal waiting result while required checks or GitHub's mergeability computation are pending; with github.update_stale_branch enabled, one clean stale-base update also waits for checks on its new head. Other hard gates (failing checks, requested changes, unresolved threads, a stale base, conflicts, or a closed/mismatched PR) refuse landing. No repository, issue, branch, PR, method, state, or credential input.",
 		"inputSchema": map[string]any{"type": "object", "additionalProperties": false},
 	}
 }

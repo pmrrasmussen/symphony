@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -157,11 +158,15 @@ type apiFixture struct {
 	graphqlErr   bool
 
 	// Landing (PMR-37) fixture state.
-	mergeable      *bool
-	mergeableState string
-	merges         int
-	mergeMethods   []string
-	mergeFails     bool
+	mergeable                 *bool
+	mergeableState            string
+	merges                    int
+	mergeMethods              []string
+	mergeFails                bool
+	updateBranchCalls         int
+	updateBranchFails         bool
+	updateBranchHead          string
+	clearChecksOnBranchUpdate bool
 }
 
 func newAPI(t *testing.T) *apiFixture {
@@ -236,6 +241,27 @@ func (f *apiFixture) serve(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/pulls/7":
 		encoded, _ := json.Marshal(f.pullJSON())
 		_, _ = w.Write(encoded)
+	case r.Method == http.MethodPut && r.URL.Path == "/repos/owner/repo/pulls/7/update-branch":
+		var body map[string]any
+		if json.NewDecoder(r.Body).Decode(&body) != nil || body["expected_head_sha"] != f.prSHA {
+			f.t.Errorf("update branch body=%v want expected_head_sha=%q", body, f.prSHA)
+		}
+		f.updateBranchCalls++
+		if f.updateBranchFails {
+			w.WriteHeader(http.StatusUnprocessableEntity)
+			_, _ = w.Write([]byte(`{"message":"Pull Request is not mergeable"}`))
+			return
+		}
+		if f.updateBranchHead == "" {
+			f.updateBranchHead = "updated-head"
+		}
+		f.prSHA = f.updateBranchHead
+		if f.clearChecksOnBranchUpdate {
+			f.checkRuns = nil
+			f.statuses = nil
+		}
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"message":"Updating pull request branch."}`))
 	case r.Method == http.MethodPut && r.URL.Path == "/repos/owner/repo/pulls/7/merge":
 		var body map[string]any
 		if json.NewDecoder(r.Body).Decode(&body) != nil {
@@ -910,6 +936,108 @@ func TestLandRefusesOnStaleBase(t *testing.T) {
 	if linear.refused != 1 || api.merges != 0 {
 		t.Fatalf("refused=%d merges=%d", linear.refused, api.merges)
 	}
+}
+
+func TestLandUpdatesCleanStaleBranchThenWaitsForNewChecks(t *testing.T) {
+	api, linear := newAPI(t), &fakeLinear{}
+	api.prExists = true
+	passingRequiredChecks(api, "ci/build")
+	readyToLand(api)
+	api.clearChecksOnBranchUpdate = true
+	git := &staleBaseGit{fakeGit: &fakeGit{}}
+	manager, session := testLandingSession(t, api, git, linear, []string{"ci/build"}, "merge")
+	session.settings.UpdateStaleBranch = true
+	var log bytes.Buffer
+	manager.logger = slog.New(slog.NewJSONHandler(&log, nil))
+
+	result, err := session.Land(context.Background())
+	if err != nil || result.Status != LandWaiting || !strings.Contains(result.Reason, "branch was updated") {
+		t.Fatalf("update result=%+v err=%v", result, err)
+	}
+	if api.updateBranchCalls != 1 || api.merges != 0 || linear.refused != 0 {
+		t.Fatalf("updates=%d merges=%d refused=%d", api.updateBranchCalls, api.merges, linear.refused)
+	}
+	if !strings.Contains(log.String(), `"issue_identifier":"PMR-27"`) || !strings.Contains(log.String(), `"pr_number":7`) || !strings.Contains(log.String(), `"head_sha":"updated-head"`) || strings.Contains(log.String(), `"issue_id"`) || strings.Contains(log.String(), `"repository"`) {
+		t.Fatalf("update log=%q", log.String())
+	}
+
+	result, err = session.Land(context.Background())
+	if err != nil || result.Status != LandWaiting || result.Reason != "required checks are pending" {
+		t.Fatalf("new-head checks result=%+v err=%v", result, err)
+	}
+	passingRequiredChecks(api, "ci/build")
+	result, err = session.Land(context.Background())
+	if err != nil || result.Status != LandMerged || api.merges != 1 || linear.refused != 0 {
+		t.Fatalf("landing result=%+v err=%v merges=%d refused=%d", result, err, api.merges, linear.refused)
+	}
+}
+
+func TestLandRefusesConflictedStaleBranchWithoutUpdating(t *testing.T) {
+	api, linear := newAPI(t), &fakeLinear{}
+	api.prExists = true
+	passingRequiredChecks(api, "ci/build")
+	readyToLand(api)
+	api.mergeable = boolPtr(false)
+	api.mergeableState = "dirty"
+	_, session := testLandingSession(t, api, &staleBaseGit{fakeGit: &fakeGit{}}, linear, []string{"ci/build"}, "merge")
+	session.settings.UpdateStaleBranch = true
+	if _, err := session.Land(context.Background()); err == nil || !strings.Contains(err.Error(), "conflicts") {
+		t.Fatalf("conflicted stale branch error=%v", err)
+	}
+	if api.updateBranchCalls != 0 || linear.refused != 1 {
+		t.Fatalf("updates=%d refused=%d", api.updateBranchCalls, linear.refused)
+	}
+}
+
+func TestLandRefusesWhenStaleBranchUpdateFails(t *testing.T) {
+	api, linear := newAPI(t), &fakeLinear{}
+	api.prExists = true
+	passingRequiredChecks(api, "ci/build")
+	readyToLand(api)
+	api.updateBranchFails = true
+	_, session := testLandingSession(t, api, &staleBaseGit{fakeGit: &fakeGit{}}, linear, []string{"ci/build"}, "merge")
+	session.settings.UpdateStaleBranch = true
+	if _, err := session.Land(context.Background()); err == nil || !strings.Contains(err.Error(), "could not update stale") {
+		t.Fatalf("update failure error=%v", err)
+	}
+	if api.updateBranchCalls != 1 || linear.refused != 1 || api.merges != 0 {
+		t.Fatalf("updates=%d refused=%d merges=%d", api.updateBranchCalls, linear.refused, api.merges)
+	}
+}
+
+func TestLandRefusesWhenBaseMovesAgainAfterStaleBranchUpdate(t *testing.T) {
+	api, linear := newAPI(t), &fakeLinear{}
+	api.prExists = true
+	passingRequiredChecks(api, "ci/build")
+	readyToLand(api)
+	git := &alwaysStaleBaseGit{fakeGit: &fakeGit{}}
+	_, session := testLandingSession(t, api, git, linear, []string{"ci/build"}, "merge")
+	session.settings.UpdateStaleBranch = true
+	result, err := session.Land(context.Background())
+	if err != nil || result.Status != LandWaiting {
+		t.Fatalf("initial update result=%+v err=%v", result, err)
+	}
+	if _, err := session.Land(context.Background()); err == nil || !strings.Contains(err.Error(), "base branch changed") {
+		t.Fatalf("repeated staleness error=%v", err)
+	}
+	if api.updateBranchCalls != 1 || linear.refused != 1 || api.merges != 0 {
+		t.Fatalf("updates=%d refused=%d merges=%d", api.updateBranchCalls, linear.refused, api.merges)
+	}
+}
+
+// alwaysStaleBaseGit makes every base read observe a new commit, including
+// after a successful update-branch call.
+type alwaysStaleBaseGit struct {
+	*fakeGit
+	baseCalls int
+}
+
+func (g *alwaysStaleBaseGit) Run(ctx context.Context, dir string, args, env []string) (string, error) {
+	if args[0] == "rev-parse" && len(args) > 1 && strings.HasPrefix(args[1], "refs/remotes/origin/") {
+		g.baseCalls++
+		return "base-" + strconv.Itoa(g.baseCalls), nil
+	}
+	return g.fakeGit.Run(ctx, dir, args, env)
 }
 
 func TestLandRefusesOnDivergedWorktreeHead(t *testing.T) {

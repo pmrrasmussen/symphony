@@ -13,6 +13,12 @@ contain prompts, issue content, tool arguments, and other sensitive data.
 limit snapshots, and stderr diagnostics. It never floods with the app-server's
 generic protocol notifications.
 
+At startup, the info log also records `startup credential configuration` with
+`linear_credentials_configured` and `github_credentials_configured` booleans.
+They confirm that the required Linear credential and any configured GitHub
+credential were resolved from the workflow; they do not verify remote
+authentication, and neither credential value nor its source path is logged.
+
 `--log-level debug` is opt-in and adds the actionable detail needed to
 diagnose a run that looks idle:
 

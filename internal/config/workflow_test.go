@@ -664,6 +664,8 @@ func TestGitHubLandingPolicyIsStrictAndFailsClosed(t *testing.T) {
 		{name: "merge_method is not in the bounded enum", github: full + "merge_state: Merging, merge_method: rewrite, required_checks: [ci]}"},
 		{name: "merge_method without merge_state", github: "github: {owner: pmrrasmussen, repository: symphony, base_branch: main, token: $PMR37_GITHUB_TOKEN, merge_method: squash}"},
 		{name: "required_checks without merge_state", github: "github: {owner: pmrrasmussen, repository: symphony, base_branch: main, token: $PMR37_GITHUB_TOKEN, required_checks: [ci]}"},
+		{name: "update_stale_branch is not a boolean", github: full + "merge_state: Merging, required_checks: [ci], update_stale_branch: yes}"},
+		{name: "update_stale_branch without merge_state", github: "github: {owner: pmrrasmussen, repository: symphony, base_branch: main, token: $PMR37_GITHUB_TOKEN, update_stale_branch: true}"},
 		{name: "merge_state without a fully configured github integration", github: "github: {owner: pmrrasmussen, merge_state: Merging, required_checks: [ci]}"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -690,7 +692,7 @@ func TestGitHubLandingPolicyParsesValidConfiguration(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := w.Config.GitHub
-	if !got.Enabled || got.MergeState != "Merging" || got.MergeMethod != "merge" || len(got.RequiredChecks) != 2 || got.RequiredChecks[0] != "ci/build" || got.RequiredChecks[1] != "ci/test" {
+	if !got.Enabled || got.MergeState != "Merging" || got.MergeMethod != "merge" || got.UpdateStaleBranch || len(got.RequiredChecks) != 2 || got.RequiredChecks[0] != "ci/build" || got.RequiredChecks[1] != "ci/test" {
 		t.Fatalf("github=%+v", got)
 	}
 
@@ -704,6 +706,18 @@ func TestGitHubLandingPolicyParsesValidConfiguration(t *testing.T) {
 	}
 	if w.Config.GitHub.MergeMethod != "squash" {
 		t.Fatalf("merge_method=%q", w.Config.GitHub.MergeMethod)
+	}
+
+	content = strings.Replace(content, "required_checks: [ci/build, ci/test]", "required_checks: [ci/build, ci/test], update_stale_branch: true", 1)
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	w, err = Load(path, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !w.Config.GitHub.UpdateStaleBranch {
+		t.Fatal("update_stale_branch was not enabled")
 	}
 }
 

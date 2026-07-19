@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/pmrrasmussen/symphony/internal/config"
+	"github.com/pmrrasmussen/symphony/internal/observability"
 	"github.com/pmrrasmussen/symphony/internal/preflight"
 )
 
@@ -81,5 +83,24 @@ func TestRunRejectsUndocumentedLogLevel(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "--log-level") {
 		t.Fatalf("stderr did not explain the rejected flag: %s", stderr.String())
+	}
+}
+
+func TestLogStartupCredentialStatusReportsConfigurationWithoutSecrets(t *testing.T) {
+	var output bytes.Buffer
+	log := observability.New(slog.NewJSONHandler(&output, nil), nil)
+	logStartupCredentialStatus(log, config.Settings{
+		GitHub: config.GitHub{Enabled: true, Token: "github-secret"},
+	})
+
+	var record map[string]any
+	if err := json.Unmarshal(output.Bytes(), &record); err != nil {
+		t.Fatal(err)
+	}
+	if record["msg"] != "startup credential configuration" || record["linear_credentials_configured"] != true || record["github_credentials_configured"] != true {
+		t.Fatalf("record=%v", record)
+	}
+	if strings.Contains(output.String(), "github-secret") {
+		t.Fatalf("credential appeared in log: %s", output.String())
 	}
 }
