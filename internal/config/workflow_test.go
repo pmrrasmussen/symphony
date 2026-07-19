@@ -641,6 +641,72 @@ func TestInvalidGitHubConfigurationStaysDisabledWithoutAffectingWorkflow(t *test
 	}
 }
 
+// TestGitHubLandingPolicyIsStrictAndFailsClosed exercises the PMR-37
+// github.merge_state/merge_method/required_checks fields. Unlike the rest of
+// the github: block (which silently disables on any invalid value), these
+// fields must reject the whole workflow load, the same way
+// tracker.provider.agent_transitions does.
+func TestGitHubLandingPolicyIsStrictAndFailsClosed(t *testing.T) {
+	t.Setenv("PMR37_GITHUB_TOKEN", "github-secret")
+	path := filepath.Join(t.TempDir(), "WORKFLOW.md")
+	full := "github: {owner: pmrrasmussen, repository: symphony, base_branch: main, token: $PMR37_GITHUB_TOKEN, "
+	for _, test := range []struct {
+		name   string
+		github string
+	}{
+		{name: "merge_state is an active state", github: full + "merge_state: Todo, required_checks: [ci]}"},
+		{name: "merge_state is a terminal state", github: full + "merge_state: Done, required_checks: [ci]}"},
+		{name: "merge_state equals handoff_state", github: full + `merge_state: "In Review", required_checks: [ci]}`},
+		{name: "merge_state missing required_checks", github: full + "merge_state: Merging}"},
+		{name: "required_checks is an empty list", github: full + "merge_state: Merging, required_checks: []}"},
+		{name: "required_checks has duplicate entries", github: full + "merge_state: Merging, required_checks: [ci, CI]}"},
+		{name: "required_checks has a blank entry", github: full + `merge_state: Merging, required_checks: [" "]}`},
+		{name: "merge_method is not in the bounded enum", github: full + "merge_state: Merging, merge_method: rewrite, required_checks: [ci]}"},
+		{name: "merge_method without merge_state", github: "github: {owner: pmrrasmussen, repository: symphony, base_branch: main, token: $PMR37_GITHUB_TOKEN, merge_method: squash}"},
+		{name: "required_checks without merge_state", github: "github: {owner: pmrrasmussen, repository: symphony, base_branch: main, token: $PMR37_GITHUB_TOKEN, required_checks: [ci]}"},
+		{name: "merge_state without a fully configured github integration", github: "github: {owner: pmrrasmussen, merge_state: Merging, required_checks: [ci]}"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			content := "---\ntracker: {kind: linear, provider: {handoff_state: \"In Review\"}, active_states: [Todo, \"In Progress\"], terminal_states: [Done, Canceled]}\n" + test.github + "\n---\nprompt"
+			if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Load(path, ""); err == nil {
+				t.Fatalf("invalid landing configuration was accepted rather than failing closed: %s", test.github)
+			}
+		})
+	}
+}
+
+func TestGitHubLandingPolicyParsesValidConfiguration(t *testing.T) {
+	t.Setenv("PMR37_GITHUB_TOKEN", "github-secret")
+	path := filepath.Join(t.TempDir(), "WORKFLOW.md")
+	content := "---\ntracker: {kind: linear, provider: {handoff_state: \"In Review\"}, active_states: [Todo, \"In Progress\"], terminal_states: [Done, Canceled]}\ngithub: {owner: pmrrasmussen, repository: symphony, base_branch: main, token: $PMR37_GITHUB_TOKEN, merge_state: Merging, required_checks: [ci/build, ci/test]}\n---\nprompt"
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	w, err := Load(path, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := w.Config.GitHub
+	if !got.Enabled || got.MergeState != "Merging" || got.MergeMethod != "merge" || len(got.RequiredChecks) != 2 || got.RequiredChecks[0] != "ci/build" || got.RequiredChecks[1] != "ci/test" {
+		t.Fatalf("github=%+v", got)
+	}
+
+	content = strings.Replace(content, "merge_state: Merging, required_checks", "merge_state: Merging, merge_method: squash, required_checks", 1)
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	w, err = Load(path, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w.Config.GitHub.MergeMethod != "squash" {
+		t.Fatalf("merge_method=%q", w.Config.GitHub.MergeMethod)
+	}
+}
+
 func TestRenderHandoffCommentUsesOnlyRepositoryPolicy(t *testing.T) {
 	d := t.TempDir()
 	p := filepath.Join(d, "WORKFLOW.md")

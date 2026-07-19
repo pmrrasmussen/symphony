@@ -56,6 +56,17 @@ type fakeLinear struct {
 	activeErr error
 	links     []string
 	completed int
+
+	// Landing (PMR-37) fake state. mergeStateErr/mergeState let a test
+	// simulate a human moving the issue away from Merging. refuseErr and
+	// completeErr let a test simulate the fallback transition or the Done
+	// completion call itself failing independently of the substantive gate.
+	mergeStateErr    error
+	refuseErr        error
+	refused          int
+	refusedDestState string
+	completeErr      error
+	landCompleted    int
 }
 
 func (l *fakeLinear) EnsureActive(context.Context) error { return l.activeErr }
@@ -77,6 +88,36 @@ func (l *fakeLinear) Complete(context.Context) (bool, error) {
 		return false, nil
 	}
 	l.completed++
+	return true, nil
+}
+
+func (l *fakeLinear) EnsureMergeState(context.Context, string) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.mergeStateErr
+}
+
+func (l *fakeLinear) RefuseLanding(_ context.Context, mergeState string) (bool, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.refuseErr != nil {
+		return false, l.refuseErr
+	}
+	l.refused++
+	l.refusedDestState = mergeState
+	return true, nil
+}
+
+func (l *fakeLinear) CompleteLanding(context.Context, string) (bool, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.completeErr != nil {
+		return false, l.completeErr
+	}
+	if l.landCompleted > 0 {
+		return false, nil
+	}
+	l.landCompleted++
 	return true, nil
 }
 
@@ -114,6 +155,13 @@ type apiFixture struct {
 	threads      []map[string]any
 	threadsTotal int
 	graphqlErr   bool
+
+	// Landing (PMR-37) fixture state.
+	mergeable      *bool
+	mergeableState string
+	merges         int
+	mergeMethods   []string
+	mergeFails     bool
 }
 
 func newAPI(t *testing.T) *apiFixture {
@@ -131,10 +179,13 @@ func (f *apiFixture) pullJSON() map[string]any {
 	return map[string]any{
 		"number": f.prNumber, "html_url": "https://github.com/owner/repo/pull/7",
 		"state": f.prState, "merged": f.prMerged, "body": f.prBody,
+		"mergeable": f.mergeable, "mergeable_state": f.mergeableState,
 		"head": map[string]any{"ref": f.prHeadRef, "sha": f.prSHA},
 		"base": map[string]any{"ref": f.prBaseRef},
 	}
 }
+
+func boolPtr(b bool) *bool { return &b }
 
 func (f *apiFixture) serve(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
@@ -185,10 +236,28 @@ func (f *apiFixture) serve(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/pulls/7":
 		encoded, _ := json.Marshal(f.pullJSON())
 		_, _ = w.Write(encoded)
-	case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/commits/sha1/status":
+	case r.Method == http.MethodPut && r.URL.Path == "/repos/owner/repo/pulls/7/merge":
+		var body map[string]any
+		if json.NewDecoder(r.Body).Decode(&body) != nil {
+			f.t.Errorf("merge body decode failed")
+		}
+		f.merges++
+		if method, ok := body["merge_method"].(string); ok {
+			f.mergeMethods = append(f.mergeMethods, method)
+		}
+		if f.mergeFails {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			_, _ = w.Write([]byte(`{"message":"Pull Request is not mergeable"}`))
+			return
+		}
+		f.prMerged = true
+		f.prState = "closed"
+		encoded, _ := json.Marshal(map[string]any{"merged": true, "sha": f.prSHA, "message": "merged"})
+		_, _ = w.Write(encoded)
+	case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/commits/"+f.prSHA+"/status":
 		encoded, _ := json.Marshal(map[string]any{"state": f.overall, "statuses": f.statuses})
 		_, _ = w.Write(encoded)
-	case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/commits/sha1/check-runs":
+	case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/commits/"+f.prSHA+"/check-runs":
 		encoded, _ := json.Marshal(map[string]any{"check_runs": f.checkRuns})
 		_, _ = w.Write(encoded)
 	case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/pulls/7/reviews":
@@ -230,6 +299,97 @@ func testSession(t *testing.T, api *apiFixture, git *fakeGit, linear *fakeLinear
 
 func testInput() PublishInput {
 	return PublishInput{Why: "Fix a bug", WhatChanged: "Adjusted the handler", OnCall: "no rotation"}
+}
+
+// testLandingSession builds a Session configured for github_land_pr: the
+// fixture's pull request head SHA is set to "head" so it matches fakeGit's
+// default HEAD, meaning no push is exercised unless a test overrides it.
+func testLandingSession(t *testing.T, api *apiFixture, git gitRunner, linear *fakeLinear, requiredChecks []string, mergeMethod string) (*Manager, *Session) {
+	t.Helper()
+	// newAPI's default prSHA ("sha1") never matches fakeGit's default HEAD
+	// ("head"); align them here so ordinary landing tests do not exercise
+	// the push-before-land path unless a test explicitly sets a different
+	// prSHA before calling this helper (see TestLandPushesNewLocalCommitsBeforeLanding).
+	if api.prSHA == "sha1" {
+		api.prSHA = "head"
+	}
+	settings := api.settings()
+	settings.MergeState = "Merging"
+	settings.MergeMethod = mergeMethod
+	settings.RequiredChecks = requiredChecks
+	m := New(func() config.Settings { return config.Settings{GitHub: settings} }, slog.Default())
+	m.git = git
+	s := &Session{manager: m, settings: settings, issue: domain.Issue{ID: "issue-27", Identifier: "PMR-27", Title: "Lifecycle", URL: "https://linear.app/issue/PMR-27"}, workspace: t.TempDir(), branch: "symphony/pmr-27", linear: linear}
+	return m, s
+}
+
+// passingRequiredChecks marks every name as a completed, successful check
+// run so a landing test's gates other than "checks" can be exercised.
+func passingRequiredChecks(api *apiFixture, names ...string) {
+	api.mu.Lock()
+	defer api.mu.Unlock()
+	for _, name := range names {
+		api.checkRuns = append(api.checkRuns, map[string]any{"name": name, "status": "completed", "conclusion": "success"})
+	}
+}
+
+// readyToLand configures a fixture so every landing gate other than checks
+// passes: approved review, no unresolved threads, and a clean mergeable PR.
+func readyToLand(api *apiFixture) {
+	api.mu.Lock()
+	api.reviews = []map[string]any{{"user": map[string]any{"login": "alice"}, "state": "APPROVED", "body": "lgtm", "submitted_at": "t1"}}
+	api.mergeable = boolPtr(true)
+	api.mergeableState = "clean"
+	api.mu.Unlock()
+}
+
+// staleBaseGit reports a different base-branch commit on the second
+// rev-parse of the configured base ref, simulating a concurrent push to the
+// base branch between github_land_pr's early and immediate pre-merge reads.
+type staleBaseGit struct {
+	*fakeGit
+	baseCalls int
+}
+
+func (g *staleBaseGit) Run(ctx context.Context, dir string, args, env []string) (string, error) {
+	if args[0] == "rev-parse" && len(args) > 1 && strings.HasPrefix(args[1], "refs/remotes/origin/") {
+		g.baseCalls++
+		if g.baseCalls == 1 {
+			return "base-before", nil
+		}
+		return "base-after", nil
+	}
+	return g.fakeGit.Run(ctx, dir, args, env)
+}
+
+// divergedHeadGit reports that the worktree HEAD is not a descendant of the
+// published pull request's head, simulating a worktree whose local branch
+// diverged from what was last published.
+type divergedHeadGit struct{ *fakeGit }
+
+func (g *divergedHeadGit) Run(ctx context.Context, dir string, args, env []string) (string, error) {
+	if args[0] == "merge-base" {
+		return "", errors.New("not an ancestor")
+	}
+	return g.fakeGit.Run(ctx, dir, args, env)
+}
+
+// pushSyncGit keeps the fixture's fake GitHub PR head in sync with a
+// simulated push, so a "new local commits need pushing before landing" test
+// can assert the whole flow proceeds to a fresh, matching head.
+type pushSyncGit struct {
+	*fakeGit
+	api     *apiFixture
+	newHead string
+}
+
+func (g *pushSyncGit) Run(ctx context.Context, dir string, args, env []string) (string, error) {
+	if args[0] == "push" {
+		g.api.mu.Lock()
+		g.api.prSHA = g.newHead
+		g.api.mu.Unlock()
+	}
+	return g.fakeGit.Run(ctx, dir, args, env)
 }
 
 func TestPublishCreatesThenReusesDeterministicPullRequest(t *testing.T) {
@@ -621,5 +781,306 @@ func TestContextRejectsGraphQLFailureWithoutLeakingRawPayload(t *testing.T) {
 	api.mu.Unlock()
 	if _, err := session.Context(context.Background()); err == nil {
 		t.Fatal("graphql failure was not surfaced as an error")
+	}
+}
+
+func TestLandWaitsWhileRequiredChecksAreMissingOrPending(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		configure func(*apiFixture)
+	}{
+		{name: "missing", configure: func(api *apiFixture) {}},
+		{name: "pending", configure: func(api *apiFixture) {
+			api.checkRuns = append(api.checkRuns, map[string]any{"name": "ci/build", "status": "in_progress", "conclusion": nil})
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			api, git, linear := newAPI(t), &fakeGit{}, &fakeLinear{}
+			api.prExists = true
+			test.configure(api)
+			_, session := testLandingSession(t, api, git, linear, []string{"ci/build"}, "merge")
+			result, err := session.Land(context.Background())
+			if err != nil {
+				t.Fatalf("waiting on pending checks must not be an error: %v", err)
+			}
+			if result.Status != LandWaiting {
+				t.Fatalf("result=%+v", result)
+			}
+			if linear.refused != 0 || linear.landCompleted != 0 || api.merges != 0 {
+				t.Fatalf("waiting mutated Linear or GitHub: refused=%d completed=%d merges=%d", linear.refused, linear.landCompleted, api.merges)
+			}
+		})
+	}
+}
+
+func TestLandRefusesOnFailingRequiredChecks(t *testing.T) {
+	api, git, linear := newAPI(t), &fakeGit{}, &fakeLinear{}
+	api.prExists = true
+	api.checkRuns = []map[string]any{{"name": "ci/build", "status": "completed", "conclusion": "failure"}}
+	_, session := testLandingSession(t, api, git, linear, []string{"ci/build"}, "merge")
+	if _, err := session.Land(context.Background()); err == nil || !strings.Contains(err.Error(), "required checks failed") {
+		t.Fatalf("failing required check error=%v", err)
+	}
+	if linear.refused != 1 || linear.refusedDestState != "Merging" {
+		t.Fatalf("hard gate did not attempt the Merging fallback: refused=%d dest=%q", linear.refused, linear.refusedDestState)
+	}
+	if api.merges != 0 || linear.landCompleted != 0 {
+		t.Fatalf("failing checks must never merge: merges=%d completed=%d", api.merges, linear.landCompleted)
+	}
+}
+
+func TestLandRefusesOnEffectiveChangesRequestedReview(t *testing.T) {
+	api, git, linear := newAPI(t), &fakeGit{}, &fakeLinear{}
+	api.prExists = true
+	passingRequiredChecks(api, "ci/build")
+	api.reviews = []map[string]any{
+		{"user": map[string]any{"login": "alice"}, "state": "APPROVED", "body": "lgtm", "submitted_at": "t1"},
+		{"user": map[string]any{"login": "bob"}, "state": "CHANGES_REQUESTED", "body": "no", "submitted_at": "t2"},
+	}
+	api.mergeable = boolPtr(true)
+	_, session := testLandingSession(t, api, git, linear, []string{"ci/build"}, "merge")
+	if _, err := session.Land(context.Background()); err == nil || !strings.Contains(err.Error(), "changes-requested") {
+		t.Fatalf("changes-requested error=%v", err)
+	}
+	if linear.refused != 1 || api.merges != 0 {
+		t.Fatalf("refused=%d merges=%d", linear.refused, api.merges)
+	}
+}
+
+func TestLandRefusesOnUnresolvedReviewThreads(t *testing.T) {
+	api, git, linear := newAPI(t), &fakeGit{}, &fakeLinear{}
+	api.prExists = true
+	passingRequiredChecks(api, "ci/build")
+	readyToLand(api)
+	api.threads = []map[string]any{{"isResolved": false}}
+	_, session := testLandingSession(t, api, git, linear, []string{"ci/build"}, "merge")
+	if _, err := session.Land(context.Background()); err == nil || !strings.Contains(err.Error(), "unresolved review threads") {
+		t.Fatalf("unresolved threads error=%v", err)
+	}
+	if linear.refused != 1 || api.merges != 0 {
+		t.Fatalf("refused=%d merges=%d", linear.refused, api.merges)
+	}
+}
+
+func TestLandWaitsWhileMergeabilityIsUndetermined(t *testing.T) {
+	api, git, linear := newAPI(t), &fakeGit{}, &fakeLinear{}
+	api.prExists = true
+	passingRequiredChecks(api, "ci/build")
+	api.reviews = []map[string]any{{"user": map[string]any{"login": "alice"}, "state": "APPROVED", "body": "lgtm", "submitted_at": "t1"}}
+	// api.mergeable stays nil: GitHub has not yet computed mergeability.
+	_, session := testLandingSession(t, api, git, linear, []string{"ci/build"}, "merge")
+	result, err := session.Land(context.Background())
+	if err != nil {
+		t.Fatalf("undetermined mergeability must not be an error: %v", err)
+	}
+	if result.Status != LandWaiting {
+		t.Fatalf("result=%+v", result)
+	}
+	if linear.refused != 0 || api.merges != 0 {
+		t.Fatalf("waiting on mergeability mutated state: refused=%d merges=%d", linear.refused, api.merges)
+	}
+}
+
+func TestLandRefusesOnMergeConflicts(t *testing.T) {
+	api, git, linear := newAPI(t), &fakeGit{}, &fakeLinear{}
+	api.prExists = true
+	passingRequiredChecks(api, "ci/build")
+	api.reviews = []map[string]any{{"user": map[string]any{"login": "alice"}, "state": "APPROVED", "body": "lgtm", "submitted_at": "t1"}}
+	api.mergeable = boolPtr(false)
+	api.mergeableState = "dirty"
+	_, session := testLandingSession(t, api, git, linear, []string{"ci/build"}, "merge")
+	if _, err := session.Land(context.Background()); err == nil || !strings.Contains(err.Error(), "conflicts") {
+		t.Fatalf("merge conflict error=%v", err)
+	}
+	if linear.refused != 1 || api.merges != 0 {
+		t.Fatalf("refused=%d merges=%d", linear.refused, api.merges)
+	}
+}
+
+func TestLandRefusesOnStaleBase(t *testing.T) {
+	api, linear := newAPI(t), &fakeLinear{}
+	api.prExists = true
+	passingRequiredChecks(api, "ci/build")
+	readyToLand(api)
+	git := &staleBaseGit{fakeGit: &fakeGit{}}
+	_, session := testLandingSession(t, api, git, linear, []string{"ci/build"}, "merge")
+	if _, err := session.Land(context.Background()); err == nil || !strings.Contains(err.Error(), "base branch changed") {
+		t.Fatalf("stale base error=%v", err)
+	}
+	if linear.refused != 1 || api.merges != 0 {
+		t.Fatalf("refused=%d merges=%d", linear.refused, api.merges)
+	}
+}
+
+func TestLandRefusesOnDivergedWorktreeHead(t *testing.T) {
+	api, linear := newAPI(t), &fakeLinear{}
+	api.prExists, api.prSHA = true, "old-head"
+	passingRequiredChecks(api, "ci/build")
+	readyToLand(api)
+	git := &divergedHeadGit{fakeGit: &fakeGit{}}
+	settings := api.settings()
+	settings.MergeState, settings.MergeMethod, settings.RequiredChecks = "Merging", "merge", []string{"ci/build"}
+	m := New(func() config.Settings { return config.Settings{GitHub: settings} }, slog.Default())
+	m.git = git
+	session := &Session{manager: m, settings: settings, issue: domain.Issue{ID: "issue-27", Identifier: "PMR-27", Title: "Lifecycle", URL: "https://linear.app/issue/PMR-27"}, workspace: t.TempDir(), branch: "symphony/pmr-27", linear: linear}
+	if _, err := session.Land(context.Background()); err == nil || !strings.Contains(err.Error(), "diverged") {
+		t.Fatalf("diverged head error=%v", err)
+	}
+	if linear.refused != 1 || api.merges != 0 {
+		t.Fatalf("refused=%d merges=%d", linear.refused, api.merges)
+	}
+}
+
+func TestLandPushesNewLocalCommitsBeforeLanding(t *testing.T) {
+	api, linear := newAPI(t), &fakeLinear{}
+	api.prExists, api.prSHA = true, "old-head"
+	passingRequiredChecks(api, "ci/build")
+	readyToLand(api)
+	base := &fakeGit{}
+	git := &pushSyncGit{fakeGit: base, api: api, newHead: "head"}
+	_, session := testLandingSession(t, api, git, linear, []string{"ci/build"}, "merge")
+	result, err := session.Land(context.Background())
+	if err != nil {
+		t.Fatalf("push-then-land failed: %v", err)
+	}
+	if result.Status != LandMerged {
+		t.Fatalf("result=%+v", result)
+	}
+	base.mu.Lock()
+	foundPush := false
+	for _, call := range base.calls {
+		if call[0] == "push" {
+			foundPush = true
+		}
+	}
+	base.mu.Unlock()
+	if !foundPush {
+		t.Fatal("new local commits were not pushed before landing")
+	}
+}
+
+func TestLandRefusesOnHumanLinearStateOverride(t *testing.T) {
+	api, git := newAPI(t), &fakeGit{}
+	api.prExists = true
+	passingRequiredChecks(api, "ci/build")
+	readyToLand(api)
+	linear := &fakeLinear{mergeStateErr: errors.New("issue moved by a human")}
+	_, session := testLandingSession(t, api, git, linear, []string{"ci/build"}, "merge")
+	if _, err := session.Land(context.Background()); err == nil {
+		t.Fatal("human Linear state override was not refused")
+	}
+	if api.merges != 0 {
+		t.Fatalf("human override must never merge: merges=%d", api.merges)
+	}
+}
+
+func TestLandRefusesOnClosedOrMismatchedPullRequest(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		configure func(*apiFixture)
+		wantText  string
+	}{
+		{name: "closed", configure: func(api *apiFixture) { api.prState = "closed" }, wantText: "closed"},
+		{name: "mismatched base", configure: func(api *apiFixture) { api.prBaseRef = "develop" }, wantText: "mismatched"},
+		{name: "ambiguous", configure: func(api *apiFixture) { api.multiplePulls = true }, wantText: "more than one"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			api, git, linear := newAPI(t), &fakeGit{}, &fakeLinear{}
+			api.prExists = true
+			test.configure(api)
+			_, session := testLandingSession(t, api, git, linear, []string{"ci/build"}, "merge")
+			if _, err := session.Land(context.Background()); err == nil || !strings.Contains(err.Error(), test.wantText) {
+				t.Fatalf("error=%v want substring %q", err, test.wantText)
+			}
+			if api.merges != 0 {
+				t.Fatalf("mismatched pull request must never merge: merges=%d", api.merges)
+			}
+		})
+	}
+}
+
+func TestLandRequiresNoPublishedPullRequest(t *testing.T) {
+	api, git, linear := newAPI(t), &fakeGit{}, &fakeLinear{}
+	_, session := testLandingSession(t, api, git, linear, []string{"ci/build"}, "merge")
+	if _, err := session.Land(context.Background()); err == nil || !strings.Contains(err.Error(), "existing pull request") {
+		t.Fatalf("error=%v", err)
+	}
+}
+
+func TestLandMergesWithEveryConfiguredMethod(t *testing.T) {
+	for _, method := range []string{"merge", "squash", "rebase"} {
+		t.Run(method, func(t *testing.T) {
+			api, git, linear := newAPI(t), &fakeGit{}, &fakeLinear{}
+			api.prExists = true
+			passingRequiredChecks(api, "ci/build")
+			readyToLand(api)
+			_, session := testLandingSession(t, api, git, linear, []string{"ci/build"}, method)
+			result, err := session.Land(context.Background())
+			if err != nil {
+				t.Fatalf("landing failed: %v", err)
+			}
+			if result.Status != LandMerged || result.Method != method || result.Number != api.prNumber {
+				t.Fatalf("result=%+v", result)
+			}
+			if api.merges != 1 || len(api.mergeMethods) != 1 || api.mergeMethods[0] != method {
+				t.Fatalf("merges=%d methods=%v", api.merges, api.mergeMethods)
+			}
+			if linear.landCompleted != 1 {
+				t.Fatalf("linear completion=%d", linear.landCompleted)
+			}
+		})
+	}
+}
+
+func TestLandDuplicateCallAfterMergeIsIdempotent(t *testing.T) {
+	api, git, linear := newAPI(t), &fakeGit{}, &fakeLinear{}
+	api.prExists = true
+	passingRequiredChecks(api, "ci/build")
+	readyToLand(api)
+	_, session := testLandingSession(t, api, git, linear, []string{"ci/build"}, "merge")
+	first, err := session.Land(context.Background())
+	if err != nil || first.Status != LandMerged {
+		t.Fatalf("first landing failed: result=%+v err=%v", first, err)
+	}
+	second, err := session.Land(context.Background())
+	if err != nil || second.Status != LandMerged {
+		t.Fatalf("duplicate landing failed: result=%+v err=%v", second, err)
+	}
+	if api.merges != 1 {
+		t.Fatalf("duplicate landing merged again: merges=%d", api.merges)
+	}
+	if linear.landCompleted != 1 {
+		t.Fatalf("duplicate landing completion=%d", linear.landCompleted)
+	}
+}
+
+func TestLandReconcilesWhenGitHubSucceedsButLinearCompletionFails(t *testing.T) {
+	api, git, linear := newAPI(t), &fakeGit{}, &fakeLinear{}
+	api.prExists = true
+	passingRequiredChecks(api, "ci/build")
+	readyToLand(api)
+	linear.completeErr = errors.New("linear unavailable")
+	_, session := testLandingSession(t, api, git, linear, []string{"ci/build"}, "merge")
+	if _, err := session.Land(context.Background()); err == nil {
+		t.Fatal("Linear completion failure after a successful merge must be reported")
+	}
+	if api.merges != 1 {
+		t.Fatalf("merge must have happened exactly once: merges=%d", api.merges)
+	}
+	// Recovery: GitHub already reports the PR merged, so a retry must not
+	// merge again and must reconcile Linear to Done idempotently.
+	linear.completeErr = nil
+	result, err := session.Land(context.Background())
+	if err != nil {
+		t.Fatalf("recovery landing failed: %v", err)
+	}
+	if result.Status != LandMerged {
+		t.Fatalf("result=%+v", result)
+	}
+	if api.merges != 1 {
+		t.Fatalf("recovery must not merge again: merges=%d", api.merges)
+	}
+	if linear.landCompleted != 1 {
+		t.Fatalf("recovery completion=%d", linear.landCompleted)
 	}
 }

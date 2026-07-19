@@ -50,6 +50,35 @@ operation. Closed-unmerged PRs only produce an operator warning. The
 linked-pair and completion guard are process-local, while retries reconcile
 durable GitHub PRs and Linear comments.
 
+An additional optional landing capability (PMR-37) is gated by
+`github.merge_state`: a session bound to an issue currently in that exact
+Linear state receives a zero-argument `github_land_pr` tool. Unlike the rest
+of the GitHub adapter's optional settings, `merge_state`, the bounded
+`merge_method` enum (merge, squash, or rebase), and the non-empty
+`required_checks` list it requires are validated the same strict, fail-closed
+way as `tracker.provider.agent_transitions`: an invalid value rejects the
+whole workflow rather than silently disabling the feature. Landing re-fetches
+the configured base, verifies the credential-free origin, a clean committed
+worktree, the one deterministic open PR for the bound branch, and the current
+Linear scope/state, pushing the worktree's HEAD first if it is ahead of the
+published branch. Immediately before the irreversible merge call it re-reads
+required checks, the effective review state (each reviewer's latest
+non-dismissed review; moving the issue to `merge_state` is itself the human
+approval, so no separate approving review is required), unresolved review
+threads, the pull request's state and mergeability, and the base commit
+again. Missing or pending required checks, or undetermined mergeability,
+return a non-terminal waiting result without mutating Linear. Any other hard
+gate -- a failing check, an effective changes-requested review, an unresolved
+thread, a stale base, a merge conflict, or a closed/mismatched pull request --
+refuses landing and attempts the configured `merge_state -> In Review`
+fallback transition, itself a safe no-op once the issue is no longer exactly
+in `merge_state`. A successful merge transitions the bound issue to `Done`
+exactly once; a pull request GitHub already reports merged, discovered at any
+point (including a race during the merge call itself), reconciles that same
+`Done` transition idempotently instead of merging again, which is also how a
+GitHub merge that succeeds despite a failed Linear completion call is
+recovered on retry.
+
 The loader validates the supported core front-matter fields but preserves
 unknown extension keys for forward compatibility. It applies documented
 defaults, resolves explicit `$VARNAME` references only for documented secret

@@ -645,7 +645,7 @@ IFS= read -r line
 printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'
 IFS= read -r line
 IFS= read -r line
-case "$line" in *linear_graphql*github_publish_pr*github_pr_context*) ;; *) exit 20;; esac
+case "$line" in *linear_graphql*github_publish_pr*github_pr_context*github_land_pr*) ;; *) exit 20;; esac
 printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thread-1"}}}'
 IFS= read -r line
 printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn-1"}}}'
@@ -667,14 +667,20 @@ case "$line" in *'"success":false'*) ;; *) exit 25;; esac
 printf '%s\n' '{"jsonrpc":"2.0","id":104,"method":"item/tool/call","params":{"tool":"github_pr_context","arguments":{"number":7}}}'
 IFS= read -r line
 case "$line" in *'"success":false'*) ;; *) exit 26;; esac
+printf '%s\n' '{"jsonrpc":"2.0","id":105,"method":"item/tool/call","params":{"tool":"github_land_pr","arguments":{"reason":"nope"}}}'
+IFS= read -r line
+case "$line" in *'"success":false'*) ;; *) exit 27;; esac
+printf '%s\n' '{"jsonrpc":"2.0","id":106,"method":"item/tool/call","params":{"tool":"github_land_pr","arguments":{}}}'
+IFS= read -r line
+case "$line" in *'"success":false'*) ;; *) exit 28;; esac
 printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{}}'
 `)
 	settings := config.Settings{
 		Tracker: config.Tracker{Provider: map[string]any{"api_key": "linear-token", "project_slug_id": "project-1", "endpoint": server.URL}, ActiveStates: []string{"todo"}, HandoffState: "In Review"},
-		GitHub:  config.GitHub{Enabled: true, Owner: "owner", Repository: "repo", BaseBranch: "main", Token: "github-token", Endpoint: server.URL},
+		GitHub:  config.GitHub{Enabled: true, Owner: "owner", Repository: "repo", BaseBranch: "main", Token: "github-token", Endpoint: server.URL, MergeState: "Merging", MergeMethod: "merge", RequiredChecks: []string{"ci"}},
 	}
 	b, _ := NewWithIntegrations(func() config.Settings { return settings }, nil)
-	_, events, err := b.Start(context.Background(), domain.AgentRequest{Issue: domain.Issue{ID: "active", Identifier: "PMR-5"}, Workspace: dir, Prompt: "work", Command: "sh " + script, ApprovalPolicy: "never", ThreadSandbox: "workspace-write", TurnTimeout: time.Minute})
+	_, events, err := b.Start(context.Background(), domain.AgentRequest{Issue: domain.Issue{ID: "active", Identifier: "PMR-5", State: "Merging"}, Workspace: dir, Prompt: "work", Command: "sh " + script, ApprovalPolicy: "never", ThreadSandbox: "workspace-write", TurnTimeout: time.Minute})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -802,6 +808,93 @@ func TestGitHubContextToolHasNoInput(t *testing.T) {
 	encoded, err := json.Marshal(definition)
 	if err != nil || strings.Contains(string(encoded), "token") || strings.Contains(string(encoded), "\"owner\"") || strings.Contains(string(encoded), "\"repository\"") {
 		t.Fatalf("tool definition exposed host scope: %s err=%v", encoded, err)
+	}
+}
+
+func TestGitHubLandToolHasNoInput(t *testing.T) {
+	definition := githubLandToolDefinition()
+	schema, ok := definition["inputSchema"].(map[string]any)
+	if !ok || schema["type"] != "object" || schema["additionalProperties"] != false {
+		t.Fatalf("schema=%#v", definition["inputSchema"])
+	}
+	if _, hasProperties := schema["properties"]; hasProperties {
+		t.Fatalf("GitHub land tool unexpectedly accepts caller-controlled input: %#v", schema)
+	}
+	encoded, err := json.Marshal(definition)
+	if err != nil || strings.Contains(string(encoded), "token") || strings.Contains(string(encoded), "\"owner\"") || strings.Contains(string(encoded), "\"repository\"") || strings.Contains(string(encoded), "\"method\"") {
+		t.Fatalf("tool definition exposed host scope: %s err=%v", encoded, err)
+	}
+}
+
+// TestGitHubLandToolAdvertisedOnlyForConfiguredMergeState exercises the
+// dispatch-time filter added in backend.go's Start: github_land_pr is
+// offered only when the session's issue is currently (per AgentRequest.Issue,
+// the coordinator's own dispatch snapshot) in the exact configured Merging
+// state. This is a coarse admission filter; Land itself re-validates Linear
+// state before any mutation, which is exercised at the github package level.
+func TestGitHubLandToolAdvertisedOnlyForConfiguredMergeState(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasPrefix(r.URL.Path, "/repos/") {
+			t.Fatalf("unexpected GitHub REST request during tool advertisement: %s %s", r.Method, r.URL.Path)
+		}
+		var request map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		query := request["query"].(string)
+		switch {
+		case strings.Contains(query, "SymphonyLinearHandoffIssue"):
+			_, _ = w.Write([]byte(`{"data":{"issue":{"id":"active","identifier":"PMR-37","title":"Land","description":"safe","url":"https://linear.app/issue/PMR-37","project":{"slugId":"project-1"},"team":{"id":"team-1"},"state":{"id":"todo","name":"Todo"}}}}`))
+		case strings.Contains(query, "SymphonyLinearHandoffStates"):
+			_, _ = w.Write([]byte(`{"data":{"team":{"id":"team-1","states":{"nodes":[{"id":"review","name":"In Review"}]}}}}`))
+		default:
+			t.Fatalf("unexpected query: %s", query)
+		}
+	}))
+	defer server.Close()
+	settings := config.Settings{
+		Tracker: config.Tracker{Provider: map[string]any{"api_key": "linear-token", "project_slug_id": "project-1", "endpoint": server.URL}, ActiveStates: []string{"todo"}, HandoffState: "In Review"},
+		GitHub:  config.GitHub{Enabled: true, Owner: "owner", Repository: "repo", BaseBranch: "main", Token: "github-token", Endpoint: server.URL, MergeState: "Merging", MergeMethod: "merge", RequiredChecks: []string{"ci"}},
+	}
+	for _, test := range []struct {
+		name       string
+		issueState string
+		wantLand   bool
+	}{
+		{name: "matching Merging state", issueState: "Merging", wantLand: true},
+		{name: "non-matching state", issueState: "In Progress", wantLand: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			captured := filepath.Join(dir, "thread-start.json")
+			script := writeAppServer(t, dir, `
+IFS= read -r line
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'
+IFS= read -r line
+IFS= read -r line
+printf '%s\n' "$line" > `+captured+`
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thread-1"}}}'
+IFS= read -r line
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn-1"}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{}}'
+`)
+			b, _ := NewWithIntegrations(func() config.Settings { return settings }, nil)
+			_, events, err := b.Start(context.Background(), domain.AgentRequest{Issue: domain.Issue{ID: "active", Identifier: "PMR-37", State: test.issueState}, Workspace: dir, Prompt: "work", Command: "sh " + script, ApprovalPolicy: "never", ThreadSandbox: "workspace-write", TurnTimeout: time.Minute})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for range events {
+			}
+			data, err := os.ReadFile(captured)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if gotLand := strings.Contains(string(data), "github_land_pr"); gotLand != test.wantLand {
+				t.Fatalf("issueState=%q github_land_pr present=%v want=%v params=%s", test.issueState, gotLand, test.wantLand, data)
+			}
+		})
 	}
 }
 
