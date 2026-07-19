@@ -12,6 +12,29 @@ configured approval and sandbox policy; this service does not provide Docker,
 VM, SSH, distributed execution, or a database.  Linear credentials stay in
 the host process and are removed from Codex's environment.
 
+The canonical lifecycle (PMR-38) is `Todo -> In Progress -> In Review <->
+Rework -> Merging -> Done`. `Todo`, `In Progress`, `Rework`, and `Merging` are
+configured as `tracker.active_states`, so the coordinator dispatches a session
+for an issue in any of them; `In Review` is deliberately excluded so it stays
+the single, fixed, human-controlled review state
+(`tracker.provider.handoff_state`) that is never dispatched. Resuming in
+`Rework` uses no
+separate code path from an ordinary dispatch: the same durable workspace
+ownership, worktree, and branch described below are reused, and republishing
+the same deterministic pull request (see the GitHub adapter below) hands the
+issue back to `In Review` regardless of which active state the session
+started from. `Merging` is likewise an ordinary active state; what is
+special is that a session dispatched for an issue currently in the exact
+configured `github.merge_state` additionally receives the bounded
+`github_land_pr` tool described below. Coordinator capacity is state-aware:
+`agent.max_concurrent_agents` bounds total concurrent sessions, and the
+optional `agent.max_concurrent_agents_by_state` map additionally bounds
+concurrency within one normalized state name (for example, at most one
+concurrent `Merging` landing session even when overall capacity allows more).
+A queued retry timer never occupies this capacity -- only a live session or a
+launch already in flight does -- so a landing session and an unrelated
+implementation session admit and run independently of one another.
+
 The optional `create_child_issue` capability follows the same model: it is
 disabled unless `tracker.provider.child_issue_creation` is configured, and it
 derives its entire scope (project, team, and parent issue) from the same

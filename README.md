@@ -1,7 +1,8 @@
 # Symphony (Go)
 
 Symphony is a long-running, Codex-only issue runner. It reads repository-owned
-policy from `WORKFLOW.md`, polls Linear, and runs each eligible issue in a
+policy from `WORKFLOW.md` -- this repository's single executable source of
+delivery policy -- polls Linear, and runs each eligible issue in a
 deterministic local workspace.
 
 ```sh
@@ -10,23 +11,58 @@ go run ./cmd/symphony --workflow ./WORKFLOW.md
 go run ./cmd/symphony ./WORKFLOW.md
 ```
 
+## Canonical lifecycle
+
+`Todo -> In Progress -> In Review <-> Rework -> Merging -> Done`. `Todo`,
+`In Progress`, `Rework`, and `Merging` are active/dispatchable; `In Review` is
+the single, fixed, human-controlled review state and is never dispatched;
+`Done` and `Canceled` are terminal. A Codex session:
+
+1. Moves a `Todo` issue to `In Progress`, then implements and validates the
+   change.
+2. Publishes a structured pull request (`github_publish_pr`) and hands the
+   issue to `In Review` once validated.
+3. Resumes -- in the same worktree, branch, and pull request -- when a human
+   moves the issue to `Rework`, and republishes to hand it back to
+   `In Review`.
+4. Is dispatched again, with only the bounded zero-argument `github_land_pr`
+   tool, when a human moves the issue to `Merging`: that move is itself the
+   approval to land. Pending checks wait without changing Linear state; any
+   other hard gate returns the issue to `In Review`; a successful or
+   already-completed merge reconciles the issue to `Done`.
+
+Two-agent operation: one implementation/rework agent may run concurrently
+with one landing agent (`agent.max_concurrent_agents: 2`,
+`agent.max_concurrent_agents_by_state: {Merging: 1}`), so a `Merging` landing
+session never blocks, or is blocked by, unrelated implementation work, and a
+delayed retry never occupies a concurrency slot while it waits.
+
+See `WORKFLOW.md`'s prompt body for the full per-state start, implementation,
+validation, review handoff, rework, landing, and completion playbook, and
+[docs/architecture.md](docs/architecture.md) for the underlying trust model.
+
 ## Working with Symphony
 
-1. Create one focused Linear issue, move it to **In Progress**, and work from
-   an isolated Git worktree—not the primary checkout.
+1. Create one focused Linear issue in `Todo` (or move it to `In Progress`
+   yourself), and work from an isolated Git worktree—not the primary
+   checkout.
 2. Keep the workflow policy in the repository. Configure
    `workspace.source_root` for the source repository; Symphony creates a
    separate agent workspace for each eligible issue.
 3. Validate the narrow change first, then run broader checks when shared
    behavior changes. Review the generated workspace before keeping its work.
-4. Open a PR with **Why**, **What changed**, and **On Call**; merge only
-   after required checks and review, then move the Linear issue to **Done**.
+4. Publish a PR with **Why**, **What changed**, and **On Call** (via
+   `github_publish_pr`, or manually when host-side publishing is not
+   configured); merge only after required checks and review. Moving the
+   issue to `Merging` dispatches `github_land_pr`, which lands the PR and
+   moves the issue to **Done** automatically; without GitHub landing
+   configured, move the Linear issue to **Done** manually after merging.
 5. Use `--dry-run` before any live run. Live smoke tests are manual and must
    use dedicated Symphony test artifacts, never Dagligvare-app.
 
-For the delivery sequence, see [HOW_WE_WORK.md](HOW_WE_WORK.md). For runtime
-configuration and operational details, use [WORKFLOW.example.md](WORKFLOW.example.md)
-and [docs/architecture.md](docs/architecture.md).
+For runtime configuration and operational details, use
+[WORKFLOW.example.md](WORKFLOW.example.md) and
+[docs/architecture.md](docs/architecture.md).
 
 Run a full-lifecycle local preflight against the example without live
 credentials:
@@ -185,10 +221,15 @@ github:
 Unlike the rest of the `github:` block, an invalid `merge_state`,
 `merge_method`, or `required_checks` value rejects the whole workflow instead
 of silently disabling the feature, the same fail-closed treatment as
-`tracker.provider.agent_transitions`. A session bound to an issue currently in
-the exact configured `merge_state` receives a zero-argument `github_land_pr`
-tool: it re-verifies the worktree, branch, pull request, required checks,
-effective review state (moving the issue to `merge_state` is itself the human
+`tracker.provider.agent_transitions`. `merge_state` must differ from
+`handoff_state` and from every terminal state, but -- unlike
+`handoff_state` -- it is normally one of `active_states` (`Merging` in the
+canonical lifecycle above): a session only receives the tool once actually
+dispatched for an issue currently in that exact state. A session bound to an
+issue currently in the exact configured `merge_state` receives a
+zero-argument `github_land_pr` tool: it re-verifies the worktree, branch,
+pull request, required checks, effective review state (moving the issue to
+`merge_state` is itself the human
 approval; no separate approving review is required), unresolved review
 threads, mergeability, and current base immediately before merging, and
 transitions only the bound issue to `Done` on success. Pending checks wait
@@ -198,3 +239,35 @@ landing calls, and a GitHub merge that succeeds despite a failed Linear
 completion, are reconciled idempotently rather than merging or transitioning
 twice. Symphony never merges a pull request outside this narrow, explicitly
 configured capability.
+
+## Operator prerequisites for the canonical lifecycle
+
+`WORKFLOW.md` is fully configured for the canonical lifecycle, but going live
+against this repository's real Linear team requires the following manual,
+human-gated steps; none of them can be performed by Symphony, by this MCP
+integration (which only reads and lists issue statuses), or by an automated
+agent:
+
+1. **Create the `Rework` and `Merging` Started states** in the Linear team
+   used by `tracker.provider.project_slug_id`. Until both states exist,
+   issues can reach only `Todo`, `In Progress`, and `In Review`; `--dry-run`
+   does not contact Linear and cannot detect a missing remote state, so this
+   is a live-run precondition, not something automated validation checks.
+2. **Provision the repository-scoped GitHub token file** referenced by
+   `$SYMPHONY_GITHUB_TOKEN_FILE`: a fine-grained personal access token
+   restricted to exactly this repository, granting only the pull request,
+   checks, contents, and review permissions described above, saved to a
+   mode-600 file outside the repository.
+3. **Confirm the configured `github.required_checks` names** match what
+   GitHub actually reports for this repository. `WORKFLOW.md` uses this
+   repository's current CI job names (`scripts/check format`,
+   `scripts/check test`, `scripts/check vet`, `scripts/check race`, from
+   `.github/workflows/ci.yml`); update both files together if CI job names
+   change.
+
+Until all three are complete, Symphony keeps running safely: two-agent
+capacity and the `Todo`/`In Progress`/review-handoff path already work today,
+an issue simply never reaches `Rework` or `Merging` in Linear (Linear itself
+has no such state to move it to), `github_land_pr` is never advertised, and
+completion continues through the existing human-merge fallback described
+above.
