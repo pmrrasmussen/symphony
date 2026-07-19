@@ -1385,6 +1385,7 @@ func TestReconciliationRefreshesStateCapacityForLaterAdmissions(t *testing.T) {
 
 	c.Tick(context.Background())
 	<-agent.started
+	waitForRunning(t, c, first.Identifier)
 	fresh := first
 	fresh.State = "Doing"
 	tracker.setIssue(fresh)
