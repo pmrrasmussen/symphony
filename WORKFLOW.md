@@ -64,7 +64,14 @@ codex:
   approval_policy: never
   thread_sandbox: workspace-write
   turn_timeout_ms: 3600000
+  # read_timeout_ms bounds every steady-state JSON-RPC round trip; keep it small
+  # so a hung session is detected mid-turn.
   read_timeout_ms: 5000
+  # start_timeout_ms applies only to the cold-start handshake and thread/start,
+  # which include app-server spawn and the first model load. It is deliberately
+  # generous so a cold start does not spuriously time out, without loosening
+  # read_timeout_ms.
+  start_timeout_ms: 120000
   stall_timeout_ms: 300000
 # Host-side GitHub PR handoff and landing, fixed to this repository only
 # (PMR-36, PMR-37). The token is host-side and repository-scoped: it is read

@@ -94,7 +94,7 @@ func (b *Backend) Start(ctx context.Context, r domain.AgentRequest) (domain.Agen
 	if err != nil {
 		return domain.AgentSession{}, nil, err
 	}
-	if _, err = c.call(ctx, "initialize", map[string]any{"clientInfo": map[string]any{"name": "symphony-go", "version": "0.1.0"}, "capabilities": map[string]any{"experimentalApi": true}}); err != nil {
+	if _, err = c.callWithTimeout(ctx, "initialize", map[string]any{"clientInfo": map[string]any{"name": "symphony-go", "version": "0.1.0"}, "capabilities": map[string]any{"experimentalApi": true}}, c.startTimeout); err != nil {
 		c.kill()
 		return domain.AgentSession{}, nil, err
 	}
@@ -123,7 +123,10 @@ func (b *Backend) Start(ctx context.Context, r domain.AgentRequest) (domain.Agen
 	if len(tools) > 0 {
 		threadParams["dynamicTools"] = tools
 	}
-	res, err := c.call(ctx, "thread/start", threadParams)
+	// The cold-start handshake and thread/start use the generous start timeout:
+	// a cold app-server's first model load routinely exceeds the small
+	// steady-state read timeout. Every subsequent RPC keeps the read timeout.
+	res, err := c.callWithTimeout(ctx, "thread/start", threadParams, c.startTimeout)
 	if err != nil {
 		c.kill()
 		return domain.AgentSession{}, nil, err
@@ -187,6 +190,7 @@ type client struct {
 	workspace, approval string
 	policy              any
 	readTimeout         time.Duration
+	startTimeout        time.Duration
 	turnTimeout         time.Duration
 	ctx                 context.Context
 	handoff             *linear.HandoffSession
@@ -247,7 +251,7 @@ func start(ctx context.Context, r domain.AgentRequest, secrets []string, secretM
 	}
 	cmd.Stdout = outWriter
 	cmd.Stderr = stderrWriter
-	c := &client{cmd: cmd, in: in, workspace: r.Workspace, approval: r.ApprovalPolicy, policy: r.TurnSandboxPolicy, readTimeout: r.ReadTimeout, turnTimeout: r.TurnTimeout, ctx: ctx, handoff: handoff, github: githubSession, pending: map[int]chan callResult{}, done: make(chan struct{}), exited: make(chan struct{})}
+	c := &client{cmd: cmd, in: in, workspace: r.Workspace, approval: r.ApprovalPolicy, policy: r.TurnSandboxPolicy, readTimeout: r.ReadTimeout, startTimeout: r.StartTimeout, turnTimeout: r.TurnTimeout, ctx: ctx, handoff: handoff, github: githubSession, pending: map[int]chan callResult{}, done: make(chan struct{}), exited: make(chan struct{})}
 	cmd.Cancel = func() error { return c.killProcessGroup() }
 	if err := cmd.Start(); err != nil {
 		_ = out.Close()
@@ -374,10 +378,19 @@ func withSecretValues(matcher func(string) bool, values []string) func(string) b
 		return false
 	}
 }
+
+// call applies the steady-state read timeout to a single JSON-RPC round trip.
+// The cold-start handshake and thread/start use callWithTimeout with the
+// separate, more generous start timeout so a first model load does not trip
+// mid-turn hang detection.
 func (c *client) call(ctx context.Context, method string, params any) (map[string]any, error) {
-	if c.readTimeout > 0 {
+	return c.callWithTimeout(ctx, method, params, c.readTimeout)
+}
+
+func (c *client) callWithTimeout(ctx context.Context, method string, params any, timeout time.Duration) (map[string]any, error) {
+	if timeout > 0 {
 		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, c.readTimeout)
+		ctx, cancel = context.WithTimeout(ctx, timeout)
 		defer cancel()
 	}
 	c.mu.Lock()

@@ -106,6 +106,11 @@ type AgentRequest struct {
 	ApprovalPolicy, ThreadSandbox string
 	TurnSandboxPolicy             any
 	TurnTimeout, ReadTimeout      time.Duration
+	// StartTimeout bounds the cold-start handshake and thread/start RPCs, which
+	// on a cold codex app-server include process spawn and first model load. It
+	// is deliberately separate from ReadTimeout so a generous cold-start budget
+	// does not loosen steady-state mid-turn hang detection.
+	StartTimeout time.Duration
 }
 type AgentSession struct{ ID, ThreadID, TurnID string }
 type AgentBackend interface {
