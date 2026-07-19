@@ -140,10 +140,14 @@ github:
   poll_interval_ms: 30000
 ```
 
-Use a fine-grained token restricted to that repository. Symphony removes the
-resolved token (including inherited environment values containing it) from the
-Codex child environment. The `github_publish_pr` dynamic tool accepts no
-repository, branch, issue, or credential input, only bounded `why`,
+Use a fine-grained token restricted to that single repository, granting only
+the pull request, checks, contents, and review permissions the integration
+needs. Store it in a mode-600 file outside the repository and reference that
+path with `$SYMPHONY_GITHUB_TOKEN_FILE`; the token is never committed to the
+repository. Symphony removes the resolved token (including inherited
+environment values containing it) from the Codex child environment, so it is
+never exposed to the child process. The `github_publish_pr` dynamic tool
+accepts no repository, branch, issue, or credential input, only bounded `why`,
 `what_changed`, and `on_call` structured handoff fields: it verifies the
 worktree's credential-free GitHub origin and committed clean changes, pushes
 `symphony/<lowercase-issue-identifier>`, creates or reuses that branch's pull
