@@ -210,8 +210,9 @@ func (t *Tracker) GetIssues(ctx context.Context, ids []string) ([]domain.Issue, 
 // idempotent: an issue already in toState is a no-op. It reuses the same bound
 // GraphQL primitives as the session handoff path (scoped read, team state
 // resolution, and the fixed issueUpdate mutation), and never resolves a
-// terminal target. It is the host-side counterpart to the agent's bounded
-// linear_graphql transition and does not widen a running session's authority.
+// terminal target. It is the host-owned transition primitive (used by the
+// coordinator's dispatch-time start move and the landing host methods); no
+// model-invokable tool can write the tracker.
 func (t *Tracker) Transition(ctx context.Context, issue domain.Issue, toState string) error {
 	toState = strings.TrimSpace(toState)
 	if strings.TrimSpace(issue.ID) == "" {

@@ -1528,7 +1528,7 @@ func startTransitionSettings(t *testing.T) config.Settings {
 	w := testSettings(t)
 	s := w.Config
 	s.Tracker.ActiveStates = []string{"Todo", "In Progress"}
-	s.Tracker.StartTransitions = map[string]string{"todo": "In Progress"}
+	s.Tracker.HostTransitions = config.HostTransitions{Start: map[string]string{"todo": "In Progress"}}
 	return s
 }
 

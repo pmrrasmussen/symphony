@@ -9,27 +9,28 @@ tracker:
     # api_key: $LINEAR_API_KEY
     # Optional: only dispatch issues assigned to this Linear user ID, or `me`.
     # assignee: me
-    # Host-owned dispatch-time start edges. The coordinator applies these with
-    # the host Linear credential when it launches an issue, deterministically
-    # moving a dispatched Todo issue to In Progress before the session starts,
-    # so board-level observability never depends on the agent self-starting.
-    # Both endpoints of every edge must be active, non-terminal states. It is
-    # idempotent and fail-safe: an already-started issue is untouched and a
-    # failed move is logged and never blocks or double-dispatches the run.
-    start_transitions:
-      Todo: In Progress
-    # The canonical lifecycle's exact agent-requested state edges. Merging ->
-    # In Review is the fallback a refused github_land_pr call uses (see
-    # github.merge_state below). These are not a general destination allowlist:
-    # only these exact edges are ever honored, regardless of what a Codex
-    # session requests. The Todo -> In Progress start edge lives in
-    # start_transitions above; the coordinator, not the agent, owns it.
-    agent_transitions:
-      Merging: In Review
-    # Enables the scoped github_publish_pr/github_pr_context Codex tools
-    # below. Configure a non-active, non-terminal state from this project's
-    # Linear team; it is the single human-controlled review state and the
-    # only state a Codex session can move an issue into.
+    # Host-owned tracker transition policy. Symphony applies every edge itself,
+    # with the host Linear credential; none is exposed to a Codex session, so
+    # the agent has no tracker-write capability. The two edge sets are kept
+    # distinct on purpose (never flattened into one map): Merging is both a
+    # dispatchable state and the land-fallback source, so a flat map applied at
+    # dispatch would wrongly move a dispatched Merging landing issue.
+    transitions:
+      # Applied at dispatch, keyed by the issue's current state (Todo ->
+      # In Progress); both endpoints must be active, non-terminal states.
+      # Idempotent and fail-safe: an already-started issue is untouched and a
+      # failed move never blocks or double-dispatches the run.
+      start:
+        Todo: In Progress
+      # The Merging -> In Review fallback a refused github_land_pr uses (keyed
+      # by github.merge_state below). Never applied at dispatch.
+      refuse_landing:
+        Merging: In Review
+    # Enables the scoped github_publish_pr/github_pr_context Codex tools below
+    # and is the state github_publish_pr hands off to, host-side. Configure a
+    # non-active, non-terminal state from this project's Linear team; it is the
+    # single human-controlled review state. No Codex tool can move an issue to
+    # it (or any state); the host performs every transition.
     handoff_state: In Review
     # Optional, opt-in Codex client tool. It creates a new issue only in this
     # project/team and records the active issue as its parent; it cannot

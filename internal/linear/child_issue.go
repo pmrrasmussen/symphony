@@ -1,8 +1,8 @@
 package linear
 
 // This file implements the optional, session-bound create_child_issue tool.
-// Like the linear_graphql compatibility tool in handoff.go, it is not a
-// general Linear write API: every mutation is fixed here, and the team,
+// Like the host handoff path in handoff.go, it is not a general Linear write
+// API: every mutation is fixed here, and the team,
 // project, and parent issue are bound to the active issue before Codex is
 // launched. A dependency reference is only ever resolved against a child
 // issue this same session already created, never an arbitrary Linear ID.

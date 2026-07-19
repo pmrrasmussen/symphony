@@ -3,7 +3,6 @@ package linear
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -164,173 +163,14 @@ func (f *handoffFixture) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// callHandoff drives the host-side review handoff (comment + transition to the
+// configured handoff state) through the same locked path github_publish_pr's
+// LinkAndHandoff uses. There is no agent-invocable handoff; this exercises the
+// host reconciliation logic directly.
 func callHandoff(session *HandoffSession) error {
-	_, err := session.Call(context.Background(), json.RawMessage(`{"operation":"handoff"}`))
-	return err
-}
-
-func callTransition(session *HandoffSession, destination string) (ToolResult, error) {
-	arguments, err := json.Marshal(map[string]string{"operation": "transition", "destination": destination})
-	if err != nil {
-		return ToolResult{}, err
-	}
-	return session.Call(context.Background(), arguments)
-}
-
-func TestAgentTransitionsAreExactScopedAndIdempotent(t *testing.T) {
-	f := newHandoffFixture(t)
-	settings := f.settings()
-	settings.Tracker.AgentTransitions = map[string]string{"Todo": "In Progress", "Merging": "In Review"}
-	session, err := NewHandoff(func() config.Settings { return settings }).Prepare(context.Background(), domain.Issue{ID: "active"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	result, err := callTransition(session, "In Progress")
-	if err != nil || !result.Success || f.stateName != "In Progress" || f.transitionAttempts != 1 {
-		t.Fatalf("result=%+v err=%v state=%s transitions=%d", result, err, f.stateName, f.transitionAttempts)
-	}
-	if _, err := callTransition(session, "In Progress"); err != nil {
-		t.Fatalf("duplicate transition: %v", err)
-	}
-	if f.transitionAttempts != 1 {
-		t.Fatalf("duplicate mutation count=%d", f.transitionAttempts)
-	}
-	for _, destination := range []string{"Todo", "In Review"} {
-		if _, err := callTransition(session, destination); err == nil {
-			t.Fatalf("accepted unconfigured/reversed destination %q", destination)
-		}
-	}
-	if _, err := session.Call(context.Background(), json.RawMessage(`{"operation":"transition","destination":"In Progress","issue":"other"}`)); err == nil {
-		t.Fatal("transition accepted caller-controlled scope")
-	}
-}
-
-func TestAgentTransitionPermitsConfiguredMergingToReviewEdge(t *testing.T) {
-	f := newHandoffFixture(t)
-	f.stateID, f.stateName = "merging", "Merging"
-	settings := f.settings()
-	settings.Tracker.HandoffState = ""
-	settings.Tracker.AgentTransitions = map[string]string{"Merging": "In Review"}
-	session, err := NewHandoff(func() config.Settings { return settings }).Prepare(context.Background(), domain.Issue{ID: "active"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := callTransition(session, "In Review"); err != nil {
-		t.Fatal(err)
-	}
-	if f.stateName != "In Review" || f.transitionAttempts != 1 {
-		t.Fatalf("state=%s transitions=%d", f.stateName, f.transitionAttempts)
-	}
-}
-
-func TestAgentTransitionsRejectTerminalStaleAndCrossScopeStates(t *testing.T) {
-	for name, mutate := range map[string]func(*handoffFixture){
-		"terminal": func(f *handoffFixture) { f.stateID, f.stateName = "done", "Done" },
-		"stale":    func(f *handoffFixture) { f.stateID, f.stateName = "old-todo", "Todo" },
-		"project":  func(f *handoffFixture) { f.project = "other-project" },
-		"team":     func(f *handoffFixture) { f.team = "other-team" },
-	} {
-		t.Run(name, func(t *testing.T) {
-			f := newHandoffFixture(t)
-			settings := f.settings()
-			settings.Tracker.HandoffState = ""
-			settings.Tracker.AgentTransitions = map[string]string{"Todo": "In Progress"}
-			session, err := NewHandoff(func() config.Settings { return settings }).Prepare(context.Background(), domain.Issue{ID: "active"})
-			if err != nil {
-				t.Fatal(err)
-			}
-			mutate(f)
-			if _, err := callTransition(session, "In Progress"); err == nil {
-				t.Fatal("transition accepted invalid refreshed issue")
-			}
-			if f.transitionAttempts != 0 {
-				t.Fatalf("mutation attempts=%d", f.transitionAttempts)
-			}
-		})
-	}
-}
-
-func TestAgentTransitionsSerializeConcurrentCalls(t *testing.T) {
-	f := newHandoffFixture(t)
-	settings := f.settings()
-	settings.Tracker.AgentTransitions = map[string]string{"Todo": "In Progress"}
-	session, err := NewHandoff(func() config.Settings { return settings }).Prepare(context.Background(), domain.Issue{ID: "active"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	errs := make(chan error, 8)
-	var calls sync.WaitGroup
-	for range 8 {
-		calls.Add(1)
-		go func() {
-			defer calls.Done()
-			_, err := callTransition(session, "In Progress")
-			errs <- err
-		}()
-	}
-	calls.Wait()
-	close(errs)
-	for err := range errs {
-		if err != nil {
-			t.Fatal(err)
-		}
-	}
-	if f.transitionAttempts != 1 || f.stateName != "In Progress" {
-		t.Fatalf("transitions=%d state=%s", f.transitionAttempts, f.stateName)
-	}
-}
-
-func TestAgentTransitionRespectsHumanChangesBeforeAndAfterMutation(t *testing.T) {
-	t.Run("before mutation", func(t *testing.T) {
-		f := newHandoffFixture(t)
-		f.changeOnRead, f.changedStateID, f.changedStateName = 3, "merging", "Merging"
-		settings := f.settings()
-		settings.Tracker.HandoffState = ""
-		settings.Tracker.AgentTransitions = map[string]string{"Todo": "In Progress"}
-		session, err := NewHandoff(func() config.Settings { return settings }).Prepare(context.Background(), domain.Issue{ID: "active"})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, err := callTransition(session, "In Progress"); err == nil {
-			t.Fatal("transition succeeded after human state change")
-		}
-		if f.transitionAttempts != 0 {
-			t.Fatalf("mutation attempts=%d", f.transitionAttempts)
-		}
-	})
-	t.Run("after mutation", func(t *testing.T) {
-		f := newHandoffFixture(t)
-		f.postTransitionID, f.postTransitionName = "merging", "Merging"
-		settings := f.settings()
-		settings.Tracker.HandoffState = ""
-		settings.Tracker.AgentTransitions = map[string]string{"Todo": "In Progress"}
-		session, err := NewHandoff(func() config.Settings { return settings }).Prepare(context.Background(), domain.Issue{ID: "active"})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, err := callTransition(session, "In Progress"); err == nil {
-			t.Fatal("transition accepted a mismatched post-mutation state")
-		}
-		if f.transitionAttempts != 1 || f.stateName != "Merging" {
-			t.Fatalf("transitions=%d state=%s", f.transitionAttempts, f.stateName)
-		}
-	})
-}
-
-func TestAgentTransitionPolicyIsFrozenForSession(t *testing.T) {
-	f := newHandoffFixture(t)
-	settings := f.settings()
-	settings.Tracker.HandoffState = ""
-	settings.Tracker.AgentTransitions = map[string]string{"Todo": "In Progress"}
-	handoff := NewHandoff(func() config.Settings { return settings })
-	session, err := handoff.Prepare(context.Background(), domain.Issue{ID: "active"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	settings.Tracker.AgentTransitions = map[string]string{"Todo": "Merging"}
-	if _, err := callTransition(session, "In Progress"); err != nil {
-		t.Fatalf("frozen policy rejected original edge: %v", err)
-	}
+	session.handoffMu.Lock()
+	defer session.handoffMu.Unlock()
+	return session.handoffLocked(context.Background())
 }
 
 // The following tests exercise the PMR-37 github_land_pr Linear surface:
@@ -338,12 +178,17 @@ func TestAgentTransitionPolicyIsFrozenForSession(t *testing.T) {
 // (the Merging -> In Review hard-gate fallback), and CompleteLanding (the
 // Merging -> Done landing completion).
 
-func mergingSession(t *testing.T, f *handoffFixture, agentTransitions map[string]string) *HandoffSession {
+func mergingSession(t *testing.T, f *handoffFixture, refuseLanding map[string]string) *HandoffSession {
 	t.Helper()
 	f.stateID, f.stateName = "merging", "Merging"
 	settings := f.settings()
-	settings.Tracker.HandoffState = ""
-	settings.Tracker.AgentTransitions = agentTransitions
+	// A landing session always coexists with the review handoff state in
+	// production (it is what enables the bound session); Merging must be an
+	// active state for that binding. The refuse_landing fallback edge is the
+	// host-owned Merging -> In Review policy RefuseLanding consumes.
+	settings.Tracker.ActiveStates = []string{"Todo", "In Progress", "Merging"}
+	settings.Tracker.HandoffState = "In Review"
+	settings.Tracker.HostTransitions = config.HostTransitions{RefuseLanding: refuseLanding}
 	session, err := NewHandoff(func() config.Settings { return settings }).Prepare(context.Background(), domain.Issue{ID: "active"})
 	if err != nil {
 		t.Fatal(err)
@@ -623,17 +468,12 @@ func TestHandoffReconcilesTargetStateMissingComment(t *testing.T) {
 	}
 }
 
-func TestHandoffRejectsInvalidAndCrossScopeInputs(t *testing.T) {
+// The host handoff posts the bound comment only to the active issue; a comment
+// that surfaces on a different issue, project, or team is a scope violation and
+// must fail the handoff rather than proceed.
+func TestHandoffRejectsCrossScopeComment(t *testing.T) {
 	f := newHandoffFixture(t)
 	session := f.session(t, nil)
-	for _, arguments := range []string{
-		`null`, `{}`, `{"operation":7}`, `{"operation":"handoff","body":"payload"}`,
-		`{"operation":"handoff","issueID":"other"}`, `{"operation":"query","query":"mutation { anything }"}`,
-	} {
-		if _, err := session.Call(context.Background(), json.RawMessage(arguments)); err == nil {
-			t.Errorf("accepted %s", arguments)
-		}
-	}
 	for name, mutate := range map[string]func(){
 		"issue":   func() { f.commentIssue = "other" },
 		"project": func() { f.commentProject = "other" },
@@ -647,36 +487,6 @@ func TestHandoffRejectsInvalidAndCrossScopeInputs(t *testing.T) {
 				t.Fatal("cross-scope comment accepted")
 			}
 		})
-	}
-}
-
-func TestAgentTransitionLogsOperationAndEdge(t *testing.T) {
-	f := newHandoffFixture(t)
-	settings := f.settings()
-	settings.Tracker.HandoffState = ""
-	settings.Tracker.AgentTransitions = map[string]string{"Todo": "In Progress"}
-	h := NewHandoff(func() config.Settings { return settings })
-	var logs bytes.Buffer
-	h.SetLogger(slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
-	session, err := h.Prepare(context.Background(), domain.Issue{ID: "active"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := callTransition(session, "In Progress"); err != nil {
-		t.Fatal(err)
-	}
-	edge := findLogRecord(t, &logs, "Linear transition")
-	if edge["operation"] != "transition" || edge["from_state"] != "Todo" || edge["to_state"] != "In Progress" || edge["issue_identifier"] != "PMR-18" {
-		t.Fatalf("agent transition edge missing operation/from/to/issue: %v", edge)
-	}
-	// A duplicate call is an idempotent no-op that records a debug skip.
-	logs.Reset()
-	if _, err := callTransition(session, "In Progress"); err != nil {
-		t.Fatal(err)
-	}
-	skip := findLogRecord(t, &logs, "Linear transition skipped")
-	if skip["operation"] != "transition" || skip["from_state"] != "In Progress" || skip["issue_identifier"] != "PMR-18" {
-		t.Fatalf("agent transition skip missing operation/from/issue: %v", skip)
 	}
 }
 
@@ -696,30 +506,6 @@ func TestHandoffLogsOperationAndEdge(t *testing.T) {
 	for _, secret := range []string{"test-token", "private agent payload", "Ready PMR-18"} {
 		if strings.Contains(logs.String(), secret) {
 			t.Fatalf("handoff edge log leaked %q: %s", secret, logs.String())
-		}
-	}
-}
-
-func TestHandoffLogsOnlySafeContextAndTrimsCommentInput(t *testing.T) {
-	f := newHandoffFixture(t)
-	var logs bytes.Buffer
-	session := f.session(t, slog.New(slog.NewTextHandler(&logs, nil)))
-	if _, err := session.Call(context.Background(), json.RawMessage(`{"operation":"comment","body":"  bounded comment  "}`)); err != nil {
-		t.Fatal(err)
-	}
-	if got := f.comments[len(f.comments)-1]; got != "bounded comment" {
-		t.Fatalf("comment=%q", got)
-	}
-	if err := callHandoff(session); err != nil {
-		t.Fatal(err)
-	}
-	logged := logs.String()
-	if !strings.Contains(logged, "issue_id=active") || !strings.Contains(logged, "issue_identifier=PMR-18") {
-		t.Fatalf("missing safe context: %s", logged)
-	}
-	for _, secret := range []string{"test-token", "private agent payload", "Ready PMR-18", "bounded comment"} {
-		if strings.Contains(logged, secret) {
-			t.Fatalf("log leaked %q: %s", secret, logged)
 		}
 	}
 }

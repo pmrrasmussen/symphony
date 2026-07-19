@@ -454,62 +454,6 @@ func TestDrainReportsBoundedRedactedStderrBeforeTurn(t *testing.T) {
 	}
 }
 
-func TestEnabledLinearHandoffIsAdvertisedAndUsesOnlyBoundIssue(t *testing.T) {
-	var graphQLCalls int
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		defer r.Body.Close()
-		var request map[string]any
-		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
-			t.Fatal(err)
-		}
-		graphQLCalls++
-		query := request["query"].(string)
-		w.Header().Set("Content-Type", "application/json")
-		switch {
-		case strings.Contains(query, "SymphonyLinearHandoffIssue"):
-			_, _ = w.Write([]byte(`{"data":{"issue":{"id":"active","identifier":"PMR-5","title":"Handoff","description":"safe","url":"https://linear.app/issue/PMR-5","project":{"slugId":"project-1"},"team":{"id":"team-1"},"state":{"id":"todo","name":"Todo"}}}}`))
-		case strings.Contains(query, "SymphonyLinearHandoffStates"):
-			_, _ = w.Write([]byte(`{"data":{"team":{"id":"team-1","states":{"nodes":[{"id":"review","name":"In Review"}]}}}}`))
-		default:
-			t.Fatalf("unexpected query: %s", query)
-		}
-	}))
-	defer server.Close()
-	dir := t.TempDir()
-	script := filepath.Join(dir, "fake-app-server.sh")
-	body := `#!/bin/sh
-IFS= read -r line
-printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'
-IFS= read -r line
-IFS= read -r line
-case "$line" in *linear_graphql*) ;; *) exit 20;; esac
-printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thread-1"}}}'
-IFS= read -r line
-printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn-1"}}}'
-printf '%s\n' '{"jsonrpc":"2.0","id":99,"method":"item/tool/call","params":{"threadId":"thread-1","turnId":"turn-1","callId":"call-1","tool":"linear_graphql","arguments":{"operation":"read"}}}'
-IFS= read -r line
-case "$line" in *'"success":true'*PMR-5*) ;; *) exit 21;; esac
-printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{}}'
-`
-	if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	settings := config.Settings{Tracker: config.Tracker{
-		Provider:     map[string]any{"api_key": "test-token", "project_slug_id": "project-1", "endpoint": server.URL},
-		ActiveStates: []string{"todo"}, HandoffState: "In Review",
-	}}
-	b := NewWithLinearHandoff(func() config.Settings { return settings }, "LINEAR_API_KEY")
-	_, events, err := b.Start(context.Background(), domain.AgentRequest{Issue: domain.Issue{ID: "active"}, Workspace: dir, Prompt: "work", Command: "sh " + script, ApprovalPolicy: "never", ThreadSandbox: "workspace-write", TurnTimeout: time.Minute})
-	if err != nil {
-		t.Fatal(err)
-	}
-	for range events {
-	}
-	if graphQLCalls != 2 {
-		t.Fatalf("GraphQL calls=%d want prepare-only 2", graphQLCalls)
-	}
-}
-
 func TestUnsupportedToolIsRejectedWithoutBlockingTheTurn(t *testing.T) {
 	dir := t.TempDir()
 	script := filepath.Join(dir, "fake-app-server.sh")
@@ -547,70 +491,6 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{}}'
 	}
 }
 
-func TestBoundDynamicToolCallsEmitSafeItemLifecycleEvents(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		defer r.Body.Close()
-		var request map[string]any
-		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
-			t.Fatal(err)
-		}
-		query := request["query"].(string)
-		w.Header().Set("Content-Type", "application/json")
-		switch {
-		case strings.Contains(query, "SymphonyLinearHandoffIssue"):
-			_, _ = w.Write([]byte(`{"data":{"issue":{"id":"active","identifier":"PMR-39","title":"Handoff","description":"safe","url":"https://linear.app/issue/PMR-39","project":{"slugId":"project-1"},"team":{"id":"team-1"},"state":{"id":"todo","name":"Todo"}}}}`))
-		case strings.Contains(query, "SymphonyLinearHandoffStates"):
-			_, _ = w.Write([]byte(`{"data":{"team":{"id":"team-1","states":{"nodes":[{"id":"review","name":"In Review"}]}}}}`))
-		default:
-			_, _ = w.Write([]byte(`{"data":{"issueUpdate":{"success":true}}}`))
-		}
-	}))
-	defer server.Close()
-	dir := t.TempDir()
-	script := writeAppServer(t, dir, `
-IFS= read -r line
-printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'
-IFS= read -r line
-IFS= read -r line
-printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thread-1"}}}'
-IFS= read -r line
-printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn-1"}}}'
-printf '%s\n' '{"jsonrpc":"2.0","id":99,"method":"item/tool/call","params":{"tool":"linear_graphql","arguments":{"operation":"comment","body":"token=do-not-log-this"}}}'
-IFS= read -r line
-printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{}}'
-`)
-	settings := config.Settings{Tracker: config.Tracker{
-		Provider:     map[string]any{"api_key": "test-token", "project_slug_id": "project-1", "endpoint": server.URL},
-		ActiveStates: []string{"todo"}, HandoffState: "In Review",
-	}}
-	b := NewWithLinearHandoff(func() config.Settings { return settings })
-	req := request(dir, script)
-	req.Issue = domain.Issue{ID: "active", Identifier: "PMR-39"}
-	_, events, err := b.Start(context.Background(), req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var items []domain.Event
-	for event := range events {
-		blob := fmt.Sprintf("%+v", event)
-		if strings.Contains(blob, "do-not-log-this") {
-			t.Fatalf("event leaked bound tool call argument: %s", blob)
-		}
-		if event.Kind == domain.EventItem {
-			items = append(items, event)
-		}
-	}
-	if len(items) != 2 {
-		t.Fatalf("item events=%+v, want a started/finished pair", items)
-	}
-	if items[0].ItemType != "dynamicToolCall" || items[0].ToolName != "linear_graphql" || items[0].Outcome != domain.ItemStarted || items[0].ItemID != "99" {
-		t.Fatalf("started=%+v", items[0])
-	}
-	if items[1].ItemID != "99" || items[1].ToolName != "linear_graphql" || items[1].Outcome == domain.ItemStarted {
-		t.Fatalf("finished=%+v", items[1])
-	}
-}
-
 func TestRejectedLinearAndGitHubToolsDoNotBlockTheTurn(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer r.Body.Close()
@@ -645,7 +525,7 @@ IFS= read -r line
 printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'
 IFS= read -r line
 IFS= read -r line
-case "$line" in *linear_graphql*github_publish_pr*github_pr_context*github_land_pr*) ;; *) exit 20;; esac
+case "$line" in *github_publish_pr*github_pr_context*github_land_pr*) ;; *) exit 20;; esac
 printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thread-1"}}}'
 IFS= read -r line
 printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn-1"}}}'
@@ -952,32 +832,15 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{}}'
 			if gotLand := strings.Contains(string(data), "github_land_pr"); gotLand != test.wantLand {
 				t.Fatalf("issueState=%q github_land_pr present=%v want=%v params=%s", test.issueState, gotLand, test.wantLand, data)
 			}
+			// Trust boundary: the agent is never advertised a Linear-mutating
+			// tool. github_publish_pr must remain; linear_graphql must be absent.
+			if !strings.Contains(string(data), "github_publish_pr") {
+				t.Fatalf("issueState=%q github_publish_pr missing: %s", test.issueState, data)
+			}
+			if strings.Contains(string(data), "linear_graphql") {
+				t.Fatalf("issueState=%q advertised a Linear-mutating linear_graphql tool: %s", test.issueState, data)
+			}
 		})
-	}
-}
-
-func TestLinearTransitionToolHasOnlyBoundDestinationInput(t *testing.T) {
-	definition := linearGraphQLToolDefinition()
-	schema, ok := definition["inputSchema"].(map[string]any)
-	if !ok || schema["type"] != "object" || schema["additionalProperties"] != false {
-		t.Fatalf("schema=%#v", definition["inputSchema"])
-	}
-	properties, ok := schema["properties"].(map[string]any)
-	if !ok {
-		t.Fatalf("properties=%#v", schema["properties"])
-	}
-	for _, forbidden := range []string{"issue", "project", "team", "endpoint", "credential", "token", "state_id"} {
-		if _, exists := properties[forbidden]; exists {
-			t.Fatalf("linear tool exposed caller-controlled %q: %#v", forbidden, properties)
-		}
-	}
-	operation, ok := properties["operation"].(map[string]any)
-	if !ok {
-		t.Fatalf("operation schema=%#v", properties["operation"])
-	}
-	encoded, _ := json.Marshal(operation["enum"])
-	if !strings.Contains(string(encoded), "transition") {
-		t.Fatalf("transition operation is not advertised: %s", encoded)
 	}
 }
 

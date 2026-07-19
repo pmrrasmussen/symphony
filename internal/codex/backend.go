@@ -107,9 +107,6 @@ func (b *Backend) Start(ctx context.Context, r domain.AgentRequest) (domain.Agen
 	}
 	threadParams := map[string]any{"cwd": r.Workspace, "approvalPolicy": r.ApprovalPolicy, "sandbox": r.ThreadSandbox}
 	tools := []map[string]any{}
-	if handoff != nil && (strings.TrimSpace(settings.Tracker.HandoffState) != "" || len(settings.Tracker.AgentTransitions) > 0) {
-		tools = append(tools, linearGraphQLToolDefinition())
-	}
 	if handoff != nil && settings.Tracker.ChildIssueCreation {
 		tools = append(tools, createChildIssueToolDefinition())
 	}
@@ -644,22 +641,6 @@ func (c *client) emitItemEvent(method string, raw json.RawMessage) {
 	})
 }
 
-func linearGraphQLToolDefinition() map[string]any {
-	return map[string]any{
-		"type": "function", "name": "linear_graphql",
-		"description": "Read the active Linear issue, move only it to a workflow-configured state through an exact directed edge, hand it off to review, or add a bounded comment only to it.",
-		"inputSchema": map[string]any{
-			"type": "object", "additionalProperties": false,
-			"properties": map[string]any{
-				"operation":   map[string]any{"type": "string", "enum": []string{"read", "handoff", "comment", "transition"}},
-				"body":        map[string]any{"type": "string", "maxLength": 8192},
-				"destination": map[string]any{"type": "string", "maxLength": 256},
-			},
-			"required": []string{"operation"},
-		},
-	}
-}
-
 func createChildIssueToolDefinition() map[string]any {
 	return map[string]any{
 		"type": "function", "name": "create_child_issue",
@@ -801,7 +782,8 @@ func (c *client) handleToolCall(x rpc) {
 		result, err := c.handoff.CreateChildIssue(c.ctx, request.Arguments)
 		if err != nil {
 			// Do not return provider errors, issue data, or any credential-derived
-			// value to the child, mirroring the linear_graphql failure contract below.
+			// value to the child. The generic response is enough for the model to
+			// choose another path, while the normalized event informs the scheduler.
 			c.toolFailure(x.ID, "Linear child issue creation was rejected.")
 			return
 		}
@@ -813,36 +795,15 @@ func (c *client) handleToolCall(x rpc) {
 		c.sendServerResponse(x.ID, map[string]any{"success": result.Success, "contentItems": []any{map[string]any{"type": "inputText", "text": string(text)}}})
 		return
 	}
-	if request.Tool != "linear_graphql" || c.handoff == nil {
-		c.unsupportedTool(x.ID)
-		return
-	}
-	callID := callIDText(x.ID)
-	started := c.emitCallStarted(callID, "linear_graphql")
-	result, err := c.handoff.Call(c.ctx, request.Arguments)
-	if err != nil {
-		// Do not return provider errors, issue data, or any credential-derived
-		// value to the child. The generic response is enough for the model to
-		// choose another path, while the normalized event informs the scheduler.
-		c.emitCallFinished(callID, "linear_graphql", domain.ItemFailed, started)
-		c.toolFailure(x.ID, "Linear handoff request was rejected.")
-		return
-	}
-	text, err := json.Marshal(result.Data)
-	if err != nil {
-		c.emitCallFinished(callID, "linear_graphql", domain.ItemFailed, started)
-		c.unsupportedTool(x.ID)
-		return
-	}
-	c.emitCallFinished(callID, "linear_graphql", domain.ItemCompleted, started)
-	c.sendServerResponse(x.ID, map[string]any{"success": result.Success, "contentItems": []any{map[string]any{"type": "inputText", "text": string(text)}}})
+	// No other client-side tool is bound: the agent has no Linear-mutating tool.
+	c.unsupportedTool(x.ID)
 }
 
 // emitCallStarted and emitCallFinished report the lifecycle of Symphony's own
-// bound dynamic tools (the fixed "linear_graphql" and "github_publish_pr"
-// capability names, never a value read from the model's call arguments) so a
-// slow Linear or GitHub round trip is visible the same way an app-server item
-// is. The call ID is the protocol-assigned JSON-RPC request ID.
+// bound dynamic tools (the fixed "github_publish_pr"/"github_land_pr" capability
+// names, never a value read from the model's call arguments) so a slow GitHub
+// round trip is visible the same way an app-server item is. The call ID is the
+// protocol-assigned JSON-RPC request ID.
 func (c *client) emitCallStarted(callID, tool string) time.Time {
 	started := time.Now()
 	c.emit(domain.Event{Kind: domain.EventItem, At: started, ItemID: callID, ItemType: "dynamicToolCall", ToolName: tool, Outcome: domain.ItemStarted})

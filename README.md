@@ -18,7 +18,7 @@ go run ./cmd/symphony ./WORKFLOW.md
 the single, fixed, human-controlled review state and is never dispatched;
 `Done` and `Canceled` are terminal. When the coordinator dispatches a `Todo`
 issue it moves it to `In Progress` itself, with the host Linear credential,
-before the session starts (`tracker.provider.start_transitions`); this is
+before the session starts (`tracker.provider.transitions.start`); this is
 deterministic, idempotent, and fail-safe, so board-level observability never
 depends on the agent. A Codex session then:
 
@@ -223,7 +223,7 @@ github:
 Unlike the rest of the `github:` block, an invalid `merge_state`,
 `merge_method`, or `required_checks` value rejects the whole workflow instead
 of silently disabling the feature, the same fail-closed treatment as
-`tracker.provider.agent_transitions`. `merge_state` must be an
+`tracker.provider.transitions`. `merge_state` must be an
 `active_state` and differ from `handoff_state` and every terminal state
 (`Merging` in the canonical lifecycle above): a session only receives the
 tool once actually dispatched for an issue currently in that exact state. A

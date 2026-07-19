@@ -27,8 +27,8 @@ import (
 // It drives the real coordinator, the real linear.Tracker/linear.Handoff, and
 // the real github.Manager; only the Codex app-server JSON-RPC protocol itself
 // is replaced, by a fake domain.AgentBackend that invokes the same session
-// capabilities (linear_graphql transition, github_publish_pr, github_land_pr)
-// a live Codex session would call for the issue's current state.
+// capabilities (github_publish_pr and github_land_pr) a live Codex session
+// would call, while the host owns the Todo -> In Progress start transition.
 
 // lifecycleLinearStates are the canonical lifecycle's fixed team states. Real
 // IDs do not matter, only that they are stable and distinct.
@@ -199,9 +199,11 @@ func (w *lifecycleWorkspace) Execute(context.Context, domain.Workspace, string, 
 
 // lifecycleAgentBackend stands in for a live Codex session: for the issue's
 // current state, it invokes exactly the session capability WORKFLOW.md's
-// prompt instructs a real Codex session to call (linear_graphql transition,
-// github_publish_pr, or github_land_pr), using the real handoff/GitHub
-// sessions built the same way internal/codex/backend.go builds them.
+// prompt instructs a real Codex session to call (github_publish_pr or
+// github_land_pr), using the real handoff/GitHub sessions built the same way
+// internal/codex/backend.go builds them. The Todo -> In Progress start
+// transition is host-owned (the coordinator), so it is applied here with the
+// host Linear tracker, not by the agent.
 type lifecycleAgentBackend struct {
 	settings       func() config.Settings
 	handoffFactory *linear.Handoff
@@ -226,8 +228,9 @@ func (a *lifecycleAgentBackend) actOn(ctx context.Context, issue domain.Issue) e
 	}
 	switch strings.ToLower(strings.TrimSpace(issue.State)) {
 	case "todo":
-		arguments, _ := json.Marshal(map[string]string{"operation": "transition", "destination": "In Progress"})
-		if _, err := handoffSession.Call(ctx, arguments); err != nil {
+		// Host-owned dispatch-time start transition (the coordinator's job), not
+		// an agent capability: move it with the host Linear tracker credential.
+		if err := a.tracker.Transition(ctx, issue, "In Progress"); err != nil {
 			return fmt.Errorf("transition to In Progress: %w", err)
 		}
 	case "in progress", "rework":
@@ -325,11 +328,11 @@ func TestFullCanonicalLifecycleAgainstFakeLinearAndGitHubServers(t *testing.T) {
 
 	settings := config.Settings{
 		Tracker: config.Tracker{
-			Provider:         provider,
-			ActiveStates:     []string{"Todo", "In Progress", "Rework", "Merging"},
-			TerminalStates:   []string{"Done", "Canceled"},
-			HandoffState:     "In Review",
-			AgentTransitions: map[string]string{"Todo": "In Progress", "Merging": "In Review"},
+			Provider:        provider,
+			ActiveStates:    []string{"Todo", "In Progress", "Rework", "Merging"},
+			TerminalStates:  []string{"Done", "Canceled"},
+			HandoffState:    "In Review",
+			HostTransitions: config.HostTransitions{Start: map[string]string{"Todo": "In Progress"}, RefuseLanding: map[string]string{"Merging": "In Review"}},
 		},
 		Polling:   config.Polling{Interval: time.Hour},
 		Workspace: config.Workspace{Root: "/fake"},

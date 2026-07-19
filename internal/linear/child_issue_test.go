@@ -79,6 +79,10 @@ func (f *childIssueFixture) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			"id": "active", "identifier": "PMR-41", "title": "Decompose task", "description": "private agent payload", "url": "https://linear.app/issue/PMR-41",
 			"project": project, "team": map[string]string{"id": f.team}, "state": map[string]string{"id": f.stateID, "name": f.stateName},
 		}}})
+	case strings.Contains(query, "SymphonyLinearHandoffStates"):
+		writeJSON(f.t, w, map[string]any{"data": map[string]any{"team": map[string]any{
+			"id": f.team, "states": map[string]any{"nodes": []any{map[string]string{"id": "review", "name": "In Review"}}},
+		}}})
 	case strings.Contains(query, "SymphonyLinearChildIssueLabels"):
 		nodes := make([]any, 0, len(f.labels))
 		for name, id := range f.labels {
@@ -152,7 +156,7 @@ func TestCreateChildIssueDisabledUnlessConfigured(t *testing.T) {
 	// Keep the session bound via a different capability so Prepare still
 	// returns a session; create_child_issue must still be independently
 	// gated by ChildIssueCreation.
-	settings.Tracker.AgentTransitions = map[string]string{"In Progress": "Merging"}
+	settings.Tracker.HandoffState = "In Review"
 	session := f.sessionWithSettings(t, settings)
 	if _, err := createChildIssue(session, map[string]any{"title": "Split work"}); err == nil {
 		t.Fatal("child issue creation succeeded while disabled")

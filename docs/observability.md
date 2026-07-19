@@ -13,11 +13,11 @@ contain prompts, issue content, tool arguments, and other sensitive data.
 limit snapshots, and stderr diagnostics. It never floods with the app-server's
 generic protocol notifications.
 
-Every Linear state change Symphony performs — agent-driven through the bounded
-`linear_graphql` capability or host-side — also logs one info-level
+Every Linear state change Symphony performs — all of them host-side, since no
+model-invokable tool can write the tracker — also logs one info-level
 `"msg":"Linear transition"` record so a tracker edge is reconstructable from
-the log alone. Each carries `operation` (`transition` and `handoff` for the
-agent path; `start_transition` for the coordinator's dispatch-time move;
+the log alone. Each carries `operation` (`start_transition` for the
+coordinator's dispatch-time move; `handoff` for the host review handoff;
 `landing_refused`, `landing_completed`, `merge_reconciled`, and
 `review_completed` for the GitHub landing edges), the `from_state` and
 `to_state` state NAMES, and the issue (`issue_id`/`issue_identifier`). An
@@ -53,7 +53,7 @@ diagnose a run that looks idle:
   `item_id`, `outcome` (`started`, `completed`, `failed`, `declined`), and
   `duration_ms` once known. `item_name` appears only when the protocol
   supplies a fixed tool name directly (an MCP tool's name, or Symphony's own
-  bound `linear_graphql`/`github_publish_pr` capability); it is never derived
+  bound `github_publish_pr`/`github_land_pr` capability); it is never derived
   from command bodies or tool arguments.
 * **Heartbeat and stall records** — every reconciliation pass for a still-active
   run logs `"msg":"agent heartbeat"` with `last_activity_age_ms` and, when one
