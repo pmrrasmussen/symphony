@@ -13,6 +13,21 @@ contain prompts, issue content, tool arguments, and other sensitive data.
 limit snapshots, and stderr diagnostics. It never floods with the app-server's
 generic protocol notifications.
 
+Every Linear state change Symphony performs — agent-driven through the bounded
+`linear_graphql` capability or host-side — also logs one info-level
+`"msg":"Linear transition"` record so a tracker edge is reconstructable from
+the log alone. Each carries `operation` (`transition` and `handoff` for the
+agent path; `start_transition` for the coordinator's dispatch-time move;
+`landing_refused`, `landing_completed`, `merge_reconciled`, and
+`review_completed` for the GitHub landing edges), the `from_state` and
+`to_state` state NAMES, and the issue (`issue_id`/`issue_identifier`). An
+idempotent no-op (the issue is already in the target state) instead logs a
+debug-level `"msg":"Linear transition skipped"` with the same fields, so a
+skip never appears as a state change. These records are redaction-safe: state
+names and issue identifiers only — never a rendered comment, issue
+description, or credential. (Agent turn token accounting is tracked
+separately.)
+
 At startup, the info log also records `startup credential configuration` with
 `linear_credentials_configured` and `github_credentials_configured` booleans.
 They confirm that the required Linear credential and any configured GitHub
@@ -92,6 +107,13 @@ dispatched:
 ```sh
 tail -F .symphony/logs/symphony.jsonl \
   | jq 'select(.msg == "poll summary" or .msg == "poll candidate rejected")'
+```
+
+Every tracker state change Symphony made, as an operation + from → to trail:
+
+```sh
+tail -F .symphony/logs/symphony.jsonl \
+  | jq 'select(.msg == "Linear transition") | {operation, from_state, to_state, issue_identifier}'
 ```
 
 Workspace lifecycle final status (clean removal vs. kept for review):

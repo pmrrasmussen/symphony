@@ -62,6 +62,7 @@ type Tracker struct {
 	settings func() config.Settings
 	client   *http.Client
 	now      func() time.Time
+	logger   *slog.Logger
 
 	viewerMu sync.Mutex
 	viewer   *viewerResolution
@@ -75,7 +76,16 @@ type viewerResolution struct {
 }
 
 func New(settings func() config.Settings) *Tracker {
-	return &Tracker{settings: settings, client: newHTTPClient(nil), now: time.Now}
+	return &Tracker{settings: settings, client: newHTTPClient(nil), now: time.Now, logger: slog.Default()}
+}
+
+// SetLogger routes host-side transition edge records at the operator log
+// handler instead of the process default, so a host-driven Linear state change
+// lands in the same structured log as the agent-driven ones.
+func (t *Tracker) SetLogger(logger *slog.Logger) {
+	if logger != nil {
+		t.logger = logger
+	}
 }
 
 func newHTTPClient(transport http.RoundTripper) *http.Client {
@@ -227,6 +237,7 @@ func (t *Tracker) Transition(ctx context.Context, issue domain.Issue, toState st
 		return trackerError("transition_scope", "issue is outside the configured Linear project")
 	}
 	if strings.EqualFold(strings.TrimSpace(current.State.Name), toState) {
+		t.logTransitionSkip(current, toState)
 		return nil // Idempotent: the issue is already in the started state.
 	}
 	stateID, err := (&Handoff{client: t.client}).resolveState(ctx, s, current.TeamID(), toState)
@@ -249,7 +260,40 @@ func (t *Tracker) Transition(ctx context.Context, issue domain.Issue, toState st
 	if err := json.Unmarshal(response, &payload); err != nil || !payload.Data.IssueUpdate.Success {
 		return trackerError("transition_response", "Linear did not accept the transition")
 	}
+	t.logTransition(current, toState)
 	return nil
+}
+
+// logTransition records one performed host-side Linear state change so it is
+// reconstructable from the operator log alone: the operation, the from/to
+// state NAMES, and the issue. It is redaction-safe — state names and issue
+// identifiers only, never issue title, description, or any agent text.
+func (t *Tracker) logTransition(from handoffIssue, toState string) {
+	if t.logger == nil {
+		return
+	}
+	t.logger.Info("Linear transition",
+		"operation", "transition",
+		"from_state", strings.TrimSpace(from.State.Name),
+		"to_state", strings.TrimSpace(toState),
+		"issue_id", from.ID,
+		"issue_identifier", from.Identifier,
+	)
+}
+
+// logTransitionSkip records, at debug level, a host-side transition that was a
+// no-op because the issue was already in the target state.
+func (t *Tracker) logTransitionSkip(from handoffIssue, toState string) {
+	if t.logger == nil {
+		return
+	}
+	t.logger.Debug("Linear transition skipped",
+		"operation", "transition",
+		"from_state", strings.TrimSpace(from.State.Name),
+		"to_state", strings.TrimSpace(toState),
+		"issue_id", from.ID,
+		"issue_identifier", from.Identifier,
+	)
 }
 
 func (t *Tracker) listByStates(ctx context.Context, states []string) ([]domain.Issue, error) {

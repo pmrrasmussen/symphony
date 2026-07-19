@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -339,6 +340,75 @@ func TestTransitionMovesIssueToStartedStateAndIsIdempotent(t *testing.T) {
 	if transitions != 1 {
 		t.Fatalf("transitions=%d after idempotent call, want still 1", transitions)
 	}
+}
+
+func TestTransitionLogsHostSideEdgeAndSkip(t *testing.T) {
+	state := "Todo"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		request := decodeRequest(t, r)
+		query := request["query"].(string)
+		switch {
+		case strings.Contains(query, "SymphonyLinearHandoffIssue"):
+			writeJSON(t, w, map[string]any{"data": map[string]any{"issue": map[string]any{
+				"id": "active", "identifier": "PMR-5", "title": "Start", "project": map[string]string{"slugId": "project-1"},
+				"team": map[string]string{"id": "team-1"}, "state": map[string]string{"id": strings.ToLower(strings.ReplaceAll(state, " ", "-")), "name": state},
+			}}})
+		case strings.Contains(query, "SymphonyLinearHandoffStates"):
+			writeJSON(t, w, map[string]any{"data": map[string]any{"team": map[string]any{"id": "team-1", "states": map[string]any{"nodes": []any{
+				map[string]string{"id": "todo", "name": "Todo"}, map[string]string{"id": "in-progress", "name": "In Progress"},
+			}}}}})
+		case strings.Contains(query, "SymphonyLinearHandoffTransition"):
+			state = "In Progress"
+			writeJSON(t, w, map[string]any{"data": map[string]any{"issueUpdate": map[string]bool{"success": true}}})
+		default:
+			t.Errorf("unexpected query: %s", query)
+		}
+	}))
+	defer server.Close()
+	settings := config.Settings{Tracker: config.Tracker{
+		Provider:     map[string]any{"api_key": "test-token", "project_slug_id": "project-1", "endpoint": server.URL},
+		ActiveStates: []string{"Todo", "In Progress"}, TerminalStates: []string{"Done"},
+	}}
+	tracker := New(func() config.Settings { return settings })
+	var logs bytes.Buffer
+	tracker.SetLogger(slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+
+	if err := tracker.Transition(context.Background(), domain.Issue{ID: "active", State: "Todo"}, "In Progress"); err != nil {
+		t.Fatalf("transition: %v", err)
+	}
+	edge := findLogRecord(t, &logs, "Linear transition")
+	if edge["operation"] != "transition" || edge["from_state"] != "Todo" || edge["to_state"] != "In Progress" || edge["issue_identifier"] != "PMR-5" {
+		t.Fatalf("edge record missing operation/from/to/issue: %v", edge)
+	}
+
+	// The issue is now In Progress; an idempotent call must record a skip at
+	// debug level, still carrying the operation and issue for reconstruction.
+	if err := tracker.Transition(context.Background(), domain.Issue{ID: "active", State: "Todo"}, "In Progress"); err != nil {
+		t.Fatalf("idempotent transition: %v", err)
+	}
+	skip := findLogRecord(t, &logs, "Linear transition skipped")
+	if skip["operation"] != "transition" || skip["to_state"] != "In Progress" || skip["issue_identifier"] != "PMR-5" {
+		t.Fatalf("skip record missing operation/to/issue: %v", skip)
+	}
+}
+
+// findLogRecord returns the first JSON log line in buf whose msg equals want.
+func findLogRecord(t *testing.T, buf *bytes.Buffer, want string) map[string]any {
+	t.Helper()
+	for _, line := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		var record map[string]any
+		if err := json.Unmarshal([]byte(line), &record); err != nil {
+			t.Fatalf("decode log line %q: %v", line, err)
+		}
+		if record["msg"] == want {
+			return record
+		}
+	}
+	t.Fatalf("no %q log record in: %s", want, buf.String())
+	return nil
 }
 
 func TestTransitionRejectsIssueOutsideConfiguredProject(t *testing.T) {

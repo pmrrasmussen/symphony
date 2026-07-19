@@ -633,10 +633,10 @@ func (c *Coordinator) transitionToStarted(ctx context.Context, i domain.Issue, s
 		return
 	}
 	if err := c.tracker.Transition(ctx, i, target); err != nil {
-		c.log.Warn("dispatch start transition failed", "issue_id", i.ID, "issue_identifier", i.Identifier, "from_state", norm(i.State), "to_state", norm(target), "error", err)
+		c.log.Warn("dispatch start transition failed", "operation", "start_transition", "issue_id", i.ID, "issue_identifier", i.Identifier, "from_state", norm(i.State), "to_state", norm(target), "error", err)
 		return
 	}
-	c.log.Info("issue moved to started state", "issue_id", i.ID, "issue_identifier", i.Identifier, "from_state", norm(i.State), "to_state", norm(target))
+	c.log.Info("issue moved to started state", "operation", "start_transition", "issue_id", i.ID, "issue_identifier", i.Identifier, "from_state", norm(i.State), "to_state", norm(target))
 }
 
 func (c *Coordinator) runTurns(ctx context.Context, r *running, events <-chan domain.Event, settings config.Settings) (ended bool, current domain.Issue, err error) {

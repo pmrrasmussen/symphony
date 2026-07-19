@@ -650,6 +650,56 @@ func TestHandoffRejectsInvalidAndCrossScopeInputs(t *testing.T) {
 	}
 }
 
+func TestAgentTransitionLogsOperationAndEdge(t *testing.T) {
+	f := newHandoffFixture(t)
+	settings := f.settings()
+	settings.Tracker.HandoffState = ""
+	settings.Tracker.AgentTransitions = map[string]string{"Todo": "In Progress"}
+	h := NewHandoff(func() config.Settings { return settings })
+	var logs bytes.Buffer
+	h.SetLogger(slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	session, err := h.Prepare(context.Background(), domain.Issue{ID: "active"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := callTransition(session, "In Progress"); err != nil {
+		t.Fatal(err)
+	}
+	edge := findLogRecord(t, &logs, "Linear transition")
+	if edge["operation"] != "transition" || edge["from_state"] != "Todo" || edge["to_state"] != "In Progress" || edge["issue_identifier"] != "PMR-18" {
+		t.Fatalf("agent transition edge missing operation/from/to/issue: %v", edge)
+	}
+	// A duplicate call is an idempotent no-op that records a debug skip.
+	logs.Reset()
+	if _, err := callTransition(session, "In Progress"); err != nil {
+		t.Fatal(err)
+	}
+	skip := findLogRecord(t, &logs, "Linear transition skipped")
+	if skip["operation"] != "transition" || skip["from_state"] != "In Progress" || skip["issue_identifier"] != "PMR-18" {
+		t.Fatalf("agent transition skip missing operation/from/issue: %v", skip)
+	}
+}
+
+func TestHandoffLogsOperationAndEdge(t *testing.T) {
+	f := newHandoffFixture(t)
+	var logs bytes.Buffer
+	session := f.session(t, slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	if err := callHandoff(session); err != nil {
+		t.Fatal(err)
+	}
+	edge := findLogRecord(t, &logs, "Linear transition")
+	if edge["operation"] != "handoff" || edge["from_state"] != "Todo" || edge["to_state"] != "In Review" || edge["issue_identifier"] != "PMR-18" {
+		t.Fatalf("handoff edge missing operation/from/to/issue: %v", edge)
+	}
+	// The edge must be redaction-safe: state names only, no rendered comment,
+	// issue description, or credential.
+	for _, secret := range []string{"test-token", "private agent payload", "Ready PMR-18"} {
+		if strings.Contains(logs.String(), secret) {
+			t.Fatalf("handoff edge log leaked %q: %s", secret, logs.String())
+		}
+	}
+}
+
 func TestHandoffLogsOnlySafeContextAndTrimsCommentInput(t *testing.T) {
 	f := newHandoffFixture(t)
 	var logs bytes.Buffer

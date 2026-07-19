@@ -35,6 +35,15 @@ func (h *Handoff) Enabled() bool {
 	return h.settings().LinearSessionCapabilityEnabled()
 }
 
+// SetLogger routes the handoff (and every session it prepares) at the operator
+// log handler instead of the process default, so bounded transition/handoff
+// edge records land in the same structured log as the rest of the run.
+func (h *Handoff) SetLogger(logger *slog.Logger) {
+	if logger != nil {
+		h.logger = logger
+	}
+}
+
 // Prepare verifies that the issue is still in the configured project, finds
 // the configured team's target state, and freezes the policy for one session.
 // No Codex child is started when this fails.
@@ -219,6 +228,7 @@ func (s *HandoffSession) agentTransition(ctx context.Context, destination string
 	}
 	if s.isTransitionDestination(current, destination) {
 		s.issue = current
+		s.logSkip("transition", current.State.Name)
 		return current, nil
 	}
 	if _, err := s.validateTransition(ctx, current, destination); err != nil {
@@ -234,12 +244,14 @@ func (s *HandoffSession) agentTransition(ctx context.Context, destination string
 	}
 	if s.isTransitionDestination(current, destination) {
 		s.issue = current
+		s.logSkip("transition", current.State.Name)
 		return current, nil
 	}
 	targetID, err := s.validateTransition(ctx, current, destination)
 	if err != nil {
 		return handoffIssue{}, err
 	}
+	fromState := current.State.Name
 	if err := s.transitionTo(ctx, targetID); err != nil {
 		return handoffIssue{}, err
 	}
@@ -251,7 +263,7 @@ func (s *HandoffSession) agentTransition(ctx context.Context, destination string
 		return handoffIssue{}, trackerError("handoff_response", "Linear did not apply the configured transition")
 	}
 	s.issue = updated
-	s.log("agent_transition_complete")
+	s.logEdge("transition", fromState, updated.State.Name)
 	return updated, nil
 }
 
@@ -355,6 +367,7 @@ func (s *HandoffSession) handoffLocked(ctx context.Context) error {
 		}
 	}
 	if s.isTargetState(current) && commented {
+		s.logSkip("handoff", current.State.Name)
 		return nil
 	}
 	if !commented {
@@ -372,12 +385,18 @@ func (s *HandoffSession) handoffLocked(ctx context.Context) error {
 		}
 	}
 	if s.isTargetState(current) {
+		s.logSkip("handoff", current.State.Name)
 		return nil
 	}
 	if err := s.ensureMutable(ctx); err != nil {
 		return err
 	}
-	return s.transition(ctx)
+	fromState := current.State.Name
+	if err := s.transition(ctx); err != nil {
+		return err
+	}
+	s.logEdge("handoff", fromState, s.settings.Tracker.HandoffState)
+	return nil
 }
 
 // EnsureActive revalidates the session-bound issue immediately before a
@@ -456,7 +475,7 @@ func (s *HandoffSession) RefuseLanding(ctx context.Context, mergeState string) (
 		return false, trackerError("handoff_response", "Linear did not apply the configured Merging fallback transition")
 	}
 	s.issue = updated
-	s.log("github_land_refused_to_review")
+	s.logEdge("landing_refused", mergeState, target)
 	return true, nil
 }
 
@@ -495,7 +514,7 @@ func (s *HandoffSession) CompleteLanding(ctx context.Context, mergeState string)
 	if err := s.transitionTo(ctx, doneID); err != nil {
 		return false, err
 	}
-	s.log("github_land_completed")
+	s.logEdge("landing_completed", current.State.Name, doneName)
 	return true, nil
 }
 
@@ -543,7 +562,7 @@ func (s *HandoffSession) ReconcileMerged(ctx context.Context, mergeState string)
 	if err := s.transitionTo(ctx, doneID); err != nil {
 		return false, err
 	}
-	s.log("github_merge_reconciled")
+	s.logEdge("merge_reconciled", current.State.Name, doneName)
 	return true, nil
 }
 
@@ -629,7 +648,7 @@ func (s *HandoffSession) Complete(ctx context.Context) (bool, error) {
 	if err := s.transitionTo(ctx, doneID); err != nil {
 		return false, err
 	}
-	s.log("github_merge_completed")
+	s.logEdge("review_completed", current.State.Name, doneName)
 	return true, nil
 }
 
@@ -638,6 +657,40 @@ func (s *HandoffSession) log(outcome string) {
 		return
 	}
 	s.logger.Info("Linear handoff", "outcome", outcome, "issue_id", s.issue.ID, "issue_identifier", s.issue.Identifier)
+}
+
+// logEdge records one performed Linear state change so a tracker transition is
+// reconstructable from Symphony's logs alone: the operation, the from/to state
+// NAMES, and the bound issue. It is deliberately redaction-safe — state names
+// and issue identifiers only, never a rendered comment, prompt, or issue text.
+func (s *HandoffSession) logEdge(operation, fromState, toState string) {
+	if s.logger == nil {
+		return
+	}
+	s.logger.Info("Linear transition",
+		"operation", operation,
+		"from_state", strings.TrimSpace(fromState),
+		"to_state", strings.TrimSpace(toState),
+		"issue_id", s.issue.ID,
+		"issue_identifier", s.issue.Identifier,
+	)
+}
+
+// logSkip records, at debug level, an idempotent transition that was a no-op
+// because the issue was already in the requested state. Actual state changes
+// use logEdge at info level; a skip changes nothing and stays out of the info
+// log. State names only, like logEdge.
+func (s *HandoffSession) logSkip(operation, state string) {
+	if s.logger == nil {
+		return
+	}
+	s.logger.Debug("Linear transition skipped",
+		"operation", operation,
+		"from_state", strings.TrimSpace(state),
+		"to_state", strings.TrimSpace(state),
+		"issue_id", s.issue.ID,
+		"issue_identifier", s.issue.Identifier,
+	)
 }
 
 // ensureMutable re-reads the bound issue immediately before each mutation. A
