@@ -169,6 +169,9 @@ func (b *Backend) Cancel(ctx context.Context, s domain.AgentSession) error {
 	if c == nil {
 		return nil
 	}
+	// A hard cancel may pre-empt turn/completed, so finalize the deferred
+	// landing refusal here too. It is idempotent and a no-op when unused.
+	c.finalizeLanding()
 	c.kill()
 	select {
 	case <-c.exited:
@@ -569,6 +572,7 @@ func (c *client) handle(x rpc) {
 		return
 	}
 	if method == "turn/completed" {
+		c.finalizeLanding()
 		if usage := usageFrom(x.Params); usage != (domain.Usage{}) {
 			c.emit(domain.Event{Kind: domain.EventUsage, At: time.Now(), Usage: usage})
 		}
@@ -576,6 +580,7 @@ func (c *client) handle(x rpc) {
 		return
 	}
 	if method == "turn/failed" || method == "turn/cancelled" {
+		c.finalizeLanding()
 		c.emit(domain.Event{Kind: domain.EventFailed, At: time.Now(), Message: method})
 		return
 	}
@@ -753,6 +758,16 @@ func (c *client) handleToolCall(x rpc) {
 		result, err := c.github.Land(c.ctx)
 		if err != nil {
 			c.emitCallFinished(callID, "github_land_pr", domain.ItemFailed, started)
+			// A retryable landing gate is non-terminal: name the exact gate so
+			// Codex can fix it, push, and call github_land_pr again in this turn.
+			// Every reason is a fixed/config-derived, bounded, secret-free string
+			// defined in the github package. Any other error keeps the generic
+			// refusal message.
+			var gate *githubhost.LandGateError
+			if errors.As(err, &gate) && gate.Retryable {
+				c.toolFailure(x.ID, "GitHub landing needs a fix: "+gate.Reason+".")
+				return
+			}
 			c.toolFailure(x.ID, "GitHub pull request landing was rejected.")
 			return
 		}
@@ -826,6 +841,16 @@ func callIDText(id any) string {
 
 func (c *client) unsupportedTool(id any) {
 	c.toolFailure(id, "Unsupported client-side tool.")
+}
+
+// finalizeLanding fires the deferred Merging -> In Review transition once when
+// a Codex turn ends after a retryable github_land_pr gate but without a
+// successful landing. It is a safe no-op when there is no bound GitHub session,
+// when the bounded-fix feature is off, or when landing already resolved.
+func (c *client) finalizeLanding() {
+	if c.github != nil {
+		c.github.FinalizeLanding(c.ctx)
+	}
 }
 
 // Tool failures are normal app-server responses: the model can inspect the

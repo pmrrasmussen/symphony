@@ -75,6 +75,10 @@ type fakeLinear struct {
 	reconcileErr    error
 	reconciled      int
 	reconciledState string
+
+	// Bounded-fix (PMR-46) audit/refusal comments captured via LandComment.
+	commentErr   error
+	landComments []string
 }
 
 func (l *fakeLinear) EnsureActive(context.Context) error { return l.activeErr }
@@ -128,6 +132,16 @@ func (l *fakeLinear) RefuseLanding(_ context.Context, mergeState string) (bool, 
 	l.refused++
 	l.refusedDestState = mergeState
 	return true, nil
+}
+
+func (l *fakeLinear) LandComment(_ context.Context, body string) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.commentErr != nil {
+		return l.commentErr
+	}
+	l.landComments = append(l.landComments, body)
+	return nil
 }
 
 func (l *fakeLinear) CompleteLanding(context.Context, string) (bool, error) {
@@ -188,6 +202,9 @@ type apiFixture struct {
 	updateBranchFails         bool
 	updateBranchHead          string
 	clearChecksOnBranchUpdate bool
+
+	// Bounded-fix (PMR-46) audit comments posted to the PR issue thread.
+	prComments []string
 }
 
 func newAPI(t *testing.T) *apiFixture {
@@ -313,6 +330,15 @@ func (f *apiFixture) serve(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/issues/7/comments":
 		encoded, _ := json.Marshal(f.comments)
 		_, _ = w.Write(encoded)
+	case r.Method == http.MethodPost && r.URL.Path == "/repos/owner/repo/issues/7/comments":
+		var body map[string]any
+		if json.NewDecoder(r.Body).Decode(&body) != nil {
+			f.t.Errorf("issue comment body decode failed")
+		}
+		text, _ := body["body"].(string)
+		f.prComments = append(f.prComments, text)
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"id":1}`))
 	case r.Method == http.MethodPost && r.URL.Path == "/graphql":
 		if f.graphqlErr {
 			encoded, _ := json.Marshal(map[string]any{"errors": []map[string]any{{"message": "boom"}}})
@@ -1110,6 +1136,268 @@ func (g *alwaysStaleBaseGit) Run(ctx context.Context, dir string, args, env []st
 	return g.fakeGit.Run(ctx, dir, args, env)
 }
 
+// fixPushGit simulates a Codex fix turn whose worktree HEAD (head) advances
+// between landing attempts; a push then syncs the fixture PR head to it, so a
+// retry after a fix exercises the push-before-land + audit-comment path.
+type fixPushGit struct {
+	*fakeGit
+	api  *apiFixture
+	head string
+}
+
+func (g *fixPushGit) Run(ctx context.Context, dir string, args, env []string) (string, error) {
+	if args[0] == "rev-parse" && len(args) > 1 && args[1] == "HEAD" {
+		return g.head, nil
+	}
+	if args[0] == "push" {
+		g.api.mu.Lock()
+		g.api.prSHA = g.head
+		g.api.mu.Unlock()
+	}
+	return g.fakeGit.Run(ctx, dir, args, env)
+}
+
+func failingChecks(name string) []map[string]any {
+	return []map[string]any{{"name": name, "status": "completed", "conclusion": "failure"}}
+}
+
+// TestLandFeatureOffRefusesRetryableGateImmediately pins feature-off parity: a
+// gate that would be retryable when the bounded-fix feature is on must, with it
+// off, refuse immediately exactly as before -- a plain error, one Merging
+// fallback transition, no fix counter, and no audit/refusal comments.
+func TestLandFeatureOffRefusesRetryableGateImmediately(t *testing.T) {
+	api, git, linear := newAPI(t), &fakeGit{}, &fakeLinear{}
+	api.prExists = true
+	api.checkRuns = failingChecks("ci/build")
+	_, session := testLandingSession(t, api, git, linear, []string{"ci/build"}, "merge")
+	_, err := session.Land(context.Background())
+	var gate *LandGateError
+	if err == nil || errors.As(err, &gate) {
+		t.Fatalf("feature-off gate must be a plain immediate refusal, got err=%v", err)
+	}
+	if !strings.Contains(err.Error(), "required checks failed") {
+		t.Fatalf("error=%v", err)
+	}
+	if linear.refused != 1 || linear.refusedDestState != "Merging" {
+		t.Fatalf("refused=%d dest=%q", linear.refused, linear.refusedDestState)
+	}
+	if len(linear.landComments) != 0 || len(api.prComments) != 0 {
+		t.Fatalf("feature-off posted comments: linear=%v pr=%v", linear.landComments, api.prComments)
+	}
+	if session.landAttempts != 0 || session.retryableGateHit {
+		t.Fatalf("feature-off touched fix state: attempts=%d hit=%v", session.landAttempts, session.retryableGateHit)
+	}
+}
+
+// TestLandFailingCheckFixSucceeds exercises a retryable failing-check gate: the
+// first call returns a non-terminal LandGateError naming the gate without any
+// transition, and after the checks turn green the same session lands.
+func TestLandFailingCheckFixSucceeds(t *testing.T) {
+	api, git, linear := newAPI(t), &fakeGit{}, &fakeLinear{}
+	api.prExists = true
+	api.checkRuns = failingChecks("ci/build")
+	readyToLand(api)
+	_, session := testLandingSession(t, api, git, linear, []string{"ci/build"}, "merge")
+	session.settings.LandFixEnabled = true
+	session.settings.MaxLandAttempts = 2
+
+	_, err := session.Land(context.Background())
+	var gate *LandGateError
+	if !errors.As(err, &gate) || !gate.Retryable || !strings.Contains(gate.Reason, "required checks failed") {
+		t.Fatalf("first attempt must be a retryable gate, got err=%v", err)
+	}
+	if linear.refused != 0 || api.merges != 0 {
+		t.Fatalf("retryable gate must defer the transition: refused=%d merges=%d", linear.refused, api.merges)
+	}
+
+	api.mu.Lock()
+	api.checkRuns = []map[string]any{{"name": "ci/build", "status": "completed", "conclusion": "success"}}
+	api.mu.Unlock()
+	result, err := session.Land(context.Background())
+	if err != nil || result.Status != LandMerged {
+		t.Fatalf("fixed landing result=%+v err=%v", result, err)
+	}
+	if api.merges != 1 || linear.landCompleted != 1 || linear.refused != 0 {
+		t.Fatalf("merges=%d completed=%d refused=%d", api.merges, linear.landCompleted, linear.refused)
+	}
+	if len(linear.landComments) != 0 || len(api.prComments) != 0 {
+		t.Fatalf("no commits were pushed, so no audit comment should exist: linear=%v pr=%v", linear.landComments, api.prComments)
+	}
+}
+
+// TestLandConflictFixSucceedsWithAuditComment exercises the conflict path
+// (retryable only with allow_conflict_resolution): the first call defers, the
+// fix pushes new commits, and the push is audited to both the Linear issue and
+// the GitHub PR before the merge.
+func TestLandConflictFixSucceedsWithAuditComment(t *testing.T) {
+	api, linear := newAPI(t), &fakeLinear{}
+	api.prExists = true
+	passingRequiredChecks(api, "ci/build")
+	readyToLand(api)
+	api.mergeable = boolPtr(false)
+	api.mergeableState = "dirty"
+	git := &fixPushGit{fakeGit: &fakeGit{}, api: api, head: "head"}
+	_, session := testLandingSession(t, api, git, linear, []string{"ci/build"}, "merge")
+	session.settings.LandFixEnabled = true
+	session.settings.MaxLandAttempts = 2
+	session.settings.AllowConflictResolution = true
+
+	_, err := session.Land(context.Background())
+	var gate *LandGateError
+	if !errors.As(err, &gate) || !gate.Retryable || !strings.Contains(gate.Reason, "conflicts") {
+		t.Fatalf("conflict must be a retryable gate here, got err=%v", err)
+	}
+	if linear.refused != 0 || api.merges != 0 {
+		t.Fatalf("refused=%d merges=%d", linear.refused, api.merges)
+	}
+
+	api.mu.Lock()
+	api.mergeable = boolPtr(true)
+	api.mergeableState = "clean"
+	api.mu.Unlock()
+	git.head = "fixedhead"
+
+	result, err := session.Land(context.Background())
+	if err != nil || result.Status != LandMerged {
+		t.Fatalf("fixed landing result=%+v err=%v", result, err)
+	}
+	if api.merges != 1 || linear.landCompleted != 1 {
+		t.Fatalf("merges=%d completed=%d", api.merges, linear.landCompleted)
+	}
+	if len(linear.landComments) != 1 || len(api.prComments) != 1 {
+		t.Fatalf("expected one audit comment each: linear=%v pr=%v", linear.landComments, api.prComments)
+	}
+	if linear.landComments[0] != api.prComments[0] {
+		t.Fatalf("audit comment bodies differ: linear=%q pr=%q", linear.landComments[0], api.prComments[0])
+	}
+	if !strings.Contains(linear.landComments[0], "PMR-27") || !strings.Contains(linear.landComments[0], "fixedhead") {
+		t.Fatalf("audit comment missing identifier or SHA: %q", linear.landComments[0])
+	}
+}
+
+// TestLandConflictRefusesImmediatelyWhenResolutionNotAllowed confirms a merge
+// conflict stays a hard immediate refusal (never a retryable gate) unless
+// allow_conflict_resolution is set, even with the fix feature enabled.
+func TestLandConflictRefusesImmediatelyWhenResolutionNotAllowed(t *testing.T) {
+	api, git, linear := newAPI(t), &fakeGit{}, &fakeLinear{}
+	api.prExists = true
+	passingRequiredChecks(api, "ci/build")
+	readyToLand(api)
+	api.mergeable = boolPtr(false)
+	api.mergeableState = "dirty"
+	_, session := testLandingSession(t, api, git, linear, []string{"ci/build"}, "merge")
+	session.settings.LandFixEnabled = true
+	session.settings.MaxLandAttempts = 2
+	// AllowConflictResolution stays false.
+	_, err := session.Land(context.Background())
+	var gate *LandGateError
+	if err == nil || errors.As(err, &gate) || !strings.Contains(err.Error(), "conflicts") {
+		t.Fatalf("conflict without resolution opt-in must refuse immediately, got err=%v", err)
+	}
+	if linear.refused != 1 || len(linear.landComments) != 0 {
+		t.Fatalf("refused=%d comments=%v", linear.refused, linear.landComments)
+	}
+}
+
+// TestLandExhaustionRefusesOnceWithGateComment drives a retryable gate past the
+// attempt budget: the final call fires the Merging -> In Review transition once
+// plus a comment naming the last failed gate, and never merges.
+func TestLandExhaustionRefusesOnceWithGateComment(t *testing.T) {
+	api, git, linear := newAPI(t), &fakeGit{}, &fakeLinear{}
+	api.prExists = true
+	api.checkRuns = failingChecks("ci/build")
+	_, session := testLandingSession(t, api, git, linear, []string{"ci/build"}, "merge")
+	session.settings.LandFixEnabled = true
+	session.settings.MaxLandAttempts = 1
+
+	_, err := session.Land(context.Background())
+	var gate *LandGateError
+	if !errors.As(err, &gate) {
+		t.Fatalf("first attempt must be granted as a retryable gate, got err=%v", err)
+	}
+	if linear.refused != 0 {
+		t.Fatalf("granted attempt must not transition: refused=%d", linear.refused)
+	}
+
+	_, err = session.Land(context.Background())
+	if err == nil || errors.As(err, &gate) {
+		t.Fatalf("exhausted attempt must be a plain refusal, got err=%v", err)
+	}
+	if linear.refused != 1 || linear.refusedDestState != "Merging" {
+		t.Fatalf("refused=%d dest=%q", linear.refused, linear.refusedDestState)
+	}
+	if len(linear.landComments) != 1 || !strings.Contains(linear.landComments[0], "required checks failed") {
+		t.Fatalf("exhaustion comment=%v", linear.landComments)
+	}
+	if api.merges != 0 {
+		t.Fatalf("exhaustion must never merge: merges=%d", api.merges)
+	}
+}
+
+// TestLandFinalizeAfterTurnEnd covers a turn that ends after a retryable gate
+// but before landing: FinalizeLanding fires the deferred transition and comment
+// exactly once and is a safe no-op on repeat.
+func TestLandFinalizeAfterTurnEnd(t *testing.T) {
+	api, git, linear := newAPI(t), &fakeGit{}, &fakeLinear{}
+	api.prExists = true
+	api.checkRuns = failingChecks("ci/build")
+	_, session := testLandingSession(t, api, git, linear, []string{"ci/build"}, "merge")
+	session.settings.LandFixEnabled = true
+	session.settings.MaxLandAttempts = 2
+
+	_, err := session.Land(context.Background())
+	var gate *LandGateError
+	if !errors.As(err, &gate) {
+		t.Fatalf("attempt must be a retryable gate, got err=%v", err)
+	}
+	if linear.refused != 0 {
+		t.Fatalf("gate deferred the transition, yet refused=%d", linear.refused)
+	}
+
+	session.FinalizeLanding(context.Background())
+	if linear.refused != 1 || linear.refusedDestState != "Merging" {
+		t.Fatalf("finalize did not fire the transition: refused=%d", linear.refused)
+	}
+	if len(linear.landComments) != 1 || !strings.Contains(linear.landComments[0], "required checks failed") {
+		t.Fatalf("finalize comment=%v", linear.landComments)
+	}
+	session.FinalizeLanding(context.Background())
+	if linear.refused != 1 || len(linear.landComments) != 1 {
+		t.Fatalf("finalize must be idempotent: refused=%d comments=%v", linear.refused, linear.landComments)
+	}
+}
+
+// TestLandNonRetryableGateRefusesImmediatelyEvenWithFixEnabled confirms a
+// non-retryable gate (changes-requested) refuses immediately with the feature
+// on, grants no fix attempt, and leaves FinalizeLanding a no-op.
+func TestLandNonRetryableGateRefusesImmediatelyEvenWithFixEnabled(t *testing.T) {
+	api, git, linear := newAPI(t), &fakeGit{}, &fakeLinear{}
+	api.prExists = true
+	passingRequiredChecks(api, "ci/build")
+	api.reviews = []map[string]any{
+		{"user": map[string]any{"login": "alice"}, "state": "APPROVED", "body": "lgtm", "submitted_at": "t1"},
+		{"user": map[string]any{"login": "bob"}, "state": "CHANGES_REQUESTED", "body": "no", "submitted_at": "t2"},
+	}
+	api.mergeable = boolPtr(true)
+	_, session := testLandingSession(t, api, git, linear, []string{"ci/build"}, "merge")
+	session.settings.LandFixEnabled = true
+	session.settings.MaxLandAttempts = 2
+	session.settings.AllowConflictResolution = true
+
+	_, err := session.Land(context.Background())
+	var gate *LandGateError
+	if err == nil || errors.As(err, &gate) || !strings.Contains(err.Error(), "changes-requested") {
+		t.Fatalf("non-retryable gate must refuse immediately, got err=%v", err)
+	}
+	if linear.refused != 1 || session.landAttempts != 0 || session.retryableGateHit {
+		t.Fatalf("refused=%d attempts=%d hit=%v", linear.refused, session.landAttempts, session.retryableGateHit)
+	}
+	session.FinalizeLanding(context.Background())
+	if linear.refused != 1 || len(linear.landComments) != 0 {
+		t.Fatalf("finalize after an immediate refusal must be a no-op: refused=%d comments=%v", linear.refused, linear.landComments)
+	}
+}
+
 func TestLandRefusesOnDivergedWorktreeHead(t *testing.T) {
 	api, linear := newAPI(t), &fakeLinear{}
 	api.prExists, api.prSHA = true, "old-head"
@@ -1154,6 +1442,11 @@ func TestLandPushesNewLocalCommitsBeforeLanding(t *testing.T) {
 	base.mu.Unlock()
 	if !foundPush {
 		t.Fatal("new local commits were not pushed before landing")
+	}
+	// Feature-off parity: pushing new commits during landing must not post any
+	// audit comment. The bounded-fix audit trail is gated behind LandFixEnabled.
+	if len(linear.landComments) != 0 || len(api.prComments) != 0 {
+		t.Fatalf("feature-off push posted comments: linear=%v pr=%v", linear.landComments, api.prComments)
 	}
 }
 
