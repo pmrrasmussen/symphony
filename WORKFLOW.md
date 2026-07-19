@@ -7,7 +7,9 @@ tracker:
     # Set this to an absolute path for a mode-600 file outside the repository.
     api_key_file: $SYMPHONY_LINEAR_API_KEY_FILE
     # Exact state edges a bound Codex session may request. These are not a
-    # general destination allowlist.
+    # general destination allowlist. Todo -> In Progress starts implementation;
+    # Merging -> In Review is the fallback github_land_pr uses when a landing
+    # attempt hits a hard gate (see github.merge_state below).
     agent_transitions:
       Todo: In Progress
       Merging: In Review
@@ -17,12 +19,20 @@ tracker:
     # decomposing one task into several independently reviewable pull
     # requests: normally one child issue per isolated worktree and PR.
     # child_issue_creation: true
-    # Enables the scoped github_publish_pr/github_pr_context handoff tools
-    # below for the bound issue only. Single-agent bootstrap stage (PMR-36):
-    # Merging is not an active state yet, so only Todo and In Progress are
-    # ever dispatched, and no session can move an issue past In Review.
+    # Enables the scoped github_publish_pr/github_pr_context handoff tools for
+    # the bound issue. In Review is the single, fixed human-controlled review
+    # state: it is deliberately excluded from active_states below, so it is
+    # never dispatched, and it is the only state any Codex session can move an
+    # issue into.
     handoff_state: In Review
-  active_states: [Todo, In Progress]
+  # The canonical lifecycle (PMR-38): Todo -> In Progress -> In Review <->
+  # Rework -> Merging -> Done. Rework and Merging are active/dispatchable so a
+  # human can resume implementation after requesting changes, or dispatch a
+  # landing agent, from the same worktree and branch. In Review stays
+  # human-controlled and non-dispatchable. See WORKFLOW.md's prompt body below
+  # for the full per-state playbook; it is this repository's single
+  # executable source of delivery policy.
+  active_states: [Todo, In Progress, Rework, Merging]
   terminal_states: [Done, Canceled]
 polling:
   interval_ms: 30000
@@ -33,10 +43,13 @@ workspace:
 hooks:
   timeout_ms: 60000
 agent:
-  # Develop this repository one issue at a time by default. Two-agent
-  # operation is deliberately deferred until coordinator conformance and
-  # final rollout (PMR-38).
-  max_concurrent_agents: 1
+  # Two-agent operation (PMR-38): one implementation/rework agent may run
+  # concurrently with one landing agent. max_concurrent_agents_by_state caps
+  # Merging at exactly one landing agent even though two agents are allowed
+  # overall.
+  max_concurrent_agents: 2
+  max_concurrent_agents_by_state:
+    Merging: 1
   max_turns: 20
 codex:
   command: codex app-server
@@ -45,25 +58,97 @@ codex:
   turn_timeout_ms: 3600000
   read_timeout_ms: 5000
   stall_timeout_ms: 300000
-# Host-side GitHub PR handoff, fixed to this repository only (PMR-36). The
-# token is host-side and repository-scoped: it is read once from a mode-600
-# file outside the repository via $SYMPHONY_GITHUB_TOKEN_FILE, is never
-# committed, and Symphony strips it (and any inherited environment value
-# containing it) from the Codex child process. See README.md for the
-# fine-grained token's required scopes and permissions.
+# Host-side GitHub PR handoff and landing, fixed to this repository only
+# (PMR-36, PMR-37). The token is host-side and repository-scoped: it is read
+# once from a mode-600 file outside the repository via
+# $SYMPHONY_GITHUB_TOKEN_FILE, is never committed, and Symphony strips it (and
+# any inherited environment value containing it) from the Codex child
+# process. See README.md for the fine-grained token's required scopes and
+# permissions.
 github:
   owner: pmrrasmussen
   repository: symphony
   base_branch: main
   token_file: $SYMPHONY_GITHUB_TOKEN_FILE
   poll_interval_ms: 30000
+  # Landing capability (PMR-37, activated for real dispatch by PMR-38). A
+  # session bound to an issue currently in Merging receives the zero-argument
+  # github_land_pr tool; moving the issue to Merging is itself the human
+  # approval to land. required_checks names the exact GitHub check names this
+  # repository's CI reports (the job names in .github/workflows/ci.yml).
+  merge_state: Merging
+  merge_method: merge
+  required_checks:
+    - scripts/check format
+    - scripts/check test
+    - scripts/check vet
+    - scripts/check race
 ---
 Work on {{.issue.identifier}}: {{.issue.title}}
 
 {{.issue.description}}
 
-Follow the repository instructions. If the linear_graphql transition
-operation is available and this issue is still in Todo, move it to In
-Progress before you start implementing. Make a focused, validated change
-with a clean local commit, then follow the delivery-mode instructions
-supplied by Symphony below to hand the work off for review.
+Current Linear state: {{.issue.state}}
+
+Follow the repository instructions in AGENTS.md, README.md, and WORKFLOW.md.
+WORKFLOW.md is the single executable source of delivery policy: the
+state-specific guidance below is generated from it for this issue's current
+state.
+{{if eq .issue.state "Todo"}}
+## Start
+- If the linear_graphql transition operation is available, move this issue
+  from Todo to In Progress before you make any change.
+{{end}}
+{{if or (eq .issue.state "Todo") (eq .issue.state "In Progress")}}
+## Implementation and validation
+- Implement a focused, validated change for this issue. Run the narrowest
+  relevant check first (for example, one package's tests), then
+  `scripts/check all` once shared behavior changes.
+- Create a clean local commit once validation passes; do not leave
+  uncommitted or untracked changes in the worktree.
+
+## Review handoff
+- Follow the delivery-mode instructions Symphony supplies below (host-side
+  publish via github_publish_pr, or the manual fallback) once the change is
+  committed and validated. Publishing hands the issue to human review in In
+  Review; never attempt to merge or move the issue past review yourself.
+{{end}}
+{{if eq .issue.state "Rework"}}
+## Rework
+- A human moved this issue back to Rework with feedback on its pull request.
+  Resume in this same worktree, branch, and prior commit history; do not
+  start over, discard history, or create a new branch.
+- Read the requested changes (for example via github_pr_context, which
+  reports bounded check status, review state, and unresolved feedback), then
+  address them and validate again the same way as above: the narrowest
+  relevant check first, then `scripts/check all` once shared behavior
+  changes.
+- Call github_publish_pr again once the worktree is clean and committed. It
+  reuses the existing deterministic pull request and hands the issue back to
+  In Review, unless the pull request was merged (irrecoverable) or closed and
+  could not be reopened; report either outcome as a blocker instead of
+  creating a new pull request yourself.
+{{end}}
+{{if eq .issue.state "Merging"}}
+## Landing
+- A human moved this issue to Merging: that move is itself the approval to
+  land, so no separate approving review is required.
+- Call github_land_pr with no arguments. It re-verifies the worktree,
+  branch, pull request, required checks, effective review state, unresolved
+  review threads, mergeability, and the base branch immediately before the
+  irreversible merge call.
+
+## Hard landing blockers
+- A pending-checks result is not an error: take no further action. A later
+  Merging dispatch retries automatically once checks settle.
+- Any other refusal (a failing check, an effective changes-requested review,
+  an unresolved review thread, a stale base, a merge conflict, or a closed or
+  mismatched pull request) has already returned this issue to In Review for a
+  human; do not retry the merge yourself or transition the issue directly.
+  Report the refusal reason as a blocker.
+
+## Completion
+- A successful merge, or a pull request GitHub already reports merged,
+  transitions this issue to Done automatically. Take no further Linear action
+  yourself once github_land_pr reports a merged result.
+{{end}}

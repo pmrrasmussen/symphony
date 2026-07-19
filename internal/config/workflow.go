@@ -667,8 +667,14 @@ func githubLandingPolicy(github map[string]any, activeStates, terminalStates []s
 	if !ok || state == "" {
 		return "", "", nil, errors.New("invalid configuration: github.merge_state must be a non-empty string")
 	}
-	if stateInList(state, activeStates) {
-		return "", "", nil, errors.New("invalid configuration: github.merge_state must not be an active state")
+	// merge_state must be an active/dispatchable state (the canonical
+	// lifecycle's Merging): a session must actually be dispatched for that
+	// issue before it can be bound and receive the zero-argument
+	// github_land_pr tool (see codex/backend.go). It must never be terminal or
+	// coincide with handoff_state, either of which would make the landing gate
+	// unreachable or ambiguous.
+	if !stateInList(state, activeStates) {
+		return "", "", nil, errors.New("invalid configuration: github.merge_state must be an active state")
 	}
 	if stateInList(state, terminalStates) {
 		return "", "", nil, errors.New("invalid configuration: github.merge_state must not be a terminal state")

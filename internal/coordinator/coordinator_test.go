@@ -1385,6 +1385,7 @@ func TestReconciliationRefreshesStateCapacityForLaterAdmissions(t *testing.T) {
 
 	c.Tick(context.Background())
 	<-agent.started
+	waitForRunning(t, c, first.Identifier)
 	fresh := first
 	fresh.State = "Doing"
 	tracker.setIssue(fresh)
@@ -1404,6 +1405,92 @@ func TestReconciliationRefreshesStateCapacityForLaterAdmissions(t *testing.T) {
 	if err := c.Shutdown(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+	<-ws.after
+	<-ws.after
+}
+
+// TestMergingAndUnrelatedImplementationRunConcurrentlyUnderByStateCapacity
+// exercises the PMR-38 two-agent rollout end to end at the coordinator level:
+// one Merging landing agent and one unrelated implementation agent admit and
+// run at the same time, a queued retry timer for a third unrelated issue
+// never occupies a concurrency slot while it waits (so a later genuinely
+// free slot still admits a new candidate), and max_concurrent_agents_by_state
+// still refuses a second concurrent Merging issue even though overall
+// capacity has spare room.
+func TestMergingAndUnrelatedImplementationRunConcurrentlyUnderByStateCapacity(t *testing.T) {
+	w := testSettings(t)
+	w.Config.Agent.MaxConcurrent = 3
+	w.Config.Tracker.ActiveStates = []string{"In Progress", "Merging"}
+	w.Config.Agent.ByState = map[string]int{"merging": 1}
+
+	implementation := testIssue()
+	implementation.ID, implementation.Identifier, implementation.State = "impl", "ENG-1", "In Progress"
+	landing := testIssue()
+	landing.ID, landing.Identifier, landing.State = "landing", "ENG-2", "Merging"
+	secondLanding := testIssue()
+	secondLanding.ID, secondLanding.Identifier, secondLanding.State = "landing-2", "ENG-3", "Merging"
+	retryable := testIssue()
+	retryable.ID, retryable.Identifier, retryable.State = "retryable", "ENG-4", "In Progress"
+	extra := testIssue()
+	extra.ID, extra.Identifier, extra.State = "extra", "ENG-5", "In Progress"
+
+	tracker := &issueMapTracker{
+		candidates: []domain.Issue{implementation, landing},
+		issues: map[string]domain.Issue{
+			implementation.ID: implementation, landing.ID: landing, secondLanding.ID: secondLanding,
+			retryable.ID: retryable, extra.ID: extra,
+		},
+	}
+	block := make(chan domain.Event)
+	agent := &fakeAgent{events: func() <-chan domain.Event { return block }, started: make(chan struct{}, 3)}
+	ws := &fakeWorkspace{after: make(chan struct{}, 3)}
+	c := testCoordinator(w.Config, tracker, agent, ws)
+	timer := &fakeTimer{}
+	c.timer = timer
+
+	// One unrelated implementation issue and one Merging landing issue admit
+	// and launch together in the same poll.
+	c.Tick(context.Background())
+	<-agent.started
+	<-agent.started
+	if starts, _, _ := agent.counts(); starts != 2 {
+		t.Fatalf("starts=%d, want the unrelated implementation and Merging issues both admitted", starts)
+	}
+
+	// A queued retry for a third, unrelated issue must not occupy a
+	// concurrency slot while it waits.
+	if !c.claim(retryable, w.Config) {
+		t.Fatal("retryable issue was not claimed")
+	}
+	c.scheduleRetry(context.Background(), retryable, domain.Workspace{}, 1, retryAgent, "test", time.Minute)
+	c.mu.Lock()
+	admitted := len(c.admitted)
+	c.mu.Unlock()
+	if admitted != 2 {
+		t.Fatalf("admitted=%d, want a queued retry timer to consume no concurrency slot", admitted)
+	}
+
+	// A second concurrent Merging issue is refused by the per-state cap even
+	// though overall capacity (2 of 3) still has room.
+	if c.claim(secondLanding, w.Config) {
+		t.Fatal("a second concurrent Merging issue must be refused by max_concurrent_agents_by_state")
+	}
+
+	// The retry's reserved claim must not itself block a genuinely free
+	// general-capacity slot from admitting a new, unrelated candidate.
+	tracker.mu.Lock()
+	tracker.candidates = append(tracker.candidates, extra)
+	tracker.mu.Unlock()
+	c.Tick(context.Background())
+	<-agent.started
+	if starts, _, _ := agent.counts(); starts != 3 {
+		t.Fatalf("starts=%d, want the free general-capacity slot admitted despite the queued retry", starts)
+	}
+
+	if err := c.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	<-ws.after
 	<-ws.after
 	<-ws.after
 }
