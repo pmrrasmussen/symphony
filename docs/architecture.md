@@ -72,7 +72,13 @@ by reloadable workflow policy.
 Authoritative durable state is Linear plus the workspace tree under the
 configured root.  In-memory claims are rebuilt after restart; startup cleans
 workspaces for terminal issues.  Logs are written to the configured log root
-and must not contain credentials or complete agent payloads.
+and must not contain credentials or complete agent payloads. The default log
+level is concise; `--log-level debug` is an opt-in CLI setting that adds
+categorized poll admission/rejection summaries, safe Codex tool/item
+lifecycle classification, and heartbeat/stall records naming the outstanding
+operation, all built from a fixed, narrow decode of protocol fields that
+never includes tool arguments, command bodies, outputs, or raw payloads. See
+[observability.md](observability.md).
 
 When `workspace.source_root` is configured, `LocalWorkspaceExecutor` creates a
 detached Git worktree for each issue. This isolates Codex changes from the

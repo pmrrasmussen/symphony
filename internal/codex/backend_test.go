@@ -121,6 +121,48 @@ func TestReadRoutesServerRequestBeforeCollidingResponseID(t *testing.T) {
 	}
 }
 
+func TestItemLifecycleClassifiesSafeFieldsWithoutParsingCommandOrArguments(t *testing.T) {
+	events := make(chan domain.Event, 8)
+	c := &client{pending: map[int]chan callResult{}, active: events, activeReady: true, done: make(chan struct{})}
+	input := strings.NewReader(
+		`{"jsonrpc":"2.0","method":"item/started","params":{"threadId":"thread-1","turnId":"turn-1","startedAtMs":1,"item":{"id":"item-1","type":"commandExecution","status":"inProgress","cwd":"/work","commandActions":[],"command":["bash","-lc","token=do-not-log-this"]}}}` + "\n" +
+			`{"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"thread-1","turnId":"turn-1","completedAtMs":2,"item":{"id":"item-1","type":"commandExecution","status":"failed","cwd":"/work","commandActions":[],"command":["bash","-lc","token=do-not-log-this"],"durationMs":250,"aggregatedOutput":"secret-output-value"}}}` + "\n" +
+			`{"jsonrpc":"2.0","method":"item/started","params":{"threadId":"thread-1","turnId":"turn-1","startedAtMs":3,"item":{"id":"item-2","type":"mcpToolCall","status":"inProgress","server":"docs","tool":"read_file","arguments":{"path":"token=do-not-log-this"}}}}` + "\n" +
+			`{"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"thread-1","turnId":"turn-1","completedAtMs":4,"item":{"id":"item-2","type":"mcpToolCall","status":"completed","server":"docs","tool":"read_file","arguments":{"path":"token=do-not-log-this"},"durationMs":40,"result":{"content":"secret-result-value"}}}}` + "\n",
+	)
+	if err := c.read(input); err != nil {
+		t.Fatal(err)
+	}
+	close(events)
+	var seen []domain.Event
+	for event := range events {
+		seen = append(seen, event)
+	}
+	if len(seen) != 4 {
+		t.Fatalf("events=%+v", seen)
+	}
+	if seen[0].Kind != domain.EventItem || seen[0].ItemID != "item-1" || seen[0].ItemType != "commandExecution" || seen[0].Outcome != domain.ItemStarted || seen[0].ToolName != "" {
+		t.Fatalf("command started=%+v", seen[0])
+	}
+	if seen[1].Outcome != "failed" || seen[1].DurationMs != 250 || seen[1].ItemID != "item-1" {
+		t.Fatalf("command completed=%+v", seen[1])
+	}
+	if seen[2].ItemID != "item-2" || seen[2].ItemType != "mcpToolCall" || seen[2].ToolName != "read_file" || seen[2].Outcome != domain.ItemStarted {
+		t.Fatalf("mcp started=%+v", seen[2])
+	}
+	if seen[3].Outcome != "completed" || seen[3].DurationMs != 40 || seen[3].ToolName != "read_file" {
+		t.Fatalf("mcp completed=%+v", seen[3])
+	}
+	for _, event := range seen {
+		blob := fmt.Sprintf("%+v", event)
+		for _, secret := range []string{"do-not-log-this", "secret-output-value", "secret-result-value", "bash", "/work", "docs"} {
+			if strings.Contains(blob, secret) {
+				t.Fatalf("item event leaked command/argument/output content %q: %s", secret, blob)
+			}
+		}
+	}
+}
+
 func TestCallRemovesPendingRequestOnTimeoutAndWriteFailure(t *testing.T) {
 	t.Run("timeout", func(t *testing.T) {
 		c := bareClient(nopWriteCloser{Writer: io.Discard})
@@ -502,6 +544,70 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{}}'
 	}
 	if !seenCompleted {
 		t.Fatal("unsupported tool did not allow turn completion")
+	}
+}
+
+func TestBoundDynamicToolCallsEmitSafeItemLifecycleEvents(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		var request map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		query := request["query"].(string)
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.Contains(query, "SymphonyLinearHandoffIssue"):
+			_, _ = w.Write([]byte(`{"data":{"issue":{"id":"active","identifier":"PMR-39","title":"Handoff","description":"safe","url":"https://linear.app/issue/PMR-39","project":{"slugId":"project-1"},"team":{"id":"team-1"},"state":{"id":"todo","name":"Todo"}}}}`))
+		case strings.Contains(query, "SymphonyLinearHandoffStates"):
+			_, _ = w.Write([]byte(`{"data":{"team":{"id":"team-1","states":{"nodes":[{"id":"review","name":"In Review"}]}}}}`))
+		default:
+			_, _ = w.Write([]byte(`{"data":{"issueUpdate":{"success":true}}}`))
+		}
+	}))
+	defer server.Close()
+	dir := t.TempDir()
+	script := writeAppServer(t, dir, `
+IFS= read -r line
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'
+IFS= read -r line
+IFS= read -r line
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thread-1"}}}'
+IFS= read -r line
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn-1"}}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":99,"method":"item/tool/call","params":{"tool":"linear_graphql","arguments":{"operation":"comment","body":"token=do-not-log-this"}}}'
+IFS= read -r line
+printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{}}'
+`)
+	settings := config.Settings{Tracker: config.Tracker{
+		Provider:     map[string]any{"api_key": "test-token", "project_slug_id": "project-1", "endpoint": server.URL},
+		ActiveStates: []string{"todo"}, HandoffState: "In Review",
+	}}
+	b := NewWithLinearHandoff(func() config.Settings { return settings })
+	req := request(dir, script)
+	req.Issue = domain.Issue{ID: "active", Identifier: "PMR-39"}
+	_, events, err := b.Start(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var items []domain.Event
+	for event := range events {
+		blob := fmt.Sprintf("%+v", event)
+		if strings.Contains(blob, "do-not-log-this") {
+			t.Fatalf("event leaked bound tool call argument: %s", blob)
+		}
+		if event.Kind == domain.EventItem {
+			items = append(items, event)
+		}
+	}
+	if len(items) != 2 {
+		t.Fatalf("item events=%+v, want a started/finished pair", items)
+	}
+	if items[0].ItemType != "dynamicToolCall" || items[0].ToolName != "linear_graphql" || items[0].Outcome != domain.ItemStarted || items[0].ItemID != "99" {
+		t.Fatalf("started=%+v", items[0])
+	}
+	if items[1].ItemID != "99" || items[1].ToolName != "linear_graphql" || items[1].Outcome == domain.ItemStarted {
+		t.Fatalf("finished=%+v", items[1])
 	}
 }
 

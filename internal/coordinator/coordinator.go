@@ -133,6 +133,24 @@ type running struct {
 	stopped   stopReason
 	rateLimit map[string]int64
 	run       domain.Run
+	// outstanding is the last app-server tool/item that started without a
+	// matching completion. It is the actionable answer to "what is Codex
+	// waiting on" for heartbeat and stall records.
+	outstanding *outstandingOp
+	// lastGeneric* coalesce repeated generic progress notifications (protocol
+	// methods Symphony does not otherwise classify) so an idle-looking but
+	// chatty protocol stream cannot flood the log.
+	lastGenericKind    domain.EventKind
+	lastGenericMessage string
+	genericRepeat      int
+}
+
+// outstandingOp is the coordinator's view of a started-but-not-yet-completed
+// app-server item or dynamic tool call. It never stores anything derived from
+// tool arguments, command bodies, or outputs.
+type outstandingOp struct {
+	ItemID, ItemType, ToolName string
+	Since                      time.Time
 }
 
 func New(t domain.Tracker, a domain.AgentBackend, w domain.WorkspaceExecutor, settings func() config.Settings, logger *slog.Logger) *Coordinator {
@@ -285,18 +303,89 @@ func (c *Coordinator) tick(ctx context.Context) error {
 		return err
 	}
 	sortIssues(issues)
+	summary := pollSummary{candidates: len(issues), rejected: map[string]int64{}}
 	for _, i := range issues {
 		if ctx.Err() != nil || c.isStopping() {
+			c.logPollSummary(summary)
 			return ctx.Err()
 		}
-		if !eligible(i, s) || !c.claim(i, s) {
+		if reason := ineligibleReason(i, s); reason != "" {
+			summary.rejected[reason]++
+			c.log.Debug("poll candidate rejected", "issue_identifier", i.Identifier, "reason", reason)
 			continue
 		}
+		summary.eligible++
+		if reason := c.admissionRejectReason(i, s); reason != "" {
+			summary.rejected[reason]++
+			c.log.Debug("poll candidate rejected", "issue_identifier", i.Identifier, "reason", reason)
+			continue
+		}
+		if !c.claim(i, s) {
+			// A concurrent reconciliation or retry changed capacity between the
+			// check above and this claim; still a rejection, just a narrower one.
+			summary.rejected["claim_raced"]++
+			continue
+		}
+		summary.admitted++
 		if !c.launch(ctx, i, 0) {
 			c.release(i.ID)
+			summary.admitted--
+			summary.rejected["launch_reservation_lost"]++
 		}
 	}
+	c.logPollSummary(summary)
 	return nil
+}
+
+// pollSummary is the opt-in debug accounting of one poll pass: how many
+// candidates the tracker returned, how many were eligible, how many were
+// admitted (reserved an orchestrator slot), and a categorized count of every
+// rejection. It never carries issue identifiers or content, only counts.
+type pollSummary struct {
+	candidates, eligible, admitted int
+	rejected                       map[string]int64
+}
+
+func (c *Coordinator) logPollSummary(summary pollSummary) {
+	attrs := []any{"candidates", summary.candidates, "eligible", summary.eligible, "admitted", summary.admitted}
+	if len(summary.rejected) > 0 {
+		attrs = append(attrs, "rejected", summary.rejected)
+	}
+	c.log.Debug("poll summary", attrs...)
+}
+
+// ineligibleReason mirrors eligible's own checks so a rejected candidate's
+// debug record explains exactly which one failed.
+func ineligibleReason(i domain.Issue, s config.Settings) string {
+	switch {
+	case i.ID == "" || i.Identifier == "" || i.Title == "":
+		return "missing_identity"
+	case !active(i, s):
+		return "not_active"
+	case terminal(i, s):
+		return "terminal"
+	case !routable(i, s):
+		return "not_routable"
+	default:
+		return ""
+	}
+}
+
+// admissionRejectReason peeks at claim's own admission checks purely to
+// categorize a poll rejection; it does not itself claim or mutate state.
+func (c *Coordinator) admissionRejectReason(i domain.Issue, s config.Settings) string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	switch {
+	case c.stopping:
+		return "stopping"
+	case c.claimed[i.ID]:
+		return "already_claimed"
+	case !c.capacityAvailableLocked(norm(i.State), s):
+		return "at_capacity"
+	default:
+		return ""
+	}
 }
 
 func (c *Coordinator) reconcile(ctx context.Context) error {
@@ -349,29 +438,63 @@ func (c *Coordinator) reconcile(ctx context.Context) error {
 			// state accounting in step with tracker transitions while the run
 			// remains eligible, so later admissions see the current state.
 			c.refreshRunIssue(r, fresh)
+			c.logHeartbeat(r, now, last)
 			continue
 		}
 		if !c.stopRun(run.issue.ID, reason) {
 			continue
 		}
-		if reason == stopTerminal {
-			if err := c.workspaces.Cleanup(ctx, fresh); err != nil {
-				c.log.Warn("terminal workspace cleanup failed", "issue_id", fresh.ID, "issue_identifier", fresh.Identifier, "error", err)
-			}
+		attrs := []any{"issue_id", run.issue.ID, "issue_identifier", run.issue.Identifier, "session_id", r.session.ID, "reason", reason}
+		if reason == stopStalled {
+			attrs = append(attrs, c.outstandingAttrs(r, now, last)...)
 		}
-		c.log.Info("agent reconciled", "issue_id", run.issue.ID, "issue_identifier", run.issue.Identifier, "session_id", r.session.ID, "reason", reason)
+		if reason == stopTerminal {
+			c.cleanupWorkspace(ctx, fresh)
+		}
+		c.log.Info("agent reconciled", attrs...)
 	}
 	return nil
 }
 
+// logHeartbeat is opt-in debug detail: the last-activity age and any
+// outstanding tool/item make an apparently idle-but-active run actionable
+// without reading the raw Codex rollout.
+func (c *Coordinator) logHeartbeat(r *running, now, last time.Time) {
+	c.mu.Lock()
+	issue, session := r.issue, r.session
+	c.mu.Unlock()
+	attrs := append([]any{"issue_id", issue.ID, "issue_identifier", issue.Identifier, "session_id", session.ID}, c.outstandingAttrs(r, now, last)...)
+	c.log.Debug("agent heartbeat", attrs...)
+}
+
+// outstandingAttrs reports how long since the run last produced any event and
+// identifies the single started-but-not-completed operation, if any, without
+// ever including tool arguments or output.
+func (c *Coordinator) outstandingAttrs(r *running, now, last time.Time) []any {
+	c.mu.Lock()
+	outstanding := r.outstanding
+	c.mu.Unlock()
+	attrs := []any{"last_activity_age_ms", now.Sub(last).Milliseconds()}
+	if outstanding == nil {
+		return attrs
+	}
+	attrs = append(attrs, "outstanding_item_type", outstanding.ItemType, "outstanding_item_id", outstanding.ItemID, "outstanding_age_ms", now.Sub(outstanding.Since).Milliseconds())
+	if outstanding.ToolName != "" {
+		attrs = append(attrs, "outstanding_item_name", outstanding.ToolName)
+	}
+	return attrs
+}
+
 func (c *Coordinator) claim(i domain.Issue, s config.Settings) bool {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if c.stopping || c.claimed[i.ID] || !c.capacityAvailableLocked(norm(i.State), s) {
+		c.mu.Unlock()
 		return false
 	}
 	c.claimed[i.ID] = true
 	c.claimState[i.ID] = norm(i.State)
+	c.mu.Unlock()
+	c.log.Debug("issue claimed", "issue_id", i.ID, "issue_identifier", i.Identifier, "state", norm(i.State))
 	return true
 }
 
@@ -397,12 +520,14 @@ func (c *Coordinator) launch(parent context.Context, i domain.Issue, attempt int
 		defer c.unreserve(i.ID)
 		ctx, cancel := context.WithCancel(parent)
 		defer cancel()
+		c.log.Debug("workspace preparation started", "issue_id", i.ID, "issue_identifier", i.Identifier, "attempt", attempt)
 		ws, err := c.workspaces.Prepare(ctx, i)
 		if err != nil {
 			c.unreserve(i.ID)
 			c.finishFailure(parent, i, attempt, "workspace_prepare", err)
 			return
 		}
+		c.log.Debug("workspace prepared", "issue_id", i.ID, "issue_identifier", i.Identifier, "attempt", attempt, "created", ws.CreatedNow)
 		if err = c.workspaces.BeforeRun(ctx, ws, i); err != nil {
 			c.workspaces.AfterRun(context.Background(), ws, i)
 			c.unreserve(i.ID)
@@ -417,6 +542,7 @@ func (c *Coordinator) launch(parent context.Context, i domain.Issue, attempt int
 			c.finishFailure(parent, i, attempt, "prompt_render", err)
 			return
 		}
+		c.log.Debug("codex launch requested", "issue_id", i.ID, "issue_identifier", i.Identifier, "attempt", attempt)
 		session, events, err := c.agent.Start(ctx, domain.AgentRequest{Issue: i, Workspace: ws.Path, GitMetadataRoot: ws.GitMetadataRoot, Prompt: prompt, Command: s.Codex.Command, ApprovalPolicy: s.Codex.ApprovalPolicy, ThreadSandbox: s.Codex.ThreadSandbox, TurnSandboxPolicy: s.Codex.TurnSandboxPolicy, TurnTimeout: s.Codex.TurnTimeout, ReadTimeout: s.Codex.ReadTimeout})
 		if err != nil {
 			c.workspaces.AfterRun(context.Background(), ws, i)
@@ -507,9 +633,7 @@ func (c *Coordinator) runTurns(ctx context.Context, r *running, events <-chan do
 		c.mu.Unlock()
 		if !eligible(current, settings) {
 			if terminal(current, settings) {
-				if err := c.workspaces.Cleanup(ctx, current); err != nil {
-					c.log.Warn("terminal workspace cleanup failed", "issue_id", current.ID, "issue_identifier", current.Identifier, "error", err)
-				}
+				c.cleanupWorkspace(ctx, current)
 			}
 			return true, current, nil
 		}
@@ -604,6 +728,7 @@ func (c *Coordinator) consume(ctx context.Context, r *running, events <-chan dom
 			if at.IsZero() {
 				at = c.clock.Now()
 			}
+			e.At = at
 			c.mu.Lock()
 			r.last = at
 			c.mu.Unlock()
@@ -677,16 +802,66 @@ func (c *Coordinator) logEvent(r *running, event domain.Event) {
 		c.mu.Lock()
 		r.rateLimit = copyRateLimit(rateLimit)
 		c.mu.Unlock()
+		if len(rateLimit) == 0 {
+			// An empty snapshot carries no operator-actionable information; the
+			// app-server sends these often enough that logging each one would
+			// only add noise to the default log.
+			return
+		}
 		attrs = append(attrs, "rate_limit", rateLimit)
 		c.log.Info("agent rate limit", attrs...)
 	case domain.EventDiagnostic:
 		attrs = append(attrs, "stderr", observability.Text(event.Message))
 		c.log.Warn("agent stderr", attrs...)
+	case domain.EventItem:
+		c.logItemEvent(r, event, attrs)
 	default:
 		// Messages can contain model output, tool arguments, prompt excerpts, or
 		// provider data. The event type is sufficient for ordinary operation.
-		c.log.Info("agent event", attrs...)
+		// This is opt-in debug detail: coalesce identical repeats so a chatty
+		// protocol stream cannot flood even the debug log, and keep it off the
+		// default info level entirely.
+		c.mu.Lock()
+		repeat := event.Kind == r.lastGenericKind && event.Message == r.lastGenericMessage
+		if repeat {
+			r.genericRepeat++
+		} else {
+			r.lastGenericKind = event.Kind
+			r.lastGenericMessage = event.Message
+			r.genericRepeat = 0
+		}
+		count := r.genericRepeat
+		c.mu.Unlock()
+		if repeat {
+			if count%20 != 0 {
+				return
+			}
+			attrs = append(attrs, "repeated", count+1)
+		}
+		c.log.Debug("agent event", attrs...)
 	}
+}
+
+// logItemEvent classifies a safe tool/item lifecycle transition and tracks
+// the run's single outstanding operation so heartbeat and stall records can
+// report what Codex is waiting on. It is opt-in debug detail: turn-level
+// start/completion already appears at the default level.
+func (c *Coordinator) logItemEvent(r *running, event domain.Event, attrs []any) {
+	c.mu.Lock()
+	if event.Outcome == domain.ItemStarted {
+		r.outstanding = &outstandingOp{ItemID: event.ItemID, ItemType: event.ItemType, ToolName: event.ToolName, Since: event.At}
+	} else if r.outstanding != nil && r.outstanding.ItemID == event.ItemID {
+		r.outstanding = nil
+	}
+	c.mu.Unlock()
+	attrs = append(attrs, "item_type", observability.Text(event.ItemType), "item_id", observability.Text(event.ItemID), "outcome", observability.Text(event.Outcome))
+	if event.ToolName != "" {
+		attrs = append(attrs, "item_name", observability.Text(event.ToolName))
+	}
+	if event.DurationMs > 0 {
+		attrs = append(attrs, "duration_ms", event.DurationMs)
+	}
+	c.log.Debug("agent item event", attrs...)
 }
 
 func (c *Coordinator) updateUsage(r *running, update domain.Usage) domain.Usage {
@@ -781,6 +956,41 @@ func normalizedRateLimit(raw map[string]any) map[string]int64 {
 	return result
 }
 
+// cleanupWorkspace removes a terminal issue's workspace and reports the
+// lifecycle outcome an operator needs to know without reading the workspace
+// package's own error text: a clean removal, or why the workspace was kept
+// (uncommitted/untracked changes, or local commits ahead of the recorded base
+// revision that a human should review before it is discarded).
+func (c *Coordinator) cleanupWorkspace(ctx context.Context, issue domain.Issue) {
+	err := c.workspaces.Cleanup(ctx, issue)
+	status := cleanupStatus(err)
+	attrs := []any{"issue_id", issue.ID, "issue_identifier", issue.Identifier, "status", status}
+	if err != nil {
+		attrs = append(attrs, "error", err)
+		c.log.Warn("workspace cleanup", attrs...)
+		return
+	}
+	c.log.Info("workspace cleanup", attrs...)
+}
+
+// cleanupStatus classifies a Cleanup error into the fixed clean/dirty/committed
+// vocabulary the workspace package's own refusal messages already describe. It
+// only ever matches fixed, secret-free substrings the workspace package
+// controls, never issue or workspace content.
+func cleanupStatus(err error) string {
+	if err == nil {
+		return "clean"
+	}
+	switch msg := err.Error(); {
+	case strings.Contains(msg, "uncommitted or untracked changes"):
+		return "dirty"
+	case strings.Contains(msg, "differs from recorded base commit"):
+		return "committed"
+	default:
+		return "blocked"
+	}
+}
+
 func (c *Coordinator) finishFailure(ctx context.Context, i domain.Issue, attempt int, reason string, err error) {
 	if ctx.Err() != nil {
 		c.log.Info("agent run cancelled", "issue_id", i.ID, "issue_identifier", i.Identifier, "reason", cancellationReason("", ctx))
@@ -862,9 +1072,7 @@ func (c *Coordinator) runRetry(id string, generation uint64) {
 	issue := fresh[0]
 	if !eligible(issue, s) {
 		if terminal(issue, s) {
-			if err := c.workspaces.Cleanup(ctx, issue); err != nil {
-				c.log.Warn("terminal workspace cleanup failed", "issue_id", issue.ID, "issue_identifier", issue.Identifier, "error", err)
-			}
+			c.cleanupWorkspace(ctx, issue)
 		}
 		c.release(id)
 		return

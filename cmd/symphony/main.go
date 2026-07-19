@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -28,14 +29,20 @@ func main() {
 }
 
 func run(args []string, stdout, stderr io.Writer) int {
-	var workflowPath, logs string
+	var workflowPath, logs, logLevelFlag string
 	var dry bool
 	flags := flag.NewFlagSet("symphony", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	flags.StringVar(&workflowPath, "workflow", "WORKFLOW.md", "path to WORKFLOW.md")
 	flags.StringVar(&logs, "logs-root", ".symphony/logs", "structured log root")
+	flags.StringVar(&logLevelFlag, "log-level", "info", "structured log level: info (concise, default) or debug (adds poll admission detail, tool/item lifecycle, and heartbeat/stall records; see docs/observability.md)")
 	flags.BoolVar(&dry, "dry-run", false, "validate the full scheduler lifecycle without live side effects")
 	if err := flags.Parse(args); err != nil {
+		return 2
+	}
+	logLevel, err := parseLogLevel(logLevelFlag)
+	if err != nil {
+		fmt.Fprintln(stderr, "symphony:", err)
 		return 2
 	}
 	workflowFlagSet := false
@@ -88,7 +95,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	defer f.Close()
-	log := observability.New(slog.NewJSONHandler(f, &slog.HandlerOptions{Level: slog.LevelInfo}), stderr)
+	log := observability.New(slog.NewJSONHandler(f, &slog.HandlerOptions{Level: logLevel}), stderr)
 	for _, warning := range s.Warnings {
 		log.Warn("workflow configuration warning", "warning", warning)
 	}
@@ -137,4 +144,20 @@ func run(args []string, stdout, stderr io.Writer) int {
 		log.Error("graceful shutdown timed out", "error", err)
 	}
 	return 0
+}
+
+// parseLogLevel accepts the two documented, operator-facing levels. The
+// default "info" keeps the log concise; "debug" is the opt-in level that adds
+// poll admission detail, tool/item lifecycle records, and heartbeat/stall
+// records, all still bound by the same redaction guarantees. See
+// docs/observability.md.
+func parseLogLevel(value string) (slog.Level, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", "info":
+		return slog.LevelInfo, nil
+	case "debug":
+		return slog.LevelDebug, nil
+	default:
+		return 0, fmt.Errorf("invalid --log-level %q: supported values are info, debug", value)
+	}
 }

@@ -31,6 +31,22 @@ const (
 	EventBlocked        EventKind = "blocked"
 	EventCompleted      EventKind = "completed"
 	EventFailed         EventKind = "failed"
+	// EventItem reports a single safe app-server tool or item lifecycle
+	// transition (a command execution, file change, MCP/dynamic tool call, and
+	// so on). It never carries tool arguments, command bodies, or outputs; see
+	// ItemID, ItemType, ToolName, Outcome, and DurationMs.
+	EventItem EventKind = "item"
+)
+
+// ItemOutcome enumerates the safe, protocol-derived lifecycle outcomes an
+// EventItem can report. These mirror the Codex app-server's own status enum
+// values plus the synthetic "started" outcome Symphony assigns on arrival.
+const (
+	ItemStarted   = "started"
+	ItemCompleted = "completed"
+	ItemFailed    = "failed"
+	ItemDeclined  = "declined"
+	ItemCanceled  = "canceled"
 )
 
 type Event struct {
@@ -40,6 +56,15 @@ type Event struct {
 	PID                                  int
 	Usage                                Usage
 	RateLimit                            map[string]any
+	// ItemID and ItemType identify the outstanding operation for an EventItem
+	// record: a stable protocol-assigned call/item identifier and its
+	// protocol-defined type (for example "commandExecution", "mcpToolCall",
+	// "fileChange", or "dynamicToolCall"). ToolName is only ever a
+	// protocol-provided identifier (an MCP/dynamic tool's fixed name), never a
+	// value parsed out of tool arguments or command bodies.
+	ItemID, ItemType, ToolName string
+	Outcome                    string
+	DurationMs                 int64
 }
 type RunStatus string
 

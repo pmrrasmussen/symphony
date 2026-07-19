@@ -63,6 +63,12 @@ func FromSlog(logger *slog.Logger) *Logger {
 // standard slog.Logger.
 func (l *Logger) Handler() slog.Handler { return l.handler }
 
+// Debug is the opt-in, operator-enabled level for actionable diagnostics: poll
+// admission/rejection detail, tool/item lifecycle transitions, and heartbeat
+// records. It is gated by the configured handler level like any other level,
+// so it has no effect (and no cost beyond the Enabled check) unless the
+// operator has raised the log level to debug.
+func (l *Logger) Debug(message string, args ...any) { l.log(slog.LevelDebug, message, attrs(args)...) }
 func (l *Logger) Info(message string, args ...any)  { l.log(slog.LevelInfo, message, attrs(args)...) }
 func (l *Logger) Warn(message string, args ...any)  { l.log(slog.LevelWarn, message, attrs(args)...) }
 func (l *Logger) Error(message string, args ...any) { l.log(slog.LevelError, message, attrs(args)...) }

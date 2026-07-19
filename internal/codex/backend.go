@@ -554,6 +554,10 @@ func (c *client) handle(x rpc) {
 		c.emit(domain.Event{Kind: domain.EventRateLimit, At: time.Now(), RateLimit: p})
 		return
 	}
+	if method == "item/started" || method == "item/completed" {
+		c.emitItemEvent(method, x.Params)
+		return
+	}
 	if method == "turn/completed" {
 		if usage := usageFrom(x.Params); usage != (domain.Usage{}) {
 			c.emit(domain.Event{Kind: domain.EventUsage, At: time.Now(), Usage: usage})
@@ -566,6 +570,47 @@ func (c *client) handle(x rpc) {
 		return
 	}
 	c.emit(domain.Event{Kind: domain.EventProgress, At: time.Now(), Message: method})
+}
+
+// itemLifecycle is deliberately narrow: it decodes only the protocol-defined
+// item identity, type, an already-fixed tool name (never a value parsed out
+// of tool arguments), status, and a protocol-computed duration. Any other
+// field on the item payload -- command bodies, tool arguments, tool output,
+// diffs, search queries, model reasoning -- has no matching struct field and
+// is silently discarded by json.Unmarshal, so it can never reach a log.
+type itemLifecycle struct {
+	Item struct {
+		ID         string `json:"id"`
+		Type       string `json:"type"`
+		Tool       string `json:"tool"`
+		Status     string `json:"status"`
+		DurationMs int64  `json:"durationMs"`
+	} `json:"item"`
+}
+
+// emitItemEvent classifies an "item/started" or "item/completed" app-server
+// notification into a safe EventItem record: the outstanding operation's
+// protocol-defined type and ID, its fixed tool name when the protocol
+// supplies one directly (MCP and dynamic tool calls), and its started or
+// completed outcome. See itemLifecycle for the parsing boundary.
+func (c *client) emitItemEvent(method string, raw json.RawMessage) {
+	var notification itemLifecycle
+	if err := json.Unmarshal(raw, &notification); err != nil || notification.Item.ID == "" {
+		return
+	}
+	outcome := domain.ItemStarted
+	if method == "item/completed" {
+		outcome = notification.Item.Status
+		if outcome == "" {
+			outcome = domain.ItemCompleted
+		}
+	}
+	c.emit(domain.Event{
+		Kind: domain.EventItem, At: time.Now(),
+		ItemID: observability.Text(notification.Item.ID), ItemType: observability.Text(notification.Item.Type),
+		ToolName: observability.Text(notification.Item.Tool), Outcome: observability.Text(outcome),
+		DurationMs: notification.Item.DurationMs,
+	})
 }
 
 func linearGraphQLToolDefinition() map[string]any {
@@ -624,11 +669,15 @@ func (c *client) handleToolCall(x rpc) {
 			c.toolFailure(x.ID, "GitHub pull request publication arguments were rejected.")
 			return
 		}
+		callID := callIDText(x.ID)
+		started := c.emitCallStarted(callID, "github_publish_pr")
 		result, err := c.github.Publish(c.ctx, input)
 		if err != nil {
+			c.emitCallFinished(callID, "github_publish_pr", domain.ItemFailed, started)
 			c.toolFailure(x.ID, "GitHub pull request publication was rejected.")
 			return
 		}
+		c.emitCallFinished(callID, "github_publish_pr", domain.ItemCompleted, started)
 		content, _ := json.Marshal(map[string]any{"branch": result.Branch, "pull_request": result.URL, "number": result.Number, "body_updated": result.BodyUpdated})
 		c.sendServerResponse(x.ID, map[string]any{"success": true, "contentItems": []any{map[string]any{"type": "inputText", "text": string(content)}}})
 		return
@@ -639,16 +688,21 @@ func (c *client) handleToolCall(x rpc) {
 			c.unsupportedTool(x.ID)
 			return
 		}
+		callID := callIDText(x.ID)
+		started := c.emitCallStarted(callID, "github_pr_context")
 		result, err := c.github.Context(c.ctx)
 		if err != nil {
+			c.emitCallFinished(callID, "github_pr_context", domain.ItemFailed, started)
 			c.toolFailure(x.ID, "GitHub pull request context request was rejected.")
 			return
 		}
 		content, err := json.Marshal(result)
 		if err != nil {
+			c.emitCallFinished(callID, "github_pr_context", domain.ItemFailed, started)
 			c.unsupportedTool(x.ID)
 			return
 		}
+		c.emitCallFinished(callID, "github_pr_context", domain.ItemCompleted, started)
 		c.sendServerResponse(x.ID, map[string]any{"success": true, "contentItems": []any{map[string]any{"type": "inputText", "text": string(content)}}})
 		return
 	}
@@ -656,20 +710,42 @@ func (c *client) handleToolCall(x rpc) {
 		c.unsupportedTool(x.ID)
 		return
 	}
+	callID := callIDText(x.ID)
+	started := c.emitCallStarted(callID, "linear_graphql")
 	result, err := c.handoff.Call(c.ctx, request.Arguments)
 	if err != nil {
 		// Do not return provider errors, issue data, or any credential-derived
 		// value to the child. The generic response is enough for the model to
 		// choose another path, while the normalized event informs the scheduler.
+		c.emitCallFinished(callID, "linear_graphql", domain.ItemFailed, started)
 		c.toolFailure(x.ID, "Linear handoff request was rejected.")
 		return
 	}
 	text, err := json.Marshal(result.Data)
 	if err != nil {
+		c.emitCallFinished(callID, "linear_graphql", domain.ItemFailed, started)
 		c.unsupportedTool(x.ID)
 		return
 	}
+	c.emitCallFinished(callID, "linear_graphql", domain.ItemCompleted, started)
 	c.sendServerResponse(x.ID, map[string]any{"success": result.Success, "contentItems": []any{map[string]any{"type": "inputText", "text": string(text)}}})
+}
+
+// emitCallStarted and emitCallFinished report the lifecycle of Symphony's own
+// bound dynamic tools (the fixed "linear_graphql" and "github_publish_pr"
+// capability names, never a value read from the model's call arguments) so a
+// slow Linear or GitHub round trip is visible the same way an app-server item
+// is. The call ID is the protocol-assigned JSON-RPC request ID.
+func (c *client) emitCallStarted(callID, tool string) time.Time {
+	started := time.Now()
+	c.emit(domain.Event{Kind: domain.EventItem, At: started, ItemID: callID, ItemType: "dynamicToolCall", ToolName: tool, Outcome: domain.ItemStarted})
+	return started
+}
+func (c *client) emitCallFinished(callID, tool, outcome string, started time.Time) {
+	c.emit(domain.Event{Kind: domain.EventItem, At: time.Now(), ItemID: callID, ItemType: "dynamicToolCall", ToolName: tool, Outcome: outcome, DurationMs: time.Since(started).Milliseconds()})
+}
+func callIDText(id any) string {
+	return observability.Text(fmt.Sprint(id))
 }
 
 func (c *client) unsupportedTool(id any) {
