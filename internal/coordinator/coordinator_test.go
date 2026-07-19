@@ -354,6 +354,29 @@ func waitForSubstring(t *testing.T, buf *syncBuffer, substr string, timeout time
 	}
 }
 
+// waitForRunning blocks until identifier appears in c's running snapshot.
+// agent.started only confirms Start was called; the launch goroutine still
+// needs to record the session in c.running afterward, and a test that
+// advances the clock and re-ticks before that happens will see reconcile
+// find no running sessions at all, so a stall or eligibility change it
+// expects to observe is silently missed and any following blocking receive
+// (e.g. <-ws.after) hangs until the test binary's own timeout.
+func waitForRunning(t *testing.T, c *Coordinator, identifier string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		for _, r := range c.Snapshot().Running {
+			if r.IssueIdentifier == identifier {
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("issue %s never appeared in the running snapshot", identifier)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 func TestRenderExplainsHostAndManualDeliveryModes(t *testing.T) {
 	settings := config.Settings{Prompt: "Work on {{.issue.identifier}}"}
 	issue := domain.Issue{Identifier: "PMR-40"}
@@ -1082,6 +1105,7 @@ func TestReconciliationCancellationDoesNotRetry(t *testing.T) {
 
 	c.Tick(context.Background())
 	<-agent.started
+	waitForRunning(t, c, issue.Identifier)
 	ineligible := issue
 	ineligible.Dispatchable = false
 	tracker.setIssue(ineligible)
@@ -1324,6 +1348,7 @@ func TestStalledRunCancelsAndSchedulesRetry(t *testing.T) {
 
 	c.Tick(context.Background())
 	<-agent.started
+	waitForRunning(t, c, issue.Identifier)
 	clock.set(time.Date(2026, 7, 18, 12, 0, 2, 0, time.UTC))
 	c.Tick(context.Background())
 	<-ws.after
