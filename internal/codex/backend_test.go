@@ -696,6 +696,64 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{}}'
 	}
 }
 
+// TestStartTimeoutGovernsThreadStartDistinctlyFromReadTimeout proves the
+// cold-start seam (PMR-57): a thread/start that takes longer than the small
+// steady-state read timeout still succeeds when it stays within the generous
+// start timeout, and a thread/start is bounded by the start timeout rather
+// than the read timeout (a large read timeout cannot rescue it).
+func TestStartTimeoutGovernsThreadStartDistinctlyFromReadTimeout(t *testing.T) {
+	// The handshake responds immediately; only thread/start is deliberately slow
+	// (2s), well beyond a small read timeout.
+	slowThreadStart := `
+IFS= read -r line
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'
+IFS= read -r line
+IFS= read -r line
+sleep 2
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thread-1"}}}'
+IFS= read -r line
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn-1"}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{}}'
+`
+	t.Run("start timeout covers a slow thread/start beyond the read timeout", func(t *testing.T) {
+		dir := t.TempDir()
+		script := writeAppServer(t, dir, slowThreadStart)
+		req := request(dir, script)
+		// The 2s thread/start exceeds this read timeout but stays within the
+		// generous start timeout, so a cold start must still succeed.
+		req.ReadTimeout = 200 * time.Millisecond
+		req.StartTimeout = 10 * time.Second
+		_, events, err := New().Start(context.Background(), req)
+		if err != nil {
+			t.Fatalf("cold thread/start within start timeout failed: %v", err)
+		}
+		seenCompleted := false
+		for event := range events {
+			if event.Kind == domain.EventFailed {
+				t.Fatalf("slow-but-in-budget thread/start produced failure: %+v", event)
+			}
+			seenCompleted = seenCompleted || event.Kind == domain.EventCompleted
+		}
+		if !seenCompleted {
+			t.Fatal("slow-but-in-budget thread/start did not complete")
+		}
+	})
+	t.Run("start timeout bounds thread/start regardless of a large read timeout", func(t *testing.T) {
+		dir := t.TempDir()
+		script := writeAppServer(t, dir, slowThreadStart)
+		req := request(dir, script)
+		// A large read timeout cannot rescue thread/start: it is governed by the
+		// start timeout, which the 2s delay exceeds. The handshake responds well
+		// within this 1s budget, so the bound that fires is thread/start's.
+		req.ReadTimeout = 10 * time.Second
+		req.StartTimeout = time.Second
+		_, _, err := New().Start(context.Background(), req)
+		if err == nil || !strings.Contains(err.Error(), "thread/start timed out") {
+			t.Fatalf("start timeout did not bound thread/start: err=%v", err)
+		}
+	})
+}
+
 func TestStartUsesBashForConfiguredCommands(t *testing.T) {
 	dir := t.TempDir()
 	command := `function app_server {
@@ -1132,7 +1190,7 @@ func request(dir, script string) domain.AgentRequest {
 	return domain.AgentRequest{
 		Workspace: dir, Prompt: "work", Command: "sh " + script,
 		ApprovalPolicy: "never", ThreadSandbox: "workspace-write",
-		TurnTimeout: time.Minute, ReadTimeout: time.Second,
+		TurnTimeout: time.Minute, ReadTimeout: time.Second, StartTimeout: time.Minute,
 	}
 }
 

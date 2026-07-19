@@ -238,6 +238,44 @@ func TestDefaultsAndPathReferencesAreDeterministic(t *testing.T) {
 	}
 }
 
+// TestCodexStartTimeoutDefaultsGenerouslyAndParsesIndependently proves the
+// cold-start budget is decoupled from the steady-state read timeout: when
+// start_timeout_ms is omitted it defaults generously (survives a cold model
+// load) while read_timeout_ms keeps its small default, and an explicit value
+// is parsed independently of read_timeout_ms (PMR-57).
+func TestCodexStartTimeoutDefaultsGenerouslyAndParsesIndependently(t *testing.T) {
+	d := t.TempDir()
+	p := filepath.Join(d, "WORKFLOW.md")
+	defaults := "---\ntracker: {kind: linear, active_states: [Todo], terminal_states: [Done]}\n---\nprompt"
+	if err := os.WriteFile(p, []byte(defaults), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	w, err := Load(p, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w.Config.Codex.StartTimeout != 120_000*time.Millisecond {
+		t.Fatalf("default start timeout=%v want 120s", w.Config.Codex.StartTimeout)
+	}
+	if w.Config.Codex.ReadTimeout != 5_000*time.Millisecond {
+		t.Fatalf("default read timeout=%v want 5s", w.Config.Codex.ReadTimeout)
+	}
+	if w.Config.Codex.StartTimeout <= w.Config.Codex.ReadTimeout {
+		t.Fatalf("start timeout %v must exceed read timeout %v", w.Config.Codex.StartTimeout, w.Config.Codex.ReadTimeout)
+	}
+	explicit := "---\ntracker: {kind: linear, active_states: [Todo], terminal_states: [Done]}\ncodex: {read_timeout_ms: 5000, start_timeout_ms: 90000}\n---\nprompt"
+	if err := os.WriteFile(p, []byte(explicit), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	w, err = Load(p, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w.Config.Codex.StartTimeout != 90_000*time.Millisecond || w.Config.Codex.ReadTimeout != 5_000*time.Millisecond {
+		t.Fatalf("explicit start=%v read=%v", w.Config.Codex.StartTimeout, w.Config.Codex.ReadTimeout)
+	}
+}
+
 func TestEmptyRequiredPathReferenceIsRejected(t *testing.T) {
 	d := t.TempDir()
 	p := filepath.Join(d, "WORKFLOW.md")
@@ -945,7 +983,7 @@ func TestReloadPublishesEveryDynamicSettingAsOneSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	updated := "---\ntracker: {kind: linear, provider: {api_key: ' second-key '}, required_labels: [Ready], active_states: [Backlog, Started], terminal_states: [Closed]}\npolling: {interval_ms: 200}\nworkspace: {root: work-two, source_root: " + secondSource + "}\nhooks: {after_create: two-create, before_run: two-before, after_run: two-after, before_remove: two-remove, timeout_ms: 201}\nagent: {max_concurrent_agents: 3, max_turns: 4, max_retry_backoff_ms: 202, max_concurrent_agents_by_state: {Started: 2}}\ncodex: {command: codex-two, approval_policy: on-request, thread_sandbox: danger-full-access, turn_sandbox_policy: {type: two}, turn_timeout_ms: 203, read_timeout_ms: 204, stall_timeout_ms: 205}\n---\nsecond"
+	updated := "---\ntracker: {kind: linear, provider: {api_key: ' second-key '}, required_labels: [Ready], active_states: [Backlog, Started], terminal_states: [Closed]}\npolling: {interval_ms: 200}\nworkspace: {root: work-two, source_root: " + secondSource + "}\nhooks: {after_create: two-create, before_run: two-before, after_run: two-after, before_remove: two-remove, timeout_ms: 201}\nagent: {max_concurrent_agents: 3, max_turns: 4, max_retry_backoff_ms: 202, max_concurrent_agents_by_state: {Started: 2}}\ncodex: {command: codex-two, approval_policy: on-request, thread_sandbox: danger-full-access, turn_sandbox_policy: {type: two}, turn_timeout_ms: 203, read_timeout_ms: 204, start_timeout_ms: 206, stall_timeout_ms: 205}\n---\nsecond"
 	if err := os.WriteFile(workflow, []byte(updated), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -968,7 +1006,7 @@ func TestReloadPublishesEveryDynamicSettingAsOneSnapshot(t *testing.T) {
 		t.Fatalf("agent=%+v", settings.Agent)
 	}
 	policy, ok := settings.Codex.TurnSandboxPolicy.(map[string]any)
-	if !ok || policy["type"] != "two" || settings.Codex.Command != "codex-two" || settings.Codex.ApprovalPolicy != "on-request" || settings.Codex.ThreadSandbox != "danger-full-access" || settings.Codex.TurnTimeout != 203*time.Millisecond || settings.Codex.ReadTimeout != 204*time.Millisecond || settings.Codex.StallTimeout != 205*time.Millisecond {
+	if !ok || policy["type"] != "two" || settings.Codex.Command != "codex-two" || settings.Codex.ApprovalPolicy != "on-request" || settings.Codex.ThreadSandbox != "danger-full-access" || settings.Codex.TurnTimeout != 203*time.Millisecond || settings.Codex.ReadTimeout != 204*time.Millisecond || settings.Codex.StartTimeout != 206*time.Millisecond || settings.Codex.StallTimeout != 205*time.Millisecond {
 		t.Fatalf("codex=%+v", settings.Codex)
 	}
 }

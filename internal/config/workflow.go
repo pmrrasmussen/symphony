@@ -129,6 +129,12 @@ type Codex struct {
 	Command, ApprovalPolicy, ThreadSandbox string
 	TurnSandboxPolicy                      any
 	TurnTimeout, ReadTimeout, StallTimeout time.Duration
+	// StartTimeout bounds the cold-start handshake and thread/start RPCs
+	// separately from ReadTimeout. A cold codex app-server start (process
+	// spawn plus first model load) routinely exceeds the small steady-state
+	// read timeout, so it gets a generous budget that does not loosen
+	// mid-turn hang detection.
+	StartTimeout time.Duration
 }
 
 // Load validates the known core fields while retaining unknown extension keys.
@@ -345,6 +351,14 @@ func decode(raw map[string]any, base, path, logRoot string, sources *sourceSnaps
 	if err != nil {
 		return Settings{}, err
 	}
+	// A cold codex app-server start (process spawn plus first model load) far
+	// exceeds the small steady-state read_timeout_ms. This budget governs only
+	// the initial handshake and thread/start; 120s gives generous headroom
+	// above the ~60s that survived a real cold start live (PMR-57).
+	startTimeout, err := durationMS(codex, "start_timeout_ms", 120_000)
+	if err != nil {
+		return Settings{}, err
+	}
 	stallTimeout, err := durationMS(codex, "stall_timeout_ms", 300_000)
 	if err != nil {
 		return Settings{}, err
@@ -383,7 +397,7 @@ func decode(raw map[string]any, base, path, logRoot string, sources *sourceSnaps
 		Workspace: Workspace{Root: workspaceRoot, SourceRoot: sourceRoot},
 		Hooks:     Hooks{AfterCreate: afterCreate, BeforeRun: beforeRun, AfterRun: afterRun, BeforeRemove: beforeRemove, Timeout: hookTimeout},
 		Agent:     Agent{MaxConcurrent: maxConcurrent, MaxTurns: maxTurns, MaxRetryBackoff: maxRetryBackoff, ByState: byState},
-		Codex:     Codex{Command: command, ApprovalPolicy: approvalPolicy, ThreadSandbox: threadSandbox, TurnSandboxPolicy: codex["turn_sandbox_policy"], TurnTimeout: turnTimeout, ReadTimeout: readTimeout, StallTimeout: stallTimeout},
+		Codex:     Codex{Command: command, ApprovalPolicy: approvalPolicy, ThreadSandbox: threadSandbox, TurnSandboxPolicy: codex["turn_sandbox_policy"], TurnTimeout: turnTimeout, ReadTimeout: readTimeout, StartTimeout: startTimeout, StallTimeout: stallTimeout},
 		GitHub:    githubSettings,
 		// Keep only the names of environment variables that carry host
 		// credentials. The Codex launcher uses this metadata to prevent those
@@ -398,7 +412,7 @@ func decode(raw map[string]any, base, path, logRoot string, sources *sourceSnaps
 	if len(s.Tracker.ActiveStates) == 0 || len(s.Tracker.TerminalStates) == 0 {
 		return s, errors.New("invalid configuration: tracker active_states and terminal_states are required")
 	}
-	if s.Polling.Interval <= 0 || s.Hooks.Timeout <= 0 || s.Agent.MaxConcurrent <= 0 || s.Agent.MaxTurns <= 0 || s.Agent.MaxRetryBackoff <= 0 || strings.TrimSpace(s.Codex.Command) == "" || s.Codex.TurnTimeout <= 0 || s.Codex.ReadTimeout <= 0 {
+	if s.Polling.Interval <= 0 || s.Hooks.Timeout <= 0 || s.Agent.MaxConcurrent <= 0 || s.Agent.MaxTurns <= 0 || s.Agent.MaxRetryBackoff <= 0 || strings.TrimSpace(s.Codex.Command) == "" || s.Codex.TurnTimeout <= 0 || s.Codex.ReadTimeout <= 0 || s.Codex.StartTimeout <= 0 {
 		return s, errors.New("invalid configuration: non-positive duration or agent limit")
 	}
 	if s.Workspace.SourceRoot != "" {
