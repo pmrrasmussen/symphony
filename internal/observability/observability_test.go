@@ -29,6 +29,22 @@ func TestLoggerReportsSinkFailureWithoutPanicking(t *testing.T) {
 	}
 }
 
+func TestDebugIsGatedByTheConfiguredHandlerLevel(t *testing.T) {
+	var infoLevel bytes.Buffer
+	logger := New(slog.NewJSONHandler(&infoLevel, &slog.HandlerOptions{Level: slog.LevelInfo}), nil)
+	logger.Debug("opt-in detail", "key", "value")
+	if infoLevel.Len() != 0 {
+		t.Fatalf("debug record was emitted at the default info level: %s", infoLevel.String())
+	}
+
+	var debugLevel bytes.Buffer
+	logger = New(slog.NewJSONHandler(&debugLevel, &slog.HandlerOptions{Level: slog.LevelDebug}), nil)
+	logger.Debug("opt-in detail", "key", "value")
+	if !strings.Contains(debugLevel.String(), "opt-in detail") {
+		t.Fatalf("debug record was not emitted once the operator raised the level: %s", debugLevel.String())
+	}
+}
+
 type failingHandler struct{}
 
 func (failingHandler) Enabled(context.Context, slog.Level) bool { return true }

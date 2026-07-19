@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -47,6 +48,309 @@ func TestObservabilityNormalizesEventsAndProtectsSensitiveMessages(t *testing.T)
 		if !strings.Contains(output, field) {
 			t.Fatalf("operator log missing %s: %s", field, output)
 		}
+	}
+}
+
+func TestEmptyRateLimitSnapshotIsOmittedFromTheLog(t *testing.T) {
+	w := testSettings(t)
+	issue := testIssue()
+	events := make(chan domain.Event, 2)
+	events <- domain.Event{Kind: domain.EventRateLimit, At: time.Now(), RateLimit: map[string]any{"token": "do-not-log-this"}}
+	events <- domain.Event{Kind: domain.EventCompleted, At: time.Now()}
+	close(events)
+	agent := &fakeAgent{events: func() <-chan domain.Event { return events }}
+	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{})}
+	var logs bytes.Buffer
+	c := New(&fakeTracker{issue: issue}, agent, ws, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&logs, nil)))
+	c.Tick(context.Background())
+	<-ws.after
+	if err := c.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if output := logs.String(); strings.Contains(output, "agent rate limit") {
+		t.Fatalf("empty rate-limit snapshot was logged: %s", output)
+	}
+}
+
+func TestGenericProgressEventsAreDebugOnlyAndCoalesceRepeats(t *testing.T) {
+	w := testSettings(t)
+	issue := testIssue()
+	events := make(chan domain.Event, 25)
+	for i := 0; i < 22; i++ {
+		events <- domain.Event{Kind: domain.EventProgress, At: time.Now(), Message: "thread/tokenUsage/updated"}
+	}
+	events <- domain.Event{Kind: domain.EventCompleted, At: time.Now()}
+	close(events)
+	agent := &fakeAgent{events: func() <-chan domain.Event { return events }}
+	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{})}
+	var infoLogs, debugLogs bytes.Buffer
+	c := New(&fakeTracker{issue: issue}, agent, ws, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&infoLogs, nil)))
+	c.Tick(context.Background())
+	<-ws.after
+	if err := c.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if output := infoLogs.String(); strings.Contains(output, `"msg":"agent event"`) {
+		t.Fatalf("generic progress flooded the default info log: %s", output)
+	}
+
+	events = make(chan domain.Event, 25)
+	for i := 0; i < 22; i++ {
+		events <- domain.Event{Kind: domain.EventProgress, At: time.Now(), Message: "thread/tokenUsage/updated"}
+	}
+	events <- domain.Event{Kind: domain.EventCompleted, At: time.Now()}
+	close(events)
+	agent = &fakeAgent{events: func() <-chan domain.Event { return events }}
+	ws = &fakeWorkspace{shouldRun: true, after: make(chan struct{})}
+	c = New(&fakeTracker{issue: issue}, agent, ws, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&debugLogs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	c.Tick(context.Background())
+	<-ws.after
+	if err := c.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	count := strings.Count(debugLogs.String(), `"msg":"agent event"`)
+	if count == 0 || count >= 22 {
+		t.Fatalf("repeated generic progress was not coalesced at debug level: count=%d log=%s", count, debugLogs.String())
+	}
+}
+
+func TestIneligibleReasonCategorizesEachRejection(t *testing.T) {
+	tests := []struct {
+		name   string
+		issue  domain.Issue
+		s      config.Settings
+		reason string
+	}{
+		{name: "missing identity", issue: domain.Issue{}, s: config.Settings{}, reason: "missing_identity"},
+		{
+			name:   "not active",
+			issue:  domain.Issue{ID: "a", Identifier: "X-1", Title: "t", State: "Backlog", Dispatchable: true},
+			s:      config.Settings{Tracker: config.Tracker{ActiveStates: []string{"Todo"}}},
+			reason: "not_active",
+		},
+		{
+			name:   "terminal",
+			issue:  domain.Issue{ID: "a", Identifier: "X-1", Title: "t", State: "Done", Dispatchable: true},
+			s:      config.Settings{Tracker: config.Tracker{ActiveStates: []string{"Done"}, TerminalStates: []string{"Done"}}},
+			reason: "terminal",
+		},
+		{
+			name:   "not routable",
+			issue:  domain.Issue{ID: "a", Identifier: "X-1", Title: "t", State: "Todo", Dispatchable: true},
+			s:      config.Settings{Tracker: config.Tracker{ActiveStates: []string{"Todo"}, RequiredLabels: []string{"ready"}}},
+			reason: "not_routable",
+		},
+		{
+			name:   "eligible",
+			issue:  domain.Issue{ID: "a", Identifier: "X-1", Title: "t", State: "Todo", Dispatchable: true},
+			s:      config.Settings{Tracker: config.Tracker{ActiveStates: []string{"Todo"}}},
+			reason: "",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := ineligibleReason(test.issue, test.s); got != test.reason {
+				t.Fatalf("ineligibleReason=%q, want %q", got, test.reason)
+			}
+		})
+	}
+}
+
+func TestPollSummaryReportsNoCandidatesAtDebugLevel(t *testing.T) {
+	w := testSettings(t)
+	tracker := &issueMapTracker{issues: map[string]domain.Issue{}}
+	var logs bytes.Buffer
+	c := New(tracker, &fakeAgent{}, &fakeWorkspace{}, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	c.Tick(context.Background())
+	output := logs.String()
+	if !strings.Contains(output, `"msg":"poll summary"`) || !strings.Contains(output, `"candidates":0`) || !strings.Contains(output, `"eligible":0`) || !strings.Contains(output, `"admitted":0`) {
+		t.Fatalf("no-candidate poll summary missing expected counts: %s", output)
+	}
+}
+
+func TestPollSummaryCategorizesRejectionsAndOmitsAtInfoLevel(t *testing.T) {
+	w := testSettings(t)
+	ready := testIssue()
+	ready.ID, ready.Identifier = "ready", "ENG-3"
+	claimed := testIssue()
+	claimed.ID, claimed.Identifier = "claimed", "ENG-4"
+	tracker := &issueMapTracker{candidates: []domain.Issue{ready, claimed}, issues: map[string]domain.Issue{ready.ID: ready, claimed.ID: claimed}}
+	agent := &fakeAgent{events: closedEvents}
+	ws := &fakeWorkspace{after: make(chan struct{}, 1)}
+	var infoLogs, debugLogs bytes.Buffer
+	c := New(tracker, agent, ws, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&infoLogs, nil)))
+	timer := &fakeTimer{signal: make(chan struct{}, 1)}
+	c.timer = timer
+	if !c.claim(claimed, w.Config) {
+		t.Fatal("pre-claim failed")
+	}
+	c.Tick(context.Background())
+	<-timer.signal
+	if err := c.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	<-ws.after
+	if output := infoLogs.String(); strings.Contains(output, `"msg":"poll summary"`) {
+		t.Fatalf("poll summary debug detail leaked into the default info log: %s", output)
+	}
+
+	ready2 := testIssue()
+	ready2.ID, ready2.Identifier = "ready2", "ENG-5"
+	claimed2 := testIssue()
+	claimed2.ID, claimed2.Identifier = "claimed2", "ENG-6"
+	tracker2 := &issueMapTracker{candidates: []domain.Issue{ready2, claimed2}, issues: map[string]domain.Issue{ready2.ID: ready2, claimed2.ID: claimed2}}
+	agent2 := &fakeAgent{events: closedEvents}
+	ws2 := &fakeWorkspace{after: make(chan struct{}, 1)}
+	c2 := New(tracker2, agent2, ws2, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&debugLogs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	timer2 := &fakeTimer{signal: make(chan struct{}, 1)}
+	c2.timer = timer2
+	if !c2.claim(claimed2, w.Config) {
+		t.Fatal("pre-claim failed")
+	}
+	c2.Tick(context.Background())
+	<-timer2.signal
+	if err := c2.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	<-ws2.after
+	output := debugLogs.String()
+	if !strings.Contains(output, `"candidates":2`) || !strings.Contains(output, `"eligible":2`) || !strings.Contains(output, `"admitted":1`) {
+		t.Fatalf("poll summary counts=%s", output)
+	}
+	if !strings.Contains(output, `"already_claimed":1`) {
+		t.Fatalf("poll summary missing categorized rejection: %s", output)
+	}
+	if !strings.Contains(output, `"issue_identifier":"ENG-6"`) || !strings.Contains(output, `"reason":"already_claimed"`) {
+		t.Fatalf("per-issue rejection record missing: %s", output)
+	}
+}
+
+func TestHeartbeatAndStallRecordOutstandingOperation(t *testing.T) {
+	w := testSettings(t)
+	w.Config.Codex.StallTimeout = time.Second
+	issue := testIssue()
+	tracker := &fakeTracker{issue: issue}
+	events := make(chan domain.Event, 1)
+	events <- domain.Event{Kind: domain.EventItem, ItemID: "item-1", ItemType: "commandExecution", Outcome: domain.ItemStarted}
+	agent := &fakeAgent{events: func() <-chan domain.Event { return events }, started: make(chan struct{}, 1)}
+	ws := &fakeWorkspace{after: make(chan struct{}, 1)}
+	logs := &syncBuffer{}
+	c := New(tracker, agent, ws, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	clock := &mutableClock{now: time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)}
+	c.clock = clock
+	timer := &fakeTimer{signal: make(chan struct{}, 1)}
+	c.timer = timer
+
+	c.Tick(context.Background())
+	<-agent.started
+	waitForSubstring(t, logs, `"msg":"agent item event"`, time.Second)
+
+	clock.set(clock.now.Add(200 * time.Millisecond))
+	c.Tick(context.Background())
+	heartbeat := waitForSubstring(t, logs, `"msg":"agent heartbeat"`, time.Second)
+	if !strings.Contains(heartbeat, `"outstanding_item_type":"commandExecution"`) || !strings.Contains(heartbeat, `"outstanding_item_id":"item-1"`) {
+		t.Fatalf("heartbeat missing outstanding operation: %s", heartbeat)
+	}
+
+	clock.set(clock.now.Add(2 * time.Second))
+	c.Tick(context.Background())
+	<-ws.after
+	<-timer.signal
+	stalled := waitForSubstring(t, logs, `"reason":"stalled"`, time.Second)
+	if !strings.Contains(stalled, `"outstanding_item_id":"item-1"`) || !strings.Contains(stalled, `"outstanding_item_type":"commandExecution"`) || !strings.Contains(stalled, `"last_activity_age_ms"`) {
+		t.Fatalf("stall record missing outstanding operation: %s", stalled)
+	}
+	if err := c.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCleanupStatusClassifiesWorkspaceOutcome(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{name: "clean", err: nil, want: "clean"},
+		{name: "dirty", err: errors.New("refusing to remove Git workspace with uncommitted or untracked changes"), want: "dirty"},
+		{name: "committed", err: fmt.Errorf("refusing to remove Git workspace whose HEAD %s differs from recorded base commit %s", "abc", "def"), want: "committed"},
+		{name: "blocked", err: errors.New("refusing to remove workspace without durable ownership state"), want: "blocked"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := cleanupStatus(test.err); got != test.want {
+				t.Fatalf("cleanupStatus=%q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+// TestNewDebugRecordsNeverCarryToolInputsOrSecrets exercises every new debug
+// and info log path added for actionable diagnostics (poll summaries, item
+// lifecycle, heartbeat/stall records, claim/preparation records, cleanup
+// status) with representative secret-shaped values in the fields an operator
+// cannot control, and asserts none of them appear in the emitted log.
+func TestNewDebugRecordsNeverCarryToolInputsOrSecrets(t *testing.T) {
+	w := testSettings(t)
+	issue := testIssue()
+	issue.Description = "issue description must-not-appear"
+	tracker := &fakeTracker{issue: issue}
+	events := make(chan domain.Event, 4)
+	events <- domain.Event{Kind: domain.EventItem, ItemID: "item-1", ItemType: "commandExecution", ToolName: "token=do-not-log-this", Outcome: domain.ItemStarted}
+	events <- domain.Event{Kind: domain.EventItem, ItemID: "item-1", ItemType: "commandExecution", ToolName: "token=do-not-log-this", Outcome: "failed", DurationMs: 5}
+	events <- domain.Event{Kind: domain.EventProgress, Message: "prompt=do-not-log-this"}
+	events <- domain.Event{Kind: domain.EventCompleted}
+	close(events)
+	agent := &fakeAgent{events: func() <-chan domain.Event { return events }}
+	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{})}
+	var logs bytes.Buffer
+	c := New(tracker, agent, ws, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	c.Tick(context.Background())
+	<-ws.after
+	if err := c.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	output := logs.String()
+	for _, secret := range []string{"do-not-log-this", "must-not-appear"} {
+		if strings.Contains(output, secret) {
+			t.Fatalf("new debug/info record leaked %q: %s", secret, output)
+		}
+	}
+	if !strings.Contains(output, `"msg":"agent item event"`) || !strings.Contains(output, `"item_type":"commandExecution"`) {
+		t.Fatalf("item event record missing: %s", output)
+	}
+}
+
+// syncBuffer is a concurrency-safe io.Writer/String() pair used to poll a log
+// sink that a background coordinator goroutine is still writing to.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.Write(p)
+}
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.String()
+}
+
+func waitForSubstring(t *testing.T, buf *syncBuffer, substr string, timeout time.Duration) string {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		output := buf.String()
+		if strings.Contains(output, substr) {
+			return output
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for log containing %q; got: %s", substr, output)
+		}
+		time.Sleep(2 * time.Millisecond)
 	}
 }
 

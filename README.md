@@ -85,8 +85,16 @@ Relative workspace and log paths are resolved from the workflow file; omitted
 
 See [docs/architecture.md](docs/architecture.md), the
 [Linear tracker profile](docs/linear-tracker.md), the
-[workspace ownership and recovery guide](docs/completion-markers.md), and
+[workspace ownership and recovery guide](docs/completion-markers.md), the
+[observability guide](docs/observability.md), and
 [WORKFLOW.example.md](WORKFLOW.example.md).
+
+By default the structured log at `--logs-root` (`.symphony/logs/symphony.jsonl`)
+stays concise. Pass `--log-level debug` for actionable detail on an
+apparently idle run: categorized poll admission/rejection summaries, safe
+Codex tool/item lifecycle records, and heartbeat/stall records naming the
+outstanding operation. See [docs/observability.md](docs/observability.md) for
+`tail`/`jq` examples and the full level and redaction contract.
 
 For ongoing repository development, configure `workspace.source_root: .`.
 Symphony then creates one detached Git worktree per issue beneath
