@@ -9,13 +9,22 @@ tracker:
     # api_key: $LINEAR_API_KEY
     # Optional: only dispatch issues assigned to this Linear user ID, or `me`.
     # assignee: me
-    # The canonical lifecycle's exact agent-requested state edges. Todo -> In
-    # Progress starts implementation; Merging -> In Review is the fallback a
-    # refused github_land_pr call uses (see github.merge_state below). These
-    # are not a general destination allowlist: only these exact edges are ever
-    # honored, regardless of what a Codex session requests.
-    agent_transitions:
+    # Host-owned dispatch-time start edges. The coordinator applies these with
+    # the host Linear credential when it launches an issue, deterministically
+    # moving a dispatched Todo issue to In Progress before the session starts,
+    # so board-level observability never depends on the agent self-starting.
+    # Both endpoints of every edge must be active, non-terminal states. It is
+    # idempotent and fail-safe: an already-started issue is untouched and a
+    # failed move is logged and never blocks or double-dispatches the run.
+    start_transitions:
       Todo: In Progress
+    # The canonical lifecycle's exact agent-requested state edges. Merging ->
+    # In Review is the fallback a refused github_land_pr call uses (see
+    # github.merge_state below). These are not a general destination allowlist:
+    # only these exact edges are ever honored, regardless of what a Codex
+    # session requests. The Todo -> In Progress start edge lives in
+    # start_transitions above; the coordinator, not the agent, owns it.
+    agent_transitions:
       Merging: In Review
     # Enables the scoped github_publish_pr/github_pr_context Codex tools
     # below. Configure a non-active, non-terminal state from this project's

@@ -287,6 +287,76 @@ func TestHandoffBindsIssueProjectTeamAndFixedOperations(t *testing.T) {
 	}
 }
 
+func TestTransitionMovesIssueToStartedStateAndIsIdempotent(t *testing.T) {
+	// state is the issue's current Linear state; the handler flips it to the
+	// target after a successful mutation so a second call observes the
+	// idempotent no-op path.
+	state := "Todo"
+	var transitions int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		request := decodeRequest(t, r)
+		query := request["query"].(string)
+		variables := request["variables"].(map[string]any)
+		switch {
+		case strings.Contains(query, "SymphonyLinearHandoffIssue"):
+			writeJSON(t, w, map[string]any{"data": map[string]any{"issue": map[string]any{
+				"id": "active", "identifier": "PMR-5", "title": "Start", "project": map[string]string{"slugId": "project-1"},
+				"team": map[string]string{"id": "team-1"}, "state": map[string]string{"id": strings.ToLower(strings.ReplaceAll(state, " ", "-")), "name": state},
+			}}})
+		case strings.Contains(query, "SymphonyLinearHandoffStates"):
+			writeJSON(t, w, map[string]any{"data": map[string]any{"team": map[string]any{"id": "team-1", "states": map[string]any{"nodes": []any{
+				map[string]string{"id": "todo", "name": "Todo"}, map[string]string{"id": "in-progress", "name": "In Progress"},
+			}}}}})
+		case strings.Contains(query, "SymphonyLinearHandoffTransition"):
+			transitions++
+			if got := variables["stateID"]; got != "in-progress" {
+				t.Errorf("transition stateID=%v, want in-progress", got)
+			}
+			state = "In Progress"
+			writeJSON(t, w, map[string]any{"data": map[string]any{"issueUpdate": map[string]bool{"success": true}}})
+		default:
+			t.Errorf("unexpected query: %s", query)
+		}
+	}))
+	defer server.Close()
+	settings := config.Settings{Tracker: config.Tracker{
+		Provider:     map[string]any{"api_key": "test-token", "project_slug_id": "project-1", "endpoint": server.URL},
+		ActiveStates: []string{"Todo", "In Progress"}, TerminalStates: []string{"Done", "Canceled"},
+	}}
+	tracker := New(func() config.Settings { return settings })
+
+	if err := tracker.Transition(context.Background(), domain.Issue{ID: "active", State: "Todo"}, "In Progress"); err != nil {
+		t.Fatalf("first transition: %v", err)
+	}
+	if transitions != 1 {
+		t.Fatalf("transitions=%d after first move, want 1", transitions)
+	}
+	// The issue is now In Progress; a second call must be an idempotent no-op
+	// that issues no mutation (the restart / turn-limit re-dispatch case).
+	if err := tracker.Transition(context.Background(), domain.Issue{ID: "active", State: "Todo"}, "In Progress"); err != nil {
+		t.Fatalf("idempotent transition: %v", err)
+	}
+	if transitions != 1 {
+		t.Fatalf("transitions=%d after idempotent call, want still 1", transitions)
+	}
+}
+
+func TestTransitionRejectsIssueOutsideConfiguredProject(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(t, w, map[string]any{"data": map[string]any{"issue": map[string]any{
+			"id": "active", "identifier": "PMR-5", "title": "Start", "project": map[string]string{"slugId": "wrong"},
+			"team": map[string]string{"id": "team-1"}, "state": map[string]string{"id": "todo", "name": "Todo"},
+		}}})
+	}))
+	defer server.Close()
+	settings := config.Settings{Tracker: config.Tracker{
+		Provider:     map[string]any{"api_key": "test-token", "project_slug_id": "project-1", "endpoint": server.URL},
+		ActiveStates: []string{"Todo", "In Progress"}, TerminalStates: []string{"Done"},
+	}}
+	err := New(func() config.Settings { return settings }).Transition(context.Background(), domain.Issue{ID: "active", State: "Todo"}, "In Progress")
+	assertCategory(t, err, "transition_scope")
+}
+
 func TestHandoffRejectsHumanTerminalChangeBeforeMutation(t *testing.T) {
 	var reads, mutations int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

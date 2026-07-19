@@ -17,7 +17,16 @@ Rework -> Merging -> Done`. `Todo`, `In Progress`, `Rework`, and `Merging` are
 configured as `tracker.active_states`, so the coordinator dispatches a session
 for an issue in any of them; `In Review` is deliberately excluded so it stays
 the single, fixed, human-controlled review state
-(`tracker.provider.handoff_state`) that is never dispatched. Resuming in
+(`tracker.provider.handoff_state`) that is never dispatched. When the
+coordinator dispatches an issue whose state matches a configured
+`tracker.provider.start_transitions` source (the canonical `Todo -> In
+Progress`), it performs that move itself, host-side, with the Linear
+credential before the session starts, so board-level observability does not
+depend on the agent self-starting. The move reuses the same read-and-verify,
+resolve-state, and `issueUpdate` primitives as the agent handoff path but is
+never exposed to Codex; it is idempotent (an already-started or restart-
+re-observed issue is untouched) and fail-safe (a failed move is logged and
+never blocks or double-dispatches the run). Resuming in
 `Rework` uses no
 separate code path from an ordinary dispatch: the same durable workspace
 ownership, worktree, and branch described below are reused, and republishing

@@ -16,10 +16,13 @@ go run ./cmd/symphony ./WORKFLOW.md
 `Todo -> In Progress -> In Review <-> Rework -> Merging -> Done`. `Todo`,
 `In Progress`, `Rework`, and `Merging` are active/dispatchable; `In Review` is
 the single, fixed, human-controlled review state and is never dispatched;
-`Done` and `Canceled` are terminal. A Codex session:
+`Done` and `Canceled` are terminal. When the coordinator dispatches a `Todo`
+issue it moves it to `In Progress` itself, with the host Linear credential,
+before the session starts (`tracker.provider.start_transitions`); this is
+deterministic, idempotent, and fail-safe, so board-level observability never
+depends on the agent. A Codex session then:
 
-1. Moves a `Todo` issue to `In Progress`, then implements and validates the
-   change.
+1. Implements and validates the change (the issue is already `In Progress`).
 2. Publishes a structured pull request (`github_publish_pr`) and hands the
    issue to `In Review` once validated.
 3. Resumes -- in the same worktree, branch, and pull request -- when a human

@@ -6,12 +6,20 @@ tracker:
     project_slug_id: 6e13e4a9f215
     # Set this to an absolute path for a mode-600 file outside the repository.
     api_key_file: $SYMPHONY_LINEAR_API_KEY_FILE
-    # Exact state edges a bound Codex session may request. These are not a
-    # general destination allowlist. Todo -> In Progress starts implementation;
-    # Merging -> In Review is the fallback github_land_pr uses when a landing
-    # attempt hits a hard gate (see github.merge_state below).
-    agent_transitions:
+    # Host-owned dispatch-time start edge. The coordinator applies this with
+    # the host Linear credential when it launches an issue, so a dispatched
+    # Todo issue is deterministically moved to In Progress before the session
+    # starts (board-level observability no longer depends on the agent). It is
+    # idempotent and fail-safe: an already-started issue is untouched and a
+    # failed move never blocks the run.
+    start_transitions:
       Todo: In Progress
+    # Exact state edges a bound Codex session may request. These are not a
+    # general destination allowlist. Merging -> In Review is the fallback
+    # github_land_pr uses when a landing attempt hits a hard gate (see
+    # github.merge_state below). Todo -> In Progress is no longer here: the
+    # coordinator owns that start transition via start_transitions above.
+    agent_transitions:
       Merging: In Review
     # Optional, opt-in Codex client tool. It creates a new issue only in this
     # project/team and records the active issue as its Linear parent; it
@@ -94,11 +102,6 @@ Follow the repository instructions in AGENTS.md, README.md, and WORKFLOW.md.
 WORKFLOW.md is the single executable source of delivery policy: the
 state-specific guidance below is generated from it for this issue's current
 state.
-{{if eq .issue.state "Todo"}}
-## Start
-- If the linear_graphql transition operation is available, move this issue
-  from Todo to In Progress before you make any change.
-{{end}}
 {{if or (eq .issue.state "Todo") (eq .issue.state "In Progress")}}
 ## Implementation and validation
 - Implement a focused, validated change for this issue. Run the narrowest

@@ -536,6 +536,46 @@ func TestAgentTransitionPolicyIsExactAndReloadSafe(t *testing.T) {
 	}
 }
 
+func TestStartTransitionPolicyIsHostOwnedAndValidated(t *testing.T) {
+	d := t.TempDir()
+	p := filepath.Join(d, "WORKFLOW.md")
+	good := "---\ntracker: {kind: linear, provider: {start_transitions: {Todo: \"In Progress\"}}, active_states: [Todo, In Progress], terminal_states: [Done]}\n---\nprompt"
+	if err := os.WriteFile(p, []byte(good), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := NewStore(p, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy := s.Current().Config.Tracker.StartTransitions
+	if len(policy) != 1 || policy["todo"] != "In Progress" {
+		t.Fatalf("start transition policy=%#v, want lowercased source todo -> In Progress", policy)
+	}
+	// A host-owned start transition must not enable the agent's Linear session
+	// on its own: it narrows agent capability rather than widening it.
+	if s.Current().Config.LinearSessionCapabilityEnabled() {
+		t.Fatal("start_transitions alone must not enable the agent Linear session capability")
+	}
+	for _, invalid := range []string{
+		"tracker: {kind: linear, provider: {start_transitions: []}, active_states: [Todo, In Progress], terminal_states: [Done]}",
+		"tracker: {kind: linear, provider: {start_transitions: {Todo: Todo}}, active_states: [Todo, In Progress], terminal_states: [Done]}",
+		// Target must be an active state.
+		"tracker: {kind: linear, provider: {start_transitions: {Todo: \"In Progress\"}}, active_states: [Todo], terminal_states: [Done]}",
+		// Neither endpoint may be terminal.
+		"tracker: {kind: linear, provider: {start_transitions: {Todo: Done}}, active_states: [Todo, Done], terminal_states: [Done]}",
+	} {
+		if err := os.WriteFile(p, []byte("---\n"+invalid+"\n---\nprompt"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Reload(); err == nil {
+			t.Fatalf("invalid start transition policy reloaded: %s", invalid)
+		}
+		if got := s.Current().Config.Tracker.StartTransitions["todo"]; got != "In Progress" {
+			t.Fatalf("invalid reload replaced start transition policy: %#v", s.Current().Config.Tracker.StartTransitions)
+		}
+	}
+}
+
 func TestChildIssueCreationPolicyIsOptInBooleanAndReloadSafe(t *testing.T) {
 	d := t.TempDir()
 	p := filepath.Join(d, "WORKFLOW.md")

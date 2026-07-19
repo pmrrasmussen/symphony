@@ -14,6 +14,7 @@
 | `handoff_state` | optional | Enables the tightly scoped Codex `linear_graphql` compatibility tool. The name must be a non-active workflow state in the active issue's Linear team. |
 | `handoff_comment_template` | optional | A repository-owned Go template for the comment made by the tool's `handoff` operation. It requires `handoff_state` and receives only `issue`. |
 | `agent_transitions` | optional | A non-empty mapping of exact source state names to destination state names for the bounded Codex `transition` operation. Terminal and same-state edges are rejected. |
+| `start_transitions` | optional | A non-empty mapping of exact source to destination state names the coordinator applies host-side, with the host credential, when it dispatches an issue (the canonical `Todo -> In Progress`). Both endpoints of every edge must be active, non-terminal states. Unlike `agent_transitions`, it is never exposed to a Codex session; it narrows agent capability rather than widening it, so it does not by itself enable the `linear_graphql` tool. The move is idempotent (an already-started issue is untouched) and fail-safe (a failed move is logged and never blocks or double-dispatches the run). Terminal and same-state edges are rejected. |
 | `child_issue_creation` | optional | Boolean. Enables the session-bound Codex `create_child_issue` tool, described below. Disabled by default. |
 
 Invalid provider values produce `invalid_tracker_config`; a missing or empty key
