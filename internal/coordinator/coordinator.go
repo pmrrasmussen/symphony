@@ -41,6 +41,15 @@ const (
 	continuationDelay           = time.Second
 )
 
+// handoffObservationFloor is the lower bound for how long the coordinator
+// remembers that it drove an issue into the review handoff state. The effective
+// retention is max(this, 2*poll interval) so a poll always runs while the
+// memory is live and an external automation that reverts the handoff (the
+// PMR-63 In Review -> In Progress flap) is observed and logged rather than
+// silently re-dispatched with no trace. Healthy handoffs that stay in review
+// are swept out after this window, so the map never grows unbounded.
+const handoffObservationFloor = 2 * time.Minute
+
 // turnLimitError means that the agent used its bounded session without
 // reaching a verified handoff or a terminal tracker state. It is deliberately
 // retriable: the issue remains active and no terminal tracker transition occurs
@@ -115,13 +124,28 @@ type Coordinator struct {
 	// claim, it deliberately excludes delayed retry timers: a timer still owns
 	// its issue to prevent duplicate dispatch, but it must not idle a worker
 	// slot while it waits.
-	admitted  map[string]string
-	retries   map[string]retryState
+	admitted map[string]string
+	retries  map[string]retryState
+	// handoffs records issues Symphony itself drove into the configured review
+	// handoff state, keyed by issue ID, so the poll loop can recognize and log
+	// an external actor (for example Linear's native GitHub PR automation)
+	// reverting that handoff to an active state instead of silently
+	// re-dispatching it. It is in-process only and discarded safely on restart.
+	handoffs  map[string]handoffObservation
 	nextRetry uint64
 	stopping  bool
 	ctx       context.Context
 	cancel    context.CancelFunc
 	wg        sync.WaitGroup
+}
+
+// handoffObservation is the coordinator's memory of one host-driven transition
+// into the review handoff state. It stores only the normalized state name and
+// the time of the observation — never issue content — so the poll loop can
+// attribute a later active-state re-appearance to an external actor.
+type handoffObservation struct {
+	state string
+	at    time.Time
 }
 
 type running struct {
@@ -162,6 +186,7 @@ func New(t domain.Tracker, a domain.AgentBackend, w domain.WorkspaceExecutor, se
 		timer: realTimer{}, clock: realClock{}, log: observability.FromSlog(logger),
 		running: map[string]*running{}, claimed: map[string]bool{},
 		claimState: map[string]string{}, admitted: map[string]string{}, retries: map[string]retryState{},
+		handoffs: map[string]handoffObservation{},
 	}
 }
 
@@ -297,6 +322,8 @@ func (c *Coordinator) tick(ctx context.Context) error {
 		return ctx.Err()
 	}
 	s := c.settings()
+	now := c.clock.Now()
+	c.sweepHandoffObservations(now, s)
 	issues, err := c.tracker.ListCandidates(ctx, s.Tracker.ActiveStates)
 	if err != nil {
 		c.log.Error("candidate poll failed", "error", err)
@@ -309,6 +336,12 @@ func (c *Coordinator) tick(ctx context.Context) error {
 			c.logPollSummary(summary)
 			return ctx.Err()
 		}
+		// A candidate the tracker returns in an active state that Symphony itself
+		// just handed off to the review state has been reverted by an external
+		// actor (see PMR-63: Linear's native GitHub PR automation). Log the
+		// external delta so the flap is visible in the JSONL instead of only in
+		// Linear's history. Symphony does not itself re-assert the handoff here.
+		c.noteExternalReversion(i, s, now)
 		if reason := ineligibleReason(i, s); reason != "" {
 			summary.rejected[reason]++
 			c.log.Debug("poll candidate rejected", "issue_identifier", i.Identifier, "reason", reason)
@@ -388,6 +421,66 @@ func (c *Coordinator) admissionRejectReason(i domain.Issue, s config.Settings) s
 	}
 }
 
+// noteHandoffObservation records that Symphony itself drove issue into the
+// configured review handoff state, so a later external revert of that handoff
+// is attributable at poll time. It is a no-op when no handoff state is
+// configured or the issue is not in it.
+func (c *Coordinator) noteHandoffObservation(issue domain.Issue, s config.Settings, now time.Time) {
+	handoff := norm(s.Tracker.HandoffState)
+	if handoff == "" || issue.ID == "" || norm(issue.State) != handoff {
+		return
+	}
+	c.mu.Lock()
+	c.handoffs[issue.ID] = handoffObservation{state: handoff, at: now}
+	c.mu.Unlock()
+}
+
+// noteExternalReversion logs, exactly once, when an active candidate is an
+// issue Symphony recently handed off to the review state: an external actor
+// (not Symphony, which has no In Review -> active writer) reverted the handoff.
+// It consumes the observation so a single revert is reported once, and never
+// mutates the tracker — re-asserting the handoff is a documented follow-up.
+func (c *Coordinator) noteExternalReversion(i domain.Issue, s config.Settings, now time.Time) {
+	if norm(s.Tracker.HandoffState) == "" || i.ID == "" {
+		return
+	}
+	c.mu.Lock()
+	observation, ok := c.handoffs[i.ID]
+	if ok {
+		delete(c.handoffs, i.ID)
+	}
+	c.mu.Unlock()
+	if !ok || norm(i.State) == observation.state {
+		return
+	}
+	c.log.Warn("external tracker state change observed",
+		"operation", "external_reversion",
+		"issue_id", i.ID,
+		"issue_identifier", i.Identifier,
+		"from_state", observation.state,
+		"to_state", norm(i.State),
+		"since_handoff_ms", now.Sub(observation.at).Milliseconds(),
+	)
+}
+
+// sweepHandoffObservations discards handoff memories older than the retention
+// window (max of the floor and two poll intervals, so a poll always runs while
+// a memory is live). A healthy handoff that stays in review is never reverted
+// and so is only ever cleared here, keeping the map bounded.
+func (c *Coordinator) sweepHandoffObservations(now time.Time, s config.Settings) {
+	ttl := handoffObservationFloor
+	if window := 2 * s.Polling.Interval; window > ttl {
+		ttl = window
+	}
+	c.mu.Lock()
+	for id, observation := range c.handoffs {
+		if now.Sub(observation.at) > ttl {
+			delete(c.handoffs, id)
+		}
+	}
+	c.mu.Unlock()
+}
+
 func (c *Coordinator) reconcile(ctx context.Context) error {
 	type runRef struct {
 		r     *running
@@ -444,6 +537,10 @@ func (c *Coordinator) reconcile(ctx context.Context) error {
 		if !c.stopRun(run.issue.ID, reason) {
 			continue
 		}
+		// A run stopped because its issue left the active set for the review
+		// handoff state is Symphony's own handoff; remember it so a later
+		// external revert of that handoff is attributable at poll time.
+		c.noteHandoffObservation(fresh, s, now)
 		attrs := []any{"issue_id", run.issue.ID, "issue_identifier", run.issue.Identifier, "session_id", r.session.ID, "reason", reason}
 		if reason == stopStalled {
 			attrs = append(attrs, c.outstandingAttrs(r, now, last)...)
@@ -493,6 +590,9 @@ func (c *Coordinator) claim(i domain.Issue, s config.Settings) bool {
 	}
 	c.claimed[i.ID] = true
 	c.claimState[i.ID] = norm(i.State)
+	// A claimed issue is being actively worked; any prior handoff memory is
+	// stale (the poll loop already reported an external revert before this).
+	delete(c.handoffs, i.ID)
 	c.mu.Unlock()
 	c.log.Debug("issue claimed", "issue_id", i.ID, "issue_identifier", i.Identifier, "state", norm(i.State))
 	return true
@@ -592,6 +692,13 @@ func (c *Coordinator) launch(parent context.Context, i domain.Issue, attempt int
 		}
 		c.workspaces.AfterRun(context.Background(), ws, i)
 		if ended {
+			// A run that ended because its issue reached the review handoff
+			// state is Symphony's own handoff; remember it so an external
+			// revert of that handoff is attributable at the next poll.
+			c.mu.Lock()
+			final := r.issue
+			c.mu.Unlock()
+			c.noteHandoffObservation(final, s, c.clock.Now())
 			c.release(i.ID)
 			return
 		}

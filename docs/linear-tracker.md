@@ -79,6 +79,32 @@ Linear credential, so no model-invokable path can transition the board:
   applies the `transitions.refuse_landing` fallback (`Merging -> In Review`).
 - The poll loop reconciles an externally merged pull request to `Done`.
 
+### Disable the tracker's native PR-to-status automation for managed issues
+
+Symphony owns every managed issue's state transitions. Linear's own **native
+GitHub PR automation** (for example "move the issue to In Progress when its
+linked pull request opens") is an *external* writer that races Symphony's host
+review handoff: within roughly a second of `github_publish_pr` moving an issue
+to `handoff_state` and linking its pull request, the automation can move it
+back to an active state (an `In Review -> In Progress` flap; PMR-63). Symphony
+has no code path that moves an issue out of `handoff_state` into an active
+state, so any such backward edge is external.
+
+Disable Linear's PR-linked status automations for the team and project that
+back `tracker.provider.project_slug_id` (Linear → Settings → the team → GitHub
+integration / workflow automations). This is a live-run operator prerequisite,
+not something `--dry-run` or the MCP integration can verify — check it in the
+Linear UI.
+
+If the automation is left enabled, Symphony no longer silently re-dispatches
+the reverted issue: the poll loop remembers each issue it drove into
+`handoff_state` and logs an `external tracker state change observed`
+(`operation: external_reversion`) record — with the from/to state names and the
+elapsed time since the handoff — the first time that issue reappears as an
+active candidate. Symphony does not automatically re-assert the handoff; see
+[docs/observability.md](observability.md) for the log record and the deferred
+auto-reconcile follow-up.
+
 When neither `handoff_state` nor `child_issue_creation` is configured, Symphony
 binds no Linear session for the Codex child and advertises no session-bound
 Linear tool. When either is configured, the service validates the active issue's

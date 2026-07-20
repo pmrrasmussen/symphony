@@ -38,7 +38,12 @@ tracker:
     # review, host-side. In Review is the single, fixed human-controlled review
     # state: it is deliberately excluded from active_states below, so it is
     # never dispatched. No Codex tool can move an issue into it (or any state);
-    # the host performs the handoff.
+    # the host performs the handoff. Operator prerequisite: disable Linear's
+    # native GitHub PR-to-status automation for this team/project — it is an
+    # external writer that races this handoff and can flap the issue back to an
+    # active state (In Review -> In Progress; PMR-63). Symphony logs any such
+    # external revert (operation: external_reversion) but does not re-assert the
+    # handoff itself; see README.md and docs/linear-tracker.md.
     handoff_state: In Review
   # The canonical lifecycle (PMR-38): Todo -> In Progress -> In Review <->
   # Rework -> Merging -> Done. Rework and Merging are active/dispatchable so a
