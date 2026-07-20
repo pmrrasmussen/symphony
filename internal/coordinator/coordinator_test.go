@@ -1638,6 +1638,131 @@ func TestDispatchTransitionFailureDoesNotBlockOrDoubleDispatch(t *testing.T) {
 	}
 }
 
+// TestHandoffRunRecordsObservationForRevertDetection proves a completed run
+// that ends because its issue reached the review handoff state is remembered,
+// so a later external revert of that handoff can be attributed at poll time.
+func TestHandoffRunRecordsObservationForRevertDetection(t *testing.T) {
+	w := testSettings(t)
+	w.Config.Tracker.HandoffState = "In Review"
+	w.Config.Tracker.ActiveStates = []string{"Todo", "In Progress"}
+	issue := testIssue()
+	issue.State = "In Progress"
+	handoff := issue
+	handoff.State = "In Review"
+	handoff.Dispatchable = false
+	tracker := &fakeTracker{issue: issue}
+	tracker.setFresh(handoff)
+	agent := &fakeAgent{events: completedEvents}
+	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{}, 1)}
+	c := testCoordinator(w.Config, tracker, agent, ws)
+
+	c.Tick(context.Background())
+	<-ws.after
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		c.mu.Lock()
+		observation, ok := c.handoffs[issue.ID]
+		c.mu.Unlock()
+		if ok && observation.state == "in review" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("completed handoff run did not record a review-state observation")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if err := c.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestExternalHandoffRevertIsObservedAtPoll proves the PMR-63 flap is now
+// visible in the log: an active candidate that Symphony itself just handed off
+// to the review state was reverted by an external actor, so the poll loop logs
+// the external delta exactly once and never re-logs or mutates the tracker.
+func TestExternalHandoffRevertIsObservedAtPoll(t *testing.T) {
+	w := testSettings(t)
+	w.Config.Tracker.HandoffState = "In Review"
+	w.Config.Tracker.ActiveStates = []string{"Todo", "In Progress"}
+	reverted := testIssue()
+	reverted.State = "In Progress"
+	tracker := &fakeTracker{issue: reverted}
+	var logs bytes.Buffer
+	c := New(tracker, &fakeAgent{}, &fakeWorkspace{}, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&logs, nil)))
+	c.clock = fakeClock{now: time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)}
+
+	// Pre-claim the reverted issue so the poll does not also launch a run, then
+	// record Symphony's own prior handoff into the review state (claiming clears
+	// any prior memory, so the observation must be set afterward).
+	if !c.claim(reverted, w.Config) {
+		t.Fatal("pre-claim failed")
+	}
+	c.noteHandoffObservation(domain.Issue{ID: reverted.ID, Identifier: reverted.Identifier, State: "In Review"}, w.Config, c.clock.Now())
+
+	c.Tick(context.Background())
+
+	output := logs.String()
+	if !strings.Contains(output, `"msg":"external tracker state change observed"`) ||
+		!strings.Contains(output, `"operation":"external_reversion"`) ||
+		!strings.Contains(output, `"from_state":"in review"`) ||
+		!strings.Contains(output, `"to_state":"in progress"`) ||
+		!strings.Contains(output, `"issue_identifier":"ENG-1"`) {
+		t.Fatalf("external handoff revert was not logged from the poll loop: %s", output)
+	}
+	c.mu.Lock()
+	_, still := c.handoffs[reverted.ID]
+	c.mu.Unlock()
+	if still {
+		t.Fatal("handoff observation was not consumed after the revert was logged")
+	}
+
+	logs.Reset()
+	c.Tick(context.Background())
+	if strings.Contains(logs.String(), "external_reversion") {
+		t.Fatalf("a single external revert was re-logged on a later poll: %s", logs.String())
+	}
+	if err := c.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestHealthyHandoffIsSweptWithoutExternalRevertLog proves the common case — an
+// issue that stays in review and is never reverted — neither logs a spurious
+// external delta nor leaks its handoff memory: the retention window bounds the
+// map even when the issue never reappears as a candidate.
+func TestHealthyHandoffIsSweptWithoutExternalRevertLog(t *testing.T) {
+	w := testSettings(t)
+	w.Config.Tracker.HandoffState = "In Review"
+	w.Config.Polling.Interval = 30 * time.Second
+	tracker := &issueMapTracker{issues: map[string]domain.Issue{}}
+	var logs bytes.Buffer
+	clock := &mutableClock{now: time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)}
+	c := New(tracker, &fakeAgent{}, &fakeWorkspace{}, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&logs, nil)))
+	c.clock = clock
+	c.noteHandoffObservation(domain.Issue{ID: "id", Identifier: "ENG-1", State: "In Review"}, w.Config, clock.Now())
+
+	c.Tick(context.Background())
+	c.mu.Lock()
+	_, present := c.handoffs["id"]
+	c.mu.Unlock()
+	if !present {
+		t.Fatal("handoff memory was dropped inside the retention window")
+	}
+
+	clock.set(clock.now.Add(3 * time.Minute))
+	c.Tick(context.Background())
+	c.mu.Lock()
+	_, stillThere := c.handoffs["id"]
+	c.mu.Unlock()
+	if stillThere {
+		t.Fatal("stale handoff memory was not swept after the retention window")
+	}
+	if strings.Contains(logs.String(), "external_reversion") {
+		t.Fatalf("a healthy handoff wrongly logged an external revert: %s", logs.String())
+	}
+}
+
 func testCoordinator(settings config.Settings, tracker domain.Tracker, agent domain.AgentBackend, ws domain.WorkspaceExecutor) *Coordinator {
 	c := New(tracker, agent, ws, func() config.Settings { return settings }, nil)
 	c.clock = fakeClock{now: time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)}

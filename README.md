@@ -266,6 +266,19 @@ agent:
    `scripts/check test`, `scripts/check vet`, `scripts/check race`, from
    `.github/workflows/ci.yml`); update both files together if CI job names
    change.
+4. **Disable the tracker's native PR-to-status automation** for the managed
+   team and project. Symphony owns every managed issue's transitions; Linear's
+   built-in "move to In Progress when the linked PR opens" automation is an
+   external writer that races the host review handoff and can flap an issue
+   `In Review -> In Progress` moments after Symphony hands it off (PMR-63).
+   Turn off the PR-linked status automations in Linear → Settings → the team →
+   GitHub integration / workflow automations; this is verifiable only in the
+   Linear UI. If left enabled, Symphony does not silently re-dispatch the
+   reverted issue — it logs an `external tracker state change observed`
+   (`operation: external_reversion`) record naming the from/to states — but it
+   does not currently re-assert the handoff automatically. See the
+   [Linear tracker profile](docs/linear-tracker.md) and the
+   [observability guide](docs/observability.md).
 
 Until all three are complete, Symphony keeps running safely: two-agent
 capacity and the `Todo`/`In Progress`/review-handoff path already work today,

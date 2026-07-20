@@ -30,7 +30,11 @@ tracker:
     # and is the state github_publish_pr hands off to, host-side. Configure a
     # non-active, non-terminal state from this project's Linear team; it is the
     # single human-controlled review state. No Codex tool can move an issue to
-    # it (or any state); the host performs every transition.
+    # it (or any state); the host performs every transition. Operator
+    # prerequisite: disable the tracker's native GitHub PR-to-status automation
+    # for this team/project — it races the handoff and can flap the issue back
+    # to an active state (PMR-63). Symphony logs any such external revert
+    # (operation: external_reversion); see README.md and docs/linear-tracker.md.
     handoff_state: In Review
     # Optional, opt-in Codex client tool. It creates a new issue only in this
     # project/team and records the active issue as its parent; it cannot

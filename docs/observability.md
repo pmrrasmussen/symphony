@@ -28,6 +28,21 @@ names and issue identifiers only — never a rendered comment, issue
 description, or credential. (Agent turn token accounting is tracked
 separately.)
 
+Symphony also logs state changes it did **not** perform. The poll loop
+remembers each issue it drove into the review `handoff_state`, and if such an
+issue later reappears as an active candidate — an external actor (typically the
+tracker's native GitHub PR automation) reverted the handoff — it logs one
+warn-level `"msg":"external tracker state change observed"` record with
+`operation: external_reversion`, the `from_state` (the handoff state) and
+`to_state` (the active state it was reverted to) NAMES, the
+`issue_id`/`issue_identifier`, and `since_handoff_ms` (elapsed time since the
+handoff). It is logged once per revert and, like every transition record, is
+redaction-safe. Symphony does not itself re-assert the handoff — the operator
+mitigation is to disable the tracker's native PR-to-status automation (see the
+[Linear tracker profile](linear-tracker.md)); automatically re-asserting the
+handoff without overriding a legitimate human reactivation is a deferred
+follow-up.
+
 At startup, the info log also records `startup credential configuration` with
 `linear_credentials_configured` and `github_credentials_configured` booleans.
 They confirm that the required Linear credential and any configured GitHub
