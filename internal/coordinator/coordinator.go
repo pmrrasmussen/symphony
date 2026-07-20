@@ -544,7 +544,7 @@ func (c *Coordinator) launch(parent context.Context, i domain.Issue, attempt int
 			return
 		}
 		c.log.Debug("codex launch requested", "issue_id", i.ID, "issue_identifier", i.Identifier, "attempt", attempt)
-		session, events, err := c.agent.Start(ctx, domain.AgentRequest{Issue: i, Workspace: ws.Path, GitMetadataRoot: ws.GitMetadataRoot, Prompt: prompt, Command: s.Codex.Command, ApprovalPolicy: s.Codex.ApprovalPolicy, ThreadSandbox: s.Codex.ThreadSandbox, TurnSandboxPolicy: s.Codex.TurnSandboxPolicy, TurnTimeout: s.Codex.TurnTimeout, ReadTimeout: s.Codex.ReadTimeout, StartTimeout: s.Codex.StartTimeout})
+		session, events, err := c.agent.Start(ctx, domain.AgentRequest{Issue: i, Workspace: ws.Path, GitMetadataRoots: ws.GitMetadataRoots, Prompt: prompt, Command: s.Codex.Command, ApprovalPolicy: s.Codex.ApprovalPolicy, ThreadSandbox: s.Codex.ThreadSandbox, TurnSandboxPolicy: s.Codex.TurnSandboxPolicy, TurnTimeout: s.Codex.TurnTimeout, ReadTimeout: s.Codex.ReadTimeout, StartTimeout: s.Codex.StartTimeout})
 		if err != nil {
 			c.workspaces.AfterRun(context.Background(), ws, i)
 			c.unreserve(i.ID)

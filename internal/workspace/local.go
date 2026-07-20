@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -194,9 +195,17 @@ func (l *Local) Prepare(ctx context.Context, issue domain.Issue) (domain.Workspa
 	return ws, nil
 }
 
-// setGitMetadataRoot grants the agent the Git boundary that a linked worktree
-// needs for local commits. Git stores a linked worktree's index and objects
-// outside the worktree, so workspace-write alone cannot create a commit.
+// setGitMetadataRoot grants the agent only the Git boundary a detached-HEAD
+// commit in a linked worktree needs: the source repository's shared object
+// store and this worktree's own per-worktree metadata directory. Git stores a
+// linked worktree's HEAD, index, and reflog under the per-worktree directory and
+// its objects in the shared store, so those two roots are sufficient to add and
+// commit. It deliberately excludes the rest of the source common directory --
+// refs/heads (including the primary branch), the primary working tree's index,
+// packed-refs, and other worktrees' directories -- so a misbehaving agent cannot
+// write the source repository's branches or primary index (PMR-65). It also
+// records an integrity baseline so AfterRun can detect any drift that slips past
+// this narrowed grant.
 func (l *Local) setGitMetadataRoot(ctx context.Context, ws *domain.Workspace, issue domain.Issue) error {
 	state, found, err := l.loadState(issue)
 	if err != nil {
@@ -218,7 +227,17 @@ func (l *Local) setGitMetadataRoot(ctx context.Context, ws *domain.Workspace, is
 	if !available {
 		return errors.New("recorded Git workspace repository is unavailable; cannot grant local commit access")
 	}
-	ws.GitMetadataRoot = state.GitCommonDir
+	objects, err := canonicalExistingDirectory(filepath.Join(state.GitCommonDir, "objects"))
+	if err != nil {
+		return fmt.Errorf("resolve Git object store for local commits: %w", err)
+	}
+	ws.GitMetadataRoots = []string{objects, filepath.Clean(state.GitWorktreeDir)}
+	// The integrity baseline is a best-effort backstop: an unexpected failure to
+	// fingerprint the source must not fail an otherwise valid workspace. An empty
+	// baseline simply skips the post-run assertion.
+	if baseline, err := sourceIntegrityDigest(ctx, state.SourceRoot, state.GitCommonDir); err == nil {
+		ws.GitIntegrityBaseline = baseline
+	}
 	return nil
 }
 func (l *Local) BeforeRun(ctx context.Context, ws domain.Workspace, issue domain.Issue) error {
@@ -228,6 +247,66 @@ func (l *Local) AfterRun(ctx context.Context, ws domain.Workspace, issue domain.
 	if err := l.hook(ctx, ws, issue, "after_run", l.settings().Hooks.AfterRun); err != nil {
 		fmt.Fprintf(os.Stderr, "symphony after_run hook error issue=%s: %v\n", issue.Identifier, err)
 	}
+	l.assertSourceIntegrity(ctx, ws, issue)
+}
+
+// assertSourceIntegrity is the PMR-65 defense-in-depth backstop. Even though the
+// narrowed sandbox grant should make it impossible, it re-checks that the run
+// left the source repository's branches (other than the symphony/* publish
+// branches Symphony itself creates) and primary working tree index exactly as
+// they were when the workspace was prepared, and alerts if not. It deliberately
+// only detects and alerts; it never rewrites the operator's refs or index,
+// because it cannot distinguish an agent breach from a legitimate concurrent
+// operator change and a destructive "repair" could lose real work.
+func (l *Local) assertSourceIntegrity(ctx context.Context, ws domain.Workspace, issue domain.Issue) {
+	if ws.GitIntegrityBaseline == "" {
+		return
+	}
+	state, found, err := l.loadState(issue)
+	if err != nil || !found || state.SourceRoot == "" {
+		return
+	}
+	current, err := sourceIntegrityDigest(ctx, state.SourceRoot, state.GitCommonDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "symphony source integrity check error issue=%s: %v\n", issue.Identifier, err)
+		return
+	}
+	if current != ws.GitIntegrityBaseline {
+		fmt.Fprintf(os.Stderr, "symphony source integrity alert issue=%s: source branches or primary index changed during the run; an isolated worktree must never modify them; inspect %s\n", issue.Identifier, state.SourceRoot)
+	}
+}
+
+// sourceIntegrityDigest fingerprints the source repository state an isolated
+// detached worktree must never modify: every branch head except the symphony/*
+// publish branches Symphony itself creates, plus the primary working tree's
+// index. It ignores unrelated churn (object packing, other worktrees) so a
+// post-run comparison flags exactly a source branch or primary-index write.
+func sourceIntegrityDigest(ctx context.Context, sourceRoot, commonDir string) (string, error) {
+	refs, err := gitMetadataAllowEmpty(ctx, sourceRoot, "for-each-ref", "--format=%(refname) %(objectname)", "refs/heads/")
+	if err != nil {
+		return "", fmt.Errorf("read source branch heads: %w", err)
+	}
+	kept := make([]string, 0)
+	for _, line := range strings.Split(refs, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "refs/heads/symphony/") {
+			continue
+		}
+		kept = append(kept, line)
+	}
+	sort.Strings(kept)
+	digest := sha256.New()
+	for _, line := range kept {
+		digest.Write([]byte(line))
+		digest.Write([]byte{0})
+	}
+	index, err := os.ReadFile(filepath.Join(commonDir, "index"))
+	if err != nil && !os.IsNotExist(err) {
+		return "", fmt.Errorf("read primary index: %w", err)
+	}
+	indexSum := sha256.Sum256(index)
+	digest.Write(indexSum[:])
+	return fmt.Sprintf("%x", digest.Sum(nil)), nil
 }
 
 func (l *Local) Cleanup(ctx context.Context, issue domain.Issue) error {

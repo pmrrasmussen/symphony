@@ -100,8 +100,16 @@ type Tracker interface {
 	Transition(ctx context.Context, issue Issue, toState string) error
 }
 type AgentRequest struct {
-	Issue                         Issue
-	Workspace, GitMetadataRoot    string
+	Issue Issue
+	// GitMetadataRoots are the only paths outside the workspace directory a
+	// workspace-write turn may write: the source repository's shared object
+	// store and this linked worktree's own per-worktree metadata directory. It
+	// deliberately excludes the rest of the source common directory (branch
+	// refs, the primary index, packed-refs, other worktrees) so a misbehaving
+	// agent cannot mutate the source repository's branches or primary working
+	// tree (PMR-65).
+	Workspace                     string
+	GitMetadataRoots              []string
 	Prompt, Command               string
 	ApprovalPolicy, ThreadSandbox string
 	TurnSandboxPolicy             any
@@ -119,8 +127,15 @@ type AgentBackend interface {
 	Cancel(context.Context, AgentSession) error
 }
 type Workspace struct {
-	Path, Key, GitMetadataRoot string
-	CreatedNow                 bool
+	Path, Key        string
+	GitMetadataRoots []string
+	// GitIntegrityBaseline fingerprints the source repository state an isolated
+	// worktree must never modify (its non-symphony branch heads and primary
+	// index) at preparation time, so a post-run assertion can detect drift that
+	// slips past the narrowed sandbox grant (PMR-65). Empty for non-Git
+	// workspaces or when the baseline could not be captured.
+	GitIntegrityBaseline string
+	CreatedNow           bool
 }
 type WorkspaceExecutor interface {
 	Prepare(context.Context, Issue) (Workspace, error)

@@ -156,10 +156,16 @@ When `workspace.source_root` is configured, `LocalWorkspaceExecutor` creates a
 detached Git worktree for each issue. This isolates Codex changes from the
 checkout running Symphony; a human must review and integrate the resulting
 changes. The source root must already have a commit, and Git worktrees require
-the local repository to be trusted. A workspace-write Codex turn receives the
-validated common Git directory for that linked worktree so it can create local
-commits; this does not grant network access or a GitHub credential. The host
-still owns all GitHub publishing authority. Workspace state below the configured
+the local repository to be trusted. A workspace-write Codex turn is granted
+write access to only the two paths a detached-HEAD commit needs -- the source
+repository's shared object store and this linked worktree's own per-worktree
+metadata directory -- and never the rest of the common directory, so the agent
+cannot write the source repository's branch refs (including the primary branch)
+or the primary working tree's index. This does not grant network access or a
+GitHub credential. As a defense-in-depth backstop, after each run Symphony
+re-checks that the source repository's non-`symphony/*` branch heads and primary
+index are unchanged from a baseline captured at preparation, and alerts on
+drift. The host still owns all GitHub publishing authority. Workspace state below the configured
 root records durable ownership and Git cleanup identity; it never suppresses an
 otherwise active issue. Invalid ownership state, or missing state beside an
 existing workspace, fails closed during preparation. The schema, restart
