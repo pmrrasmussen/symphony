@@ -298,17 +298,20 @@ func start(ctx context.Context, r domain.AgentRequest, secrets []string, secretM
 	return c, nil
 }
 
-// localCommitSandbox extends only workspace-write turns with the Git common
-// directory that Symphony validated for this linked worktree. The worker still
-// has no network or GitHub credential, while git commit can write its index and
-// object database outside the worktree directory.
+// localCommitSandbox extends only workspace-write turns with the narrow Git
+// roots Symphony validated for this linked worktree: the source repository's
+// shared object store and this worktree's own per-worktree metadata directory.
+// The worker still has no network or GitHub credential, while a detached-HEAD
+// git commit can write its objects, HEAD, index, and reflog. The rest of the
+// source common directory (branch refs, the primary index, other worktrees)
+// stays outside the grant, so an agent cannot mutate source branches (PMR-65).
 func localCommitSandbox(r domain.AgentRequest) any {
-	root := strings.TrimSpace(r.GitMetadataRoot)
-	if root == "" || r.ThreadSandbox != "workspace-write" {
+	grants := uniquePaths(r.GitMetadataRoots)
+	if len(grants) == 0 || r.ThreadSandbox != "workspace-write" {
 		return r.TurnSandboxPolicy
 	}
 	if r.TurnSandboxPolicy == nil {
-		return map[string]any{"type": "workspaceWrite", "writableRoots": []string{root}}
+		return map[string]any{"type": "workspaceWrite", "writableRoots": grants}
 	}
 	policy, ok := r.TurnSandboxPolicy.(map[string]any)
 	if !ok || policy["type"] != "workspaceWrite" {
@@ -318,18 +321,17 @@ func localCommitSandbox(r domain.AgentRequest) any {
 	for key, value := range policy {
 		copy[key] = value
 	}
-	roots := []string{root}
+	var roots []string
 	if configured, ok := copy["writableRoots"].([]string); ok {
-		roots = append(configured, root)
+		roots = append(roots, configured...)
 	} else if configured, ok := copy["writableRoots"].([]any); ok {
-		roots = roots[:0]
 		for _, value := range configured {
 			if path, ok := value.(string); ok && strings.TrimSpace(path) != "" {
 				roots = append(roots, path)
 			}
 		}
-		roots = append(roots, root)
 	}
+	roots = append(roots, grants...)
 	copy["writableRoots"] = uniquePaths(roots)
 	return copy
 }

@@ -955,7 +955,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn-1"}}}'
 printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{}}'
 `)
 	b := New()
-	_, events, err := b.Start(context.Background(), domain.AgentRequest{Workspace: dir, GitMetadataRoot: gitMetadata, Prompt: "work", Command: "sh " + script, ApprovalPolicy: "never", ThreadSandbox: "workspace-write", TurnTimeout: time.Minute})
+	_, events, err := b.Start(context.Background(), domain.AgentRequest{Workspace: dir, GitMetadataRoots: []string{gitMetadata}, Prompt: "work", Command: "sh " + script, ApprovalPolicy: "never", ThreadSandbox: "workspace-write", TurnTimeout: time.Minute})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -985,17 +985,45 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{}}'
 func TestLocalCommitSandboxPreservesStricterConfiguredPolicies(t *testing.T) {
 	root := "/trusted/git-common"
 	readOnly := map[string]any{"type": "readOnly"}
-	if got := localCommitSandbox(domain.AgentRequest{GitMetadataRoot: root, ThreadSandbox: "workspace-write", TurnSandboxPolicy: readOnly}); !reflect.DeepEqual(got, readOnly) {
+	if got := localCommitSandbox(domain.AgentRequest{GitMetadataRoots: []string{root}, ThreadSandbox: "workspace-write", TurnSandboxPolicy: readOnly}); !reflect.DeepEqual(got, readOnly) {
 		t.Fatalf("read-only policy changed to %#v", got)
 	}
 	configured := map[string]any{"type": "workspaceWrite", "writableRoots": []any{"/extra", root}}
-	got, ok := localCommitSandbox(domain.AgentRequest{GitMetadataRoot: root, ThreadSandbox: "workspace-write", TurnSandboxPolicy: configured}).(map[string]any)
+	got, ok := localCommitSandbox(domain.AgentRequest{GitMetadataRoots: []string{root}, ThreadSandbox: "workspace-write", TurnSandboxPolicy: configured}).(map[string]any)
 	if !ok {
 		t.Fatalf("policy type=%T", got)
 	}
 	roots, ok := got["writableRoots"].([]string)
 	if !ok || !reflect.DeepEqual(roots, []string{"/extra", root}) {
 		t.Fatalf("roots=%#v", got["writableRoots"])
+	}
+}
+
+// TestLocalCommitSandboxGrantsOnlyNarrowedGitRoots proves the narrowed grant
+// (PMR-65): a workspace-write turn is granted exactly the object store and the
+// per-worktree metadata directory Symphony validated, and never the source
+// common directory, its refs/heads, or the primary index.
+func TestLocalCommitSandboxGrantsOnlyNarrowedGitRoots(t *testing.T) {
+	commonDir := "/src/.git"
+	objects := commonDir + "/objects"
+	worktreeDir := commonDir + "/worktrees/PMR-1"
+	got, ok := localCommitSandbox(domain.AgentRequest{GitMetadataRoots: []string{objects, worktreeDir}, ThreadSandbox: "workspace-write"}).(map[string]any)
+	if !ok || got["type"] != "workspaceWrite" {
+		t.Fatalf("policy=%#v", got)
+	}
+	roots, ok := got["writableRoots"].([]string)
+	if !ok {
+		t.Fatalf("writable roots type=%T", got["writableRoots"])
+	}
+	if !reflect.DeepEqual(roots, []string{objects, worktreeDir}) {
+		t.Fatalf("writable roots=%#v want exactly the object store and worktree metadata dir", roots)
+	}
+	for _, forbidden := range []string{commonDir, commonDir + "/refs/heads", commonDir + "/index", commonDir + "/packed-refs"} {
+		for _, granted := range roots {
+			if granted == forbidden {
+				t.Fatalf("narrowed grant unexpectedly included %q", forbidden)
+			}
+		}
 	}
 }
 

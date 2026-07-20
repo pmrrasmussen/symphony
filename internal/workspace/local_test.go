@@ -2,12 +2,15 @@ package workspace
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"github.com/pmrrasmussen/symphony/internal/config"
 	"github.com/pmrrasmussen/symphony/internal/domain"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -168,8 +171,21 @@ func TestPrepareUsesDetachedGitWorktree(t *testing.T) {
 	if err != nil || !found || state.BaseCommit == "" {
 		t.Fatalf("detached worktree base commit was not recorded: state=%+v found=%t err=%v", state, found, err)
 	}
-	if ws.GitMetadataRoot != state.GitCommonDir {
-		t.Fatalf("Git metadata root=%q, want recorded common directory %q", ws.GitMetadataRoot, state.GitCommonDir)
+	wantObjects, err := canonicalExistingDirectory(filepath.Join(state.GitCommonDir, "objects"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ws.GitMetadataRoots) != 2 || ws.GitMetadataRoots[0] != wantObjects || ws.GitMetadataRoots[1] != filepath.Clean(state.GitWorktreeDir) {
+		t.Fatalf("Git metadata roots=%q, want object store %q and worktree dir %q", ws.GitMetadataRoots, wantObjects, state.GitWorktreeDir)
+	}
+	// The narrowed grant must never hand the agent the whole common directory,
+	// its branch refs, or the primary index (PMR-65).
+	for _, forbidden := range []string{state.GitCommonDir, filepath.Join(state.GitCommonDir, "refs", "heads"), filepath.Join(state.GitCommonDir, "index")} {
+		for _, granted := range ws.GitMetadataRoots {
+			if granted == forbidden {
+				t.Fatalf("Git metadata roots leaked source-repo path %q: %q", forbidden, ws.GitMetadataRoots)
+			}
+		}
 	}
 	if err := l.Cleanup(context.Background(), issue); err != nil {
 		t.Fatal(err)
@@ -616,6 +632,140 @@ func TestAfterCreateCannotCreateUnclassifiableGitRepository(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(root, Key(issue.Identifier))); !os.IsNotExist(err) {
 		t.Fatalf("unclassifiable Git repository remains: %v", err)
 	}
+}
+
+// TestNarrowedGrantSufficesForDetachedCommitAndProtectsSource proves the two
+// halves of the PMR-65 fix on a real repository: a detached-HEAD add+commit in
+// the linked worktree needs only the shared object store and the worktree's own
+// metadata directory (it succeeds and moves the worktree HEAD), and it writes
+// nothing outside those two granted roots -- in particular it leaves every
+// source branch head and the primary index byte-for-byte unchanged.
+func TestNarrowedGrantSufficesForDetachedCommitAndProtectsSource(t *testing.T) {
+	source := newGitRepository(t)
+	root := filepath.Join(t.TempDir(), "workspaces")
+	s := config.Settings{Workspace: config.Workspace{Root: root, SourceRoot: source}}
+	l := New(func() config.Settings { return s })
+	issue := domain.Issue{ID: "1", Identifier: "PMR-1"}
+	ws, err := l.Prepare(context.Background(), issue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, _, err := l.loadState(issue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	objects, err := canonicalExistingDirectory(filepath.Join(state.GitCommonDir, "objects"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Fingerprint everything under the common directory except the two granted
+	// roots (the object store and this worktree's own metadata directory). A
+	// detached-HEAD commit that only needs those roots must leave this set of
+	// files unchanged.
+	granted := []string{objects, filepath.Clean(state.GitWorktreeDir)}
+	before := snapshotCommonDirExcept(t, state.GitCommonDir, granted)
+	baseHead := gitShow(t, ws.Path, "HEAD")
+
+	if err := os.WriteFile(filepath.Join(ws.Path, "worktree.txt"), []byte("agent change\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, ws.Path, "add", "worktree.txt")
+	runGit(t, ws.Path, "commit", "-m", "agent commit on detached HEAD")
+
+	newHead := gitShow(t, ws.Path, "HEAD")
+	if newHead == baseHead {
+		t.Fatalf("detached-HEAD commit did not advance the worktree HEAD (%s)", newHead)
+	}
+	if out, err := exec.Command("git", "-C", ws.Path, "symbolic-ref", "-q", "HEAD").CombinedOutput(); err == nil {
+		t.Fatalf("worktree left detached state and is on branch %q", strings.TrimSpace(string(out)))
+	}
+	after := snapshotCommonDirExcept(t, state.GitCommonDir, granted)
+	if !reflect.DeepEqual(before, after) {
+		t.Fatalf("detached-HEAD commit wrote outside the granted roots\nbefore=%v\nafter=%v", before, after)
+	}
+	if want := gitShow(t, source, "HEAD"); want != baseHead {
+		t.Fatalf("source HEAD moved from %s to %s during a detached worktree commit", baseHead, want)
+	}
+}
+
+// TestSourceIntegrityDigestDetectsBranchAndIndexWrites unit-tests the PMR-65
+// backstop's detection primitive: the digest ignores the symphony/* publish
+// branches Symphony itself creates, but changes when any other branch head moves
+// or the primary index is written.
+func TestSourceIntegrityDigestDetectsBranchAndIndexWrites(t *testing.T) {
+	source := newGitRepository(t)
+	commonDir := filepath.Join(source, ".git")
+	ctx := context.Background()
+	base, err := sourceIntegrityDigest(ctx, source, commonDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, source, "branch", "symphony/pmr-1")
+	if got, err := sourceIntegrityDigest(ctx, source, commonDir); err != nil || got != base {
+		t.Fatalf("symphony/* branch changed the digest: got=%q base=%q err=%v", got, base, err)
+	}
+	runGit(t, source, "branch", "feature")
+	afterBranch, err := sourceIntegrityDigest(ctx, source, commonDir)
+	if err != nil || afterBranch == base {
+		t.Fatalf("a new non-symphony branch head was not detected: got=%q base=%q err=%v", afterBranch, base, err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "staged.txt"), []byte("staged\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, source, "add", "staged.txt")
+	afterIndex, err := sourceIntegrityDigest(ctx, source, commonDir)
+	if err != nil || afterIndex == afterBranch {
+		t.Fatalf("a primary index write was not detected: got=%q previous=%q err=%v", afterIndex, afterBranch, err)
+	}
+}
+
+// snapshotCommonDirExcept fingerprints the contents of every file under root
+// except those inside the excluded directories, so a test can assert that an
+// operation wrote nothing outside the excluded (granted) roots.
+func snapshotCommonDirExcept(t *testing.T, root string, excluded []string) map[string]string {
+	t.Helper()
+	root = filepath.Clean(root)
+	snapshot := map[string]string{}
+	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		for _, dir := range excluded {
+			if path == dir || strings.HasPrefix(path, filepath.Clean(dir)+string(filepath.Separator)) {
+				if info.IsDir() {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+		}
+		if info.IsDir() {
+			return nil
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		sum := sha256.Sum256(data)
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		snapshot[rel] = fmt.Sprintf("%x", sum)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return snapshot
+}
+
+func gitShow(t *testing.T, dir string, rev string) string {
+	t.Helper()
+	out, err := exec.Command("git", "-C", dir, "rev-parse", rev).CombinedOutput()
+	if err != nil {
+		t.Fatalf("git rev-parse %s: %v: %s", rev, err, out)
+	}
+	return strings.TrimSpace(string(out))
 }
 
 func newGitRepository(t *testing.T) string {
