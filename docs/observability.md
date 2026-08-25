@@ -26,7 +26,8 @@ model-invokable tool can write the tracker — also logs one info-level
 the log alone. Each carries `operation` (`start_transition` for the
 coordinator's dispatch-time move; `handoff` for the host review handoff;
 `landing_refused`, `landing_completed`, `merge_reconciled`, and
-`review_completed` for the GitHub landing edges), the `from_state` and
+`review_completed` for the GitHub landing edges; `transition` for a host-side
+move applied through the tracker adapter itself), the `from_state` and
 `to_state` state NAMES, and the issue (`issue_id`/`issue_identifier`). An
 idempotent no-op (the issue is already in the target state) instead logs a
 debug-level `"msg":"Linear transition skipped"` with the same fields, so a
@@ -37,18 +38,79 @@ separately.)
 
 Symphony also logs state changes it did **not** perform. The poll loop
 remembers each issue it drove into the review `handoff_state`, and if such an
-issue later reappears as an active candidate — an external actor (typically the
-tracker's native GitHub PR automation) reverted the handoff — it logs one
-warn-level `"msg":"external tracker state change observed"` record with
-`operation: external_reversion`, the `from_state` (the handoff state) and
-`to_state` (the active state it was reverted to) NAMES, the
+issue later reappears as an active candidate it logs exactly one record for
+that change. `handoff_state` is human-controlled and Symphony has no writer out
+of it, so every such change comes from outside Symphony — but only some of them
+are a fault, and the `operation` field says which:
+
+* `operation: review_approved` — the handoff state -> `github.merge_state`
+  (`In Review -> Merging`). Moving the issue there is itself the human
+  approval to land, so this is normal operation, logged at **info** level with
+  `"msg":"human review state change observed"`. The edge is recognized *by*
+  `github.merge_state`: with landing unconfigured there is no merge state to
+  match, so the same move is unnameable and warns instead.
+* `operation: rework_requested` — the handoff state -> the lifecycle's rework
+  state (`In Review -> Rework`), the human review decision that sends the work
+  back for changes. Also **info**, with the same message. Symphony names the
+  rework state by elimination: `tracker.provider.transitions.start` enumerates
+  the pre-review implementation states (the canonical `Todo -> In Progress`
+  edge) and `github.merge_state` is the landing authorization, so removing both
+  from `active_states` leaves the states only a human review decision moves an
+  issue into. That naming is trusted **only when exactly one state remains** —
+  canonically `Rework`. Configure a second unaccounted-for active state (a
+  parked `Blocked`, a dispatchable `Backlog`, or a dispatch entry state no
+  start edge names) and nothing qualifies: Symphony will not guess which of
+  them is the rework state, so every such change warns instead.
+* `operation: external_reversion` — anything else: the handoff was contradicted
+  by reactivating handed-off work as though implementation had not happened
+  (typically the tracker's native GitHub PR automation flapping
+  `In Review -> In Progress`; PMR-63), or the destination is one the configured
+  lifecycle cannot name (no start policy, or two or more remaining candidates as
+  above). This one keeps its actionable **warn**-level
+  `"msg":"external tracker state change observed"` record. The warning is the
+  default on purpose: an expected-change record for a state Symphony merely
+  failed to recognize would hide exactly the fault this record exists to
+  surface.
+
+Every one of the three carries the `from_state` (the handoff state) and
+`to_state` (the state it was moved to) NAMES, the
 `issue_id`/`issue_identifier`, and `since_handoff_ms` (elapsed time since the
-handoff). It is logged once per revert and, like every transition record, is
-redaction-safe. Symphony does not itself re-assert the handoff — the operator
-mitigation is to disable the tracker's native PR-to-status automation (see the
-[Linear tracker profile](linear-tracker.md)); automatically re-asserting the
-handoff without overriding a legitimate human reactivation is a deferred
-follow-up.
+handoff). Each is logged once per change and, like every transition record, is
+redaction-safe. Symphony does not itself re-assert a reverted handoff — the
+operator mitigation is to disable the tracker's native PR-to-status automation
+(see the [Linear tracker profile](linear-tracker.md)); automatically
+re-asserting the handoff without overriding a legitimate human reactivation is
+a deferred follow-up.
+
+Every `operation` value — the performed edges above and these three observed
+ones — comes from one bounded vocabulary of fixed literals
+(`internal/observability`), so a log query can rely on the field's values
+instead of matching per-call-site strings.
+
+Landing decisions Symphony settles for the agent are visible at info level
+too, so a pending GitHub gate is never mistaken for an agent problem. A
+non-terminal landing wait logs `"msg":"agent landing waiting"` with
+`operation: landing_waiting` and the bounded, host-generated `reason`
+(`required checks are pending`, `github has not yet computed mergeability`, …),
+followed by `"msg":"landing wait retry scheduled"` (same `operation`, plus
+`attempt`, `wait_attempt`, and `delay_ms`; it is logged only once the retry was
+actually armed) and the ordinary `"msg":"agent retry scheduled"` record carrying
+`retry_kind: landing`. A landing retry is always identified by that
+`retry_kind`; its `reason` is `landing_waiting`, or `landing_slot_unavailable`
+when the redispatch had to queue behind the state's concurrency limit. The
+`wait_attempt` count is the "this landing is stuck" signal — the agent `attempt`
+deliberately stays put for a non-failure, while consecutive waits escalate
+`delay_ms` from `github.poll_interval_ms` toward `agent.max_retry_backoff_ms`
+and also appear as `wait_attempt` in the coordinator snapshot's `retrying`
+entries. The run itself finishes as
+`"status":"waiting"` in `"msg":"agent logical run finished"` — deliberately
+distinct from the `blocked`/`failed` statuses and from an agent failure's
+warn-level `"msg":"agent run retry scheduled"` (`reason: turn_limit_exhausted`
+and friends). A terminal landing logs `"msg":"agent landing resolved"` with
+`operation: landing_resolved`, and the hard-gate fallback keeps its existing
+`"msg":"Linear transition"` record with `operation: landing_refused`. Together
+these four records distinguish waiting, the delayed retry, a hard refusal, and
+an agent failure without reading the Codex rollout.
 
 At startup, the info log also records `startup credential configuration` with
 `linear_credentials_configured` and `github_credentials_configured` booleans.
@@ -138,11 +200,35 @@ tail -F .symphony/logs/symphony.jsonl \
   | jq 'select(.msg == "Linear transition") | {operation, from_state, to_state, issue_identifier}'
 ```
 
-Workspace lifecycle final status (clean removal vs. kept for review):
+Every state change out of the review handoff state Symphony did not make,
+with its classification (`review_approved`, `rework_requested`, or the
+actionable `external_reversion`):
+
+```sh
+tail -F .symphony/logs/symphony.jsonl \
+  | jq 'select(.msg | test("human review state change|external tracker state change")) | {operation, from_state, to_state, issue_identifier, since_handoff_ms}'
+```
+
+Workspace lifecycle final status (removal vs. kept for review):
 
 ```sh
 tail -F .symphony/logs/symphony.jsonl | jq 'select(.msg == "workspace cleanup")'
 ```
+
+Each record carries one fixed `status`: `clean` (removed, no local commits
+past the recorded base commit), `landed` (removed, and it did hold local
+commits, which Symphony verified as the merged pull request head for that
+issue), `dirty` (kept: uncommitted or untracked changes), `committed` (kept:
+local commits that are not verifiably merged, including a landing that could
+not be verified), or `blocked` (kept: any other fail-closed refusal, such as
+unowned or unverifiable state). Only `clean` and `landed` removed anything; the
+warn-level records carry the workspace package's own refusal text as `error`.
+The read-only landing check that separates `landed` from `committed` logs its
+own info-level `"msg":"GitHub landing verified for workspace cleanup"` or
+`"msg":"GitHub landing unverified; workspace commits are preserved"` record
+with the `repository`, the shortened `workspace_commit`, and, when verified,
+the `pr_number`. See [workspace ownership and
+recovery](completion-markers.md) for the full cleanup safety table.
 
 ## What never appears in the log
 

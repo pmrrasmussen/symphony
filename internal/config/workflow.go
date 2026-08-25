@@ -60,7 +60,11 @@ type Settings struct {
 type GitHub struct {
 	Enabled                                        bool
 	Owner, Repository, BaseBranch, Token, Endpoint string
-	PollInterval                                   time.Duration
+	// PollInterval paces the host's linked pull-request poll loop and, since
+	// PMR-78, is also the floor for the coordinator's delayed landing
+	// redispatch after github_land_pr reports a non-terminal wait. Consecutive
+	// waits escalate that delay toward Agent.MaxRetryBackoff.
+	PollInterval time.Duration
 	// MergeState is the exact Linear state that grants the zero-argument
 	// github_land_pr capability to a session bound to an issue currently in
 	// that state. Empty means landing is not configured.

@@ -43,9 +43,12 @@ tracker:
     # the host performs the handoff. Operator prerequisite: disable Linear's
     # native GitHub PR-to-status automation for this team/project — it is an
     # external writer that races this handoff and can flap the issue back to an
-    # active state (In Review -> In Progress; PMR-63). Symphony logs any such
-    # external revert (operation: external_reversion) but does not re-assert the
-    # handoff itself; see README.md and docs/linear-tracker.md.
+    # active state (In Review -> In Progress; PMR-63). Symphony warns on any
+    # such external revert (operation: external_reversion) but does not
+    # re-assert the handoff itself. The expected human decisions out of In
+    # Review are logged as expected instead: In Review -> Merging as
+    # operation: review_approved and In Review -> Rework as
+    # operation: rework_requested. See README.md and docs/linear-tracker.md.
     handoff_state: In Review
   # The canonical lifecycle (PMR-38): Todo -> In Progress -> In Review <->
   # Rework -> Merging -> Done. Rework and Merging are active/dispatchable so a
@@ -104,6 +107,11 @@ github:
   repository: symphony
   base_branch: main
   token_file: $SYMPHONY_GITHUB_TOKEN_FILE
+  # Paces the linked pull-request poll loop, and is also the floor for the
+  # delayed landing redispatch after github_land_pr reports a non-terminal
+  # wait. Consecutive waits escalate that delay toward
+  # agent.max_retry_backoff_ms, so a gate that never settles backs off instead
+  # of respawning a landing session every interval.
   poll_interval_ms: 30000
   # Landing capability (PMR-37, activated for real dispatch by PMR-38). A
   # session bound to an issue currently in Merging receives the zero-argument
@@ -179,8 +187,10 @@ state.
   irreversible merge call.
 
 ## Hard landing blockers
-- A pending-checks result is not an error: take no further action. A later
-  Merging dispatch retries automatically once checks settle.
+- A pending-checks or pending-mergeability result is not an error: it ends
+  this run. Take no further action and do not call github_land_pr again --
+  Symphony releases the worker and redispatches landing itself once checks
+  settle, so retrying here only wastes turns.
 - Any other refusal (a failing check, an effective changes-requested review,
   an unresolved review thread, a stale base, a merge conflict, or a closed or
   mismatched pull request) has already returned this issue to In Review for a
@@ -189,6 +199,7 @@ state.
 
 ## Completion
 - A successful merge, or a pull request GitHub already reports merged,
-  transitions this issue to Done automatically. Take no further Linear action
-  yourself once github_land_pr reports a merged result.
+  transitions this issue to Done automatically and ends this run. Take no
+  further Linear action yourself, and never call github_land_pr again after a
+  merged result: the capability is closed for this run and refuses.
 {{end}}

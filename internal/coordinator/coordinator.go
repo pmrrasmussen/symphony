@@ -37,8 +37,17 @@ func (realClock) Now() time.Time { return time.Now() }
 type retryKind string
 
 const (
-	retryAgent        retryKind = "agent"
+	retryAgent retryKind = "agent"
+	// retryLanding is a coordinator-owned landing redispatch after the
+	// host-side landing capability reported a non-terminal wait. It is
+	// deliberately distinct from retryAgent: it is not an agent failure, it does
+	// not escalate the attempt, and its delay follows the GitHub poll interval
+	// instead of the failure backoff (PMR-78).
+	retryLanding      retryKind = "landing"
 	continuationDelay           = time.Second
+	// defaultLandingRetryDelay is the landing redispatch floor when neither
+	// github.poll_interval_ms nor polling.interval_ms is configured.
+	defaultLandingRetryDelay = 30 * time.Second
 )
 
 // handoffObservationFloor is the lower bound for how long the coordinator
@@ -58,6 +67,32 @@ type turnLimitError struct{ limit int }
 
 func (e turnLimitError) Error() string {
 	return fmt.Sprintf("agent turn limit exhausted after %d turns while issue remains active", e.limit)
+}
+
+// landingWaitError means the host-side landing capability returned a
+// non-terminal waiting result: required checks or GitHub's own mergeability
+// computation have not settled, so no further model turn can advance the issue.
+// It is deliberately NOT an agent failure — the run ends, the worker slot is
+// released, and the coordinator redispatches the same attempt after a bounded
+// delay, so a wait consumes neither agent.max_turns nor the failure backoff
+// escalation (PMR-78). The reason is the github package's own fixed, bounded,
+// secret-free waiting string.
+type landingWaitError struct{ reason string }
+
+func (e landingWaitError) Error() string {
+	if e.reason == "" {
+		return "landing waiting"
+	}
+	return "landing waiting: " + e.reason
+}
+
+// landingWait reports whether an agent run ended on a landing wait.
+func landingWait(err error) (landingWaitError, bool) {
+	var wait landingWaitError
+	if errors.As(err, &wait) {
+		return wait, true
+	}
+	return landingWaitError{}, false
 }
 
 // blockedError carries only a normalized blocker category. Agent event text
@@ -131,12 +166,19 @@ type Coordinator struct {
 	// an external actor (for example Linear's native GitHub PR automation)
 	// reverting that handoff to an active state instead of silently
 	// re-dispatching it. It is in-process only and discarded safely on restart.
-	handoffs  map[string]handoffObservation
-	nextRetry uint64
-	stopping  bool
-	ctx       context.Context
-	cancel    context.CancelFunc
-	wg        sync.WaitGroup
+	handoffs map[string]handoffObservation
+	// landingWaits counts consecutive non-terminal landing waits for a claimed
+	// issue. It escalates the delayed landing redispatch so a gate that never
+	// settles (a genuinely long check run, or a required_checks name that does
+	// not match any GitHub job) backs off toward agent.max_retry_backoff_ms
+	// instead of respawning a session at the GitHub poll cadence forever. It is
+	// cleared with the claim, so any other landing outcome resets it (PMR-78).
+	landingWaits map[string]int
+	nextRetry    uint64
+	stopping     bool
+	ctx          context.Context
+	cancel       context.CancelFunc
+	wg           sync.WaitGroup
 }
 
 // handoffObservation is the coordinator's memory of one host-driven transition
@@ -161,6 +203,11 @@ type running struct {
 	// matching completion. It is the actionable answer to "what is Codex
 	// waiting on" for heartbeat and stall records.
 	outstanding *outstandingOp
+	// landingResolved records that this run's landing capability reported a
+	// terminal outcome (the pull request is merged and the issue reconciled to
+	// its terminal state). The run then ends without another turn even if the
+	// tracker refresh has not yet observed the transition (PMR-78).
+	landingResolved bool
 	// lastGeneric* coalesce repeated generic progress notifications (protocol
 	// methods Symphony does not otherwise classify) so an idle-looking but
 	// chatty protocol stream cannot flood the log.
@@ -186,7 +233,7 @@ func New(t domain.Tracker, a domain.AgentBackend, w domain.WorkspaceExecutor, se
 		timer: realTimer{}, clock: realClock{}, log: observability.FromSlog(logger),
 		running: map[string]*running{}, claimed: map[string]bool{},
 		claimState: map[string]string{}, admitted: map[string]string{}, retries: map[string]retryState{},
-		handoffs: map[string]handoffObservation{},
+		handoffs: map[string]handoffObservation{}, landingWaits: map[string]int{},
 	}
 }
 
@@ -216,11 +263,17 @@ type RunningSnapshot struct {
 }
 
 type RetrySnapshot struct {
-	IssueIdentifier string    `json:"issue_identifier"`
-	Attempt         int       `json:"attempt"`
-	Kind            string    `json:"kind"`
-	Reason          string    `json:"reason"`
-	Due             time.Time `json:"due_at"`
+	IssueIdentifier string `json:"issue_identifier"`
+	Attempt         int    `json:"attempt"`
+	Kind            string `json:"kind"`
+	Reason          string `json:"reason"`
+	// WaitAttempt is the number of consecutive landing waits behind a
+	// "landing" retry. It is the operator's "this landing is stuck" signal:
+	// the agent attempt deliberately stays put for a non-failure, so a climbing
+	// wait count (and the growing delay it drives) is what distinguishes a slow
+	// check run from a gate that will never settle (PMR-78).
+	WaitAttempt int       `json:"wait_attempt,omitempty"`
+	Due         time.Time `json:"due_at"`
 }
 
 // OutstandingOperationSnapshot identifies the one safe app-server operation
@@ -245,7 +298,7 @@ func (c *Coordinator) Snapshot() Snapshot {
 		snapshot.Running = append(snapshot.Running, RunningSnapshot{IssueIdentifier: run.issue.Identifier, IssueState: run.issue.State, SessionID: run.session.ID, ThreadID: run.session.ThreadID, TurnID: run.session.TurnID, Attempt: run.run.Attempt, TurnCount: run.run.TurnCount, StartedAt: run.run.StartedAt, LastEventAt: run.last, Usage: run.run.Usage, RateLimit: copyRateLimit(run.rateLimit), OutstandingOperation: item})
 	}
 	for _, retry := range c.retries {
-		snapshot.Retrying = append(snapshot.Retrying, RetrySnapshot{IssueIdentifier: retry.issue.Identifier, Attempt: retry.attempt, Kind: string(retry.kind), Reason: retry.reason, Due: retry.due})
+		snapshot.Retrying = append(snapshot.Retrying, RetrySnapshot{IssueIdentifier: retry.issue.Identifier, Attempt: retry.attempt, Kind: string(retry.kind), Reason: retry.reason, WaitAttempt: c.landingWaits[retry.issue.ID], Due: retry.due})
 	}
 	sort.Slice(snapshot.Running, func(i, j int) bool { return snapshot.Running[i].IssueIdentifier < snapshot.Running[j].IssueIdentifier })
 	sort.Slice(snapshot.Retrying, func(i, j int) bool {
@@ -320,6 +373,7 @@ func (c *Coordinator) Shutdown(ctx context.Context) error {
 		delete(c.retries, id)
 		delete(c.claimed, id)
 		delete(c.claimState, id)
+		delete(c.landingWaits, id)
 	}
 	c.mu.Unlock()
 	c.cancelAll(ctx, runs)
@@ -363,11 +417,13 @@ func (c *Coordinator) tick(ctx context.Context) error {
 			return ctx.Err()
 		}
 		// A candidate the tracker returns in an active state that Symphony itself
-		// just handed off to the review state has been reverted by an external
-		// actor (see PMR-63: Linear's native GitHub PR automation). Log the
-		// external delta so the flap is visible in the JSONL instead of only in
-		// Linear's history. Symphony does not itself re-assert the handoff here.
-		c.noteExternalReversion(i, s, now)
+		// just handed off to the review state was moved by someone else: a human
+		// review decision (approve for landing, or send back for rework), or an
+		// external reversion of the handoff (see PMR-63: Linear's native GitHub
+		// PR automation). Log the external delta, classified, so the edge is
+		// visible in the JSONL instead of only in Linear's history. Symphony does
+		// not itself re-assert the handoff here.
+		c.notePostHandoffStateChange(i, s, now)
 		if reason := ineligibleReason(i, s); reason != "" {
 			summary.rejected[reason]++
 			c.log.Debug("poll candidate rejected", "issue_identifier", i.Identifier, "reason", reason)
@@ -461,12 +517,16 @@ func (c *Coordinator) noteHandoffObservation(issue domain.Issue, s config.Settin
 	c.mu.Unlock()
 }
 
-// noteExternalReversion logs, exactly once, when an active candidate is an
-// issue Symphony recently handed off to the review state: an external actor
-// (not Symphony, which has no In Review -> active writer) reverted the handoff.
-// It consumes the observation so a single revert is reported once, and never
-// mutates the tracker — re-asserting the handoff is a documented follow-up.
-func (c *Coordinator) noteExternalReversion(i domain.Issue, s config.Settings, now time.Time) {
+// notePostHandoffStateChange logs, exactly once, when an active candidate is an
+// issue Symphony recently handed off to the review state. Every such change is
+// external — the review state is human-controlled and Symphony has no
+// In Review -> active writer — but not every one is a fault: the human approval
+// and rework decisions are the lifecycle working as designed and are logged as
+// expected changes, while an unexpected reactivation stays a warning. It
+// consumes the observation so a single change is reported once, and never
+// mutates the tracker — re-asserting a reverted handoff is a documented
+// follow-up.
+func (c *Coordinator) notePostHandoffStateChange(i domain.Issue, s config.Settings, now time.Time) {
 	if norm(s.Tracker.HandoffState) == "" || i.ID == "" {
 		return
 	}
@@ -479,14 +539,90 @@ func (c *Coordinator) noteExternalReversion(i domain.Issue, s config.Settings, n
 	if !ok || norm(i.State) == observation.state {
 		return
 	}
-	c.log.Warn("external tracker state change observed",
-		"operation", "external_reversion",
+	operation := postHandoffOperation(norm(i.State), s)
+	attrs := []any{
+		"operation", operation,
 		"issue_id", i.ID,
 		"issue_identifier", i.Identifier,
 		"from_state", observation.state,
 		"to_state", norm(i.State),
 		"since_handoff_ms", now.Sub(observation.at).Milliseconds(),
-	)
+	}
+	if operation == observability.OperationExternalReversion {
+		c.log.Warn("external tracker state change observed", attrs...)
+		return
+	}
+	c.log.Info("human review state change observed", attrs...)
+}
+
+// postHandoffOperation classifies one state change out of the review handoff
+// state that Symphony did not perform. Moving the issue into the configured
+// github.merge_state is the documented human approval to land, and moving it
+// into the lifecycle's rework state is the documented human request for
+// changes; both are expected. Everything else — including any destination
+// Symphony cannot name from the configured lifecycle — contradicts the handoff
+// by reactivating handed-off work as though implementation had not happened
+// (the PMR-63 flap of the tracker's native PR-to-status automation) and stays
+// an actionable warning. The warning is the default on purpose: a silent
+// expected-change record for a state Symphony merely failed to recognize would
+// hide exactly the fault this record exists to surface.
+func postHandoffOperation(to string, s config.Settings) observability.Operation {
+	switch {
+	case to != "" && to == norm(s.GitHub.MergeState):
+		return observability.OperationReviewApproved
+	case reworkDecision(to, s):
+		return observability.OperationReworkRequested
+	default:
+		return observability.OperationExternalReversion
+	}
+}
+
+// reworkDecision reports whether state is the lifecycle's human rework state.
+// Symphony names that state by elimination against the configured lifecycle:
+// tracker.provider.transitions.start enumerates the pre-review implementation
+// states (the canonical Todo -> In Progress edge) and github.merge_state is the
+// landing authorization, so removing both from active_states leaves the states
+// only a human review decision moves an issue into.
+//
+// That naming is trusted only when exactly one state remains, which is the
+// canonical lifecycle's Rework. With no start policy configured, or with two or
+// more remaining candidates (an extra parked state such as Blocked, a Backlog
+// in active_states, or a dispatch entry state that no start edge names),
+// Symphony cannot tell the rework state from a state an external writer parked
+// handed-off work in, so nothing qualifies and every such change keeps its
+// warning. The merge state is excluded here too, so this predicate is correct
+// on its own rather than relying on postHandoffOperation's case order.
+func reworkDecision(state string, s config.Settings) bool {
+	if state == "" || state == norm(s.GitHub.MergeState) {
+		return false
+	}
+	candidates := reworkCandidates(s)
+	return len(candidates) == 1 && candidates[0] == state
+}
+
+// reworkCandidates returns the normalized active states that neither the host
+// start policy nor the merge state accounts for. An empty start policy yields
+// no candidates: without it Symphony cannot identify the pre-review
+// implementation states, so it can name nothing by elimination.
+func reworkCandidates(s config.Settings) []string {
+	if len(s.Tracker.HostTransitions.Start) == 0 {
+		return nil
+	}
+	accounted := map[string]bool{norm(s.GitHub.MergeState): true}
+	for source, target := range s.Tracker.HostTransitions.Start {
+		accounted[norm(source)] = true
+		accounted[norm(target)] = true
+	}
+	candidates := make([]string, 0, len(s.Tracker.ActiveStates))
+	for _, state := range s.Tracker.ActiveStates {
+		name := norm(state)
+		if name == "" || accounted[name] {
+			continue
+		}
+		accounted[name] = true // Also de-duplicates a repeated active state.
+		candidates = append(candidates, name)
+	}
+	return candidates
 }
 
 // sweepHandoffObservations discards handoff memories older than the retention
@@ -741,6 +877,10 @@ func (c *Coordinator) launch(parent context.Context, i domain.Issue, attempt int
 			return
 		}
 		c.unreserve(i.ID)
+		if wait, ok := landingWait(consumeErr); ok {
+			c.finishLandingWait(parent, i, attempt, wait.reason)
+			return
+		}
 		c.finishFailure(parent, i, attempt, agentFailureReason(consumeErr), consumeErr)
 	}()
 	return true
@@ -768,10 +908,10 @@ func (c *Coordinator) transitionToStarted(ctx context.Context, i domain.Issue, s
 		return target
 	}
 	if err := c.tracker.Transition(ctx, i, target); err != nil {
-		c.log.Warn("dispatch start transition failed", "operation", "start_transition", "issue_id", i.ID, "issue_identifier", i.Identifier, "from_state", norm(i.State), "to_state", norm(target), "error", err)
+		c.log.Warn("dispatch start transition failed", "operation", observability.OperationStartTransition, "issue_id", i.ID, "issue_identifier", i.Identifier, "from_state", norm(i.State), "to_state", norm(target), "error", err)
 		return ""
 	}
-	c.log.Info("issue moved to started state", "operation", "start_transition", "issue_id", i.ID, "issue_identifier", i.Identifier, "from_state", norm(i.State), "to_state", norm(target))
+	c.log.Info("issue moved to started state", "operation", observability.OperationStartTransition, "issue_id", i.ID, "issue_identifier", i.Identifier, "from_state", norm(i.State), "to_state", norm(target))
 	return target
 }
 
@@ -802,6 +942,18 @@ func (c *Coordinator) runTurns(ctx context.Context, r *running, events <-chan do
 			}
 			return true, current, nil
 		}
+		c.mu.Lock()
+		landingResolved := r.landingResolved
+		c.mu.Unlock()
+		if landingResolved {
+			// Landing already merged the pull request and reconciled the issue.
+			// End the run here even when this refresh still reports the pre-merge
+			// state, so no later turn or landing tool call is possible (PMR-78).
+			// This issue will never be polled or retried again, so the workspace
+			// must be released here exactly as on the terminal-state path above.
+			c.cleanupWorkspace(ctx, current)
+			return true, current, nil
+		}
 		if turnCount >= settings.Agent.MaxTurns {
 			return false, current, turnLimitError{limit: settings.Agent.MaxTurns}
 		}
@@ -817,6 +969,11 @@ func (c *Coordinator) runTurns(ctx context.Context, r *running, events <-chan do
 		r.run.TurnCount++
 		c.mu.Unlock()
 	}
+}
+
+func isLandingWait(err error) bool {
+	_, ok := landingWait(err)
+	return ok
 }
 
 func agentFailureReason(err error) string {
@@ -865,6 +1022,8 @@ func (c *Coordinator) finishRun(r *running, completed bool, stopped stopReason, 
 		r.run.Status = domain.RunCanceled
 	case completed:
 		r.run.Status = domain.RunSucceeded
+	case isLandingWait(err):
+		r.run.Status = domain.RunWaiting
 	case agentFailureReason(err) == "agent_blocked", agentFailureReason(err) == "turn_limit_exhausted":
 		r.run.Status = domain.RunBlocked
 	case err != nil && strings.Contains(strings.ToLower(err.Error()), "timeout"):
@@ -903,7 +1062,16 @@ func (c *Coordinator) consume(ctx context.Context, r *running, events <-chan dom
 				return false, blockedError{category: blockerCategory(e.Message)}
 			case domain.EventFailed:
 				return false, fmt.Errorf("agent failed: %s", e.Message)
-			case domain.EventCompleted:
+			case domain.EventLandingWaiting:
+				// A landing wait ends the run without another turn; the
+				// coordinator owns the delayed landing retry from here (PMR-78).
+				return false, landingWaitError{reason: observability.Text(e.Message)}
+			case domain.EventLandingResolved, domain.EventCompleted:
+				if e.Kind == domain.EventLandingResolved {
+					c.mu.Lock()
+					r.landingResolved = true
+					c.mu.Unlock()
+				}
 				// Reconciliation and event delivery can race. An event that
 				// arrives after reconciliation has canceled this run must never
 				// turn into a successful terminal outcome.
@@ -978,6 +1146,14 @@ func (c *Coordinator) logEvent(r *running, event domain.Event) {
 	case domain.EventDiagnostic:
 		attrs = append(attrs, "stderr", observability.Text(event.Message))
 		c.log.Warn("agent stderr", attrs...)
+	case domain.EventLandingWaiting:
+		// The reason is the github package's own fixed waiting string, so it is
+		// safe to log; it is still redacted defensively like every other text.
+		attrs = append(attrs, "operation", "landing_waiting", "reason", observability.Text(event.Message))
+		c.log.Info("agent landing waiting", attrs...)
+	case domain.EventLandingResolved:
+		attrs = append(attrs, "operation", "landing_resolved")
+		c.log.Info("agent landing resolved", attrs...)
 	case domain.EventItem:
 		c.logItemEvent(r, event, attrs)
 	default:
@@ -1123,12 +1299,13 @@ func normalizedRateLimit(raw map[string]any) map[string]int64 {
 
 // cleanupWorkspace removes a terminal issue's workspace and reports the
 // lifecycle outcome an operator needs to know without reading the workspace
-// package's own error text: a clean removal, or why the workspace was kept
+// package's own error text: a clean removal, a removal that discarded local
+// commits Symphony verified as merged, or why the workspace was kept
 // (uncommitted/untracked changes, or local commits ahead of the recorded base
 // revision that a human should review before it is discarded).
 func (c *Coordinator) cleanupWorkspace(ctx context.Context, issue domain.Issue) {
-	err := c.workspaces.Cleanup(ctx, issue)
-	status := cleanupStatus(err)
+	outcome, err := c.workspaces.Cleanup(ctx, issue)
+	status := cleanupStatus(outcome, err)
 	attrs := []any{"issue_id", issue.ID, "issue_identifier", issue.Identifier, "status", status}
 	if err != nil {
 		attrs = append(attrs, "error", err)
@@ -1138,13 +1315,17 @@ func (c *Coordinator) cleanupWorkspace(ctx context.Context, issue domain.Issue) 
 	c.log.Info("workspace cleanup", attrs...)
 }
 
-// cleanupStatus classifies a Cleanup error into the fixed clean/dirty/committed
-// vocabulary the workspace package's own refusal messages already describe. It
-// only ever matches fixed, secret-free substrings the workspace package
-// controls, never issue or workspace content.
-func cleanupStatus(err error) string {
+// cleanupStatus classifies a Cleanup result into the fixed
+// clean/landed/dirty/committed vocabulary the workspace package's own outcome
+// and refusal messages already describe. It only ever reports a workspace-owned
+// outcome constant or matches fixed, secret-free substrings the workspace
+// package controls, never issue or workspace content.
+func cleanupStatus(outcome domain.CleanupOutcome, err error) string {
 	if err == nil {
-		return "clean"
+		if outcome == domain.CleanupLanded {
+			return string(domain.CleanupLanded)
+		}
+		return string(domain.CleanupClean)
 	}
 	switch msg := err.Error(); {
 	case strings.Contains(msg, "uncommitted or untracked changes"):
@@ -1174,11 +1355,68 @@ func (c *Coordinator) finishFailure(ctx context.Context, i domain.Issue, attempt
 	c.scheduleRetry(ctx, i, domain.Workspace{}, attempt+1, retryAgent, reason, backoff(attempt+1, c.settings().Agent.MaxRetryBackoff))
 }
 
-func (c *Coordinator) scheduleRetry(ctx context.Context, i domain.Issue, ws domain.Workspace, attempt int, kind retryKind, reason string, delay time.Duration) {
+// finishLandingWait ends a run whose landing capability reported a
+// non-terminal wait. A wait is not an agent failure: the same attempt is
+// redispatched after landingRetryDelay, so it consumes neither Codex turns nor
+// the failure backoff escalation, and while the timer waits it holds only the
+// duplicate-prevention claim — never an orchestrator slot (PMR-78).
+func (c *Coordinator) finishLandingWait(ctx context.Context, i domain.Issue, attempt int, reason string) {
+	if ctx.Err() != nil {
+		c.log.Info("agent run cancelled", "issue_id", i.ID, "issue_identifier", i.Identifier, "reason", cancellationReason("", ctx))
+		c.release(i.ID)
+		return
+	}
+	s := c.settings()
+	c.mu.Lock()
+	c.landingWaits[i.ID]++
+	waits := c.landingWaits[i.ID]
+	c.mu.Unlock()
+	delay := landingRetryDelay(s, waits)
+	if !c.scheduleRetry(ctx, i, domain.Workspace{}, attempt, retryLanding, "landing_waiting", delay) {
+		return
+	}
+	c.log.Info("landing wait retry scheduled", "operation", "landing_waiting", "issue_id", i.ID, "issue_identifier", i.Identifier, "reason", reason, "attempt", attempt, "wait_attempt", waits, "delay_ms", delay.Milliseconds())
+}
+
+// landingRetryDelay bounds the wait before a landing is redispatched. Its floor
+// is the configured GitHub poll interval -- the cadence at which the GitHub
+// state being waited on can change -- and it escalates with the number of
+// consecutive waits toward agent.max_retry_backoff_ms, so a gate that never
+// settles cannot respawn a session every poll interval forever. The coordinator
+// deliberately does not itself give up on a stuck landing: returning the issue
+// to review is the landing capability's own bounded, commented authority
+// (github_land_pr's merge_state -> In Review fallback), and a Merging issue that
+// stops making progress stays visible on the board with a climbing wait_attempt.
+// The floor is never undercut, so a small backoff ceiling cannot turn landing
+// into a tighter GitHub poll than the configured interval.
+func landingRetryDelay(s config.Settings, waits int) time.Duration {
+	floor := s.GitHub.PollInterval
+	if floor <= 0 {
+		floor = s.Polling.Interval
+	}
+	if floor <= 0 {
+		// The same fallback the GitHub linked-PR poll loop uses when no interval
+		// is configured (see internal/github.Manager.Run).
+		floor = defaultLandingRetryDelay
+	}
+	// backoff already caps its escalation at the ceiling, and the poll floor
+	// always wins: a small max_retry_backoff_ms must never make landing poll
+	// GitHub faster than its configured interval.
+	delay := floor
+	if escalated := backoff(waits, s.Agent.MaxRetryBackoff); escalated > delay {
+		delay = escalated
+	}
+	return delay
+}
+
+// scheduleRetry arms one delayed redispatch and reports whether it did: a
+// shutdown or a released claim declines it, so a caller that logs the retry
+// separately can stay truthful.
+func (c *Coordinator) scheduleRetry(ctx context.Context, i domain.Issue, ws domain.Workspace, attempt int, kind retryKind, reason string, delay time.Duration) bool {
 	c.mu.Lock()
 	if c.stopping || !c.claimed[i.ID] {
 		c.mu.Unlock()
-		return
+		return false
 	}
 	if previous, ok := c.retries[i.ID]; ok && previous.timer != nil {
 		previous.timer.Stop()
@@ -1199,6 +1437,7 @@ func (c *Coordinator) scheduleRetry(ctx context.Context, i domain.Issue, ws doma
 	}
 	c.mu.Unlock()
 	c.log.Info("agent retry scheduled", "issue_id", i.ID, "issue_identifier", i.Identifier, "retry_kind", kind, "reason", reason, "attempt", attempt, "due", state.due)
+	return true
 }
 
 func (c *Coordinator) runRetry(id string, generation uint64) {
@@ -1248,6 +1487,17 @@ func (c *Coordinator) runRetry(id string, generation uint64) {
 	// The retry still owns its claim, but another admitted run used the slot
 	// after we refreshed it. Keep that duplicate-prevention claim and retry
 	// with the prescribed bounded backoff instead of dropping the work.
+	if retry.kind == retryLanding {
+		// A contended landing slot is no more an agent failure than the wait
+		// itself: keep the attempt (it feeds the rendered prompt) and the
+		// landing cadence, so a queued landing never polls GitHub faster than
+		// the configured interval (PMR-78).
+		c.mu.Lock()
+		waits := c.landingWaits[id]
+		c.mu.Unlock()
+		c.scheduleRetry(ctx, issue, retry.workspace, retry.attempt, retryLanding, "landing_slot_unavailable", landingRetryDelay(s, waits))
+		return
+	}
 	attempt := retry.attempt + 1
 	c.scheduleRetry(ctx, issue, retry.workspace, attempt, retry.kind, "no available orchestrator slots", backoff(attempt, s.Agent.MaxRetryBackoff))
 }
@@ -1307,6 +1557,7 @@ func (c *Coordinator) release(id string) {
 	delete(c.claimState, id)
 	delete(c.admitted, id)
 	delete(c.retries, id)
+	delete(c.landingWaits, id)
 	c.mu.Unlock()
 }
 

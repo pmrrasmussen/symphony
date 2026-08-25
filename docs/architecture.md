@@ -112,7 +112,20 @@ non-dismissed review; moving the issue to `merge_state` is itself the human
 approval, so no separate approving review is required), unresolved review
 threads, the pull request's state and mergeability, and the base commit
 again. Missing or pending required checks, or undetermined mergeability,
-return a non-terminal waiting result without mutating Linear. With
+return a non-terminal waiting result without mutating Linear. A waiting result
+is settled by the host, not by the model (PMR-78): it ends the logical run at
+once, releases the concurrency slot, keeps the issue in `merge_state`, and the
+coordinator schedules one delayed landing redispatch whose timer holds only the
+duplicate-prevention claim. That delay starts at `github.poll_interval_ms` and
+escalates with the number of consecutive waits toward
+`agent.max_retry_backoff_ms`, so an unsettling gate degrades to a slow poll
+rather than a permanent per-interval respawn; the wait count is reset with the
+claim and surfaced as `wait_attempt`. A redispatch that finds the state's
+concurrency limit taken keeps that same cadence and attempt instead of
+escalating as a failure would. A terminal result -- merged, already merged, or a
+completed reconciliation -- ends the run the same way and closes
+`github_land_pr` for that run, so no later turn or duplicate tool call can
+re-invoke it; `Land` itself stays idempotent purely as the recovery path. With
 `github.update_stale_branch: true`, one clean stale-base update waits for
 checks on its new head. Any other hard gate -- a failing check, an effective
 changes-requested review, an unresolved thread, a stale base, a merge
@@ -198,8 +211,9 @@ otherwise active issue. Invalid ownership state, or missing state beside an
 existing workspace, fails closed during preparation. The schema, restart
 behavior, and deliberate operator remediation procedure are documented in
 [workspace ownership and recovery](completion-markers.md). Cleanup refuses to
-remove a worktree with local changes or a commit that differs from its recorded
-base revision.
+remove a worktree with local changes, and refuses to remove a worktree whose
+commit differs from its recorded base revision unless the host GitHub adapter
+verifies that exact commit as the merged head of the issue's pull request.
 
 Workspace containment is checked against canonical filesystem paths, including
 existing symlink ancestors. Service-owned workspace directories, the durable
@@ -224,7 +238,11 @@ delay between turns, until `agent.max_turns`. Reaching that boundary while the
 issue is still active is an explicit blocked/exhausted result, not successful
 completion. The coordinator logs `turn_limit_exhausted` and schedules its
 normal backoff retry, leaving the workspace eligible so a resolved external
-condition or a Linear update can be dispatched safely. Durable completion is
+condition or a Linear update can be dispatched safely. A run that ends on a
+host gate no model turn can advance -- today only a landing wait -- is
+deliberately not that failure path: it finishes as a `waiting` run and gets a
+delayed, non-escalating `landing` retry instead of consuming turns and an
+agent-exhaustion attempt. Durable completion is
 reserved for a verified handoff or terminal tracker transition; an ordinary
 Codex turn completion is never enough to suppress an active issue.
 

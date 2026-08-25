@@ -33,8 +33,15 @@ tracker:
     # it (or any state); the host performs every transition. Operator
     # prerequisite: disable the tracker's native GitHub PR-to-status automation
     # for this team/project — it races the handoff and can flap the issue back
-    # to an active state (PMR-63). Symphony logs any such external revert
-    # (operation: external_reversion); see README.md and docs/linear-tracker.md.
+    # to an active state (PMR-63). Symphony warns on any such external revert
+    # (operation: external_reversion). The expected human decisions out of this
+    # state are logged as expected instead — approval to land
+    # (operation: review_approved) and changes requested
+    # (operation: rework_requested) — but only once the lifecycle names them
+    # unambiguously: review_approved needs github.merge_state below, and
+    # rework_requested needs exactly one active_states entry that neither
+    # transitions.start nor github.merge_state accounts for. Otherwise every
+    # such change keeps the warning; see README.md and docs/linear-tracker.md.
     handoff_state: In Review
     # Optional, opt-in Codex client tool for capturing meaningful out-of-scope
     # work. It creates a parentless issue only in this project/team, always in
@@ -102,6 +109,10 @@ codex:
 #   base_branch: main
 #   token_file: $SYMPHONY_GITHUB_TOKEN_FILE
 #   # Alternatively: token: $SYMPHONY_GITHUB_TOKEN
+#   # Paces the linked pull-request poll loop, and is also the floor for the
+#   # delayed landing redispatch after github_land_pr reports a non-terminal
+#   # wait (pending checks or undetermined mergeability). Consecutive waits
+#   # escalate that delay toward agent.max_retry_backoff_ms.
 #   poll_interval_ms: 30000
 #   # Optional landing capability. A session bound to an issue currently in
 #   # this exact Linear state receives a zero-argument github_land_pr tool;

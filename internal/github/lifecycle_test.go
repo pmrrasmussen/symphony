@@ -221,11 +221,22 @@ func (f *apiFixture) settings() config.GitHub {
 func (f *apiFixture) pullJSON() map[string]any {
 	return map[string]any{
 		"number": f.prNumber, "html_url": "https://github.com/owner/repo/pull/7",
-		"state": f.prState, "merged": f.prMerged, "body": f.prBody,
+		"state": f.prState, "merged": f.prMerged, "merged_at": f.mergedAt(), "body": f.prBody,
 		"mergeable": f.mergeable, "mergeable_state": f.mergeableState,
 		"head": map[string]any{"ref": f.prHeadRef, "sha": f.prSHA},
 		"base": map[string]any{"ref": f.prBaseRef},
 	}
+}
+
+// mergedAt mirrors GitHub's pull-request-simple schema, which the list
+// endpoint returns: it carries merged_at but no merged field. Landing
+// verification treats either as merged, and merged_at is the one that is
+// actually present in production, so the fixture must emit it.
+func (f *apiFixture) mergedAt() any {
+	if !f.prMerged {
+		return nil
+	}
+	return "2026-08-25T09:00:00Z"
 }
 
 func boolPtr(b bool) *bool { return &b }
@@ -1367,6 +1378,111 @@ func TestLandFinalizeAfterTurnEnd(t *testing.T) {
 	}
 }
 
+// TestLandWaitAfterRetryableGateKeepsIssueInMerging covers PMR-78: a fix turn
+// whose retry finds the required check running again is genuinely pending, so
+// the wait supersedes the deferred Merging -> In Review refusal. The issue stays
+// in Merging for the coordinator's delayed landing retry.
+func TestLandWaitAfterRetryableGateKeepsIssueInMerging(t *testing.T) {
+	api, git, linear := newAPI(t), &fakeGit{}, &fakeLinear{}
+	api.prExists = true
+	api.checkRuns = failingChecks("ci/build")
+	_, session := testLandingSession(t, api, git, linear, []string{"ci/build"}, "merge")
+	session.settings.LandFixEnabled = true
+	session.settings.MaxLandAttempts = 1
+
+	_, err := session.Land(context.Background())
+	var gate *LandGateError
+	if !errors.As(err, &gate) {
+		t.Fatalf("failing check must be granted as a retryable gate, got err=%v", err)
+	}
+	api.mu.Lock()
+	api.checkRuns = []map[string]any{{"name": "ci/build", "status": "in_progress", "conclusion": nil}}
+	api.mu.Unlock()
+
+	result, err := session.Land(context.Background())
+	if err != nil || result.Status != LandWaiting {
+		t.Fatalf("re-running check must wait: result=%+v err=%v", result, err)
+	}
+	session.FinalizeLanding(context.Background())
+	if linear.refused != 0 || len(linear.landComments) != 0 || api.merges != 0 {
+		t.Fatalf("a pending check must leave the issue in Merging: refused=%d comments=%v merges=%d", linear.refused, linear.landComments, api.merges)
+	}
+	// A genuine hard gate after the wait still applies the fallback exactly once.
+	api.mu.Lock()
+	api.checkRuns = failingChecks("ci/build")
+	api.mu.Unlock()
+	if _, err := session.Land(context.Background()); err == nil {
+		t.Fatal("a failing check after the wait must still refuse")
+	}
+	if linear.refused != 1 || len(linear.landComments) != 1 {
+		t.Fatalf("exhausted gate after a wait must refuse once: refused=%d comments=%v", linear.refused, linear.landComments)
+	}
+	session.FinalizeLanding(context.Background())
+	if linear.refused != 1 || len(linear.landComments) != 1 {
+		t.Fatalf("finalize after the refusal must be a no-op: refused=%d comments=%v", linear.refused, linear.landComments)
+	}
+}
+
+// TestLandingResolvedClosesTheCapabilityOnlyOnTerminalSuccess covers the
+// PMR-78 duplicate-call guard the Codex tool dispatch consults: a terminal,
+// fully reconciled landing closes github_land_pr for the run, while a wait or a
+// merge whose Linear completion failed must stay open for recovery.
+func TestLandingResolvedClosesTheCapabilityOnlyOnTerminalSuccess(t *testing.T) {
+	t.Run("waiting keeps the capability open", func(t *testing.T) {
+		api, git, linear := newAPI(t), &fakeGit{}, &fakeLinear{}
+		api.prExists = true
+		_, session := testLandingSession(t, api, git, linear, []string{"ci/build"}, "merge")
+		result, err := session.Land(context.Background())
+		if err != nil || result.Status != LandWaiting {
+			t.Fatalf("result=%+v err=%v", result, err)
+		}
+		if session.LandingResolved() {
+			t.Fatal("a waiting landing must not close the capability")
+		}
+	})
+	t.Run("terminal landing closes the capability", func(t *testing.T) {
+		api, git, linear := newAPI(t), &fakeGit{}, &fakeLinear{}
+		api.prExists = true
+		passingRequiredChecks(api, "ci/build")
+		readyToLand(api)
+		_, session := testLandingSession(t, api, git, linear, []string{"ci/build"}, "merge")
+		if session.LandingResolved() {
+			t.Fatal("a fresh session must not report a resolved landing")
+		}
+		result, err := session.Land(context.Background())
+		if err != nil || result.Status != LandMerged {
+			t.Fatalf("result=%+v err=%v", result, err)
+		}
+		if !session.LandingResolved() {
+			t.Fatal("a merged and reconciled landing must close the capability for this run")
+		}
+		if api.merges != 1 || linear.landCompleted != 1 {
+			t.Fatalf("merges=%d completions=%d, want exactly one of each", api.merges, linear.landCompleted)
+		}
+	})
+	t.Run("failed linear completion keeps the recovery path open", func(t *testing.T) {
+		api, git, linear := newAPI(t), &fakeGit{}, &fakeLinear{}
+		api.prExists = true
+		passingRequiredChecks(api, "ci/build")
+		readyToLand(api)
+		linear.completeErr = errors.New("linear unavailable")
+		_, session := testLandingSession(t, api, git, linear, []string{"ci/build"}, "merge")
+		if _, err := session.Land(context.Background()); err == nil {
+			t.Fatal("a failed Linear completion must be reported")
+		}
+		if session.LandingResolved() {
+			t.Fatal("an unreconciled merge must keep the capability open for recovery")
+		}
+		linear.completeErr = nil
+		if result, err := session.Land(context.Background()); err != nil || result.Status != LandMerged {
+			t.Fatalf("recovery landing result=%+v err=%v", result, err)
+		}
+		if !session.LandingResolved() || api.merges != 1 {
+			t.Fatalf("resolved=%v merges=%d", session.LandingResolved(), api.merges)
+		}
+	})
+}
+
 // TestLandNonRetryableGateRefusesImmediatelyEvenWithFixEnabled confirms a
 // non-retryable gate (changes-requested) refuses immediately with the feature
 // on, grants no fix attempt, and leaves FinalizeLanding a no-op.
@@ -1573,5 +1689,121 @@ func TestLandReconcilesWhenGitHubSucceedsButLinearCompletionFails(t *testing.T) 
 	}
 	if linear.landCompleted != 1 {
 		t.Fatalf("recovery completion=%d", linear.landCompleted)
+	}
+}
+
+// verifyLandedManager builds a read-only Manager for the terminal workspace
+// cleanup verification path, with no session, worktree, or Linear handoff: the
+// verifier is host-owned and must never need any of them.
+func verifyLandedManager(t *testing.T, api *apiFixture, mutate func(*config.GitHub)) *Manager {
+	t.Helper()
+	settings := api.settings()
+	if mutate != nil {
+		mutate(&settings)
+	}
+	return New(func() config.Settings { return config.Settings{GitHub: settings} }, slog.Default())
+}
+
+func TestVerifyLandedConfirmsOnlyTheMergedPullRequestHead(t *testing.T) {
+	const workspaceHead = "landed-head"
+	tests := []struct {
+		name      string
+		configure func(*apiFixture)
+		mutate    func(*config.GitHub)
+		commit    string
+		want      bool
+		wantErr   bool
+		wantCalls bool
+	}{
+		{
+			name:      "merged head commit",
+			configure: func(api *apiFixture) { api.prExists, api.prMerged, api.prSHA = true, true, workspaceHead },
+			commit:    workspaceHead,
+			want:      true,
+			wantCalls: true,
+		},
+		{
+			name:      "merged pull request with a rewritten head",
+			configure: func(api *apiFixture) { api.prExists, api.prMerged, api.prSHA = true, true, "rewritten-head" },
+			commit:    workspaceHead,
+			wantCalls: true,
+		},
+		{
+			name:      "open pull request",
+			configure: func(api *apiFixture) { api.prExists, api.prSHA = true, workspaceHead },
+			commit:    workspaceHead,
+			wantCalls: true,
+		},
+		{
+			name:      "closed unmerged pull request",
+			configure: func(api *apiFixture) { api.prExists, api.prState, api.prSHA = true, "closed", workspaceHead },
+			commit:    workspaceHead,
+			wantCalls: true,
+		},
+		{
+			name:      "no pull request",
+			configure: func(api *apiFixture) {},
+			commit:    workspaceHead,
+			wantCalls: true,
+		},
+		{
+			name:      "ambiguous pull requests",
+			configure: func(api *apiFixture) { api.prExists, api.multiplePulls, api.prMerged = true, true, true },
+			commit:    workspaceHead,
+			wantErr:   true,
+			wantCalls: true,
+		},
+		{
+			name:      "github integration disabled",
+			configure: func(api *apiFixture) { api.prExists, api.prMerged, api.prSHA = true, true, workspaceHead },
+			mutate:    func(s *config.GitHub) { s.Enabled = false },
+			commit:    workspaceHead,
+		},
+		{
+			name:      "no recorded commit",
+			configure: func(api *apiFixture) { api.prExists, api.prMerged, api.prSHA = true, true, workspaceHead },
+			commit:    "   ",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			api := newAPI(t)
+			test.configure(api)
+			m := verifyLandedManager(t, api, test.mutate)
+			issue := domain.Issue{ID: "issue-27", Identifier: "PMR-27"}
+
+			landed, err := m.VerifyLanded(context.Background(), issue, test.commit)
+			if test.wantErr != (err != nil) {
+				t.Fatalf("VerifyLanded error=%v, wantErr=%t", err, test.wantErr)
+			}
+			if landed != test.want {
+				t.Fatalf("VerifyLanded=%t, want %t", landed, test.want)
+			}
+			api.mu.Lock()
+			defer api.mu.Unlock()
+			if (len(api.auth) > 0) != test.wantCalls {
+				t.Fatalf("GitHub requests=%d, want any=%t", len(api.auth), test.wantCalls)
+			}
+			if api.created != 0 || api.merges != 0 || len(api.patches) != 0 || api.updateBranchCalls != 0 {
+				t.Fatalf("verification mutated GitHub: created=%d merges=%d patches=%v update_branch=%d", api.created, api.merges, api.patches, api.updateBranchCalls)
+			}
+		})
+	}
+}
+
+// A branch name Symphony would never have produced must not be verified
+// against some other repository branch.
+func TestVerifyLandedRejectsAnIssueWithoutADerivableBranch(t *testing.T) {
+	api := newAPI(t)
+	api.prExists, api.prMerged = true, true
+	m := verifyLandedManager(t, api, nil)
+	landed, err := m.VerifyLanded(context.Background(), domain.Issue{ID: "issue-27", Identifier: "-.-"}, api.prSHA)
+	if landed || err != nil {
+		t.Fatalf("VerifyLanded=%t err=%v, want false and no error", landed, err)
+	}
+	api.mu.Lock()
+	defer api.mu.Unlock()
+	if len(api.auth) != 0 {
+		t.Fatalf("undecidable branch issued %d GitHub requests", len(api.auth))
 	}
 }

@@ -25,7 +25,9 @@ New writes use the `symphony.workspace-state/v2` schema:
 ```
 
 `issue_id` and `identifier` bind the file to one Linear issue. `base_commit`
-keeps terminal cleanup from deleting locally changed or committed work.
+keeps terminal cleanup from deleting locally changed work, and from deleting
+committed work unless Symphony verifies that exact commit as the merged pull
+request head (see [Terminal cleanup safety](#terminal-cleanup-safety)).
 `preparation` advances through `creating`, `hook_pending`, and `ready`; an
 interrupted pre-ready workspace is discarded and recreated before the
 after-create hook is retried. The source-worktree paths and common-directory
@@ -59,6 +61,41 @@ their owned workspaces. An active issue that reaches the Codex turn limit is
 recorded as an explicit blocked/exhausted run and retried with normal backoff;
 it remains dispatchable without a tracker edit. Terminal issues are cleaned up
 only when worktree safety checks allow it.
+
+## Terminal cleanup safety
+
+Cleanup of a terminal issue's owned Git worktree is fail-closed. Only the first
+two outcomes below remove anything; the remaining three preserve the worktree
+for a human:
+
+| Worktree | Result |
+| --- | --- |
+| Clean, HEAD still at the recorded `base_commit` | Removed, logged `status: clean`. |
+| Clean, HEAD is a local commit that a landing verification confirms is the merged pull request head for this issue | Removed, logged `status: landed`. |
+| Uncommitted or untracked changes | Preserved, logged `status: dirty`. |
+| Clean, HEAD is a local commit that is not verifiably merged | Preserved, logged `status: committed`. |
+| Unowned, replaced, or unverifiable source identity | Preserved, logged `status: blocked`. |
+
+The landing verification is host-owned, read-only, and reachable from every
+cleanup path — end of run, terminal reconciliation, retry, and the startup
+sweep after a restart — because it re-reads GitHub instead of relying on
+in-process memory of the landing. It asks one question: does the configured
+repository have exactly one pull request for this issue's `symphony/<issue>`
+branch, is it merged, and is its head commit the commit still checked out in
+the worktree? Only an exact match permits removal, so a locally amended or
+rebased HEAD, a commit never pushed to the bound branch, an unconfigured GitHub
+integration, and any request failure all keep the committed work for manual
+review. The configured `github.merge_method` does not affect this: a pull
+request's head commit is the source branch tip, which GitHub does not rewrite
+when it squashes or rebases onto the base branch, so verified cleanup works
+under all three merge methods. The verification never merges,
+comments, or transitions anything.
+
+A removal deletes the whole worktree directory, including files Git ignores.
+`git status` does not report them, so a `.gitignore`d local file in a
+verified-landed worktree does not survive cleanup. Before verified cleanup
+existed a worktree holding local commits was always preserved, so in practice
+such files survived every completed run.
 
 ## Manual recovery
 

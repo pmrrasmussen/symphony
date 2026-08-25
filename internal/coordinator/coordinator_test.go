@@ -268,18 +268,23 @@ func TestHeartbeatAndStallRecordOutstandingOperation(t *testing.T) {
 
 func TestCleanupStatusClassifiesWorkspaceOutcome(t *testing.T) {
 	tests := []struct {
-		name string
-		err  error
-		want string
+		name    string
+		outcome domain.CleanupOutcome
+		err     error
+		want    string
 	}{
-		{name: "clean", err: nil, want: "clean"},
+		{name: "clean", outcome: domain.CleanupClean, err: nil, want: "clean"},
+		{name: "landed", outcome: domain.CleanupLanded, err: nil, want: "landed"},
 		{name: "dirty", err: errors.New("refusing to remove Git workspace with uncommitted or untracked changes"), want: "dirty"},
 		{name: "committed", err: fmt.Errorf("refusing to remove Git workspace whose HEAD %s differs from recorded base commit %s", "abc", "def"), want: "committed"},
+		{name: "unverifiable landing stays committed", err: fmt.Errorf("refusing to remove Git workspace whose HEAD %s differs from recorded base commit %s; merged landing could not be verified", "abc", "def"), want: "committed"},
 		{name: "blocked", err: errors.New("refusing to remove workspace without durable ownership state"), want: "blocked"},
+		// A refused cleanup never reports a removal outcome, even if one leaks in.
+		{name: "landed outcome never masks a refusal", outcome: domain.CleanupLanded, err: errors.New("refusing to remove Git workspace with uncommitted or untracked changes"), want: "dirty"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if got := cleanupStatus(test.err); got != test.want {
+			if got := cleanupStatus(test.outcome, test.err); got != test.want {
 				t.Fatalf("cleanupStatus=%q, want %q", got, test.want)
 			}
 		})
@@ -674,7 +679,7 @@ func (f *fakeWorkspace) AfterRun(context.Context, domain.Workspace, domain.Issue
 		f.after <- struct{}{}
 	}
 }
-func (f *fakeWorkspace) Cleanup(context.Context, domain.Issue) error {
+func (f *fakeWorkspace) Cleanup(context.Context, domain.Issue) (domain.CleanupOutcome, error) {
 	f.mu.Lock()
 	f.cleanups++
 	cleaned := f.cleaned
@@ -682,7 +687,7 @@ func (f *fakeWorkspace) Cleanup(context.Context, domain.Issue) error {
 	if cleaned != nil {
 		cleaned <- struct{}{}
 	}
-	return nil
+	return domain.CleanupClean, nil
 }
 func (f *fakeWorkspace) Execute(context.Context, domain.Workspace, string, []string) ([]byte, error) {
 	return nil, nil
@@ -860,6 +865,286 @@ func TestActiveIssueAtTurnLimitIsBlockedAndRetriedWithoutCompletionMarker(t *tes
 	if err := c.Shutdown(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// TestLandingWaitEndsRunWithoutTurnsAndSchedulesBoundedLandingRetry reproduces
+// the PMR-77 defect: a non-terminal landing wait must end the run at once
+// instead of spending the remaining turns on repeated landing calls and then a
+// turn-limit agent retry. The run instead ends as a wait, releases its
+// orchestrator slot, keeps the duplicate-prevention claim, and schedules one
+// delayed landing retry at the configured GitHub poll interval.
+func TestLandingWaitEndsRunWithoutTurnsAndSchedulesBoundedLandingRetry(t *testing.T) {
+	w := testSettings(t)
+	w.Config.Agent.MaxTurns = 20
+	w.Config.Agent.MaxRetryBackoff = 10 * time.Minute
+	w.Config.GitHub.PollInterval = 30 * time.Second
+	issue := testIssue()
+	var log syncBuffer
+	agent := &fakeAgent{events: landingWaitingEvents}
+	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{}, 1)}
+	c := New(&fakeTracker{issue: issue}, agent, ws, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&log, nil)))
+	c.clock = fakeClock{now: time.Date(2026, 8, 25, 9, 41, 0, 0, time.UTC)}
+	timer := &fakeTimer{signal: make(chan struct{}, 1)}
+	c.timer = timer
+
+	c.Tick(context.Background())
+	<-ws.after
+	<-timer.signal
+
+	starts, continues, cancels := agent.counts()
+	if starts != 1 || continues != 0 || cancels != 1 {
+		t.Fatalf("starts=%d continues=%d cancels=%d, want one start, no continuation turn, one cancel", starts, continues, cancels)
+	}
+	c.mu.Lock()
+	retry := c.retries[issue.ID]
+	claimed, admitted, running := c.claimed[issue.ID], len(c.admitted), len(c.running)
+	c.mu.Unlock()
+	if retry.kind != retryLanding || retry.reason != "landing_waiting" || retry.attempt != 0 {
+		t.Fatalf("retry=%+v, want an unescalated landing retry", retry)
+	}
+	if !claimed || admitted != 0 || running != 0 {
+		t.Fatalf("claimed=%v admitted=%d running=%d, want the claim held with no slot occupied", claimed, admitted, running)
+	}
+	if timer.scheduled() != 1 || timer.delays[0] != 30*time.Second {
+		t.Fatalf("landing retry delays=%v, want one github poll interval", timer.delays)
+	}
+	if _, marks, cleanups, _ := ws.counts(); marks != 0 || cleanups != 0 {
+		t.Fatalf("landing wait marks=%d cleanups=%d, want neither completion nor cleanup", marks, cleanups)
+	}
+	for _, want := range []string{`"msg":"agent landing waiting"`, `"operation":"landing_waiting"`, `"reason":"required checks are pending"`, `"msg":"landing wait retry scheduled"`, `"wait_attempt":1`, `"status":"waiting"`, `"retry_kind":"landing"`} {
+		waitForSubstring(t, &log, want, time.Second)
+	}
+	if records := log.String(); strings.Contains(records, "turn_limit_exhausted") || strings.Contains(records, `"msg":"agent run retry scheduled"`) {
+		t.Fatalf("landing wait logged an agent failure: %s", records)
+	}
+	if err := c.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestLandingResolvedEndsRunWithoutAnotherTurn covers the PMR-77 duplicate
+// terminal call: once landing merged the pull request and reconciled the issue,
+// the run ends immediately — even when this tracker refresh still reports the
+// issue active — so no later turn can call the landing tool again.
+func TestLandingResolvedEndsRunWithoutAnotherTurn(t *testing.T) {
+	w := testSettings(t)
+	w.Config.Agent.MaxTurns = 20
+	issue := testIssue()
+	var log syncBuffer
+	agent := &fakeAgent{events: landingResolvedEvents}
+	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{}, 1)}
+	c := New(&fakeTracker{issue: issue}, agent, ws, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&log, nil)))
+	c.clock = fakeClock{now: time.Date(2026, 8, 25, 9, 41, 0, 0, time.UTC)}
+	timer := &fakeTimer{}
+	c.timer = timer
+
+	c.Tick(context.Background())
+	<-ws.after
+	waitForRelease(t, c, issue.ID)
+
+	starts, continues, cancels := agent.counts()
+	if starts != 1 || continues != 0 || cancels != 1 {
+		t.Fatalf("starts=%d continues=%d cancels=%d, want one start, no continuation turn, one cancel", starts, continues, cancels)
+	}
+	if timer.scheduled() != 0 {
+		t.Fatalf("terminal landing scheduled %d retries, want none", timer.scheduled())
+	}
+	if _, _, cleanups, _ := ws.counts(); cleanups != 1 {
+		t.Fatalf("cleanups=%d, want the workspace released even though the refresh still reports the issue active", cleanups)
+	}
+	records := log.String()
+	if !strings.Contains(records, `"msg":"agent landing resolved"`) || !strings.Contains(records, `"operation":"landing_resolved"`) {
+		t.Fatalf("log missing the landing resolution record: %s", records)
+	}
+	if !strings.Contains(records, `"status":"succeeded"`) {
+		t.Fatalf("terminal landing did not finish the run successfully: %s", records)
+	}
+}
+
+// waitForRelease waits until a finished run has released its claim, which the
+// launch goroutine does after the workspace after_run hook.
+func waitForRelease(t *testing.T, c *Coordinator, id string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		c.mu.Lock()
+		claimed, running := c.claimed[id], len(c.running)
+		c.mu.Unlock()
+		if !claimed && running == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("run for %s never released its claim (claimed=%v running=%d)", id, claimed, running)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+// TestLandingWaitRedispatchesWithEscalatingDelay drives the mechanism itself:
+// the delayed landing retry relaunches the same attempt in a fresh session, and
+// a gate that stays unsettled backs off instead of respawning at a fixed
+// cadence forever. Adapted from the PMR-78 review probe.
+func TestLandingWaitRedispatchesWithEscalatingDelay(t *testing.T) {
+	w := testSettings(t)
+	w.Config.Agent.MaxTurns = 20
+	w.Config.Agent.MaxRetryBackoff = 10 * time.Minute
+	// A poll interval below the first backoff step so escalation is visible.
+	w.Config.GitHub.PollInterval = 5 * time.Second
+	issue := testIssue()
+	var log syncBuffer
+	agent := &fakeAgent{events: landingWaitingEvents}
+	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{}, 4)}
+	c := New(&fakeTracker{issue: issue}, agent, ws, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&log, nil)))
+	c.clock = fakeClock{now: time.Date(2026, 8, 25, 9, 41, 0, 0, time.UTC)}
+	timer := &fakeTimer{signal: make(chan struct{}, 4)}
+	c.timer = timer
+
+	c.Tick(context.Background())
+	<-ws.after
+	<-timer.signal
+
+	// Firing the landing timer must relaunch landing, not fail the issue.
+	timer.fire(0)
+	<-ws.after
+	<-timer.signal
+
+	starts, continues, cancels := agent.counts()
+	if starts != 2 || continues != 0 || cancels != 2 {
+		t.Fatalf("starts=%d continues=%d cancels=%d, want two dispatches, no continuation turn, one cancel each", starts, continues, cancels)
+	}
+	c.mu.Lock()
+	retry, ok := c.retries[issue.ID]
+	waits, claimed, admitted := c.landingWaits[issue.ID], c.claimed[issue.ID], len(c.admitted)
+	c.mu.Unlock()
+	if !ok || retry.kind != retryLanding || retry.reason != "landing_waiting" || retry.attempt != 0 {
+		t.Fatalf("retry=%+v ok=%v, want a second landing retry on the same attempt", retry, ok)
+	}
+	if waits != 2 || !claimed || admitted != 0 {
+		t.Fatalf("waits=%d claimed=%v admitted=%d", waits, claimed, admitted)
+	}
+	if len(timer.delays) != 2 || timer.delays[0] != 10*time.Second || timer.delays[1] != 20*time.Second {
+		t.Fatalf("landing retry delays=%v, want an escalating sequence", timer.delays)
+	}
+	waitForSubstring(t, &log, `"wait_attempt":2`, time.Second)
+	if records := log.String(); strings.Contains(records, "turn_limit_exhausted") {
+		t.Fatalf("repeated landing waits escalated into an agent failure: %s", records)
+	}
+	if snapshot := c.Snapshot(); len(snapshot.Retrying) != 1 || snapshot.Retrying[0].WaitAttempt != 2 || snapshot.Retrying[0].Attempt != 0 {
+		t.Fatalf("snapshot retrying=%+v, want wait_attempt 2 on attempt 0", snapshot.Retrying)
+	}
+	if err := c.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	c.mu.Lock()
+	leaked, leakedWaits := c.claimed[issue.ID], len(c.landingWaits)
+	c.mu.Unlock()
+	if leaked || leakedWaits != 0 {
+		t.Fatalf("shutdown leaked claim=%v landing waits=%d", leaked, leakedWaits)
+	}
+}
+
+// TestCapacityBlockedLandingRetryKeepsItsCadence covers the redispatch that
+// loses the state's single landing slot: it stays a landing retry on the same
+// attempt at the landing cadence, instead of becoming a faster failure-backoff
+// retry that would poll GitHub harder than configured. Adapted from the PMR-78
+// review probe.
+func TestCapacityBlockedLandingRetryKeepsItsCadence(t *testing.T) {
+	w := testSettings(t)
+	w.Config.Agent.MaxTurns = 20
+	w.Config.Agent.MaxConcurrent = 1
+	w.Config.Agent.MaxRetryBackoff = 10 * time.Minute
+	w.Config.GitHub.PollInterval = 30 * time.Second
+	issue := testIssue()
+	agent := &fakeAgent{events: landingWaitingEvents}
+	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{}, 4)}
+	c := testCoordinator(w.Config, &fakeTracker{issue: issue}, agent, ws)
+	timer := &fakeTimer{signal: make(chan struct{}, 4)}
+	c.timer = timer
+
+	c.Tick(context.Background())
+	<-ws.after
+	<-timer.signal
+
+	// Another issue takes the only orchestrator slot before the timer fires.
+	c.mu.Lock()
+	c.admitted["other"] = "todo"
+	c.mu.Unlock()
+
+	timer.fire(0)
+	<-timer.signal
+
+	c.mu.Lock()
+	retry := c.retries[issue.ID]
+	claimed := c.claimed[issue.ID]
+	c.mu.Unlock()
+	if !claimed {
+		t.Fatal("capacity-blocked landing retry dropped its claim")
+	}
+	if retry.kind != retryLanding || retry.reason != "landing_slot_unavailable" || retry.attempt != 0 {
+		t.Fatalf("retry=%+v, want a landing retry on the same attempt", retry)
+	}
+	if len(timer.delays) != 2 || timer.delays[1] != 30*time.Second {
+		t.Fatalf("delays=%v, want the landing cadence rather than a failure backoff", timer.delays)
+	}
+	if starts, _, _ := agent.counts(); starts != 1 {
+		t.Fatalf("starts=%d, want no dispatch while the slot is taken", starts)
+	}
+	if err := c.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLandingRetryDelayFloorsEscalatesAndCaps(t *testing.T) {
+	settings := config.Settings{
+		Polling: config.Polling{Interval: time.Minute},
+		Agent:   config.Agent{MaxRetryBackoff: 90 * time.Second},
+		GitHub:  config.GitHub{PollInterval: 30 * time.Second},
+	}
+	for _, test := range []struct {
+		name     string
+		settings config.Settings
+		waits    int
+		want     time.Duration
+	}{
+		{name: "first wait uses the github poll floor", settings: settings, waits: 1, want: 30 * time.Second},
+		{name: "escalates past the floor", settings: settings, waits: 3, want: 40 * time.Second},
+		{name: "capped by the retry ceiling", settings: settings, waits: 9, want: 90 * time.Second},
+		{
+			name:     "the poll floor is never undercut by a small ceiling",
+			settings: config.Settings{Agent: config.Agent{MaxRetryBackoff: 5 * time.Second}, GitHub: config.GitHub{PollInterval: 30 * time.Second}},
+			waits:    4,
+			want:     30 * time.Second,
+		},
+		{
+			name:     "falls back to the tracker poll interval",
+			settings: config.Settings{Polling: config.Polling{Interval: 2 * time.Minute}, Agent: config.Agent{MaxRetryBackoff: 10 * time.Minute}},
+			waits:    1,
+			want:     2 * time.Minute,
+		},
+		{name: "unconfigured intervals use the documented default", settings: config.Settings{}, waits: 1, want: 30 * time.Second},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := landingRetryDelay(test.settings, test.waits); got != test.want {
+				t.Fatalf("landingRetryDelay(waits=%d)=%s, want %s", test.waits, got, test.want)
+			}
+		})
+	}
+}
+
+func landingWaitingEvents() <-chan domain.Event {
+	ch := make(chan domain.Event, 2)
+	ch <- domain.Event{Kind: domain.EventItem, At: time.Now(), ItemID: "1", ItemType: "dynamicToolCall", ToolName: "github_land_pr", Outcome: domain.ItemCompleted}
+	ch <- domain.Event{Kind: domain.EventLandingWaiting, At: time.Now(), SessionID: "t-u", Message: "required checks are pending"}
+	close(ch)
+	return ch
+}
+
+func landingResolvedEvents() <-chan domain.Event {
+	ch := make(chan domain.Event, 2)
+	ch <- domain.Event{Kind: domain.EventItem, At: time.Now(), ItemID: "1", ItemType: "dynamicToolCall", ToolName: "github_land_pr", Outcome: domain.ItemCompleted}
+	ch <- domain.Event{Kind: domain.EventLandingResolved, At: time.Now(), SessionID: "t-u"}
+	close(ch)
+	return ch
 }
 
 func TestBoundedRunRefreshesAndContinuesSameSessionToExactMaxTurns(t *testing.T) {
@@ -1746,6 +2031,10 @@ func TestExternalHandoffRevertIsObservedAtPoll(t *testing.T) {
 	w := testSettings(t)
 	w.Config.Tracker.HandoffState = "In Review"
 	w.Config.Tracker.ActiveStates = []string{"Todo", "In Progress"}
+	// In Progress is a start-policy endpoint, so the revert warns because it
+	// reactivated a pre-review implementation state — not merely because the
+	// destination was unclassifiable.
+	w.Config.Tracker.HostTransitions.Start = map[string]string{"todo": "In Progress"}
 	reverted := testIssue()
 	reverted.State = "In Progress"
 	tracker := &fakeTracker{issue: reverted}
@@ -1821,6 +2110,132 @@ func TestHealthyHandoffIsSweptWithoutExternalRevertLog(t *testing.T) {
 	}
 	if strings.Contains(logs.String(), "external_reversion") {
 		t.Fatalf("a healthy handoff wrongly logged an external revert: %s", logs.String())
+	}
+}
+
+// TestPostHandoffStateChangeIsClassified proves the human-controlled review
+// state's outbound edges are told apart in the log: moving the issue to the
+// merge state is the human approval that authorizes landing and moving it to
+// the rework state is a human review decision — both expected, both info —
+// while anything Symphony cannot name from the configured lifecycle, including
+// a reactivation into a pre-review implementation state, stays an actionable
+// warning.
+func TestPostHandoffStateChangeIsClassified(t *testing.T) {
+	canonical := []string{"Todo", "In Progress", "Rework", "Merging"}
+	fromTodo := map[string]string{"todo": "In Progress"}
+	const (
+		expectedMessage = "human review state change observed"
+		warnedMessage   = "external tracker state change observed"
+	)
+	for _, tc := range []struct {
+		name                             string
+		activeStates                     []string
+		start                            map[string]string
+		mergeState                       string
+		state, operation, message, level string
+	}{
+		{
+			name: "approval into the merge state", activeStates: canonical, start: fromTodo, mergeState: "Merging",
+			state: "Merging", operation: "review_approved", message: expectedMessage, level: "INFO",
+		},
+		{
+			name: "changes requested into the single remaining state", activeStates: canonical, start: fromTodo, mergeState: "Merging",
+			state: "Rework", operation: "rework_requested", message: expectedMessage, level: "INFO",
+		},
+		{
+			name: "reactivation into the start policy's target", activeStates: canonical, start: fromTodo, mergeState: "Merging",
+			state: "In Progress", operation: "external_reversion", message: warnedMessage, level: "WARN",
+		},
+		{
+			name: "reactivation into the start policy's source", activeStates: canonical, start: fromTodo, mergeState: "Merging",
+			state: "Todo", operation: "external_reversion", message: warnedMessage, level: "WARN",
+		},
+		{
+			// A second unaccounted-for active state makes the rework state
+			// unnameable, so work parked in it is never passed off as expected.
+			name:         "parked in an extra active state",
+			activeStates: []string{"Todo", "In Progress", "Rework", "Merging", "Blocked"},
+			start:        fromTodo, mergeState: "Merging",
+			state: "Blocked", operation: "external_reversion", message: warnedMessage, level: "WARN",
+		},
+		{
+			// The same ambiguity suppresses the rework naming itself: Symphony
+			// warns rather than guessing which of the two states is Rework.
+			name:         "ambiguous candidates suppress the rework naming",
+			activeStates: []string{"Todo", "In Progress", "Rework", "Merging", "Blocked"},
+			start:        fromTodo, mergeState: "Merging",
+			state: "Rework", operation: "external_reversion", message: warnedMessage, level: "WARN",
+		},
+		{
+			name:         "thrown back to a dispatchable backlog",
+			activeStates: []string{"Backlog", "Todo", "In Progress", "Rework", "Merging"},
+			start:        fromTodo, mergeState: "Merging",
+			state: "Backlog", operation: "external_reversion", message: warnedMessage, level: "WARN",
+		},
+		{
+			// A dispatch entry state the start policy does not name is still a
+			// pre-review implementation state; reactivating into it must warn.
+			name:         "reactivation into an unnamed entry state",
+			activeStates: []string{"Todo", "Ready", "In Progress", "Rework", "Merging"},
+			start:        map[string]string{"ready": "In Progress"}, mergeState: "Merging",
+			state: "Todo", operation: "external_reversion", message: warnedMessage, level: "WARN",
+		},
+		{
+			name: "no start policy leaves rework unnameable", activeStates: canonical, mergeState: "Merging",
+			state: "Rework", operation: "external_reversion", message: warnedMessage, level: "WARN",
+		},
+		{
+			// The approval edge is identified by github.merge_state alone, so it
+			// survives a missing start policy.
+			name: "approval without a start policy", activeStates: canonical, mergeState: "Merging",
+			state: "Merging", operation: "review_approved", message: expectedMessage, level: "INFO",
+		},
+		{
+			// With landing unconfigured there is no merge state to recognize, so
+			// the same edge is unnameable and warns instead.
+			name: "approval with landing unconfigured", activeStates: canonical, start: fromTodo,
+			state: "Merging", operation: "external_reversion", message: warnedMessage, level: "WARN",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := testSettings(t)
+			w.Config.Tracker.HandoffState = "In Review"
+			w.Config.Tracker.ActiveStates = tc.activeStates
+			w.Config.Tracker.HostTransitions.Start = tc.start
+			w.Config.GitHub.MergeState = tc.mergeState
+			moved := testIssue()
+			moved.State = tc.state
+			tracker := &fakeTracker{issue: moved}
+			var logs bytes.Buffer
+			c := New(tracker, &fakeAgent{}, &fakeWorkspace{}, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&logs, nil)))
+			c.clock = fakeClock{now: time.Date(2026, 8, 25, 12, 0, 0, 0, time.UTC)}
+
+			// Pre-claim so the poll only classifies the change instead of also
+			// launching a run, then record Symphony's own prior handoff (claiming
+			// clears any prior memory, so the observation must be set afterward).
+			if !c.claim(moved, w.Config) {
+				t.Fatal("pre-claim failed")
+			}
+			c.noteHandoffObservation(domain.Issue{ID: moved.ID, Identifier: moved.Identifier, State: "In Review"}, w.Config, c.clock.Now())
+
+			c.Tick(context.Background())
+
+			output := logs.String()
+			if !strings.Contains(output, `"msg":"`+tc.message+`"`) ||
+				!strings.Contains(output, `"operation":"`+tc.operation+`"`) ||
+				!strings.Contains(output, `"level":"`+tc.level+`"`) ||
+				!strings.Contains(output, `"from_state":"in review"`) ||
+				!strings.Contains(output, `"to_state":"`+norm(tc.state)+`"`) ||
+				!strings.Contains(output, `"issue_identifier":"ENG-1"`) {
+				t.Fatalf("post-handoff change to %s was not classified as %s: %s", tc.state, tc.operation, output)
+			}
+			if tc.operation != "external_reversion" && strings.Contains(output, "external_reversion") {
+				t.Fatalf("an expected human review decision was also logged as a reversion: %s", output)
+			}
+			if err := c.Shutdown(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }
 
