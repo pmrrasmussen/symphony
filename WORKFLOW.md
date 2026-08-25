@@ -60,7 +60,8 @@ polling:
   interval_ms: 30000
 workspace:
   root: .symphony/workspaces
-  # Each issue receives a detached Git worktree of this repository.
+  # Each new issue receives a detached Git worktree at refreshed origin/main;
+  # later dispatches reuse that issue's existing worktree and commit history.
   source_root: .
 hooks:
   timeout_ms: 60000

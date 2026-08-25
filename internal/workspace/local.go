@@ -1015,7 +1015,14 @@ func gitMetadataAllowEmpty(ctx context.Context, dir string, args ...string) (str
 }
 
 func addWorktree(ctx context.Context, sourceRoot, path string) error {
-	if err := gitMutation(ctx, sourceRoot, "worktree", "add", "--detach", path, "HEAD"); err != nil {
+	if err := gitMutation(ctx, sourceRoot, "fetch", "--no-tags", "origin", "+refs/heads/main:refs/remotes/origin/main"); err != nil {
+		return fmt.Errorf("refresh origin/main before creating workspace: %w", err)
+	}
+	baseCommit, err := gitMetadata(ctx, sourceRoot, "rev-parse", "--verify", "refs/remotes/origin/main^{commit}")
+	if err != nil {
+		return fmt.Errorf("resolve refreshed origin/main commit: %w", err)
+	}
+	if err := gitMutation(ctx, sourceRoot, "worktree", "add", "--detach", path, baseCommit); err != nil {
 		return fmt.Errorf("create workspace worktree: %w", err)
 	}
 	return nil
