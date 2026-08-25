@@ -80,8 +80,12 @@ codex:
   command: codex app-server
   approval_policy: never
   thread_sandbox: workspace-write
-  # Preserve workspace-scoped filesystem access while allowing local test
-  # servers (for example Go httptest listeners) to bind sockets.
+  # workspaceWrite bounds writes to this issue's worktree plus the two narrow
+  # Git metadata roots Symphony grants for a local commit. networkAccess: true
+  # grants unrestricted outbound network access, not merely local sockets:
+  # repository tests that bind loopback listeners are why it is enabled, not
+  # the limit of what it permits. The sandbox does not restrict reads, so a
+  # worker can read any file this user can, credential files included.
   turn_sandbox_policy:
     type: workspaceWrite
     networkAccess: true

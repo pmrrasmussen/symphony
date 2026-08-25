@@ -386,7 +386,10 @@ func decode(raw map[string]any, base, path, logRoot string, sources *sourceSnaps
 	if err != nil {
 		return Settings{}, err
 	}
-	turnSandboxPolicy, err := sandboxPolicy(codex)
+	if !contains(sandboxModes, threadSandbox) {
+		return Settings{}, fmt.Errorf("invalid configuration: codex.thread_sandbox must be one of %s, got %q", strings.Join(sandboxModes, ", "), threadSandbox)
+	}
+	turnSandboxPolicy, err := sandboxPolicy(codex, threadSandbox)
 	if err != nil {
 		return Settings{}, err
 	}
@@ -1162,12 +1165,61 @@ func cloneValue(value any) any {
 	}
 }
 
-// sandboxPolicy validates the optional per-turn sandbox policy. The value is
-// forwarded verbatim as turn/start's sandboxPolicy, so a malformed shape must
-// fail configuration validation instead of surfacing as an opaque app-server
-// rejection mid-run. Absence stays nil so the launcher's own narrowed
-// workspace-write grant remains the effective policy (PMR-65, PMR-80).
-func sandboxPolicy(codex map[string]any) (any, error) {
+// sandboxModes are the thread_sandbox values Codex accepts (app-server
+// SandboxMode). An unlisted value is rejected here rather than surfacing as an
+// opaque thread/start failure on every dispatch.
+var sandboxModes = []string{"read-only", "workspace-write", "danger-full-access"}
+
+const (
+	sandboxFieldBool          = "bool"
+	sandboxFieldNetworkAccess = "networkAccess"
+)
+
+// sandboxPolicyFields lists, per Codex SandboxPolicy variant, exactly the
+// fields the app-server protocol accepts and the value form each takes. Codex
+// ignores unknown fields silently, so `networkAcces: true` would otherwise
+// leave egress denied while the operator believed it enabled; anything outside
+// these sets is rejected instead. Note that networkAccess is a boolean for
+// readOnly and workspaceWrite, the NetworkAccess enum for externalSandbox, and
+// not accepted at all for dangerFullAccess.
+//
+// workspaceWrite's real schema also accepts writableRoots. It is deliberately
+// omitted: Symphony's launcher is the only supplier of writable paths (PMR-65)
+// and merges its narrowed Git roots into whatever is configured, so a
+// configured root would widen write authority past what the documentation
+// promises. sandboxPolicy rejects the key with a dedicated message.
+var sandboxPolicyFields = map[string]map[string]string{
+	"dangerFullAccess": {},
+	"readOnly":         {"networkAccess": sandboxFieldBool},
+	"externalSandbox":  {"networkAccess": sandboxFieldNetworkAccess},
+	"workspaceWrite":   {"networkAccess": sandboxFieldBool, "excludeSlashTmp": sandboxFieldBool, "excludeTmpdirEnvVar": sandboxFieldBool},
+}
+
+// sandboxPolicyThreadModes lists the thread_sandbox values each policy type may
+// accompany. Codex applies sandboxPolicy as an override of the thread mode for
+// that turn and every later one, so a policy requesting authority the thread
+// mode lacks silently escalates the session. workspaceWrite must match exactly
+// because the launcher applies its narrowed Git metadata grant only to
+// workspace-write threads: permitting it elsewhere would forward a
+// workspace-write policy carrying no narrowing at all. readOnly is never
+// broader than any mode, and externalSandbox delegates confinement outside
+// Codex entirely, so it is treated as full access.
+var sandboxPolicyThreadModes = map[string][]string{
+	"readOnly":         {"read-only", "workspace-write", "danger-full-access"},
+	"workspaceWrite":   {"workspace-write"},
+	"dangerFullAccess": {"danger-full-access"},
+	"externalSandbox":  {"danger-full-access"},
+}
+
+// sandboxPolicy validates the optional per-turn sandbox policy against the
+// Codex SandboxPolicy schema. The value is forwarded verbatim as turn/start's
+// sandboxPolicy, so a malformed shape must fail configuration validation
+// instead of surfacing as an opaque app-server rejection mid-run -- or, worse,
+// being accepted with a field Codex silently ignores. Absence stays nil so the
+// launcher's own narrowed workspace-write grant remains the effective policy
+// (PMR-65, PMR-80). Values are matched exactly, never trimmed, because what is
+// validated here is what is forwarded.
+func sandboxPolicy(codex map[string]any, threadSandbox string) (any, error) {
 	v, exists := codex["turn_sandbox_policy"]
 	if !exists || v == nil {
 		return nil, nil
@@ -1177,15 +1229,68 @@ func sandboxPolicy(codex map[string]any) (any, error) {
 		return nil, errors.New("invalid configuration: codex.turn_sandbox_policy must be an object")
 	}
 	kind, ok := policy["type"].(string)
-	if !ok || strings.TrimSpace(kind) == "" {
-		return nil, errors.New("invalid configuration: codex.turn_sandbox_policy.type must be a non-empty string")
+	if !ok {
+		return nil, errors.New("invalid configuration: codex.turn_sandbox_policy.type must be a string")
 	}
-	if network, exists := policy["networkAccess"]; exists {
-		if _, ok := network.(bool); !ok {
-			return nil, errors.New("invalid configuration: codex.turn_sandbox_policy.networkAccess must be a boolean")
+	fields, known := sandboxPolicyFields[kind]
+	if !known {
+		return nil, fmt.Errorf("invalid configuration: codex.turn_sandbox_policy.type must be one of %s, got %q", strings.Join(sortedKeys(sandboxPolicyFields), ", "), kind)
+	}
+	if _, exists := policy["writableRoots"]; exists {
+		return nil, errors.New("invalid configuration: codex.turn_sandbox_policy.writableRoots must not be configured; Symphony grants the workspace plus only the narrow Git metadata roots a local commit needs")
+	}
+	var unsupported []string
+	for key := range policy {
+		if key == "type" {
+			continue
+		}
+		if _, ok := fields[key]; !ok {
+			unsupported = append(unsupported, fmt.Sprintf("%q", key))
 		}
 	}
+	if len(unsupported) > 0 {
+		sort.Strings(unsupported)
+		return nil, fmt.Errorf("invalid configuration: codex.turn_sandbox_policy does not support %s for type %q", strings.Join(unsupported, ", "), kind)
+	}
+	for _, key := range sortedKeys(fields) {
+		value, exists := policy[key]
+		if !exists {
+			continue
+		}
+		switch fields[key] {
+		case sandboxFieldBool:
+			if _, ok := value.(bool); !ok {
+				return nil, fmt.Errorf("invalid configuration: codex.turn_sandbox_policy.%s must be a boolean for type %q", key, kind)
+			}
+		case sandboxFieldNetworkAccess:
+			access, ok := value.(string)
+			if !ok || (access != "restricted" && access != "enabled") {
+				return nil, fmt.Errorf("invalid configuration: codex.turn_sandbox_policy.%s must be \"restricted\" or \"enabled\" for type %q", key, kind)
+			}
+		}
+	}
+	if modes := sandboxPolicyThreadModes[kind]; !contains(modes, threadSandbox) {
+		return nil, fmt.Errorf("invalid configuration: codex.turn_sandbox_policy.type %q overrides the thread sandbox and requires codex.thread_sandbox to be one of %s, got %q", kind, strings.Join(modes, ", "), threadSandbox)
+	}
 	return policy, nil
+}
+
+func contains(values []string, value string) bool {
+	for _, candidate := range values {
+		if candidate == value {
+			return true
+		}
+	}
+	return false
+}
+
+func sortedKeys[V any](m map[string]V) []string {
+	out := make([]string, 0, len(m))
+	for key := range m {
+		out = append(out, key)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func object(parent map[string]any, key string) (map[string]any, error) {

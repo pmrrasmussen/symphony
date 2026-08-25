@@ -191,16 +191,32 @@ write access to only the two paths a detached-HEAD commit needs -- the source
 repository's shared object store and this linked worktree's own per-worktree
 metadata directory -- and never the rest of the common directory, so the agent
 cannot write the source repository's branch refs (including the primary branch)
-or the primary working tree's index. This grants no credential of any kind:
-host-owned Linear and GitHub secrets are stripped from the Codex child
-environment by name and by value. Network authority is separate and
-repository-owned: `codex.turn_sandbox_policy` is forwarded verbatim as each
-turn's sandbox policy, and this repository configures `type: workspaceWrite`
-with `networkAccess: true` so repository validation that binds a local loopback
-listener can run (PMR-80). That setting lifts only the socket restriction --
-writes stay confined to the same workspace and narrowed Git roots, and the
-agent has no host credential to spend on the network it can reach. Omitting
-the key keeps the narrowed workspace-write grant with sockets denied.
+or the primary working tree's index. Host-owned Linear and GitHub secrets are
+stripped from the Codex child environment by variable name and by value, so no
+host credential is passed to the worker as a variable.
+
+That bound covers writes and the environment only. A Codex sandbox does not
+restrict reads: a worker can read any file the user running Symphony can,
+including credential files outside the worktree. This is a property of Codex's
+sandbox modes generally -- the same reads succeed under `read-only` -- not of
+the workspace-write grant. Network authority is separate and repository-owned:
+`codex.turn_sandbox_policy` is validated against the Codex `SandboxPolicy`
+schema and forwarded verbatim, overriding `thread_sandbox` for that turn and
+later ones, and this repository configures `type: workspaceWrite` with
+`networkAccess: true` (PMR-80). That boolean grants unrestricted outbound
+network access, not merely local socket binding; repository validation that
+binds loopback listeners is the reason it is enabled, not the limit of what it
+permits. Omitting the key leaves outbound access denied.
+
+So the operative boundary for a worker under this repository's policy is:
+writes confined to its own worktree and the narrowed Git roots, no host
+credential in its environment, but local reads and outbound network both
+available. What protects host credentials from exfiltration is therefore the
+absence of untrusted input reaching the worker, not the sandbox. Symphony's
+validation keeps the policy from widening further: `writableRoots` is rejected
+so the launcher remains the only source of writable paths, and unknown keys
+inside the policy are rejected so a misspelled field cannot silently change
+what the operator believes is configured.
 
 As a defense-in-depth backstop, after each run Symphony re-checks that the
 source repository's non-`symphony/*` branch heads and primary

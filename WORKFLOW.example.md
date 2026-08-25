@@ -79,15 +79,25 @@ codex:
   command: codex app-server
   approval_policy: never
   thread_sandbox: workspace-write
-  # Per-turn sandbox policy, forwarded verbatim to Codex. workspaceWrite keeps
-  # every write inside the issue's own worktree (plus the two narrow Git
-  # metadata roots Symphony grants for a local commit); networkAccess only
-  # lifts the socket restriction, so repository validation that binds a local
-  # loopback listener -- Go httptest servers, for example -- can run. It
-  # broadens no filesystem authority, and host-owned Linear/GitHub credentials
-  # are still stripped from the Codex child environment, so the agent has no
-  # credential to spend on the network it can now reach. Omit the key to keep
-  # the launcher's narrowed workspace-write grant with sockets denied.
+  # Per-turn sandbox policy, validated here and then forwarded verbatim to
+  # Codex, where it overrides thread_sandbox for this and every later turn.
+  #
+  # workspaceWrite bounds *writes* to the issue's own worktree plus the two
+  # narrow Git metadata roots Symphony grants for a local commit. It does not
+  # restrict *reads*: a worker can read any file this user can, including
+  # credential files outside the worktree. That is a property of Codex's
+  # sandbox modes generally -- read-only included -- not of this setting.
+  #
+  # networkAccess: true grants unrestricted outbound network access. Codex
+  # exposes only this boolean; nothing narrower is expressible. Loopback
+  # listeners for repository tests (Go httptest servers, for example) are the
+  # reason to enable it, not the limit of what it permits.
+  #
+  # Host-owned Linear and GitHub secrets are stripped from the Codex child
+  # *environment* by name and by value, so no host credential is passed to the
+  # worker as a variable. With reads and egress both available, the protection
+  # against credential exfiltration is that no untrusted input reaches the
+  # worker -- not the sandbox. Omit the key to leave egress denied.
   turn_sandbox_policy:
     type: workspaceWrite
     networkAccess: true

@@ -169,9 +169,15 @@ applied by reconciliation. `--logs-root` selects the process log destination at
 startup and is not a reloadable `WORKFLOW.md` field.
 
 `codex.thread_sandbox` sets the session's sandbox mode and the optional
-`codex.turn_sandbox_policy` object is validated and then forwarded verbatim as
-every turn's sandbox policy. This repository configures the policy a worker
-needs to run its own validation:
+`codex.turn_sandbox_policy` object is validated against the Codex
+`SandboxPolicy` schema and then forwarded verbatim as every turn's sandbox
+policy. Codex treats that policy as an override of `thread_sandbox` for the
+turn and all later turns, so the two must agree; a policy that requests write
+authority the thread mode does not have is rejected at load. `writableRoots` is
+rejected outright -- Symphony supplies the narrowed Git roots itself -- and
+unknown keys inside the policy are rejected so a typo such as `networkAcces`
+cannot silently leave the setting off. This repository configures the policy a
+worker needs to run its own validation:
 
 ```yaml
 codex:
@@ -181,16 +187,29 @@ codex:
     networkAccess: true
 ```
 
-`workspaceWrite` keeps every write inside the issue's own Git worktree, plus
-only the two narrow Git metadata roots Symphony grants so a detached-HEAD
-commit can succeed. `networkAccess: true` lifts only the socket restriction, so
-repository tests that bind a local loopback listener -- Go `httptest` servers,
-for example -- can run; it broadens no filesystem authority. Host-owned Linear
-and GitHub credentials are still removed from the Codex child environment by
-name and by value, so the agent has no host credential to spend on the network
-it can reach, and all publishing authority stays with the host. Omit
-`turn_sandbox_policy` to keep the narrowed workspace-write grant with sockets
-denied.
+`workspaceWrite` bounds **writes** to the issue's own Git worktree plus only
+the two narrow Git metadata roots Symphony grants so a detached-HEAD commit can
+succeed. It does not restrict **reads**: a worker can read any file the user
+running Symphony can, including credential files outside the worktree. That is
+true of Codex's sandbox modes generally -- the same reads succeed under
+`read-only` -- and is not a consequence of this setting.
+
+`networkAccess: true` grants **unrestricted outbound network access**, not
+merely the ability to bind a local socket. Codex exposes a single boolean here
+and nothing narrower is expressible. Repository tests that bind loopback
+listeners -- Go `httptest` servers, for example -- are the reason this
+repository enables it, not the limit of what it permits. Omit
+`turn_sandbox_policy` to leave outbound access denied.
+
+Host-owned Linear and GitHub secrets are absent from the Codex child
+**environment**: Symphony strips them by variable name and by value before
+launch, so no host credential is handed to the worker as a variable, and all
+publishing authority stays with the host. That guarantee covers the
+environment, not reachability and not files on disk. With both local reads and
+outbound network available to the worker, what protects host credentials from
+exfiltration is that no untrusted input reaches the worker -- the issue text
+and repository content it acts on are operator-owned -- rather than the sandbox
+itself.
 
 Prompt templates use strict, lowercase variables: `issue` (for example
 `{{.issue.identifier}}`) and `attempt` (nil on the first run, then a 1-based
