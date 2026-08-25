@@ -144,11 +144,10 @@ func (t theme) checks(findings []operator.Finding) string {
 		summary = fmt.Sprintf("%d warn", warnings)
 	}
 	style := lipgloss.NewStyle().Foreground(lipgloss.Green)
-	for _, finding := range findings {
-		if finding.Severity == operator.SeverityError {
-			style = style.Foreground(lipgloss.Red)
-			break
-		}
+	switch {
+	case errors > 0:
+		style = style.Foreground(lipgloss.Red)
+	case warnings > 0:
 		style = style.Foreground(lipgloss.Yellow)
 	}
 	return style.Render(summary)
