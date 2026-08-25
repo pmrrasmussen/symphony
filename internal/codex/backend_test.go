@@ -19,8 +19,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pmrrasmussen/symphony/internal/capability"
 	"github.com/pmrrasmussen/symphony/internal/config"
 	"github.com/pmrrasmussen/symphony/internal/domain"
+	githubhost "github.com/pmrrasmussen/symphony/internal/github"
+	"github.com/pmrrasmussen/symphony/internal/linear"
 	"github.com/pmrrasmussen/symphony/internal/observability"
 )
 
@@ -82,7 +85,7 @@ func TestStartDrainsStderrBeforeProcessFinalization(t *testing.T) {
 	script := writeAppServer(t, dir, `
 printf '%s\n' 'token=do-not-log-this' >&2
 `)
-	c, err := start(context.Background(), request(dir, script), nil, nil, nil, nil)
+	c, err := start(context.Background(), request(dir, script), nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -717,69 +720,6 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{}}'`
 	}
 }
 
-func TestGitHubToolHasOnlyStructuredHandoffFieldsNoScopeOrCredentialInput(t *testing.T) {
-	definition := githubToolDefinition()
-	schema, ok := definition["inputSchema"].(map[string]any)
-	if !ok || schema["type"] != "object" || schema["additionalProperties"] != false {
-		t.Fatalf("schema=%#v", definition["inputSchema"])
-	}
-	properties, ok := schema["properties"].(map[string]any)
-	if !ok {
-		t.Fatalf("properties=%#v", schema["properties"])
-	}
-	allowed := map[string]bool{"why": true, "what_changed": true, "on_call": true}
-	for name := range properties {
-		if !allowed[name] {
-			t.Fatalf("GitHub tool unexpectedly accepts field %q: %#v", name, schema)
-		}
-	}
-	required, ok := schema["required"].([]string)
-	if !ok || len(required) != 3 {
-		t.Fatalf("required=%#v", schema["required"])
-	}
-	for _, name := range required {
-		if !allowed[name] {
-			t.Fatalf("required field %q is not a structured handoff field", name)
-		}
-	}
-	// The schema (not the free-text description) must never expose a
-	// scope-selection or credential field.
-	encoded, err := json.Marshal(schema)
-	if err != nil || strings.Contains(string(encoded), "token") || strings.Contains(string(encoded), "owner") || strings.Contains(string(encoded), "repository") || strings.Contains(string(encoded), "branch") || strings.Contains(string(encoded), "pull_number") {
-		t.Fatalf("tool schema exposed host scope: %s err=%v", encoded, err)
-	}
-}
-
-func TestGitHubContextToolHasNoInput(t *testing.T) {
-	definition := githubContextToolDefinition()
-	schema, ok := definition["inputSchema"].(map[string]any)
-	if !ok || schema["type"] != "object" || schema["additionalProperties"] != false {
-		t.Fatalf("schema=%#v", definition["inputSchema"])
-	}
-	if _, hasProperties := schema["properties"]; hasProperties {
-		t.Fatalf("GitHub context tool unexpectedly accepts caller-controlled input: %#v", schema)
-	}
-	encoded, err := json.Marshal(definition)
-	if err != nil || strings.Contains(string(encoded), "token") || strings.Contains(string(encoded), "\"owner\"") || strings.Contains(string(encoded), "\"repository\"") {
-		t.Fatalf("tool definition exposed host scope: %s err=%v", encoded, err)
-	}
-}
-
-func TestGitHubLandToolHasNoInput(t *testing.T) {
-	definition := githubLandToolDefinition()
-	schema, ok := definition["inputSchema"].(map[string]any)
-	if !ok || schema["type"] != "object" || schema["additionalProperties"] != false {
-		t.Fatalf("schema=%#v", definition["inputSchema"])
-	}
-	if _, hasProperties := schema["properties"]; hasProperties {
-		t.Fatalf("GitHub land tool unexpectedly accepts caller-controlled input: %#v", schema)
-	}
-	encoded, err := json.Marshal(definition)
-	if err != nil || strings.Contains(string(encoded), "token") || strings.Contains(string(encoded), "\"owner\"") || strings.Contains(string(encoded), "\"repository\"") || strings.Contains(string(encoded), "\"method\"") {
-		t.Fatalf("tool definition exposed host scope: %s err=%v", encoded, err)
-	}
-}
-
 // TestGitHubLandToolAdvertisedOnlyForConfiguredMergeState exercises the
 // dispatch-time filter added in backend.go's Start: github_land_pr is
 // offered only when the session's issue is currently (per AgentRequest.Issue,
@@ -860,32 +800,6 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{}}'
 	}
 }
 
-func TestCreateFollowupIssueToolHasNoCallerControlledScopeFields(t *testing.T) {
-	definition := createFollowupIssueToolDefinition()
-	schema, ok := definition["inputSchema"].(map[string]any)
-	if !ok || schema["type"] != "object" || schema["additionalProperties"] != false {
-		t.Fatalf("schema=%#v", definition["inputSchema"])
-	}
-	properties, ok := schema["properties"].(map[string]any)
-	if !ok {
-		t.Fatalf("properties=%#v", schema["properties"])
-	}
-	for _, forbidden := range []string{"issue", "issue_id", "project", "project_id", "team", "team_id", "state", "state_id", "endpoint", "credential", "token", "parent_id"} {
-		if _, exists := properties[forbidden]; exists {
-			t.Fatalf("create_followup_issue tool exposed caller-controlled %q: %#v", forbidden, properties)
-		}
-	}
-	for _, allowed := range []string{"title", "description", "acceptance_criteria", "relationship"} {
-		if _, exists := properties[allowed]; !exists {
-			t.Fatalf("create_followup_issue tool is missing bounded field %q: %#v", allowed, properties)
-		}
-	}
-	required, _ := schema["required"].([]string)
-	if len(required) != 3 || required[0] != "title" || required[1] != "description" || required[2] != "acceptance_criteria" {
-		t.Fatalf("required=%#v", schema["required"])
-	}
-}
-
 // TestFollowupIssueCreationIsGatedIndependentlyOfHandoffAndCreatesInBacklog
 // enables only tracker.provider.followup_issue_creation (no handoff_state or
 // agent_transitions) and verifies: the linear_graphql tool is not advertised,
@@ -951,12 +865,77 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{}}'
 	if err != nil {
 		t.Fatal(err)
 	}
-	for range events {
+	var dynamicToolCalls []domain.Event
+	for event := range events {
+		if event.ItemType == "dynamicToolCall" {
+			dynamicToolCalls = append(dynamicToolCalls, event)
+		}
 	}
 	// One read and one Backlog-state resolution bind the session, followed by
 	// one re-read before mutation (ensureMutable) and the create mutation.
 	if graphQLCalls != 4 {
 		t.Fatalf("GraphQL calls=%d want prepare+state+ensure+create=4", graphQLCalls)
+	}
+	// create_followup_issue is deliberately not reported as a dynamicToolCall
+	// (see docs/observability.md): a reported call would be tracked as an
+	// outstanding operation and would surface in heartbeat and stall records.
+	if len(dynamicToolCalls) != 0 {
+		t.Fatalf("follow-up creation emitted %d dynamicToolCall events: %+v", len(dynamicToolCalls), dynamicToolCalls)
+	}
+}
+
+// TestDynamicToolsWrapEveryDefinitionInTheAppServerEnvelope pins the wire shape
+// this adapter owns. The definitions themselves are asserted in
+// internal/capability; what is asserted here is that each one reaches the
+// app-server as a function tool whose schema is carried under "inputSchema".
+// Without this, renaming or dropping that key would advertise tools with no
+// schema at all -- no additionalProperties:false, no length bound -- and leave
+// only the provider-side parsers between a model and unbounded arguments.
+func TestDynamicToolsWrapEveryDefinitionInTheAppServerEnvelope(t *testing.T) {
+	settings := config.Settings{}
+	settings.Tracker.FollowupIssueCreation = true
+	settings.GitHub.MergeState = "Merging"
+	registry := capability.Build(capability.Bindings{
+		Settings: settings,
+		Issue:    domain.Issue{Identifier: "PMR-1", State: "Merging"},
+		Handoff:  &linear.HandoffSession{},
+		GitHub:   &githubhost.Session{},
+	})
+	tools := dynamicTools(registry)
+	if len(tools) != 4 {
+		t.Fatalf("wrapped %d tools, want 4", len(tools))
+	}
+	for _, tool := range tools {
+		if tool["type"] != "function" {
+			t.Fatalf("tool type=%#v, want \"function\": %#v", tool["type"], tool)
+		}
+		name, ok := tool["name"].(string)
+		if !ok || name == "" {
+			t.Fatalf("tool name=%#v", tool["name"])
+		}
+		if description, ok := tool["description"].(string); !ok || description == "" {
+			t.Fatalf("%s description=%#v", name, tool["description"])
+		}
+		schema, ok := tool["inputSchema"].(map[string]any)
+		if !ok {
+			t.Fatalf("%s carries no inputSchema: %#v", name, tool)
+		}
+		if schema["type"] != "object" || schema["additionalProperties"] != false {
+			t.Fatalf("%s schema=%#v", name, schema)
+		}
+		for key := range tool {
+			switch key {
+			case "type", "name", "description", "inputSchema":
+			default:
+				t.Fatalf("%s carries unexpected envelope field %q", name, key)
+			}
+		}
+	}
+}
+
+func TestDynamicToolsIsEmptyWithoutCapabilities(t *testing.T) {
+	if tools := dynamicTools(capability.Build(capability.Bindings{})); len(tools) != 0 {
+		t.Fatalf("wrapped %d tools without any bound capability", len(tools))
 	}
 }
 
