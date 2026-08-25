@@ -79,9 +79,13 @@ sweep after a restart — because it re-reads GitHub instead of relying on
 in-process memory of the landing. It asks one question: does the configured
 repository have exactly one pull request for this issue's `symphony/<issue>`
 branch, is it merged, and is its head commit the commit still checked out in
-the worktree? Only an exact match permits removal, so a squashed, amended, or
-rebased merge head, an unconfigured GitHub integration, and any request failure
-all keep the committed work for manual review. The verification never merges,
+the worktree? Only an exact match permits removal, so a locally amended or
+rebased HEAD, a commit never pushed to the bound branch, an unconfigured GitHub
+integration, and any request failure all keep the committed work for manual
+review. The configured `github.merge_method` does not affect this: a pull
+request's head commit is the source branch tip, which GitHub does not rewrite
+when it squashes or rebases onto the base branch, so verified cleanup works
+under all three merge methods. The verification never merges,
 comments, or transitions anything.
 
 ## Manual recovery

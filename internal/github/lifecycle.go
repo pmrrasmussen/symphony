@@ -162,10 +162,13 @@ func issueBranch(issue domain.Issue) (string, bool) {
 // cleanup. It is strictly read-only: it resolves the one deterministic pull
 // request for the issue's bound branch in the configured repository and reports
 // true only when that pull request is merged and its head commit is exactly the
-// commit still checked out in the workspace. A squashed, amended, rebased, or
-// otherwise rewritten head, a closed-unmerged or missing pull request, a
-// disabled GitHub integration, and any request failure all report false or an
-// error, so cleanup keeps the committed work for manual review.
+// commit still checked out in the workspace. A pull request's head commit is the
+// source branch tip, which GitHub does not rewrite when it squashes or rebases
+// onto the base branch, so this holds under every github.merge_method. A
+// locally amended or rebased HEAD, a commit never pushed to the bound branch, a
+// closed-unmerged or missing pull request, a disabled GitHub integration, and
+// any request failure all report false or an error, so cleanup keeps the
+// committed work for manual review.
 func (m *Manager) VerifyLanded(ctx context.Context, issue domain.Issue, commit string) (bool, error) {
 	s := m.settings().GitHub
 	commit = strings.TrimSpace(commit)

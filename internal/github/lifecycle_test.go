@@ -1608,7 +1608,7 @@ func TestVerifyLandedConfirmsOnlyTheMergedPullRequestHead(t *testing.T) {
 		},
 		{
 			name:      "merged pull request with a rewritten head",
-			configure: func(api *apiFixture) { api.prExists, api.prMerged, api.prSHA = true, true, "squashed-head" },
+			configure: func(api *apiFixture) { api.prExists, api.prMerged, api.prSHA = true, true, "rewritten-head" },
 			commit:    workspaceHead,
 			wantCalls: true,
 		},
