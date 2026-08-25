@@ -35,6 +35,29 @@ func TestLoadExpandsAndNormalizes(t *testing.T) {
 	}
 }
 
+func TestLoadWithEnvironmentUsesOnlyTheProvidedOverlayForServiceReferences(t *testing.T) {
+	d := t.TempDir()
+	secretFile := filepath.Join(d, "service-key")
+	if err := os.WriteFile(secretFile, []byte("service-secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(d, "WORKFLOW.md")
+	content := "---\ntracker: {kind: linear, provider: {project_slug_id: project, api_key_file: $SERVICE_KEY_FILE}, active_states: [Todo], terminal_states: [Done]}\nworkspace: {root: work}\n---\nprompt"
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := LoadWithEnvironment(path, "", map[string]string{"SERVICE_KEY_FILE": secretFile})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := loaded.Config.Tracker.Provider["api_key"]; got != "service-secret" {
+		t.Fatalf("service overlay was not resolved: %#v", got)
+	}
+	if got, want := loaded.Config.HostSecretEnvNames, []string{"SERVICE_KEY_FILE"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("secret references = %v, want %v", got, want)
+	}
+}
+
 func TestLoadPreservesLinearStateFilterSpelling(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "WORKFLOW.md")
 	content := "---\ntracker: {kind: linear, active_states: [ Todo, In Progress ], terminal_states: [ Done ]}\n---\nprompt"

@@ -163,15 +163,28 @@ type Codex struct {
 // Prompt parsing is intentionally deferred to Render: a malformed template must
 // fail only the affected run attempt, not stop polling or configuration reload.
 func Load(path, logRoot string) (Workflow, error) {
+	return LoadWithEnvironment(path, logRoot, nil)
+}
+
+// LoadWithEnvironment validates a workflow with environment values supplied by
+// its hosting boundary. Values in environment override are used only while
+// loading this candidate; they are never persisted or exposed by Settings.
+// It is intended for read-only operator inspection of LaunchAgent-specific
+// environments that are not present in the interactive process.
+func LoadWithEnvironment(path, logRoot string, environment map[string]string) (Workflow, error) {
 	abs, err := filepath.Abs(path)
 	if err != nil {
 		return Workflow{}, fmt.Errorf("missing_workflow_file: %w", err)
 	}
-	w, _, err := loadCandidate(abs, logRoot)
+	w, _, err := loadCandidateWithEnvironment(abs, logRoot, environment)
 	return w, err
 }
 
 func loadCandidate(path, logRoot string) (Workflow, [sha256.Size]byte, error) {
+	return loadCandidateWithEnvironment(path, logRoot, nil)
+}
+
+func loadCandidateWithEnvironment(path, logRoot string, environment map[string]string) (Workflow, [sha256.Size]byte, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return Workflow{}, sha256.Sum256(nil), fmt.Errorf("missing_workflow_file: %w", err)
@@ -180,7 +193,7 @@ func loadCandidate(path, logRoot string) (Workflow, [sha256.Size]byte, error) {
 	if err != nil {
 		return Workflow{}, sha256.Sum256(b), err
 	}
-	sources := newSourceSnapshot(b)
+	sources := newSourceSnapshot(b, environment)
 	s, err := decode(raw, filepath.Dir(path), path, logRoot, sources)
 	digest := sources.digest()
 	if err != nil {
@@ -1411,13 +1424,16 @@ type sourceSnapshot struct {
 	files       map[string]fileSource
 }
 
-func newSourceSnapshot(workflow []byte) *sourceSnapshot {
+func newSourceSnapshot(workflow []byte, overlay map[string]string) *sourceSnapshot {
 	environment := make(map[string]string)
 	for _, assignment := range os.Environ() {
 		name, value, found := strings.Cut(assignment, "=")
 		if found {
 			environment[name] = value
 		}
+	}
+	for name, value := range overlay {
+		environment[name] = value
 	}
 	return &sourceSnapshot{workflow: workflow, environment: environment, references: map[string]string{}, files: map[string]fileSource{}}
 }
