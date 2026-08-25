@@ -1746,6 +1746,10 @@ func TestExternalHandoffRevertIsObservedAtPoll(t *testing.T) {
 	w := testSettings(t)
 	w.Config.Tracker.HandoffState = "In Review"
 	w.Config.Tracker.ActiveStates = []string{"Todo", "In Progress"}
+	// In Progress is a start-policy endpoint, so the revert warns because it
+	// reactivated a pre-review implementation state — not merely because the
+	// destination was unclassifiable.
+	w.Config.Tracker.HostTransitions.Start = map[string]string{"todo": "In Progress"}
 	reverted := testIssue()
 	reverted.State = "In Progress"
 	tracker := &fakeTracker{issue: reverted}
@@ -1828,22 +1832,92 @@ func TestHealthyHandoffIsSweptWithoutExternalRevertLog(t *testing.T) {
 // state's outbound edges are told apart in the log: moving the issue to the
 // merge state is the human approval that authorizes landing and moving it to
 // the rework state is a human review decision — both expected, both info —
-// while a reactivation into a pre-review implementation state stays the
-// actionable PMR-63 warning.
+// while anything Symphony cannot name from the configured lifecycle, including
+// a reactivation into a pre-review implementation state, stays an actionable
+// warning.
 func TestPostHandoffStateChangeIsClassified(t *testing.T) {
+	canonical := []string{"Todo", "In Progress", "Rework", "Merging"}
+	fromTodo := map[string]string{"todo": "In Progress"}
+	const (
+		expectedMessage = "human review state change observed"
+		warnedMessage   = "external tracker state change observed"
+	)
 	for _, tc := range []struct {
-		name, state, operation, message, level string
+		name                             string
+		activeStates                     []string
+		start                            map[string]string
+		mergeState                       string
+		state, operation, message, level string
 	}{
-		{name: "approval", state: "Merging", operation: "review_approved", message: "human review state change observed", level: "INFO"},
-		{name: "rework", state: "Rework", operation: "rework_requested", message: "human review state change observed", level: "INFO"},
-		{name: "reversion", state: "In Progress", operation: "external_reversion", message: "external tracker state change observed", level: "WARN"},
+		{
+			name: "approval into the merge state", activeStates: canonical, start: fromTodo, mergeState: "Merging",
+			state: "Merging", operation: "review_approved", message: expectedMessage, level: "INFO",
+		},
+		{
+			name: "changes requested into the single remaining state", activeStates: canonical, start: fromTodo, mergeState: "Merging",
+			state: "Rework", operation: "rework_requested", message: expectedMessage, level: "INFO",
+		},
+		{
+			name: "reactivation into the start policy's target", activeStates: canonical, start: fromTodo, mergeState: "Merging",
+			state: "In Progress", operation: "external_reversion", message: warnedMessage, level: "WARN",
+		},
+		{
+			name: "reactivation into the start policy's source", activeStates: canonical, start: fromTodo, mergeState: "Merging",
+			state: "Todo", operation: "external_reversion", message: warnedMessage, level: "WARN",
+		},
+		{
+			// A second unaccounted-for active state makes the rework state
+			// unnameable, so work parked in it is never passed off as expected.
+			name:         "parked in an extra active state",
+			activeStates: []string{"Todo", "In Progress", "Rework", "Merging", "Blocked"},
+			start:        fromTodo, mergeState: "Merging",
+			state: "Blocked", operation: "external_reversion", message: warnedMessage, level: "WARN",
+		},
+		{
+			// The same ambiguity suppresses the rework naming itself: Symphony
+			// warns rather than guessing which of the two states is Rework.
+			name:         "ambiguous candidates suppress the rework naming",
+			activeStates: []string{"Todo", "In Progress", "Rework", "Merging", "Blocked"},
+			start:        fromTodo, mergeState: "Merging",
+			state: "Rework", operation: "external_reversion", message: warnedMessage, level: "WARN",
+		},
+		{
+			name:         "thrown back to a dispatchable backlog",
+			activeStates: []string{"Backlog", "Todo", "In Progress", "Rework", "Merging"},
+			start:        fromTodo, mergeState: "Merging",
+			state: "Backlog", operation: "external_reversion", message: warnedMessage, level: "WARN",
+		},
+		{
+			// A dispatch entry state the start policy does not name is still a
+			// pre-review implementation state; reactivating into it must warn.
+			name:         "reactivation into an unnamed entry state",
+			activeStates: []string{"Todo", "Ready", "In Progress", "Rework", "Merging"},
+			start:        map[string]string{"ready": "In Progress"}, mergeState: "Merging",
+			state: "Todo", operation: "external_reversion", message: warnedMessage, level: "WARN",
+		},
+		{
+			name: "no start policy leaves rework unnameable", activeStates: canonical, mergeState: "Merging",
+			state: "Rework", operation: "external_reversion", message: warnedMessage, level: "WARN",
+		},
+		{
+			// The approval edge is identified by github.merge_state alone, so it
+			// survives a missing start policy.
+			name: "approval without a start policy", activeStates: canonical, mergeState: "Merging",
+			state: "Merging", operation: "review_approved", message: expectedMessage, level: "INFO",
+		},
+		{
+			// With landing unconfigured there is no merge state to recognize, so
+			// the same edge is unnameable and warns instead.
+			name: "approval with landing unconfigured", activeStates: canonical, start: fromTodo,
+			state: "Merging", operation: "external_reversion", message: warnedMessage, level: "WARN",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			w := testSettings(t)
 			w.Config.Tracker.HandoffState = "In Review"
-			w.Config.Tracker.ActiveStates = []string{"Todo", "In Progress", "Rework", "Merging"}
-			w.Config.Tracker.HostTransitions.Start = map[string]string{"todo": "In Progress"}
-			w.Config.GitHub.MergeState = "Merging"
+			w.Config.Tracker.ActiveStates = tc.activeStates
+			w.Config.Tracker.HostTransitions.Start = tc.start
+			w.Config.GitHub.MergeState = tc.mergeState
 			moved := testIssue()
 			moved.State = tc.state
 			tracker := &fakeTracker{issue: moved}

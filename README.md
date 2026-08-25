@@ -338,11 +338,14 @@ agent:
    reverted issue — it logs a warn-level `external tracker state change
    observed` (`operation: external_reversion`) record naming the from/to
    states — but it does not currently re-assert the handoff automatically. The
-   expected human review decisions out of `In Review` are not warnings: an
-   approval to land (`In Review -> Merging`, `operation: review_approved`) and a
+   expected human review decisions out of `In Review` are not warnings: with
+   this repository's lifecycle configured, an approval to land
+   (`In Review -> Merging`, `operation: review_approved`) and a
    changes-requested move (`In Review -> Rework`,
    `operation: rework_requested`) are logged at info level as
-   `human review state change observed`. See the
+   `human review state change observed`. Any other destination — including one
+   the configured lifecycle cannot name unambiguously — keeps the warning. See
+   the
    [Linear tracker profile](docs/linear-tracker.md) and the
    [observability guide](docs/observability.md).
 

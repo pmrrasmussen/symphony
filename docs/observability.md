@@ -46,21 +46,31 @@ are a fault, and the `operation` field says which:
 * `operation: review_approved` — the handoff state -> `github.merge_state`
   (`In Review -> Merging`). Moving the issue there is itself the human
   approval to land, so this is normal operation, logged at **info** level with
-  `"msg":"human review state change observed"`.
+  `"msg":"human review state change observed"`. The edge is recognized *by*
+  `github.merge_state`: with landing unconfigured there is no merge state to
+  match, so the same move is unnameable and warns instead.
 * `operation: rework_requested` — the handoff state -> the lifecycle's rework
   state (`In Review -> Rework`), the human review decision that sends the work
-  back for changes. Also **info**, with the same message. Symphony identifies
-  the rework state as an active state that no configured host transition edge
-  touches: every pre-review implementation state appears in
-  `tracker.provider.transitions.start` (the canonical `Todo -> In Progress`
-  edge), so an active state outside that policy — and outside the merge state —
-  is one only a human review decision moves an issue into.
+  back for changes. Also **info**, with the same message. Symphony names the
+  rework state by elimination: `tracker.provider.transitions.start` enumerates
+  the pre-review implementation states (the canonical `Todo -> In Progress`
+  edge) and `github.merge_state` is the landing authorization, so removing both
+  from `active_states` leaves the states only a human review decision moves an
+  issue into. That naming is trusted **only when exactly one state remains** —
+  canonically `Rework`. Configure a second unaccounted-for active state (a
+  parked `Blocked`, a dispatchable `Backlog`, or a dispatch entry state no
+  start edge names) and nothing qualifies: Symphony will not guess which of
+  them is the rework state, so every such change warns instead.
 * `operation: external_reversion` — anything else: the handoff was contradicted
   by reactivating handed-off work as though implementation had not happened
   (typically the tracker's native GitHub PR automation flapping
-  `In Review -> In Progress`; PMR-63), or the destination is unclassifiable
-  because no start policy is configured. This one keeps its actionable
-  **warn**-level `"msg":"external tracker state change observed"` record.
+  `In Review -> In Progress`; PMR-63), or the destination is one the configured
+  lifecycle cannot name (no start policy, or two or more remaining candidates as
+  above). This one keeps its actionable **warn**-level
+  `"msg":"external tracker state change observed"` record. The warning is the
+  default on purpose: an expected-change record for a state Symphony merely
+  failed to recognize would hide exactly the fault this record exists to
+  surface.
 
 Every one of the three carries the `from_state` (the handoff state) and
 `to_state` (the state it was moved to) NAMES, the

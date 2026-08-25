@@ -53,3 +53,21 @@ const (
 	// the three logged at warn level.
 	OperationExternalReversion Operation = "external_reversion"
 )
+
+// known is the closed set above, checkable at log time. safeAttr writes an
+// Operation only when it is one of these literals: the "bounded vocabulary"
+// claim is then enforced by the redaction boundary itself rather than asserted
+// by comment, so a value converted from arbitrary text (which would otherwise
+// bypass Text's scrubbing and truncation) can never reach a log record.
+var known = map[Operation]bool{
+	OperationStartTransition:   true,
+	OperationTransition:        true,
+	OperationHandoff:           true,
+	OperationLandingRefused:    true,
+	OperationLandingCompleted:  true,
+	OperationMergeReconciled:   true,
+	OperationReviewCompleted:   true,
+	OperationReviewApproved:    true,
+	OperationReworkRequested:   true,
+	OperationExternalReversion: true,
+}

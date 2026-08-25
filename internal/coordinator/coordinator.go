@@ -503,12 +503,15 @@ func (c *Coordinator) notePostHandoffStateChange(i domain.Issue, s config.Settin
 
 // postHandoffOperation classifies one state change out of the review handoff
 // state that Symphony did not perform. Moving the issue into the configured
-// merge state is the documented human approval to land, and moving it into the
-// lifecycle's rework state is the documented human request for changes; both
-// are expected. Anything else contradicts the handoff by reactivating
-// handed-off work as though implementation had not happened (the PMR-63 flap of
-// the tracker's native PR-to-status automation) and stays an actionable
-// warning.
+// github.merge_state is the documented human approval to land, and moving it
+// into the lifecycle's rework state is the documented human request for
+// changes; both are expected. Everything else — including any destination
+// Symphony cannot name from the configured lifecycle — contradicts the handoff
+// by reactivating handed-off work as though implementation had not happened
+// (the PMR-63 flap of the tracker's native PR-to-status automation) and stays
+// an actionable warning. The warning is the default on purpose: a silent
+// expected-change record for a state Symphony merely failed to recognize would
+// hide exactly the fault this record exists to surface.
 func postHandoffOperation(to string, s config.Settings) observability.Operation {
 	switch {
 	case to != "" && to == norm(s.GitHub.MergeState):
@@ -520,27 +523,52 @@ func postHandoffOperation(to string, s config.Settings) observability.Operation 
 	}
 }
 
-// reworkDecision reports whether state is the lifecycle's human rework state:
-// an active state that no configured host transition edge touches. Every
-// pre-review implementation state appears in the host start policy (the
-// canonical Todo -> In Progress edge), so an active state outside that policy,
-// and outside the merge state, is one only a human review decision moves an
-// issue into. Without a configured start policy Symphony cannot tell the
-// pre-review states apart, so nothing qualifies and an unclassifiable change
-// keeps its warning.
+// reworkDecision reports whether state is the lifecycle's human rework state.
+// Symphony names that state by elimination against the configured lifecycle:
+// tracker.provider.transitions.start enumerates the pre-review implementation
+// states (the canonical Todo -> In Progress edge) and github.merge_state is the
+// landing authorization, so removing both from active_states leaves the states
+// only a human review decision moves an issue into.
+//
+// That naming is trusted only when exactly one state remains, which is the
+// canonical lifecycle's Rework. With no start policy configured, or with two or
+// more remaining candidates (an extra parked state such as Blocked, a Backlog
+// in active_states, or a dispatch entry state that no start edge names),
+// Symphony cannot tell the rework state from a state an external writer parked
+// handed-off work in, so nothing qualifies and every such change keeps its
+// warning. The merge state is excluded here too, so this predicate is correct
+// on its own rather than relying on postHandoffOperation's case order.
 func reworkDecision(state string, s config.Settings) bool {
-	start := s.Tracker.HostTransitions.Start
-	// The state-only issue is just how the shared active-state check is spelled;
-	// no issue content is involved in the classification.
-	if state == "" || len(start) == 0 || !active(domain.Issue{State: state}, s) {
+	if state == "" || state == norm(s.GitHub.MergeState) {
 		return false
 	}
-	for source, target := range start {
-		if norm(source) == state || norm(target) == state {
-			return false
-		}
+	candidates := reworkCandidates(s)
+	return len(candidates) == 1 && candidates[0] == state
+}
+
+// reworkCandidates returns the normalized active states that neither the host
+// start policy nor the merge state accounts for. An empty start policy yields
+// no candidates: without it Symphony cannot identify the pre-review
+// implementation states, so it can name nothing by elimination.
+func reworkCandidates(s config.Settings) []string {
+	if len(s.Tracker.HostTransitions.Start) == 0 {
+		return nil
 	}
-	return true
+	accounted := map[string]bool{norm(s.GitHub.MergeState): true}
+	for source, target := range s.Tracker.HostTransitions.Start {
+		accounted[norm(source)] = true
+		accounted[norm(target)] = true
+	}
+	candidates := make([]string, 0, len(s.Tracker.ActiveStates))
+	for _, state := range s.Tracker.ActiveStates {
+		name := norm(state)
+		if name == "" || accounted[name] {
+			continue
+		}
+		accounted[name] = true // Also de-duplicates a repeated active state.
+		candidates = append(candidates, name)
+	}
+	return candidates
 }
 
 // sweepHandoffObservations discards handoff memories older than the retention
