@@ -29,7 +29,9 @@ binary into a managed repository or self-updates a running service. Each
 repository service gets its own `.symphony/workspaces`, `.symphony/logs`, and
 `.symphony/service/{status.json,stdout.log,stderr.log}`, while its LaunchAgent
 is registered as `com.pmrrasmussen.symphony.<instance>` under
-`~/Library/LaunchAgents`.
+`~/Library/LaunchAgents`. See [the macOS repository-services guide](docs/macos-services.md)
+for the multi-instance layout, credential references, migration from a manual
+plist, and a troubleshooting-level raw plist example.
 
 `service install` runs the normal workflow preflight and validates its
 generated plist before changing launchd. Repeating it is a no-op when the
@@ -172,17 +174,19 @@ outstanding operation. See [docs/observability.md](docs/observability.md) for
 `tail`/`jq` examples and the full level and redaction contract.
 
 For a local TUI or another operator client, optionally pass `--status-file`
-with a separate path for each process (the repository-local convention is
-`.symphony/runtime/status.json`). It is an atomically replaced owner-only,
-versioned runtime snapshot, not a liveness authority; see
-[docs/runtime-status.md](docs/runtime-status.md).
+with a separate path for each process. Managed repository services use
+`.symphony/service/status.json`; a manually run process may select another
+owner-only path. It is an atomically replaced, versioned runtime snapshot, not
+a liveness authority; see [docs/runtime-status.md](docs/runtime-status.md).
 
 Use `symphony tui` for a read-only terminal view across convention-matching
 local Symphony LaunchAgents. It reads launchd observation, each instance's
 safe status snapshot, normalized effective configuration, validation findings,
 and a bounded redacted structured-log tail. `r` refreshes local observations;
 the command does not start, stop, pause, or connect to a Symphony daemon or
-remote Linear, GitHub, or Codex service.
+remote Linear, GitHub, or Codex service. It requires no central registry; see
+[the macOS repository-services guide](docs/macos-services.md) for the
+multi-repository operator workflow.
 
 For ongoing repository development, configure `workspace.source_root: .`.
 Symphony then creates one detached Git worktree per issue beneath

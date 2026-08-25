@@ -6,6 +6,13 @@ document covers the two log levels, what each adds, and how to follow the
 log during a live run without reading the raw Codex rollout, which can
 contain prompts, issue content, tool arguments, and other sensitive data.
 
+For a managed macOS repository service, this file is
+`.symphony/logs/symphony.jsonl`, separate from
+`.symphony/service/status.json`. The log is redacted event history, not an
+authoritative current-state record; status is an observational snapshot and
+launchd/process state determines liveness. See
+[macOS repository services](macos-services.md) for the operator model.
+
 ## Log levels
 
 `--log-level info` (the default) is concise: issue claim through completion
