@@ -236,7 +236,8 @@ func runService(args []string, stdout, stderr io.Writer) int {
 			return 0
 		}
 		fmt.Fprintln(stdout, "migrated", migration.Legacy, "to", migration.Label)
-		fmt.Fprintln(stdout, "replaced LaunchAgent backed up at", migration.Backup)
+		fmt.Fprintln(stdout, "replaced", migration.LegacyPlist)
+		fmt.Fprintln(stdout, "backup", migration.Backup)
 		return 0
 	case "status":
 		instance, err := service.Status(ctx, options)

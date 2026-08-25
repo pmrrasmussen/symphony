@@ -93,10 +93,16 @@ func Install(ctx context.Context, options Options) (Instance, bool, error) {
 	if err != nil && !os.IsNotExist(err) {
 		return Instance{}, false, fmt.Errorf("read existing LaunchAgent: %w", err)
 	}
+	// Observe the registration being replaced before it is overwritten: a
+	// rollback must not start a service that was not running.
+	previous := prior{Content: old, Restore: true}
+	if old != nil {
+		previous.Loaded = serviceLoadState(ctx, runner, d.Label) == loadLoaded
+	}
 	if err := atomicWrite(d.PlistPath, d.Content, 0o600); err != nil {
 		return Instance{}, false, fmt.Errorf("install LaunchAgent plist: %w", err)
 	}
-	if err := reload(ctx, runner, d, old); err != nil {
+	if err := reload(ctx, runner, d, previous); err != nil {
 		return Instance{}, false, err
 	}
 	return d.Instance, true, nil
@@ -560,14 +566,14 @@ func rejectConflicts(ctx context.Context, options Options, d desired, ignorePlis
 		return fmt.Errorf("discover existing Symphony services: %w", err)
 	}
 	for _, existing := range instances {
-		if ignorePlist != "" && filepath.Clean(existing.Paths.Plist) == filepath.Clean(ignorePlist) {
+		if ignorePlist != "" && canonical(existing.Paths.Plist) == canonical(ignorePlist) {
 			continue
 		}
 		if existing.ID == d.Label {
-			if existing.Paths.Plist != d.PlistPath || !existing.Managed {
+			if canonical(existing.Paths.Plist) != canonical(d.PlistPath) || !existing.Managed {
 				return fmt.Errorf("refusing to overwrite unmanaged LaunchAgent %s", d.PlistPath)
 			}
-			if filepath.Clean(existing.Paths.Workflow) != filepath.Clean(d.Workflow) {
+			if canonical(existing.Paths.Workflow) != canonical(d.Workflow) {
 				return fmt.Errorf("service instance identity %s is already registered for workflow %s", d.Label, existing.Paths.Workflow)
 			}
 			continue
@@ -577,11 +583,11 @@ func rejectConflicts(ctx context.Context, options Options, d desired, ignorePlis
 			{"status file", d.StatusFile, existing.Paths.StatusFile},
 			{"log root", d.LogsRoot, existing.Paths.LogsRoot},
 		} {
-			if conflict.right != "" && filepath.Clean(conflict.left) == filepath.Clean(conflict.right) {
+			if conflict.right != "" && canonical(conflict.left) == canonical(conflict.right) {
 				return fmt.Errorf("service conflict with %s: shared %s %s", existing.ID, conflict.kind, conflict.left)
 			}
 		}
-		if existing.Config != nil && d.WorkspaceSource != "" && existing.Config.WorkspaceSource != "" && filepath.Clean(d.WorkspaceSource) == filepath.Clean(existing.Config.WorkspaceSource) {
+		if existing.Config != nil && d.WorkspaceSource != "" && existing.Config.WorkspaceSource != "" && canonical(d.WorkspaceSource) == canonical(existing.Config.WorkspaceSource) {
 			return fmt.Errorf("service conflict with %s: shared workspace source %s", existing.ID, d.WorkspaceSource)
 		}
 	}
@@ -595,7 +601,7 @@ func findManaged(ctx context.Context, options Options, d desired) (operator.Inst
 	}
 	var matches []operator.Instance
 	for _, instance := range instances {
-		if instance.ID == d.Label || filepath.Clean(instance.Paths.Workflow) == filepath.Clean(d.Workflow) {
+		if instance.ID == d.Label || canonical(instance.Paths.Workflow) == canonical(d.Workflow) {
 			matches = append(matches, instance)
 		}
 	}
@@ -606,13 +612,32 @@ func findManaged(ctx context.Context, options Options, d desired) (operator.Inst
 		return operator.Instance{}, fmt.Errorf("ambiguous Symphony services for %s; leave exactly one LaunchAgent for this repository in place, then run symphony service migrate to adopt it", d.Workflow)
 	}
 	instance := matches[0]
-	if !instance.Managed || filepath.Clean(instance.Paths.Workflow) != filepath.Clean(d.Workflow) {
+	if !instance.Managed || canonical(instance.Paths.Workflow) != canonical(d.Workflow) {
 		return operator.Instance{}, fmt.Errorf("refusing to manage unrelated LaunchAgent %s; run symphony service migrate to adopt a compatible hand-authored Symphony LaunchAgent for this repository", instance.Paths.Plist)
 	}
 	if options.Name != "" && instance.ID != d.Label {
 		return operator.Instance{}, fmt.Errorf("configured service name %s does not match %s", d.Label, instance.ID)
 	}
 	return instance, nil
+}
+
+// canonical resolves symlinks so path comparisons match what Git, launchd, and
+// a running daemon actually use. A repository reached through a symlink must
+// not read as a different repository. Paths that do not exist yet, such as a
+// status file, are resolved through their nearest existing parent.
+func canonical(path string) string {
+	if path == "" {
+		return ""
+	}
+	path = filepath.Clean(path)
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		return resolved
+	}
+	parent := filepath.Dir(path)
+	if parent == path {
+		return path
+	}
+	return filepath.Join(canonical(parent), filepath.Base(path))
 }
 
 func atomicWrite(path string, content []byte, permission os.FileMode) error {
@@ -644,35 +669,47 @@ func atomicWrite(path string, content []byte, permission os.FileMode) error {
 	return os.Rename(tempPath, path)
 }
 
-func reload(ctx context.Context, runner Runner, d desired, old []byte) error {
+// prior describes the registration a failed update must put back. Loaded and
+// Restore keep the two rollback paths from stepping on each other: a rollback
+// never bootstraps a registration that was not loaded, and never bootstraps
+// one whose restoration another caller owns.
+type prior struct {
+	Content []byte
+	Loaded  bool
+	Restore bool
+}
+
+func reload(ctx context.Context, runner Runner, d desired, previous prior) error {
 	service := launchService(d.Label)
 	// bootout is expected to fail for a first installation. Any prior plist was
 	// already validated. If loading or starting the replacement fails, restore
 	// that prior registration before reporting the failed update.
 	_ = launchctl(ctx, runner, "bootout", service)
 	if err := launchctl(ctx, runner, "bootstrap", "gui/"+fmt.Sprint(os.Getuid()), d.PlistPath); err != nil {
-		return restoreAfterReloadFailure(ctx, runner, d, old, "load", err)
+		return restoreAfterReloadFailure(ctx, runner, d, previous, "load", err)
 	}
 	if err := launchctl(ctx, runner, "kickstart", "-k", service); err != nil {
 		// Do not leave a replacement registration loaded when it did not start.
 		_ = launchctl(ctx, runner, "bootout", service)
-		return restoreAfterReloadFailure(ctx, runner, d, old, "start", err)
+		return restoreAfterReloadFailure(ctx, runner, d, previous, "start", err)
 	}
 	return nil
 }
 
-func restoreAfterReloadFailure(ctx context.Context, runner Runner, d desired, old []byte, operation string, cause error) error {
-	if old == nil {
+func restoreAfterReloadFailure(ctx context.Context, runner Runner, d desired, previous prior, operation string, cause error) error {
+	if previous.Content == nil {
 		if err := os.Remove(d.PlistPath); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("%s %s: %w (remove failed installation plist: %v)", operation, d.Label, cause, err)
 		}
 		return fmt.Errorf("%s %s: %w", operation, d.Label, cause)
 	}
-	if err := atomicWrite(d.PlistPath, old, 0o600); err != nil {
+	if err := atomicWrite(d.PlistPath, previous.Content, 0o600); err != nil {
 		return fmt.Errorf("%s %s: %w (restore prior plist: %v)", operation, d.Label, cause, err)
 	}
-	if err := launchctl(ctx, runner, "bootstrap", "gui/"+fmt.Sprint(os.Getuid()), d.PlistPath); err != nil {
-		return fmt.Errorf("%s %s: %w (restore prior service: %v)", operation, d.Label, cause, err)
+	if previous.Restore && previous.Loaded {
+		if err := launchctl(ctx, runner, "bootstrap", "gui/"+fmt.Sprint(os.Getuid()), d.PlistPath); err != nil {
+			return fmt.Errorf("%s %s: %w (restore prior service: %v)", operation, d.Label, cause, err)
+		}
 	}
 	return fmt.Errorf("%s %s: %w", operation, d.Label, cause)
 }

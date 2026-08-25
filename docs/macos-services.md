@@ -221,8 +221,10 @@ validation of the generated plist.
 It then looks only at LaunchAgents that convention-matching discovery already
 reads, and considers an *unmanaged* one to belong to this repository when it
 shares at least one repository path: the `WorkingDirectory`, the `--workflow`,
-the `--logs-root`, or the `--status-file`. Anything else is unrelated and is
-never read further, moved, or unloaded.
+the `--logs-root`, or the `--status-file`. Paths are compared with symlinks
+resolved, so a repository reached through a symlink is still the same
+repository. Anything else is unrelated and is never read further, moved, or
+unloaded.
 
 The single related agent must then match this repository exactly:
 
@@ -242,25 +244,56 @@ for example `refusing to migrate LaunchAgent <path>: workflow "..." is not
 ...`. Two related unmanaged agents are refused as `ambiguous hand-authored
 Symphony LaunchAgents`; remove or correct all but one and rerun.
 
+Finally, because a plist on disk is not the same thing as a registered job,
+`migrate` enumerates the Symphony jobs launchd currently has loaded. Only three
+kinds are accounted for: the managed target, the legacy agent being replaced,
+and the services of *other* repositories whose LaunchAgents are on disk.
+Anything else -- most commonly a job still registered under a label whose plist
+was renamed or deleted, which keeps scheduling this repository even though no
+per-label check can see it -- refuses the migration:
+
+```text
+refusing to migrate while other Symphony services are loaded:
+com.pmrrasmussen.symphony; no LaunchAgent in ... accounts for them
+```
+
+Unload the named label with `launchctl bootout "gui/$(id -u)/<label>"`, or
+restore its LaunchAgent so it can be identified, then rerun. If launchd cannot
+be enumerated at all, `migrate` refuses as well: an unverified launchd is not
+evidence that nothing is running.
+
 ### What migration does, and how to undo it
 
-1. Copies the legacy plist to
+Every check above runs first. Nothing on disk or in launchd changes until all
+of them pass, so a refused migration leaves no plist, backup, or registration
+altered.
+
+1. Boots out the legacy label and *verifies* it is gone. Absence has to be
+   positively observed: launchd stating that it has no such job -- `Could not
+   find service` from `print`, or `No such process` from `bootout` -- is the
+   only benign negative, and it is the normal result for a hand-authored plist
+   that sits on disk unloaded. A `bootout` that fails for any other reason, or
+   an observation that simply does not answer, aborts the migration before
+   anything is removed or installed, naming the label and the manual
+   `launchctl bootout` command to run first. An unload that launchd reports as
+   still in progress is retried briefly before being treated as a failure.
+2. Copies the legacy plist to
    `<repo>/.symphony/service/<label>.plist.pre-migration.backup`. That path is
    outside `~/Library/LaunchAgents`, so launchd can never load the replaced
    registration again, and the file remains a known-good copy to restore from.
-2. Boots out the legacy label and *verifies* it is no longer loaded, then
-   removes its plist, so the repository never has two schedulers loaded at
-   once. A hand-authored plist that was sitting on disk unloaded migrates
-   normally; `launchctl bootout` reporting a failure for it is expected. But a
-   legacy service that was running and is still loaded after the bootout
-   aborts the migration before anything is removed or installed, naming the
-   label and the manual `launchctl bootout` command to run first.
-3. Writes the managed plist, bootstraps it, and kickstarts it.
+3. Removes the legacy plist, writes the managed plist, bootstraps it, and
+   kickstarts it.
 
-If any later step fails, the legacy plist is written back to its original path
-and bootstrapped again when it was loaded, and the error names both the cause
-and the restored agent. A failed `migrate` therefore leaves the previously
-valid service running, with no managed plist left behind.
+If any step from 2 onwards fails, the replaced plist is written back to its
+original path with its original mode, and the error names the cause, the
+restored LaunchAgent, and the backup copy. A rollback re-bootstraps a
+registration only if that registration was loaded before the migration, so a
+failed `migrate` never *starts* a service the operator had deliberately
+stopped, and never leaves both a managed and a legacy scheduler loaded where
+one was loaded before. A managed plist that already existed at the target path
+is restored rather than removed. In the rare case where writing the plist back
+also fails, the error says so and names the backup to copy into place by
+hand.
 
 Rerunning `migrate` after a successful migration is a no-op that reports
 `already managed <label>`. From then on `service status`, `service restart`,

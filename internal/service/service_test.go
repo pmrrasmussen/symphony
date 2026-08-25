@@ -5,20 +5,30 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 
 	"github.com/pmrrasmussen/symphony/internal/operator"
 )
 
-// fakeRunner models the launchd state the service package observes: only a
-// bootstrapped label is printable, and bootout fails for anything else. loaded
-// seeds labels that are already registered before a test acts.
+// fakeRunner models launchd the way the service package must cope with it.
+// Load state is a set of labels that exists independently of any plist on
+// disk, so a job whose plist was renamed or deleted is representable; print
+// can fail without reporting absence; and an unload can be reported as still
+// in progress.
 type fakeRunner struct {
-	root   string
-	calls  []string
-	fail   string
+	root  string
+	calls []string
+	fail  string
+	// loaded are the labels launchd currently has registered.
 	loaded map[string]bool
+	// printFail are labels whose print fails for a reason that is not absence,
+	// so the caller learns nothing about whether they are loaded.
+	printFail map[string]bool
+	// unloadLag is how many further prints still report a label as loaded
+	// after a successful bootout, modelling an asynchronous unload.
+	unloadLag map[string]int
 }
 
 func (r *fakeRunner) Run(_ context.Context, name string, args ...string) ([]byte, error) {
@@ -42,23 +52,44 @@ func (r *fakeRunner) Run(_ context.Context, name string, args ...string) ([]byte
 	return nil, errors.New("unexpected command")
 }
 
+// launchctl reproduces the observable contract the service package relies on,
+// including the messages launchd uses to report a genuinely absent service.
 func (r *fakeRunner) launchctl(args []string) ([]byte, error) {
 	if r.loaded == nil {
 		r.loaded = map[string]bool{}
 	}
 	switch args[0] {
 	case "print":
-		if r.loaded[serviceLabel(args[1])] {
-			return nil, nil
+		label := serviceLabel(args[1])
+		if r.printFail[label] {
+			return []byte("Could not print domain: 5: Input/output error"), errors.New("exit status 5")
 		}
-		return []byte("Could not find service"), errors.New("service not loaded")
+		if r.loaded[label] {
+			return []byte("state = running"), nil
+		}
+		if r.unloadLag[label] > 0 {
+			r.unloadLag[label]--
+			return []byte("state = exited"), nil
+		}
+		return []byte("Could not find service \"" + label + "\" in domain for user gui: 501"), errors.New("exit status 113")
 	case "bootout":
 		label := serviceLabel(args[1])
 		if !r.loaded[label] {
-			return []byte("No such process"), errors.New("service not loaded")
+			return []byte("Boot-out failed: 3: No such process"), errors.New("exit status 3")
 		}
 		delete(r.loaded, label)
 		return nil, nil
+	case "list":
+		lines := []string{"PID\tStatus\tLabel"}
+		labels := make([]string, 0, len(r.loaded))
+		for label := range r.loaded {
+			labels = append(labels, label)
+		}
+		sort.Strings(labels)
+		for _, label := range labels {
+			lines = append(lines, "1234\t0\t"+label)
+		}
+		return []byte(strings.Join(lines, "\n") + "\n"), nil
 	case "bootstrap":
 		r.loaded[strings.TrimSuffix(filepath.Base(args[len(args)-1]), ".plist")] = true
 		return nil, nil
