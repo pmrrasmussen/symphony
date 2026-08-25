@@ -1014,7 +1014,7 @@ func TestReloadPublishesEveryDynamicSettingAsOneSnapshot(t *testing.T) {
 		}
 	}
 	workflow := filepath.Join(d, "WORKFLOW.md")
-	initial := "---\ntracker: {kind: linear, provider: {api_key: ' first-key '}, active_states: [Todo], terminal_states: [Done]}\npolling: {interval_ms: 100}\nworkspace: {root: work-one, source_root: " + firstSource + "}\nhooks: {after_create: one, before_run: one, after_run: one, before_remove: one, timeout_ms: 101}\nagent: {max_concurrent_agents: 1, max_turns: 2, max_retry_backoff_ms: 102, max_concurrent_agents_by_state: {Todo: 1}}\ncodex: {command: codex-one, approval_policy: never, thread_sandbox: workspace-write, turn_sandbox_policy: {type: one}, turn_timeout_ms: 103, read_timeout_ms: 104, stall_timeout_ms: 105}\n---\nfirst"
+	initial := "---\ntracker: {kind: linear, provider: {api_key: ' first-key '}, active_states: [Todo], terminal_states: [Done]}\npolling: {interval_ms: 100}\nworkspace: {root: work-one, source_root: " + firstSource + "}\nhooks: {after_create: one, before_run: one, after_run: one, before_remove: one, timeout_ms: 101}\nagent: {max_concurrent_agents: 1, max_turns: 2, max_retry_backoff_ms: 102, max_concurrent_agents_by_state: {Todo: 1}}\ncodex: {command: codex-one, approval_policy: never, thread_sandbox: workspace-write, turn_sandbox_policy: {type: workspaceWrite}, turn_timeout_ms: 103, read_timeout_ms: 104, stall_timeout_ms: 105}\n---\nfirst"
 	if err := os.WriteFile(workflow, []byte(initial), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -1022,7 +1022,7 @@ func TestReloadPublishesEveryDynamicSettingAsOneSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	updated := "---\ntracker: {kind: linear, provider: {api_key: ' second-key '}, required_labels: [Ready], active_states: [Backlog, Started], terminal_states: [Closed]}\npolling: {interval_ms: 200}\nworkspace: {root: work-two, source_root: " + secondSource + "}\nhooks: {after_create: two-create, before_run: two-before, after_run: two-after, before_remove: two-remove, timeout_ms: 201}\nagent: {max_concurrent_agents: 3, max_turns: 4, max_retry_backoff_ms: 202, max_concurrent_agents_by_state: {Started: 2}}\ncodex: {command: codex-two, approval_policy: on-request, thread_sandbox: danger-full-access, turn_sandbox_policy: {type: two}, turn_timeout_ms: 203, read_timeout_ms: 204, start_timeout_ms: 206, stall_timeout_ms: 205}\n---\nsecond"
+	updated := "---\ntracker: {kind: linear, provider: {api_key: ' second-key '}, required_labels: [Ready], active_states: [Backlog, Started], terminal_states: [Closed]}\npolling: {interval_ms: 200}\nworkspace: {root: work-two, source_root: " + secondSource + "}\nhooks: {after_create: two-create, before_run: two-before, after_run: two-after, before_remove: two-remove, timeout_ms: 201}\nagent: {max_concurrent_agents: 3, max_turns: 4, max_retry_backoff_ms: 202, max_concurrent_agents_by_state: {Started: 2}}\ncodex: {command: codex-two, approval_policy: on-request, thread_sandbox: danger-full-access, turn_sandbox_policy: {type: dangerFullAccess}, turn_timeout_ms: 203, read_timeout_ms: 204, start_timeout_ms: 206, stall_timeout_ms: 205}\n---\nsecond"
 	if err := os.WriteFile(workflow, []byte(updated), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -1045,7 +1045,7 @@ func TestReloadPublishesEveryDynamicSettingAsOneSnapshot(t *testing.T) {
 		t.Fatalf("agent=%+v", settings.Agent)
 	}
 	policy, ok := settings.Codex.TurnSandboxPolicy.(map[string]any)
-	if !ok || policy["type"] != "two" || settings.Codex.Command != "codex-two" || settings.Codex.ApprovalPolicy != "on-request" || settings.Codex.ThreadSandbox != "danger-full-access" || settings.Codex.TurnTimeout != 203*time.Millisecond || settings.Codex.ReadTimeout != 204*time.Millisecond || settings.Codex.StartTimeout != 206*time.Millisecond || settings.Codex.StallTimeout != 205*time.Millisecond {
+	if !ok || policy["type"] != "dangerFullAccess" || settings.Codex.Command != "codex-two" || settings.Codex.ApprovalPolicy != "on-request" || settings.Codex.ThreadSandbox != "danger-full-access" || settings.Codex.TurnTimeout != 203*time.Millisecond || settings.Codex.ReadTimeout != 204*time.Millisecond || settings.Codex.StartTimeout != 206*time.Millisecond || settings.Codex.StallTimeout != 205*time.Millisecond {
 		t.Fatalf("codex=%+v", settings.Codex)
 	}
 }
@@ -1087,7 +1087,7 @@ func TestCurrentReturnsAnImmutableSnapshotCopy(t *testing.T) {
 	d := t.TempDir()
 	workflow := filepath.Join(d, "WORKFLOW.md")
 	t.Setenv("PMR29_IMMUTABLE_SECRET", "secret")
-	content := "---\nextension: {nested: [original]}\ntracker: {kind: linear, provider: {project_slug: project, api_key: $PMR29_IMMUTABLE_SECRET, nested: {value: original}}, active_states: [Todo], terminal_states: [Done]}\nagent: {max_concurrent_agents_by_state: {Todo: 1}}\ncodex: {turn_sandbox_policy: {type: original}}\n---\nprompt"
+	content := "---\nextension: {nested: [original]}\ntracker: {kind: linear, provider: {project_slug: project, api_key: $PMR29_IMMUTABLE_SECRET, nested: {value: original}}, active_states: [Todo], terminal_states: [Done]}\nagent: {max_concurrent_agents_by_state: {Todo: 1}}\ncodex: {turn_sandbox_policy: {type: workspaceWrite, networkAccess: true}}\n---\nprompt"
 	if err := os.WriteFile(workflow, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -1105,7 +1105,7 @@ func TestCurrentReturnsAnImmutableSnapshotCopy(t *testing.T) {
 	copy.Config.Warnings[0] = "mutated"
 
 	current := store.Current()
-	if current.Raw["extension"].(map[string]any)["nested"].([]any)[0] != "original" || current.Config.Tracker.Provider["nested"].(map[string]any)["value"] != "original" || current.Config.Tracker.ActiveStates[0] != "Todo" || current.Config.Agent.ByState["todo"] != 1 || current.Config.Codex.TurnSandboxPolicy.(map[string]any)["type"] != "original" || current.Config.HostSecretEnvNames[0] != "PMR29_IMMUTABLE_SECRET" || current.Config.Warnings[0] != legacyProjectSlugWarning {
+	if current.Raw["extension"].(map[string]any)["nested"].([]any)[0] != "original" || current.Config.Tracker.Provider["nested"].(map[string]any)["value"] != "original" || current.Config.Tracker.ActiveStates[0] != "Todo" || current.Config.Agent.ByState["todo"] != 1 || current.Config.Codex.TurnSandboxPolicy.(map[string]any)["type"] != "workspaceWrite" || current.Config.HostSecretEnvNames[0] != "PMR29_IMMUTABLE_SECRET" || current.Config.Warnings[0] != legacyProjectSlugWarning {
 		t.Fatalf("published workflow was mutated through Current: %+v", current)
 	}
 }
@@ -1163,5 +1163,141 @@ func TestConcurrentReadersNeverObserveMixedSnapshots(t *testing.T) {
 	close(errors)
 	for message := range errors {
 		t.Error(message)
+	}
+}
+
+// TestRepositoryWorkflowGrantsLoopbackWithinWorkspaceWrite pins the effective
+// Codex sandbox policy this repository's own canonical WORKFLOW.md launches
+// turns with (PMR-80): workspace-scoped writes with sockets allowed, so a
+// worker can run repository validation that binds a local loopback listener.
+// The policy previously survived only as an uncommitted operator-local edit.
+func TestRepositoryWorkflowGrantsLoopbackWithinWorkspaceWrite(t *testing.T) {
+	dir := t.TempDir()
+	for variable, name := range map[string]string{"SYMPHONY_LINEAR_API_KEY_FILE": "linear-key", "SYMPHONY_GITHUB_TOKEN_FILE": "github-token"} {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte("test-secret"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv(variable, path)
+	}
+	w, err := Load(filepath.Join("..", "..", "WORKFLOW.md"), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w.Config.Codex.ThreadSandbox != "workspace-write" {
+		t.Fatalf("thread sandbox=%q want workspace-write", w.Config.Codex.ThreadSandbox)
+	}
+	policy, ok := w.Config.Codex.TurnSandboxPolicy.(map[string]any)
+	if !ok {
+		t.Fatalf("turn sandbox policy type=%T want an object", w.Config.Codex.TurnSandboxPolicy)
+	}
+	if policy["type"] != "workspaceWrite" || policy["networkAccess"] != true {
+		t.Fatalf("turn sandbox policy=%#v want workspaceWrite with networkAccess enabled", policy)
+	}
+	// Network access must not come bundled with broader filesystem authority:
+	// the launcher owns writableRoots and grants only the narrowed Git roots.
+	if roots, exists := policy["writableRoots"]; exists {
+		t.Fatalf("canonical workflow configures writable roots %#v; filesystem authority must stay with the launcher's narrowed grant", roots)
+	}
+}
+
+// TestTurnSandboxPolicyShapeIsValidated covers the shapes Codex would either
+// reject at turn/start on every dispatch or, worse, silently accept with a
+// field it ignores. The field sets come from the app-server SandboxPolicy
+// schema (codex-cli 0.149.1).
+func TestTurnSandboxPolicyShapeIsValidated(t *testing.T) {
+	for name, test := range map[string]struct{ codex, want string }{
+		"not an object":   {"{turn_sandbox_policy: workspaceWrite}", "codex.turn_sandbox_policy must be an object"},
+		"missing type":    {"{turn_sandbox_policy: {networkAccess: true}}", "codex.turn_sandbox_policy.type must be a string"},
+		"non-string type": {"{turn_sandbox_policy: {type: 7}}", "codex.turn_sandbox_policy.type must be a string"},
+		"blank type":      {"{turn_sandbox_policy: {type: '   '}}", "codex.turn_sandbox_policy.type must be one of"},
+		"unknown type":    {"{turn_sandbox_policy: {type: sandboxed}}", "codex.turn_sandbox_policy.type must be one of"},
+		// The kebab spelling thread_sandbox uses two lines above in the same
+		// YAML block is not a SandboxPolicy type. Left unvalidated it passes
+		// Load and --dry-run, then skips the narrowed Git grant and is refused
+		// by the app-server, so every dispatch fails.
+		"thread_sandbox spelling of the type":       {"{thread_sandbox: workspace-write, turn_sandbox_policy: {type: workspace-write}}", `codex.turn_sandbox_policy.type must be one of dangerFullAccess, externalSandbox, readOnly, workspaceWrite, got "workspace-write"`},
+		"misspelled network access":                 {"{turn_sandbox_policy: {type: workspaceWrite, networkAcces: true}}", `codex.turn_sandbox_policy does not support "networkAcces" for type "workspaceWrite"`},
+		"non-boolean network access":                {"{turn_sandbox_policy: {type: workspaceWrite, networkAccess: 'true'}}", "codex.turn_sandbox_policy.networkAccess must be a boolean"},
+		"boolean network access on externalSandbox": {"{thread_sandbox: danger-full-access, turn_sandbox_policy: {type: externalSandbox, networkAccess: true}}", `codex.turn_sandbox_policy.networkAccess must be "restricted" or "enabled"`},
+		"unknown network access enum value":         {"{thread_sandbox: danger-full-access, turn_sandbox_policy: {type: externalSandbox, networkAccess: unrestricted}}", `codex.turn_sandbox_policy.networkAccess must be "restricted" or "enabled"`},
+		"network access on dangerFullAccess":        {"{thread_sandbox: danger-full-access, turn_sandbox_policy: {type: dangerFullAccess, networkAccess: true}}", `codex.turn_sandbox_policy does not support "networkAccess" for type "dangerFullAccess"`},
+		"non-boolean tmp exclusion":                 {"{turn_sandbox_policy: {type: workspaceWrite, excludeSlashTmp: yes-please}}", "codex.turn_sandbox_policy.excludeSlashTmp must be a boolean"},
+		// writableRoots is rejected outright rather than validated: the
+		// launcher merges its narrowed roots into whatever is configured, so
+		// even a well-formed absolute root widens write authority past what the
+		// documentation promises. 'nope' is not even an array, and ['/'] is the
+		// worst case -- write access to the whole filesystem.
+		"unparseable writable roots":  {"{turn_sandbox_policy: {type: workspaceWrite, writableRoots: 'nope'}}", "codex.turn_sandbox_policy.writableRoots must not be configured"},
+		"filesystem root as writable": {"{turn_sandbox_policy: {type: workspaceWrite, writableRoots: ['/']}}", "codex.turn_sandbox_policy.writableRoots must not be configured"},
+		"relative writable root":      {"{turn_sandbox_policy: {type: workspaceWrite, writableRoots: ['../elsewhere']}}", "codex.turn_sandbox_policy.writableRoots must not be configured"},
+		// The turn policy overrides the thread mode for this and every later
+		// turn, so a mismatch silently escalates the session and skips the
+		// narrowed Git grant the launcher applies only to workspace-write.
+		"write authority the thread mode lacks":        {"{thread_sandbox: read-only, turn_sandbox_policy: {type: workspaceWrite, networkAccess: true}}", `requires codex.thread_sandbox to be one of workspace-write, got "read-only"`},
+		"full access on a workspace-write thread":      {"{thread_sandbox: workspace-write, turn_sandbox_policy: {type: dangerFullAccess}}", `requires codex.thread_sandbox to be one of danger-full-access, got "workspace-write"`},
+		"external sandbox on a workspace-write thread": {"{thread_sandbox: workspace-write, turn_sandbox_policy: {type: externalSandbox, networkAccess: enabled}}", `requires codex.thread_sandbox to be one of danger-full-access, got "workspace-write"`},
+		"unknown thread sandbox mode":                  {"{thread_sandbox: workspaceWrite}", `codex.thread_sandbox must be one of read-only, workspace-write, danger-full-access, got "workspaceWrite"`},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("LINEAR_API_KEY", "secret")
+			p := filepath.Join(t.TempDir(), "WORKFLOW.md")
+			content := "---\ntracker: {kind: linear, provider: {api_key: $LINEAR_API_KEY}, active_states: [Todo], terminal_states: [Done]}\ncodex: " + test.codex + "\n---\nprompt"
+			if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			w, err := Load(p, "")
+			if err == nil {
+				t.Fatalf("accepted invalid sandbox configuration as %#v", w.Config.Codex)
+			}
+			if !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("error=%q want it to contain %q", err, test.want)
+			}
+		})
+	}
+}
+
+// TestValidTurnSandboxPolicyVariantsAreAccepted keeps the validator from
+// narrowing past the Codex schema: every field the protocol accepts for a
+// variant must still load, or a legitimate operator policy becomes
+// unconfigurable.
+func TestValidTurnSandboxPolicyVariantsAreAccepted(t *testing.T) {
+	for name, codex := range map[string]string{
+		"loopback-capable workspace write":           "{thread_sandbox: workspace-write, turn_sandbox_policy: {type: workspaceWrite, networkAccess: true}}",
+		"workspace write with tmp exclusions":        "{thread_sandbox: workspace-write, turn_sandbox_policy: {type: workspaceWrite, networkAccess: false, excludeSlashTmp: true, excludeTmpdirEnvVar: true}}",
+		"read-only turn on a workspace-write thread": "{thread_sandbox: workspace-write, turn_sandbox_policy: {type: readOnly, networkAccess: false}}",
+		"external sandbox with the enum form":        "{thread_sandbox: danger-full-access, turn_sandbox_policy: {type: externalSandbox, networkAccess: enabled}}",
+		"full access matching its thread mode":       "{thread_sandbox: danger-full-access, turn_sandbox_policy: {type: dangerFullAccess}}",
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("LINEAR_API_KEY", "secret")
+			p := filepath.Join(t.TempDir(), "WORKFLOW.md")
+			content := "---\ntracker: {kind: linear, provider: {api_key: $LINEAR_API_KEY}, active_states: [Todo], terminal_states: [Done]}\ncodex: " + codex + "\n---\nprompt"
+			if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Load(p, ""); err != nil {
+				t.Fatalf("rejected a schema-valid policy: %v", err)
+			}
+		})
+	}
+}
+
+// TestOmittedTurnSandboxPolicyStaysNil keeps absence distinguishable from an
+// empty object: a nil policy is what lets the launcher substitute its own
+// narrowed workspace-write grant instead of forwarding a meaningless one.
+func TestOmittedTurnSandboxPolicyStaysNil(t *testing.T) {
+	t.Setenv("LINEAR_API_KEY", "secret")
+	p := filepath.Join(t.TempDir(), "WORKFLOW.md")
+	content := "---\ntracker: {kind: linear, provider: {api_key: $LINEAR_API_KEY}, active_states: [Todo], terminal_states: [Done]}\ncodex: {thread_sandbox: workspace-write}\n---\nprompt"
+	if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	w, err := Load(p, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w.Config.Codex.TurnSandboxPolicy != nil {
+		t.Fatalf("turn sandbox policy=%#v want nil when the key is omitted", w.Config.Codex.TurnSandboxPolicy)
 	}
 }

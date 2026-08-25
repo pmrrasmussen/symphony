@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -1047,6 +1048,87 @@ func TestLocalCommitSandboxGrantsOnlyNarrowedGitRoots(t *testing.T) {
 	}
 }
 
+// TestConfiguredNetworkAccessSurvivesAsEffectiveTurnPolicyWithoutCredentials
+// covers the whole path PMR-80 made durable: the repository-owned
+// codex.turn_sandbox_policy is loaded from WORKFLOW.md front matter, narrowed
+// by the launcher, and sent as the turn's effective sandboxPolicy. Sockets are
+// allowed so repository validation can bind a local loopback listener, while
+// writes stay confined to the workspace plus the narrowed Git roots and the
+// host's Linear and GitHub credentials never reach the child environment.
+func TestConfiguredNetworkAccessSurvivesAsEffectiveTurnPolicyWithoutCredentials(t *testing.T) {
+	dir := t.TempDir()
+	gitMetadata := filepath.Join(t.TempDir(), "git-common")
+	t.Setenv("PMR80_LINEAR_KEY", "linear-token")
+	t.Setenv("PMR80_GITHUB_TOKEN", "github-token")
+	t.Setenv("PMR80_INHERITED_COPY", "Bearer github-token")
+	workflow := filepath.Join(dir, "WORKFLOW.md")
+	front := "---\ntracker: {kind: linear, provider: {api_key: $PMR80_LINEAR_KEY}, active_states: [Todo], terminal_states: [Done]}\n" +
+		"codex: {thread_sandbox: workspace-write, turn_sandbox_policy: {type: workspaceWrite, networkAccess: true}}\n---\nprompt"
+	if err := os.WriteFile(workflow, []byte(front), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := config.Load(workflow, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	settings := loaded.Config
+	settings.HostSecretEnvNames = append(settings.HostSecretEnvNames, "PMR80_GITHUB_TOKEN")
+	settings.HostSecretValues = append(settings.HostSecretValues, "github-token")
+	script := writeAppServer(t, dir, `
+env > environment
+IFS= read -r line
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'
+IFS= read -r line
+IFS= read -r line
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thread-1"}}}'
+IFS= read -r line
+printf '%s' "$line" > turn.json
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn-1"}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{}}'
+`)
+	b := NewWithLinearHandoff(func() config.Settings { return settings })
+	_, events, err := b.Start(context.Background(), domain.AgentRequest{
+		Workspace: dir, GitMetadataRoots: []string{gitMetadata}, Prompt: "work", Command: "sh " + script,
+		ApprovalPolicy: settings.Codex.ApprovalPolicy, ThreadSandbox: settings.Codex.ThreadSandbox,
+		TurnSandboxPolicy: settings.Codex.TurnSandboxPolicy, TurnTimeout: time.Minute,
+		ReadTimeout: 30 * time.Second, StartTimeout: time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range events {
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "turn.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var request struct {
+		Params struct {
+			SandboxPolicy map[string]any `json:"sandboxPolicy"`
+		} `json:"params"`
+	}
+	if err := json.Unmarshal(data, &request); err != nil {
+		t.Fatal(err)
+	}
+	policy := request.Params.SandboxPolicy
+	if policy["type"] != "workspaceWrite" || policy["networkAccess"] != true {
+		t.Fatalf("effective turn sandbox policy=%v want workspaceWrite with networkAccess enabled", policy)
+	}
+	roots, ok := policy["writableRoots"].([]any)
+	if !ok || len(roots) != 1 || roots[0] != gitMetadata {
+		t.Fatalf("writable roots=%v want only the narrowed Git metadata grant; network access must not widen write authority", policy["writableRoots"])
+	}
+	environment, err := os.ReadFile(filepath.Join(dir, "environment"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"PMR80_LINEAR_KEY=", "PMR80_GITHUB_TOKEN=", "PMR80_INHERITED_COPY="} {
+		if strings.Contains(string(environment), name) {
+			t.Fatalf("network-enabled child environment retained credential %q", name)
+		}
+	}
+}
+
 func TestFilteredEnvRemovesConfiguredSecretByNameAndValue(t *testing.T) {
 	t.Setenv("PMR5_TOKEN_BY_NAME", "visible-if-broken")
 	t.Setenv("PMR5_TOKEN_BY_VALUE", "linear-secret")
@@ -1140,4 +1222,66 @@ func waitForPID(t *testing.T, path string) int {
 
 func redactedDiagnostic(event domain.Event) bool {
 	return event.Kind == domain.EventDiagnostic && strings.Contains(event.Message, "[REDACTED]") && !strings.Contains(event.Message, "do-not-log-this")
+}
+
+// TestFileFormCredentialPathIsRemovedByName pins the name-based half of the
+// environment blocklist. For the api_key_file form the canonical WORKFLOW.md
+// actually uses, the variable holds a *path* rather than the secret, so
+// withSecretValues never matches it and settings.HostSecretEnvNames is the only
+// control keeping it out of the child. That control is load-bearing now that
+// the turn policy grants network access: reads outside the workspace are not
+// sandboxed, so a worker that learned this path could read the credential and
+// send it. Deleting settings.HostSecretEnvNames from Start left every other
+// test in this package green.
+func TestFileFormCredentialPathIsRemovedByName(t *testing.T) {
+	dir := t.TempDir()
+	keyFile := filepath.Join(t.TempDir(), "linear-api-key")
+	if err := os.WriteFile(keyFile, []byte("linear-secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PMR80_KEY_FILE", keyFile)
+	workflow := filepath.Join(dir, "WORKFLOW.md")
+	front := "---\ntracker: {kind: linear, provider: {api_key_file: $PMR80_KEY_FILE}, active_states: [Todo], terminal_states: [Done]}\n" +
+		"codex: {thread_sandbox: workspace-write, turn_sandbox_policy: {type: workspaceWrite, networkAccess: true}}\n---\nprompt"
+	if err := os.WriteFile(workflow, []byte(front), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := config.Load(workflow, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	settings := loaded.Config
+	if !slices.Contains(settings.HostSecretEnvNames, "PMR80_KEY_FILE") {
+		t.Fatalf("host secret env names=%v want the api_key_file reference captured", settings.HostSecretEnvNames)
+	}
+	script := writeAppServer(t, dir, `
+env > environment
+IFS= read -r line
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'
+IFS= read -r line
+IFS= read -r line
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thread-1"}}}'
+IFS= read -r line
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn-1"}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{}}'
+`)
+	b := NewWithLinearHandoff(func() config.Settings { return settings })
+	_, events, err := b.Start(context.Background(), domain.AgentRequest{
+		Workspace: dir, Prompt: "work", Command: "sh " + script,
+		ApprovalPolicy: settings.Codex.ApprovalPolicy, ThreadSandbox: settings.Codex.ThreadSandbox,
+		TurnSandboxPolicy: settings.Codex.TurnSandboxPolicy, TurnTimeout: time.Minute,
+		ReadTimeout: 30 * time.Second, StartTimeout: time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range events {
+	}
+	environment, err := os.ReadFile(filepath.Join(dir, "environment"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(environment), "PMR80_KEY_FILE=") {
+		t.Fatal("child environment retained the credential file path; only the name blocklist can remove it for the api_key_file form")
+	}
 }

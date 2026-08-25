@@ -79,6 +79,28 @@ codex:
   command: codex app-server
   approval_policy: never
   thread_sandbox: workspace-write
+  # Per-turn sandbox policy, validated here and then forwarded verbatim to
+  # Codex, where it overrides thread_sandbox for this and every later turn.
+  #
+  # workspaceWrite bounds *writes* to the issue's own worktree plus the two
+  # narrow Git metadata roots Symphony grants for a local commit. It does not
+  # restrict *reads*: a worker can read any file this user can, including
+  # credential files outside the worktree. That is a property of Codex's
+  # sandbox modes generally -- read-only included -- not of this setting.
+  #
+  # networkAccess: true grants unrestricted outbound network access. Codex
+  # exposes only this boolean; nothing narrower is expressible. Loopback
+  # listeners for repository tests (Go httptest servers, for example) are the
+  # reason to enable it, not the limit of what it permits.
+  #
+  # Host-owned Linear and GitHub secrets are stripped from the Codex child
+  # *environment* by name and by value, so no host credential is passed to the
+  # worker as a variable. With reads and egress both available, the protection
+  # against credential exfiltration is that no untrusted input reaches the
+  # worker -- not the sandbox. Omit the key to leave egress denied.
+  turn_sandbox_policy:
+    type: workspaceWrite
+    networkAccess: true
   turn_timeout_ms: 3600000
   # read_timeout_ms bounds every steady-state JSON-RPC round trip; keep it small
   # so a hung session is detected mid-turn.
