@@ -373,6 +373,13 @@ func reportRetirement(events *sink, expired error) {
 // shutdown passes its own registration because by then the session may already
 // hold the next turn's, and retiring that one would revoke a live turn's
 // authority mid-run.
+//
+// The nil form means "whatever this session currently holds", so it is only ever
+// correct before the caller has stored a registration of its own. Calling it
+// after would revoke the turn it just launched, which is a live session losing
+// its capabilities with nothing reporting why -- the child simply starts getting
+// 401s. run() calls it as its first act for that reason, and Cancel is retiring
+// the session outright.
 func (s *session) retireEndpoint(only *registration) error {
 	s.mu.Lock()
 	target := s.endpoint
