@@ -553,9 +553,10 @@ func configured(value bool) string {
 	return "not configured"
 }
 
-// backendLabel names the agent runtime line after the selected backend. A
-// status snapshot written before backend selection existed carries no value, so
-// it falls back to the neutral label rather than an empty one.
+// backendLabel names the agent runtime line after the selected backend. The
+// empty case is defensive rather than expected: discovery always builds an
+// EffectiveConfig from a freshly loaded workflow, where the resolved backend
+// cannot be empty. It falls back to a neutral label rather than printing none.
 func backendLabel(backend string) string {
 	if backend == "" {
 		return "Agent"

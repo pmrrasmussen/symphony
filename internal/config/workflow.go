@@ -1197,9 +1197,6 @@ func cloneValue(value any) any {
 	}
 }
 
-// sandboxModes are the thread_sandbox values Codex accepts (app-server
-// SandboxMode). An unlisted value is rejected here rather than surfacing as an
-// opaque thread/start failure on every dispatch.
 // DefaultAgentBackend keeps every workflow written before agent.backend existed
 // behaving exactly as it did. It is exported so the process that registers the
 // backends cannot drift from the value this package accepts.
@@ -1245,6 +1242,9 @@ func (s Settings) AgentLaunchFor(backend string) (AgentLaunch, bool) {
 	return launch, true
 }
 
+// sandboxModes are the thread_sandbox values Codex accepts (app-server
+// SandboxMode). An unlisted value is rejected here rather than surfacing as an
+// opaque thread/start failure on every dispatch.
 var sandboxModes = []string{"read-only", "workspace-write", "danger-full-access"}
 
 const (
