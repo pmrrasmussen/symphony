@@ -322,3 +322,74 @@ func assertNoAccountDetails(t *testing.T, message string) {
 		}
 	}
 }
+
+// The handoff check names the tool the selected backend actually serves. An
+// operator told "publishing is enabled" who then greps for the wrong string
+// concludes the handoff never happened, so the name is part of the report.
+
+// checkMessage runs a preflight over a minimal workflow on the given backend and
+// returns one check's message. GitHub and a handoff state are both configured so
+// the handoff check takes its available branch, which is the one that has to name
+// the tool.
+func checkMessage(t *testing.T, backend, check string) string {
+	t.Helper()
+	t.Setenv("PMR53_PREFLIGHT_TOKEN", "github-secret")
+	dir := t.TempDir()
+	workflow := filepath.Join(dir, "WORKFLOW.md")
+	content := "---\n" +
+		"tracker:\n  kind: linear\n  provider: {project_slug_id: preflight, api_key: not-a-live-key, handoff_state: In Review}\n" +
+		"  active_states: [Todo]\n  terminal_states: [Done]\n" +
+		"github: {owner: o, repository: r, token: $PMR53_PREFLIGHT_TOKEN}\n" +
+		"workspace: {root: " + filepath.Join(dir, "workspaces") + ", source_root: " + dir + "}\n" +
+		"agent: {backend: " + backend + "}\n" +
+		backend + ": {command: go}\n" +
+		"---\nWork on {{.issue.identifier}}"
+	if err := os.WriteFile(workflow, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range result(t, workflow, dir).Checks {
+		if c.Name == check {
+			return c.Message
+		}
+	}
+	t.Fatalf("no %s check in the result", check)
+	return ""
+}
+
+func TestTheHandoffCheckNamesTheToolTheSelectedBackendServes(t *testing.T) {
+	for _, tc := range []struct {
+		backend, want, absent string
+	}{
+		{backend: "codex", want: "github_publish_pr", absent: "mcp__symphony__"},
+		{backend: "claude", want: "mcp__symphony__github_publish_pr"},
+	} {
+		t.Run(tc.backend, func(t *testing.T) {
+			message := checkMessage(t, tc.backend, "github_handoff")
+			if !strings.Contains(message, tc.want) {
+				t.Fatalf("github_handoff reported %q, want it to name %q", message, tc.want)
+			}
+			if tc.absent != "" && strings.Contains(message, tc.absent) {
+				t.Fatalf("github_handoff reported %q, which names %q on a backend that does not use it", message, tc.absent)
+			}
+			if !strings.Contains(message, tc.backend) {
+				t.Fatalf("github_handoff reported %q without naming the %s backend", message, tc.backend)
+			}
+		})
+	}
+}
+
+// The lifecycle check runs entirely against fakes, so it must not imply it
+// exercised an agent backend or the capability transport. Claiming coverage it
+// does not have is worse than reporting none: it is what an operator relies on
+// before a live run.
+func TestTheLifecycleCheckDoesNotClaimAgentCoverage(t *testing.T) {
+	message := checkMessage(t, "claude", "scheduler_lifecycle")
+	if !strings.Contains(message, "fakes") {
+		t.Fatalf("scheduler_lifecycle reported %q without saying it ran against fakes", message)
+	}
+	for _, unexercised := range []string{"agent backend", "router", "capability registry", "capability transport"} {
+		if !strings.Contains(message, unexercised) {
+			t.Fatalf("scheduler_lifecycle reported %q without disclaiming the %s", message, unexercised)
+		}
+	}
+}

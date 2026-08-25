@@ -140,7 +140,7 @@ invalid boundary is a failure and exits non-zero. The referenced file is read
 only to validate required configuration and is never sent anywhere during
 preflight.
 
-Live Linear and Codex smoke testing is always opt-in and uses a dedicated
+Live Linear and agent smoke testing is always opt-in and uses a dedicated
 disposable project; see [the live smoke profile](docs/live-smoke.md).
 Never run a Symphony smoke test against Dagligvare-app or any of its Linear
 workspace, team, or projects.

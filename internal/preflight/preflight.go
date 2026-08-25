@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/pmrrasmussen/symphony/internal/capability"
 	"github.com/pmrrasmussen/symphony/internal/config"
 	"github.com/pmrrasmussen/symphony/internal/coordinator"
 	"github.com/pmrrasmussen/symphony/internal/domain"
@@ -58,6 +59,24 @@ func RunWithEnvironment(ctx context.Context, workflowPath, logRoot string, envir
 	return run(ctx, workflowPath, logRoot, environment)
 }
 
+// handoffToolName is how a worker on the selected backend actually names the
+// scoped publish capability. It matters in a preflight message because the two
+// transports do not name it the same way: a Codex worker calls a dynamic tool by
+// its bare registry name, and a Claude worker calls it through the private
+// loopback MCP endpoint, where the CLI prefixes every tool with its server name.
+// An operator reading "publishing is enabled" and then grepping their logs for
+// the wrong string concludes the handoff never happened.
+//
+// This reports what the transport names it, not whether this run advertises it.
+// Availability is the bound issue's business -- github_land_pr also depends on
+// its state -- and no side-effect-free check can know that.
+func handoffToolName(settings config.Settings) string {
+	if settings.AgentLaunch().Backend == config.ClaudeAgentBackend {
+		return config.MCPToolPrefix + capability.NameGitHubPublishPR
+	}
+	return capability.NameGitHubPublishPR
+}
+
 func run(ctx context.Context, workflowPath, logRoot string, environment map[string]string) Result {
 	result := Result{Status: StatusPassed}
 	workflow, err := config.LoadWithEnvironment(workflowPath, logRoot, environment)
@@ -74,7 +93,7 @@ func run(ctx context.Context, workflowPath, logRoot string, environment map[stri
 	// cross-checks its registry against, rather than a third copy of it: what
 	// preflight reports available is then what a worker is told is available.
 	if settings.HostSidePublishPromised() {
-		result.add("github_handoff", StatusPassed, "host-side pull request publishing is enabled for the configured handoff state")
+		result.add("github_handoff", StatusPassed, "host-side pull request publishing is enabled for the configured handoff state; a "+settings.AgentLaunch().Backend+" worker reaches it as "+handoffToolName(settings))
 	} else if settings.GitHub.Enabled {
 		result.add("github_handoff", StatusWarning, "host-side pull request publishing is unavailable: configure tracker.provider.handoff_state")
 	} else if settings.Tracker.HandoffState != "" {
@@ -134,7 +153,7 @@ func run(ctx context.Context, workflowPath, logRoot string, environment map[stri
 	if err := lifecycle(ctx, settings); err != nil {
 		result.add("scheduler_lifecycle", StatusFailed, err.Error())
 	} else {
-		result.add("scheduler_lifecycle", StatusPassed, "synthetic active issue exercised tracker, workspace, agent, and exhaustion-retry boundaries")
+		result.add("scheduler_lifecycle", StatusPassed, "synthetic active issue exercised the tracker, workspace, and exhaustion-retry boundaries against fakes; no agent backend, router, capability registry, or capability transport was started")
 	}
 	return result
 }
