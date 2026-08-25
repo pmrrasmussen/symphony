@@ -320,6 +320,30 @@ func waitForLanding(t *testing.T, dir string) {
 	}
 }
 
+// drainLanding drains a turn's stream with more patience than this package's
+// shared drain. A turn timeout kills the child while the landing call it made
+// may still be in flight, and the revocation that follows drains that call and
+// then runs the finalizer before the stream closes -- three real round trips
+// after the kill. Twenty seconds is enough for that on an idle machine and not
+// on a loaded one, and a patience that expires is a false failure: what these
+// tests assert is what the tracker was told, never how quickly.
+func drainLanding(t *testing.T, events <-chan domain.Event) []domain.Event {
+	t.Helper()
+	var collected []domain.Event
+	timeout := time.After(2 * time.Minute)
+	for {
+		select {
+		case event, ok := <-events:
+			if !ok {
+				return collected
+			}
+			collected = append(collected, event)
+		case <-timeout:
+			t.Fatalf("event stream did not close; collected %d events", len(collected))
+		}
+	}
+}
+
 func requireCurl(t *testing.T) {
 	t.Helper()
 	if _, err := exec.LookPath("curl"); err != nil {
@@ -366,9 +390,14 @@ func TestEveryTurnEndPathFiresTheDeferredLandingTransition(t *testing.T) {
 		"completion": {ending: "cat <<'EOF'\n" + resultLine(false, "") + "\nEOF\n"},
 		"failure":    {ending: "cat <<'EOF'\n" + resultLine(true, `"terminal_reason":"api_error"`) + "\nEOF\n"},
 		// The child holds the turn open past its own bound. The bound is
-		// generous because the landing call it makes first is a real HTTP round
-		// trip against two remotes and a git child.
-		"turn timeout": {ending: "sleep 120\n", timeout: 5 * time.Second},
+		// deliberately far larger than it needs to be: the child's landing call
+		// has to finish before the timeout fires -- a timeout that fired
+		// mid-call would leave no gate hit and nothing to assert -- and that
+		// call is a git child plus several real HTTP round trips, which a loaded
+		// machine can stretch by an order of magnitude. It fails loudly rather
+		// than vacuously if ten seconds is ever not enough: waitForLanding says
+		// the call never came back.
+		"turn timeout": {ending: "sleep 120\n", timeout: 10 * time.Second},
 		"hard cancel":  {ending: "sleep 120\n", cancel: true},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -387,7 +416,7 @@ func TestEveryTurnEndPathFiresTheDeferredLandingTransition(t *testing.T) {
 					t.Fatalf("cancel returned with Linear transitions=%v, want exactly one to In Review", transitions)
 				}
 			}
-			drain(t, events)
+			drainLanding(t, events)
 			transitions, comments, merges := remote.observed()
 			if len(transitions) != 1 || transitions[0] != "In Review" {
 				t.Fatalf("Linear transitions=%v, want exactly one to In Review", transitions)
@@ -413,7 +442,7 @@ func TestATurnEndAfterAResolvedLandingLeavesTheIssueDone(t *testing.T) {
 	remote.readyToLand()
 	_, _, events := landingSession(t, context.Background(), remote, dir, "cat <<'EOF'\n"+resultLine(false, "")+"\nEOF\n", 0)
 	waitForLanding(t, dir)
-	drain(t, events)
+	drainLanding(t, events)
 	transitions, comments, merges := remote.observed()
 	if merges != 1 {
 		t.Fatalf("merges=%d, want exactly one", merges)
@@ -438,7 +467,7 @@ func TestATurnEndWithTheBoundedFixOffDefersNothing(t *testing.T) {
 	remote.landFixOff = true
 	_, _, events := landingSession(t, context.Background(), remote, dir, "cat <<'EOF'\n"+resultLine(false, "")+"\nEOF\n", 0)
 	waitForLanding(t, dir)
-	drain(t, events)
+	drainLanding(t, events)
 	transitions, comments, _ := remote.observed()
 	if len(transitions) != 1 || transitions[0] != "In Review" {
 		t.Fatalf("Linear transitions=%v, want exactly the one inline refusal", transitions)
@@ -465,11 +494,43 @@ func TestATurnEndWithoutALandingAttemptTransitionsNothing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if lastKind(t, drain(t, events)).Kind != domain.EventCompleted {
+	if lastKind(t, drainLanding(t, events)).Kind != domain.EventCompleted {
 		t.Fatal("the turn did not complete")
 	}
 	transitions, comments, merges := remote.observed()
 	if len(transitions) != 0 || len(comments) != 0 || merges != 0 {
 		t.Fatalf("a turn that never attempted a landing produced transitions=%v comments=%v merges=%d", transitions, comments, merges)
+	}
+}
+
+// TestTheDeferredTransitionSurvivesRunCancellation is PMR-95. The coordinator
+// stops a run by cancelling the very context Start was given and only then
+// cancelling the session (Coordinator.stopRun, and Shutdown), so by the time the
+// turn-ended finalizer runs, the run context is already done. A finalizer that
+// inherits it cannot issue the transition at all, and the issue stays in Merging
+// holding a capacity slot with nothing scheduled to move it.
+//
+// The cancellation order here is stopRun's, exactly: cancel the run context,
+// then Cancel the session on a fresh one. Every other test in this package
+// starts a session on context.Background(), which is never cancelled, so none of
+// them can observe this at all.
+func TestTheDeferredTransitionSurvivesRunCancellation(t *testing.T) {
+	requireCurl(t)
+	dir := t.TempDir()
+	remote := newLandingRemote(t)
+	runCtx, cancelRun := context.WithCancel(context.Background())
+	backend, session, events := landingSession(t, runCtx, remote, dir, "sleep 120\n", 0)
+	waitForLanding(t, dir)
+	cancelRun()
+	if err := backend.Cancel(context.Background(), session); err != nil {
+		t.Fatalf("cancel: %v", err)
+	}
+	drainLanding(t, events)
+	transitions, comments, _ := remote.observed()
+	if len(transitions) != 1 || transitions[0] != "In Review" {
+		t.Fatalf("Linear transitions=%v, want exactly one to In Review after a cancelled run", transitions)
+	}
+	if len(comments) != 1 {
+		t.Fatalf("Linear comments=%v, want exactly one", comments)
 	}
 }

@@ -326,10 +326,15 @@ func TestEveryTurnEndPathFiresTheDeferredLandingTransition(t *testing.T) {
 		"turn/failed":    {ending: turnFailed},
 		"turn/cancelled": {ending: turnCancelled},
 		"hard cancel":    {ending: turnHangs, cancel: true},
-		// The bound is generous because the landing call the child makes
-		// first is a real HTTP round trip against two remotes and a git
-		// child: a timeout that could fire mid-call would test nothing.
-		"turn timeout": {ending: turnHangs, timeout: 3 * time.Second, cancel: true},
+		// The bound is deliberately far larger than it needs to be. The
+		// child's landing call has to finish before the timeout fires --
+		// a timeout that fired mid-call would leave no gate hit and
+		// nothing to assert -- and that call is a git child plus several
+		// real HTTP round trips, which a loaded machine can stretch by an
+		// order of magnitude. Ten seconds is roughly fifty times its
+		// observed cost. It fails loudly rather than vacuously if it is
+		// ever not enough: waitForLanding says the call never came back.
+		"turn timeout": {ending: turnHangs, timeout: 10 * time.Second, cancel: true},
 	} {
 		t.Run(name, func(t *testing.T) {
 			dir := t.TempDir()
@@ -460,5 +465,42 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn-1"}}}'
 	transitions, comments, merges := remote.observed()
 	if len(transitions) != 0 || len(comments) != 0 || merges != 0 {
 		t.Fatalf("a turn that never attempted a landing produced transitions=%v comments=%v merges=%d", transitions, comments, merges)
+	}
+}
+
+// TestTheDeferredTransitionSurvivesRunCancellation is PMR-95. The coordinator
+// stops a run by cancelling the very context Start was given and only then
+// cancelling the session (Coordinator.stopRun, and Shutdown), so by the time the
+// turn-ended finalizer runs, the run context is already done. A finalizer that
+// inherits it cannot issue the transition at all, and the issue stays in Merging
+// holding a capacity slot with nothing scheduled to move it.
+//
+// The cancellation order here is stopRun's, exactly: cancel the run context,
+// then Cancel the session on a fresh one.
+func TestTheDeferredTransitionSurvivesRunCancellation(t *testing.T) {
+	dir := t.TempDir()
+	remote := newLandingRemote(t)
+	remote.failingRequiredCheck()
+	writeFakeGit(t, dir)
+	script := writeAppServer(t, dir, landingScript(dir, "false", turnHangs))
+	b := integratedBackend(func() config.Settings { return remote.settings() })
+	runCtx, cancelRun := context.WithCancel(context.Background())
+	session, events, err := b.Start(runCtx, landingRequest(remote, dir, script))
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForLanding(t, dir)
+	cancelRun()
+	if err := b.Cancel(context.Background(), session); err != nil {
+		t.Fatalf("cancel: %v", err)
+	}
+	for range events {
+	}
+	transitions, comments, _ := remote.observed()
+	if len(transitions) != 1 || transitions[0] != "In Review" {
+		t.Fatalf("Linear transitions=%v, want exactly one to In Review after a cancelled run", transitions)
+	}
+	if len(comments) != 1 {
+		t.Fatalf("Linear comments=%v, want exactly one", comments)
 	}
 }

@@ -361,7 +361,10 @@ var (
 // when it drained and finalized in order, and otherwise ErrDrainExpired,
 // ErrFinalizerExpired, or both joined -- each of which means an invariant this
 // function exists to hold was knowingly given up on. ctx is the context the
-// finalizer runs on, so it must still be live.
+// finalizer runs on, so it must still be live -- and, because the deferred
+// transition the finalizer performs is precisely the work a stopped run still
+// owes its issue, it must not be a context that whatever stopped the turn has
+// already cancelled. See internal/claude's finalizerContext.
 func (g *Registration) Revoke(ctx context.Context) error {
 	g.revokeOnce.Do(func() {
 		g.mu.Lock()
@@ -416,8 +419,8 @@ func (g *Registration) drain() bool {
 //
 // An expired finalizer is not abandoned: it is idempotent, the deferred
 // Merging -> In Review transition it may still perform must happen, and the
-// session context it runs on will end it. Revoke stops waiting and says so
-// instead of waiting for it.
+// context its caller bounded is what will eventually end it. Revoke stops waiting
+// and says so instead of waiting for it.
 func (g *Registration) finalize(ctx context.Context) bool {
 	finished := make(chan struct{})
 	go func() {

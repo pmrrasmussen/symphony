@@ -33,6 +33,21 @@ type Backend struct {
 	github      *githubhost.Manager
 }
 
+// finalizeBudget bounds the turn-ended finalizer, which runs detached from the
+// run's cancellation (see finalizeLanding). Its work is a handful of sequential
+// Linear GraphQL round trips -- the deferred transition re-reads the issue,
+// resolves the team's states, transitions, re-reads to confirm, and comments --
+// so seconds is the right order of magnitude, and the bound has three ceilings
+// to stay under. A hard Cancel runs the finalizer inline and the coordinator
+// waits only five seconds for Cancel to return, so anything longer is finished
+// after the coordinator has stopped waiting rather than instead of it. The
+// daemon's graceful shutdown deadline is twenty seconds (cmd/symphony), so the
+// budget must be the thing that ends a hung finalizer, not process exit halfway
+// through a transition. And the Claude transport's endpoint waits thirty seconds
+// for its finalizer before reporting it expired, so this stays comfortably
+// inside that too. Ten seconds satisfies all three.
+const finalizeBudget = 10 * time.Second
+
 func New(secretNames ...string) *Backend {
 	names := append(config.ReservedSecretEnvNames(), secretNames...)
 	return &Backend{sessions: map[string]*client{}, secretNames: uniquePaths(names)}
@@ -773,8 +788,21 @@ func (c *client) unsupportedTool(id any) {
 // turn ends, however it ended. It is idempotent, so the three paths that can end
 // a turn -- turn/completed, turn/failed or turn/cancelled, and a hard Cancel --
 // all call it.
+//
+// It deliberately does not run on the run-lived context Start was given, because
+// by the time this matters that context is already dead. The coordinator stops a
+// run by cancelling that very context and only then cancelling the session
+// (Coordinator.stopRun, and Shutdown), so a finalizer inheriting it could not
+// issue the deferred Merging -> In Review transition at all: the issue would stay
+// in the configured Merging state, holding a state-aware capacity slot, with
+// nothing scheduled to move it (PMR-95).
+//
+// Dropping the run's cancellation is therefore the point, and finalizeBudget is
+// what keeps that from being unbounded.
 func (c *client) finalizeLanding() {
-	c.capabilities.TurnEnded(c.ctx)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(c.ctx), finalizeBudget)
+	defer cancel()
+	c.capabilities.TurnEnded(ctx)
 }
 
 // Tool failures are normal app-server responses: the model can inspect the
