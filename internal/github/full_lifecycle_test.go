@@ -428,3 +428,276 @@ func TestFullCanonicalLifecycleAgainstFakeLinearAndGitHubServers(t *testing.T) {
 		t.Fatalf("merges=%d, want exactly one merge call", merges)
 	}
 }
+
+// landingBackend stands in for a live Codex session bound to a Merging issue.
+// It mirrors internal/codex/backend.go's landing dispatch exactly: it keeps one
+// github.Session for the whole logical run, refuses github_land_pr once the
+// session reports a resolved landing, and reports a settled landing decision as
+// the matching terminal event instead of continuing to act (PMR-78). It also
+// replays the PMR-77 evidence: a second in-turn landing call right after a
+// terminal result.
+type landingBackend struct {
+	settings       func() config.Settings
+	handoffFactory *linear.Handoff
+	githubManager  *Manager
+
+	mu                  sync.Mutex
+	sessions            map[string]*Session
+	landCalls           int
+	refusedDuplicates   int
+	unrefusedDuplicates int
+	continues           int
+	waits               []string
+	lastErr             error
+}
+
+// callLandTool applies the host-side dispatch guard and, when the capability is
+// still open, invokes it exactly as the Codex tool handler does.
+func (b *landingBackend) callLandTool(ctx context.Context, session *Session) (LandResult, bool, error) {
+	if session.LandingResolved() {
+		b.mu.Lock()
+		b.refusedDuplicates++
+		b.mu.Unlock()
+		return LandResult{}, true, nil
+	}
+	b.mu.Lock()
+	b.landCalls++
+	b.mu.Unlock()
+	result, err := session.Land(ctx)
+	return result, false, err
+}
+
+func (b *landingBackend) turn(ctx context.Context, session *Session) domain.Event {
+	result, _, err := b.callLandTool(ctx, session)
+	b.mu.Lock()
+	b.lastErr = err
+	b.mu.Unlock()
+	if err != nil {
+		return domain.Event{Kind: domain.EventBlocked, Message: "landing refused"}
+	}
+	switch result.Status {
+	case LandWaiting:
+		b.mu.Lock()
+		b.waits = append(b.waits, result.Reason)
+		b.mu.Unlock()
+		return domain.Event{Kind: domain.EventLandingWaiting, Message: result.Reason}
+	case LandMerged:
+		// PMR-77: the same turn called the tool again seconds after the
+		// terminal result. The capability must refuse it without landing again.
+		if _, refused, _ := b.callLandTool(ctx, session); !refused {
+			b.mu.Lock()
+			b.unrefusedDuplicates++
+			b.mu.Unlock()
+		}
+		return domain.Event{Kind: domain.EventLandingResolved}
+	default:
+		return domain.Event{Kind: domain.EventCompleted}
+	}
+}
+
+func (b *landingBackend) Start(ctx context.Context, r domain.AgentRequest) (domain.AgentSession, <-chan domain.Event, error) {
+	settings := b.settings()
+	handoffSession, err := b.handoffFactory.PrepareWithSettings(ctx, settings, r.Issue)
+	if err != nil {
+		return domain.AgentSession{}, nil, fmt.Errorf("prepare handoff: %w", err)
+	}
+	session := b.githubManager.PrepareWithSettings(settings.GitHub, r.Issue, r.Workspace, handoffSession)
+	if session == nil {
+		return domain.AgentSession{}, nil, errors.New("github session unavailable")
+	}
+	sessionID := fmt.Sprintf("session-%d", len(b.sessions)+1)
+	b.mu.Lock()
+	b.sessions[sessionID] = session
+	b.mu.Unlock()
+	events := make(chan domain.Event, 1)
+	events <- b.turn(ctx, session)
+	close(events)
+	return domain.AgentSession{ID: sessionID, ThreadID: "thread-" + sessionID, TurnID: "1"}, events, nil
+}
+
+func (b *landingBackend) Continue(ctx context.Context, s domain.AgentSession, _ string) (<-chan domain.Event, error) {
+	b.mu.Lock()
+	b.continues++
+	session := b.sessions[s.ID]
+	b.mu.Unlock()
+	if session == nil {
+		return nil, errors.New("unknown landing session")
+	}
+	events := make(chan domain.Event, 1)
+	events <- b.turn(ctx, session)
+	close(events)
+	return events, nil
+}
+
+func (b *landingBackend) Cancel(context.Context, domain.AgentSession) error { return nil }
+
+func (b *landingBackend) counts() (landCalls, refused, unrefused, continues int, waits []string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.landCalls, b.refusedDuplicates, b.unrefusedDuplicates, b.continues, append([]string(nil), b.waits...)
+}
+
+// landingHarness wires the real coordinator, the real Linear tracker/handoff,
+// and the real GitHub manager around a Merging issue, with only the Codex
+// app-server protocol replaced.
+func landingHarness(t *testing.T, api *apiFixture, mutate func(*config.Settings)) (*lifecycleLinearFixture, *landingBackend, *coordinator.Coordinator, *lifecycleWorkspace) {
+	t.Helper()
+	linearFixture := newLifecycleLinearFixture(t)
+	linearFixture.setState("Merging")
+
+	githubSettings := api.settings()
+	githubSettings.MergeState = "Merging"
+	githubSettings.MergeMethod = "merge"
+	githubSettings.RequiredChecks = []string{"ci"}
+	settings := config.Settings{
+		Tracker: config.Tracker{
+			Provider:        linearFixture.settings(),
+			ActiveStates:    []string{"Todo", "In Progress", "Rework", "Merging"},
+			TerminalStates:  []string{"Done", "Canceled"},
+			HandoffState:    "In Review",
+			HostTransitions: config.HostTransitions{Start: map[string]string{"Todo": "In Progress"}, RefuseLanding: map[string]string{"Merging": "In Review"}},
+		},
+		Polling:   config.Polling{Interval: time.Hour},
+		Workspace: config.Workspace{Root: "/fake"},
+		Agent:     config.Agent{MaxConcurrent: 1, MaxTurns: 20, MaxRetryBackoff: 2 * time.Hour, ByState: map[string]int{"merging": 1}},
+		Codex:     config.Codex{Command: "test", TurnTimeout: time.Second, ReadTimeout: time.Second},
+		GitHub:    githubSettings,
+		Prompt:    "Work on {{.issue.identifier}}",
+	}
+	if mutate != nil {
+		mutate(&settings)
+	}
+	settingsFunc := func() config.Settings { return settings }
+
+	tracker := linear.New(settingsFunc)
+	manager := New(settingsFunc, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	manager.git = &fakeGit{}
+	backend := &landingBackend{settings: settingsFunc, handoffFactory: linear.NewHandoff(settingsFunc), githubManager: manager, sessions: map[string]*Session{}}
+	ws := &lifecycleWorkspace{afterRun: make(chan struct{}, 4)}
+	return linearFixture, backend, coordinator.New(tracker, backend, ws, settingsFunc, nil), ws
+}
+
+// TestMergingLandingWaitEndsRunAndDefersToCoordinatorRetry reproduces the
+// PMR-77 sequence: landing cannot complete while a required check is pending.
+// The run must end on the first wait -- one landing call, no continuation turn,
+// no turn-limit retry -- with the issue still in Merging and a coordinator-owned
+// delayed landing retry holding the claim but no orchestrator slot.
+func TestMergingLandingWaitEndsRunAndDefersToCoordinatorRetry(t *testing.T) {
+	api := newAPI(t)
+	api.prExists = true
+	api.prSHA = "head"
+	readyToLand(api)
+	// The required "ci" check is deliberately absent: landing waits for it.
+	linearFixture, backend, c, ws := landingHarness(t, api, func(s *config.Settings) {
+		s.GitHub.PollInterval = time.Hour
+	})
+	ctx := context.Background()
+
+	c.Tick(ctx)
+	<-ws.afterRun
+	retry := waitForRetrySnapshot(t, c)
+
+	if retry.Kind != "landing" || retry.Attempt != 0 || retry.IssueIdentifier != "PMR-27" {
+		t.Fatalf("retry=%+v, want an unescalated landing retry for PMR-27", retry)
+	}
+	landCalls, refused, unrefused, continues, waits := backend.counts()
+	if landCalls != 1 || continues != 0 || refused != 0 || unrefused != 0 {
+		t.Fatalf("landCalls=%d continues=%d refused=%d unrefused=%d, want exactly one landing call and no continuation turn", landCalls, continues, refused, unrefused)
+	}
+	if len(waits) != 1 || waits[0] != "required checks are pending" {
+		t.Fatalf("waits=%v", waits)
+	}
+	linearFixture.mu.Lock()
+	state, comments := linearFixture.stateName, len(linearFixture.comments)
+	linearFixture.mu.Unlock()
+	if state != "Merging" {
+		t.Fatalf("issue state=%q, want it to stay in Merging while checks are pending", state)
+	}
+	if comments != 0 {
+		t.Fatalf("a pending check posted %d comments, want none", comments)
+	}
+	api.mu.Lock()
+	merges := api.merges
+	api.mu.Unlock()
+	if merges != 0 {
+		t.Fatalf("merges=%d, want none while checks are pending", merges)
+	}
+	if snapshot := c.Snapshot(); len(snapshot.Running) != 0 || snapshot.Claimed != 1 {
+		t.Fatalf("snapshot running=%d claimed=%d, want the claim held with no run occupying a slot", len(snapshot.Running), snapshot.Claimed)
+	}
+	if err := c.Shutdown(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestMergingLandingTerminalResultRefusesDuplicateCall covers the terminal half
+// of PMR-78: once landing merged the pull request and reconciled the issue to
+// Done, a second github_land_pr call in the same run is refused without
+// invoking the capability again, and the run ends without a further turn.
+func TestMergingLandingTerminalResultRefusesDuplicateCall(t *testing.T) {
+	api := newAPI(t)
+	api.prExists = true
+	api.prSHA = "head"
+	passingRequiredChecks(api, "ci")
+	readyToLand(api)
+	linearFixture, backend, c, ws := landingHarness(t, api, nil)
+	ctx := context.Background()
+
+	c.Tick(ctx)
+	<-ws.afterRun
+	waitForNoClaims(t, c)
+
+	landCalls, refused, unrefused, continues, waits := backend.counts()
+	if landCalls != 1 || refused != 1 || unrefused != 0 {
+		t.Fatalf("landCalls=%d refusedDuplicates=%d unrefused=%d, want one landing call and one refused duplicate", landCalls, refused, unrefused)
+	}
+	if continues != 0 || len(waits) != 0 {
+		t.Fatalf("continues=%d waits=%v, want no further turn after a terminal landing", continues, waits)
+	}
+	linearFixture.mu.Lock()
+	state := linearFixture.stateName
+	linearFixture.mu.Unlock()
+	if state != "Done" {
+		t.Fatalf("issue state=%q, want Done", state)
+	}
+	api.mu.Lock()
+	merges := api.merges
+	api.mu.Unlock()
+	if merges != 1 {
+		t.Fatalf("merges=%d, want exactly one", merges)
+	}
+	if snapshot := c.Snapshot(); len(snapshot.Retrying) != 0 {
+		t.Fatalf("terminal landing scheduled retries=%+v, want none", snapshot.Retrying)
+	}
+	if err := c.Shutdown(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func waitForRetrySnapshot(t *testing.T, c *coordinator.Coordinator) coordinator.RetrySnapshot {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if snapshot := c.Snapshot(); len(snapshot.Retrying) == 1 {
+			return snapshot.Retrying[0]
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no retry was scheduled: %+v", c.Snapshot())
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+func waitForNoClaims(t *testing.T, c *coordinator.Coordinator) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if snapshot := c.Snapshot(); snapshot.Claimed == 0 && len(snapshot.Running) == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("run never released its claim: %+v", c.Snapshot())
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}

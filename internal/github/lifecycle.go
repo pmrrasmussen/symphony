@@ -216,7 +216,28 @@ type Session struct {
 	lastFailedGate   string
 	landed           bool
 	deferredFired    bool
-	mu               sync.Mutex
+	// Landing-outcome state (PMR-78), also guarded by mu. landingResolved is
+	// set once landing reached its terminal outcome (merged and reconciled to
+	// Done), so the tool-dispatch path can refuse a second github_land_pr
+	// invocation in the same logical run; Land itself stays idempotent as a
+	// recovery safeguard. waitingOutcome records that the most recent landing
+	// outcome was a non-terminal wait, which supersedes any earlier deferred
+	// refusal: while checks or mergeability are genuinely pending the issue must
+	// stay in the configured Merging state for the coordinator's delayed retry.
+	landingResolved bool
+	waitingOutcome  bool
+	mu              sync.Mutex
+}
+
+// LandingResolved reports whether this session's landing already reached its
+// terminal outcome. The Codex tool-dispatch path uses it to refuse a second
+// github_land_pr invocation in the same logical run (PMR-78); Land itself
+// remains idempotent so a recovery path (a merge whose Linear completion
+// failed, or a session restarted after a crash) can still reconcile.
+func (s *Session) LandingResolved() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.landingResolved
 }
 
 func (s *Session) MatchesSecret(candidate string) bool {
@@ -435,7 +456,9 @@ const (
 	LandMerged LandStatus = "merged"
 	// LandWaiting reports that required checks or GitHub's own mergeability
 	// computation have not yet settled. It is non-terminal: the issue stays
-	// in the configured Merging state and a later call can retry.
+	// in the configured Merging state, the current run ends without spending
+	// another model turn, and the coordinator redispatches landing after a
+	// bounded delay (PMR-78).
 	LandWaiting LandStatus = "waiting"
 )
 
@@ -491,7 +514,7 @@ func (s *Session) Land(ctx context.Context) (LandResult, error) {
 		// GitHub's update-branch endpoint is asynchronous. Do not merge the
 		// old head while its accepted merge-from-base commit is still pending.
 		if pr.Head.SHA == s.staleBaseOriginalHeadSHA {
-			return LandResult{Status: LandWaiting, Number: pr.Number, URL: pr.URL, Reason: "pull request branch update is pending"}, nil
+			return s.waiting(pr.Number, pr.URL, "pull request branch update is pending"), nil
 		}
 		s.recordUpdatedHead(pr.Number, pr.Head.SHA)
 	}
@@ -590,7 +613,7 @@ func (s *Session) Land(ctx context.Context) (LandResult, error) {
 		return s.gate(ctx, "github required checks failed: "+strings.Join(failing, ", "), true)
 	}
 	if waiting {
-		return LandResult{Status: LandWaiting, Number: fresh.Number, URL: fresh.URL, Reason: "required checks are pending"}, nil
+		return s.waiting(fresh.Number, fresh.URL, "required checks are pending"), nil
 	}
 
 	// Moving the issue to Merging is the human approval to land (see policy
@@ -611,7 +634,7 @@ func (s *Session) Land(ctx context.Context) (LandResult, error) {
 		return s.gate(ctx, "github pull request has unresolved review threads", true)
 	}
 	if fresh.Mergeable == nil {
-		return LandResult{Status: LandWaiting, Number: fresh.Number, URL: fresh.URL, Reason: "github has not yet computed mergeability"}, nil
+		return s.waiting(fresh.Number, fresh.URL, "github has not yet computed mergeability"), nil
 	}
 	if !*fresh.Mergeable {
 		// A merge conflict is retryable only when conflict resolution is opted
@@ -669,7 +692,7 @@ func (s *Session) updateStaleBranch(ctx context.Context, fresh pull) (LandResult
 	if updated.Head.SHA != fresh.Head.SHA {
 		s.recordUpdatedHead(fresh.Number, updated.Head.SHA)
 	}
-	return LandResult{Status: LandWaiting, Number: fresh.Number, URL: fresh.URL, Reason: "pull request branch was updated; required checks are pending"}, nil
+	return s.waiting(fresh.Number, fresh.URL, "pull request branch was updated; required checks are pending"), nil
 }
 
 func (s *Session) recordUpdatedHead(number int, sha string) {
@@ -678,6 +701,16 @@ func (s *Session) recordUpdatedHead(number int, sha string) {
 	}
 	s.updatedHeadSHA = sha
 	s.manager.logger.Info("GitHub pull request branch updated", "issue_identifier", s.issue.Identifier, "pr_number", number, "head_sha", sha)
+}
+
+// waiting records and returns a non-terminal landing wait. A wait supersedes
+// any deferred hard-gate refusal: checks or mergeability are genuinely pending,
+// so the issue must stay in the configured Merging state for the coordinator's
+// own delayed landing retry rather than be returned to review at turn end
+// (PMR-78). It assumes s.mu is held.
+func (s *Session) waiting(number int, url, reason string) LandResult {
+	s.waitingOutcome = true
+	return LandResult{Status: LandWaiting, Number: number, URL: url, Reason: reason}
 }
 
 // completeLanding reconciles the bound Linear issue to Done for an already
@@ -689,9 +722,13 @@ func (s *Session) completeLanding(ctx context.Context, pr pull) (LandResult, err
 	// Merging -> In Review refusal must fire even if the Linear completion call
 	// below fails and is retried.
 	s.landed = true
+	s.waitingOutcome = false
 	if _, err := s.linear.CompleteLanding(ctx, s.settings.MergeState); err != nil {
 		return LandResult{}, err
 	}
+	// Only a fully reconciled landing closes the capability for this run: a
+	// merge whose Linear completion failed above must remain retryable.
+	s.landingResolved = true
 	return LandResult{Status: LandMerged, Number: pr.Number, URL: pr.URL, Method: s.settings.MergeMethod}, nil
 }
 
@@ -702,6 +739,7 @@ func (s *Session) completeLanding(ctx context.Context, pr pull) (LandResult, err
 // to keep FinalizeLanding a no-op.
 func (s *Session) refuse(ctx context.Context, reason string) (LandResult, error) {
 	s.deferredFired = true
+	s.waitingOutcome = false
 	if _, err := s.linear.RefuseLanding(ctx, s.settings.MergeState); err != nil {
 		s.manager.logger.Warn("GitHub land Merging fallback transition failed", "issue_id", s.issue.ID, "issue_identifier", s.issue.Identifier, "reason", reason)
 	}
@@ -720,6 +758,7 @@ func (s *Session) gate(ctx context.Context, reason string, retryable bool) (Land
 	}
 	s.retryableGateHit = true
 	s.lastFailedGate = reason
+	s.waitingOutcome = false
 	if s.landAttempts >= s.settings.MaxLandAttempts {
 		s.fireDeferredRefusal(ctx)
 		return LandResult{}, errors.New(reason)
@@ -748,11 +787,13 @@ func (s *Session) fireDeferredRefusal(ctx context.Context) {
 // comment) once when the Codex turn ends after a retryable landing gate was hit
 // but landing neither succeeded nor was already refused. It is a safe no-op
 // when the feature is off, when no retryable gate was hit, when landing
-// succeeded, or when the deferred transition already fired.
+// succeeded, when the last landing outcome was a non-terminal wait (the issue
+// stays in Merging for the coordinator's delayed retry), or when the deferred
+// transition already fired.
 func (s *Session) FinalizeLanding(ctx context.Context) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s.settings.LandFixEnabled || !s.retryableGateHit || s.landed {
+	if !s.settings.LandFixEnabled || !s.retryableGateHit || s.landed || s.waitingOutcome {
 		return
 	}
 	s.fireDeferredRefusal(ctx)
