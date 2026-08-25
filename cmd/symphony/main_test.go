@@ -170,9 +170,16 @@ func TestLogStartupCredentialStatusReportsConfigurationWithoutSecrets(t *testing
 // all is not: the invariant would then be silently unasserted.
 func TestWireGivesTheHostTheGitHubManagerItsBackendsUse(t *testing.T) {
 	settings := func() config.Settings { return config.Settings{} }
-	backends, polled := wire(settings, slog.Default())
+	backends, polled, endpoint, err := wire(settings, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = endpoint.Close(context.Background()) })
 	if polled == nil {
 		t.Fatal("wire returned no GitHub manager, so the host has nothing to poll or verify landings with")
+	}
+	if endpoint == nil {
+		t.Fatal("wire returned no capability endpoint, so a capability-bearing backend would have no transport to serve one over")
 	}
 	bound := 0
 	for name, backend := range backends {

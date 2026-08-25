@@ -25,8 +25,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/pmrrasmussen/symphony/internal/capability"
 	"github.com/pmrrasmussen/symphony/internal/config"
 	"github.com/pmrrasmussen/symphony/internal/domain"
+	githubhost "github.com/pmrrasmussen/symphony/internal/github"
+	"github.com/pmrrasmussen/symphony/internal/linear"
+	"github.com/pmrrasmussen/symphony/internal/mcpbridge"
 	"github.com/pmrrasmussen/symphony/internal/observability"
 )
 
@@ -56,41 +60,149 @@ const waitDelay = 2 * time.Second
 type Backend struct {
 	settings    func() config.Settings
 	secretNames []string
+	// handoff, github, and endpoint are the host-owned providers and the
+	// transport that reaches them. All three are process-wide and none of them
+	// belongs to this backend: see NewWithProviders.
+	handoff  *linear.Handoff
+	github   *githubhost.Manager
+	endpoint *mcpbridge.Server
 
 	mu       sync.Mutex
 	sessions map[string]*session
 }
 
 // session is the per-run state that outlives a single turn: the assigned
-// session ID, the turn counter, cumulative usage, and whichever process is
-// currently running.
+// session ID, the turn counter, cumulative usage, whichever process is currently
+// running, and the capability registry every turn of this run serves.
 type session struct {
 	id string
+	// ctx is the run-lived context Start was given. Capability invocations and
+	// the turn-ended finalizer run on it, never on a turn's or an HTTP request's
+	// context: a killed child cancels those instantly, which is exactly the case
+	// where aborting a merge already in flight would do the damage.
+	ctx context.Context
+
+	// registry is built once per run and holds the provider session pointers the
+	// launcher prepared, because every per-run idempotency latch -- landing
+	// attempts, the resolved-landing latch, a stale-base update -- lives in
+	// those pointers. It cannot live on a turn: claude --print runs one turn and
+	// exits, so a per-turn registry would reset that state on every
+	// continuation and a second landing attempt would look like a first.
+	// Its type is the endpoint's own narrow view of a registry rather than
+	// *capability.Registry, because that is the whole of what this backend ever
+	// needs from one: what to advertise, how to resolve a name, and the
+	// turn-ended finalizer to run when a turn is over.
+	registry mcpbridge.Capabilities
+	// advertised is the capability names registry advertised when it was built,
+	// frozen here for the same reason the registry is: it decides --tools, while
+	// the registry itself answers tools/list, and the two must not be able to
+	// disagree. See capabilityEndpoint.
+	advertised []string
+	// secretMatcher recognizes a provider-resolved credential by value, so it
+	// can be removed from the child environment even though it has no configured
+	// name and no configured value. See filteredEnv.
+	secretMatcher func(string) bool
 
 	mu   sync.Mutex
 	turn int
 	// request is the first turn's launch request. A resume must re-apply the
-	// entire contract -- the CLI restores none of --settings, --tools, or the
-	// permission mode -- and the workspace and Git metadata roots are not
-	// derivable from a session ID.
+	// entire contract -- the CLI restores none of --settings, --mcp-config,
+	// --tools, or the permission mode -- and the workspace and Git metadata
+	// roots are not derivable from a session ID.
 	request domain.AgentRequest
 	usage   domain.Usage
 	running *turn
+	// endpoint is the live capability-endpoint registration, which is per turn:
+	// its bearer token authorizes exactly one turn, and it must be retired
+	// before the next one is minted. It is held here rather than only on the
+	// turn so a hard Cancel and the next turn's launch can both reach it.
+	endpoint *registration
 }
 
-// New builds a Claude backend. secretNames are environment variable names whose
-// values must never reach the child.
+// New builds a Claude backend with no Symphony capabilities at all. secretNames
+// are environment variable names whose values must never reach the child.
 func New(settings func() config.Settings, secretNames ...string) *Backend {
 	return &Backend{settings: settings, secretNames: secretNames, sessions: map[string]*session{}}
 }
 
-// Start assigns a session ID and runs the first turn.
+// NewWithProviders binds already-built host providers, and the endpoint that
+// serves them, to this backend instead of constructing them.
+//
+// The providers are the same instances internal/codex is given, and sharing them
+// is not an optimization. One githubhost.Manager owns the linked pull request
+// table its poll loop walks and the exactly-once Linear completion guard, so a
+// process holding two would poll one table while sessions write into the other,
+// and a merged pull request would complete its issue twice or never. settings
+// must likewise be the callback both providers were built from, for the reasons
+// codex.NewWithProviders states.
+//
+// endpoint is the loopback MCP endpoint. It is a parameter rather than something
+// this backend binds for itself because it is one listener for the daemon's
+// lifetime, shared by every concurrent session and separated by per-registration
+// bearer tokens; a listener per backend would be a second socket nothing closes.
+//
+// A nil provider leaves its capabilities unbound, exactly as an unconfigured
+// integration does, and a nil endpoint leaves the session with no reachable
+// capability at all -- which is what New produces and what every Claude session
+// still gets, because configuration refuses a Claude workflow that enables one.
+func NewWithProviders(settings func() config.Settings, handoff *linear.Handoff, github *githubhost.Manager, endpoint *mcpbridge.Server, secretNames ...string) *Backend {
+	b := New(settings, secretNames...)
+	b.handoff = handoff
+	b.github = github
+	b.endpoint = endpoint
+	return b
+}
+
+// GitHubManager reports the manager this backend was given, so the host can read
+// its poll loop and landing-verifier target back out of a backend rather than
+// keeping a local of its own. See codex.Backend.GitHubManager: the one-manager
+// invariant is asserted over every wired backend that answers this, so a backend
+// that held a manager without exposing it would silently escape the assertion.
+func (b *Backend) GitHubManager() *githubhost.Manager { return b.github }
+
+// Start prepares this run's provider sessions and capability registry, assigns a
+// session ID, and runs the first turn.
+//
+// The preparation mirrors codex.Backend.Start deliberately: the same providers,
+// the same settings snapshot, the same secret matcher, and the same
+// capability.Build call, so there is no second implementation of a capability
+// for the two transports to drift apart on. What differs is only how a call is
+// framed on the wire, which is the whole point of internal/capability being
+// transport-neutral.
+//
+// One settings snapshot is frozen here for the run's lifetime -- which
+// capabilities exist, and the config.GitHub the session is bound to -- because a
+// reload mid-run that changed either would leave the registry and the launch
+// contract describing different sessions.
 func (b *Backend) Start(ctx context.Context, r domain.AgentRequest) (domain.AgentSession, <-chan domain.Event, error) {
+	settings := config.Settings{}
+	if b.settings != nil {
+		settings = b.settings()
+	}
+	var handoff *linear.HandoffSession
+	var err error
+	if b.handoff != nil && settings.LinearSessionCapabilityEnabled() {
+		handoff, err = b.handoff.PrepareWithSettings(ctx, settings, r.Issue)
+		if err != nil {
+			return domain.AgentSession{}, nil, fmt.Errorf("prepare Linear handoff: %w", err)
+		}
+	}
+	var githubSession *githubhost.Session
+	if b.github != nil {
+		githubSession = b.github.PrepareWithSettings(settings.GitHub, r.Issue, r.Workspace, handoff)
+	}
+	var secretMatcher func(string) bool
+	if handoff != nil || b.github != nil {
+		secretMatcher = func(candidate string) bool {
+			return handoff != nil && handoff.MatchesSecret(candidate) || githubSession != nil && githubSession.MatchesSecret(candidate)
+		}
+	}
 	id, err := newSessionID()
 	if err != nil {
 		return domain.AgentSession{}, nil, err
 	}
-	s := &session{id: id}
+	registry := capability.Build(capability.Bindings{Settings: settings, Issue: r.Issue, Handoff: handoff, GitHub: githubSession})
+	s := &session{id: id, ctx: ctx, registry: registry, advertised: advertisedNames(registry), secretMatcher: secretMatcher}
 	b.mu.Lock()
 	b.sessions[id] = s
 	b.mu.Unlock()
@@ -100,6 +212,22 @@ func (b *Backend) Start(ctx context.Context, r domain.AgentRequest) (domain.Agen
 		return domain.AgentSession{}, nil, err
 	}
 	return domain.AgentSession{ID: id, ThreadID: id, TurnID: "1"}, events, nil
+}
+
+// advertisedNames snapshots the registry's advertised capability names. The
+// registry is the single source: the names are read out of it rather than
+// recomputed from settings, so --tools and the tools/list this same registry
+// serves cannot describe different sets.
+func advertisedNames(registry mcpbridge.Capabilities) []string {
+	definitions := registry.Definitions()
+	if len(definitions) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(definitions))
+	for _, definition := range definitions {
+		names = append(names, definition.Name)
+	}
+	return names
 }
 
 // Continue resumes the session in a new process. The launch policy is rebuilt
@@ -136,16 +264,93 @@ func (b *Backend) Cancel(ctx context.Context, agentSession domain.AgentSession) 
 	s.mu.Lock()
 	active := s.running
 	s.mu.Unlock()
-	if active == nil {
-		return nil
+	// The kill comes first because it is immediate and is what a caller of Cancel
+	// needs promptly, while retiring the endpoint can wait on a capability call
+	// that is still running. Ordering them the other way would leave a live child
+	// for as long as that drain lasts.
+	if active != nil {
+		active.kill()
 	}
-	active.kill()
+	// A hard cancel may pre-empt every ordinary turn-end path, so the registry's
+	// turn-ended finalizer has to fire here too -- it is what performs the
+	// deferred Merging -> In Review transition after a retryable landing gate.
+	// Revoke is idempotent and drains before finalizing, so this races the turn's
+	// own shutdown safely and only one of the two reports the outcome.
+	problems := []error{s.retireEndpoint(nil)}
+	if active == nil {
+		return errors.Join(problems...)
+	}
 	select {
 	case <-active.exited:
-		return nil
 	case <-ctx.Done():
-		return ctx.Err()
+		problems = append(problems, ctx.Err())
 	}
+	return errors.Join(problems...)
+}
+
+// registration is the session's binding to the capability endpoint for one turn:
+// the endpoint registration itself, plus the latch that decides which of the
+// paths racing to retire it owns reporting what happened.
+//
+// Three paths can retire the same registration -- the turn's own shutdown, the
+// next turn's launch, and a hard Cancel -- and mcpbridge.Revoke is idempotent, so
+// without a latch a single expired drain would be reported once per path. The
+// losing caller still blocks until the winner has finished draining and
+// finalizing, because that is what makes "fully retired before the next
+// registration exists" true however the race resolves.
+type registration struct {
+	bridge *mcpbridge.Registration
+	once   sync.Once
+	err    error
+}
+
+// revoke retires the registration and reports whether this caller is the one
+// that performed it, and therefore owns reporting err.
+func (g *registration) revoke(ctx context.Context) (bool, error) {
+	owned := false
+	g.once.Do(func() {
+		g.err = g.bridge.Revoke(ctx)
+		owned = true
+	})
+	return owned, g.err
+}
+
+// retireEndpoint revokes whatever registration the session currently holds and
+// reports the outcome, which is only ever non-nil when Revoke gave up on an
+// invariant it exists to hold: an invocation still in flight when the drain
+// expired, or a turn-ended finalizer that had not returned. Both are
+// operator-visible facts with no URL, token, argument, or result in them.
+//
+// The finalizer runs on the run-lived session context rather than on a caller's,
+// exactly as the Codex transport's does: a Cancel context is bounded at seconds
+// and a turn context is already cancelled, and the finalizer's own work -- a
+// Linear transition -- needs a context that is still live.
+//
+// only, when non-nil, retires that registration and nothing else. The turn's own
+// shutdown passes its own registration because by then the session may already
+// hold the next turn's, and retiring that one would revoke a live turn's
+// authority mid-run.
+func (s *session) retireEndpoint(only *registration) error {
+	s.mu.Lock()
+	held := s.endpoint
+	if only == nil || held == only {
+		s.endpoint = nil
+	}
+	s.mu.Unlock()
+	target := only
+	if target == nil {
+		target = held
+	}
+	if target == nil {
+		return nil
+	}
+	owned, err := target.revoke(s.ctx)
+	if !owned {
+		// Another path performed the revocation and has already reported this
+		// outcome. Reporting it again would double-count one expiry.
+		return nil
+	}
+	return err
 }
 
 func (b *Backend) forget(id string) {
@@ -155,30 +360,112 @@ func (b *Backend) forget(id string) {
 }
 
 // run spawns one turn and returns its event stream.
+//
+// The order here is the part of this wiring that is easiest to get wrong and
+// hardest to notice. Every step before spawn has to happen before it:
+//
+//   - The event channel exists first, because the endpoint registration must be
+//     able to deliver a capability's terminal outcome -- a landing that reports
+//     waiting or resolved is what ends the logical run -- and it has to be able
+//     to do that from the moment the child can call a tool.
+//   - The previous turn's registration is retired before this turn's is minted.
+//     "Revoked at turn end" is not "revoked before the next turn": after
+//     emitting its terminal event, turn N's goroutine is still waiting on
+//     stderr, on Wait, and on the process-group kill, while the coordinator has
+//     already called Continue. Registering first would leave two live
+//     registrations for one session, so an escaped descendant of turn N could
+//     call a capability concurrently with turn N+1 -- against the same provider
+//     sessions, whose idempotency latches are all that stand between that and a
+//     second landing attempt presenting itself as a first.
+//   - The registration is minted before spawn, because the CLI connects to its
+//     MCP servers before it emits system/init. A token minted afterwards would
+//     race the handshake, and losing that race is not an error the child
+//     reports: it is a server stuck at "pending", which verifyInit then refuses.
 func (b *Backend) run(ctx context.Context, s *session, r domain.AgentRequest, resume bool) (<-chan domain.Event, error) {
-	args, err := launchArgs(r, s.id, resume)
+	events := &sink{events: make(chan domain.Event, eventBuffer)}
+	retired := s.retireEndpoint(nil)
+	endpoint, held, err := b.bindEndpoint(s, events)
 	if err != nil {
 		return nil, err
 	}
+	contract, err := launchArgs(r, s.id, resume, endpoint)
+	if err != nil {
+		s.discardEndpoint(held)
+		return nil, err
+	}
+	environment := filteredEnv(b.secretNames, b.settings, s.secretMatcher, endpoint)
 	// The spawn happens under the session lock so a cancellation cannot arrive
 	// between the child starting and the session recording it -- that window
-	// would kill nothing and leave the process orphaned.
+	// would kill nothing and leave the process orphaned. The registration is
+	// recorded under the same lock, so a Cancel sees both or neither.
 	s.mu.Lock()
 	s.turn++
 	turnNumber := s.turn
 	if !resume {
 		s.request = r
 	}
-	t, err := spawn(ctx, r, args, b.secretNames, b.settings)
+	t, err := spawn(ctx, r, contract, environment, events)
 	if err != nil {
 		s.mu.Unlock()
+		// Nothing will ever read this registration's stream, and no turn will
+		// end to retire it. Leaving it would be a credential lifetime leak, not
+		// a leaked struct: the registration holds the GitHub session, so a
+		// loopback-reachable, token-bearing capability set would stay live for
+		// the daemon's lifetime.
+		s.discardEndpoint(held)
 		return nil, err
 	}
+	t.registration = held
 	s.running = t
+	s.endpoint = held
 	s.mu.Unlock()
 
+	if retired != nil {
+		// The previous turn's revocation gave up on an ordering invariant. Its
+		// own stream is closed by now, so this turn's is where an operator can
+		// still see it. Both sentinel reasons are fixed strings.
+		events.emit(domain.Event{Kind: domain.EventDiagnostic, At: time.Now(),
+			Message: "claude capability endpoint revocation: " + retired.Error()})
+	}
 	go t.stream(s, r, turnNumber)
 	return t.sink.events, nil
+}
+
+// bindEndpoint registers this turn against the capability endpoint and returns
+// what the child needs to reach it.
+//
+// A registration is created whenever this backend has an endpoint at all, not
+// only when something is advertised, because the registration is also what runs
+// the registry's turn-ended finalizer -- the Codex transport calls that on every
+// turn end unconditionally, and an unadvertised capability may still hold state
+// that has to be settled. What advertisement decides is only whether the child
+// is told the endpoint exists: with nothing advertised the returned
+// capabilityEndpoint is nil, so no --mcp-config is rendered and no token reaches
+// the child, and the registration is unreachable by construction.
+func (b *Backend) bindEndpoint(s *session, events *sink) (*capabilityEndpoint, *registration, error) {
+	if b.endpoint == nil {
+		return nil, nil, nil
+	}
+	bridge, err := b.endpoint.Register(s.ctx, s.registry, events.emit)
+	if err != nil {
+		return nil, nil, fmt.Errorf("register claude capability endpoint: %w", err)
+	}
+	held := &registration{bridge: bridge}
+	if len(s.advertised) == 0 {
+		return nil, held, nil
+	}
+	return &capabilityEndpoint{url: bridge.URL(), token: bridge.Token(), names: s.advertised}, held, nil
+}
+
+// discardEndpoint retires a registration for a turn that never started. There is
+// no stream to report an expiry on and nothing was ever in flight to drain, so
+// the outcome is deliberately dropped rather than reported: the caller is
+// already returning the launch failure that explains it.
+func (s *session) discardEndpoint(held *registration) {
+	if held == nil {
+		return
+	}
+	_, _ = held.revoke(s.ctx)
 }
 
 // turn is one child process.
@@ -201,15 +488,23 @@ type turn struct {
 	// sink is the only route from any goroutine to this turn's event channel. It
 	// belongs to the turn rather than to stream's locals because the read loop is
 	// not the only thing that can have something to report about a turn, and it is
-	// built with the turn so no holder of a turn can find it unable to emit.
+	// built before the turn so the capability endpoint can be given it before the
+	// child that reaches that endpoint exists.
 	sink *sink
+
+	// contract is what this turn was launched under, carried so verifyInit checks
+	// the echo against the argument vector that produced it. See launchContract.
+	contract launchContract
+	// registration is this turn's capability-endpoint authority, retired when the
+	// turn ends however it ends. It is nil for a turn with no endpoint.
+	registration *registration
 
 	mu     sync.Mutex
 	killed bool
 }
 
 // spawn starts the CLI with the prompt on stdin and a scrubbed environment.
-func spawn(ctx context.Context, r domain.AgentRequest, args []string, secretNames []string, settings func() config.Settings) (*turn, error) {
+func spawn(ctx context.Context, r domain.AgentRequest, contract launchContract, environment []string, events *sink) (*turn, error) {
 	command := strings.TrimSpace(r.Command)
 	if command == "" {
 		command = "claude"
@@ -218,9 +513,9 @@ func spawn(ctx context.Context, r domain.AgentRequest, args []string, secretName
 	// here, so they are passed directly rather than through a shell: the
 	// settings payload is JSON and must not be word-split or expanded.
 	fields := strings.Fields(command)
-	cmd := exec.CommandContext(ctx, fields[0], append(fields[1:], args...)...)
+	cmd := exec.CommandContext(ctx, fields[0], append(fields[1:], contract.args...)...)
 	cmd.Dir = r.Workspace
-	cmd.Env = filteredEnv(secretNames, settings)
+	cmd.Env = environment
 	// A process group is what makes cancellation reach the CLI's own children:
 	// a killed turn can leave background shell commands behind otherwise.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -253,7 +548,7 @@ func spawn(ctx context.Context, r domain.AgentRequest, args []string, secretName
 	opened = append(opened, stdin)
 	t := &turn{
 		cmd: cmd, stdout: stdout, stderr: stderr, exited: make(chan struct{}), timeout: r.TurnTimeout,
-		sink: &sink{events: make(chan domain.Event, eventBuffer)},
+		sink: events, contract: contract,
 	}
 	cmd.Cancel = func() error { t.kill(); return nil }
 	// WaitDelay bounds how long Wait blocks on I/O after the process itself is
@@ -319,6 +614,22 @@ func (t *turn) stream(s *session, r domain.AgentRequest, turnNumber int) {
 	// find the channel closed. Closing it here instead would reintroduce one.
 	defer t.sink.close()
 	defer close(t.exited)
+	// Retiring this turn's endpoint registration is deferred after both of those
+	// so it runs before them. Before the stream closes, because the revocation
+	// drains an invocation that may still be running and the terminal event that
+	// invocation produces has to reach this stream. Before t.exited closes,
+	// because that is what a hard Cancel waits on, so a Cancel that returns has
+	// either retired this registration itself or waited for this to.
+	//
+	// It retires only this turn's own registration: by now the session may
+	// already hold the next turn's, and revoking that one would strip a live
+	// turn of its authority mid-run.
+	defer func() {
+		if expired := s.retireEndpoint(t.registration); expired != nil {
+			t.sink.emit(domain.Event{Kind: domain.EventDiagnostic, At: time.Now(),
+				Message: "claude capability endpoint revocation: " + expired.Error()})
+		}
+	}()
 	// Once this turn is over it must stop being the session's live process, or a
 	// later cancellation would signal a process group whose pid has been reaped
 	// and possibly recycled.
@@ -382,7 +693,7 @@ func (t *turn) stream(s *session, r domain.AgentRequest, turnNumber int) {
 			case "init":
 				var event initEvent
 				_ = json.Unmarshal(line, &event)
-				if refusal := verifyInit(event, r.Workspace); refusal != "" {
+				if refusal := verifyInit(event, r.Workspace, t.contract); refusal != "" {
 					// The policy did not apply. Fail closed rather than run a
 					// turn under an unknown boundary.
 					// Two refused init lines can arrive in a single read, and
