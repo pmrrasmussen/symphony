@@ -91,6 +91,19 @@ func (s *stubRegistry) withPrepare(name string, prepare func(json.RawMessage) (c
 	return s
 }
 
+// bindOnly binds a capability without advertising it, which is the state
+// capability.Registry deliberately allows: Build binds every capability the
+// session's providers support and advertises only the subset the configuration
+// and the issue's state permit.
+func (s *stubRegistry) bindOnly(name string, invoke capability.Invocation) *stubRegistry {
+	definition := capability.Definition{Name: name, Description: name + " description",
+		InputSchema: map[string]any{"type": "object", "additionalProperties": false}}
+	s.bound[name] = stubCapability{definition: definition, prepare: func(json.RawMessage) (capability.Invocation, *capability.Failure) {
+		return invoke, nil
+	}}
+	return s
+}
+
 func succeeds(payload any) capability.Invocation {
 	return func(context.Context) (capability.Result, *capability.Failure) {
 		return capability.Result{Success: true, Payload: payload}, nil
@@ -454,6 +467,52 @@ func TestOneSessionsTokenCannotReachAnotherSessionsRegistry(t *testing.T) {
 	}
 	if text, isError := toolOutcome(t, callTool(t, second, second.Token(), "second_only")); isError || text != `"second"` {
 		t.Fatalf("the owning session's call returned %q (isError %v)", text, isError)
+	}
+}
+
+// TestABoundButUnadvertisedCapabilityIsRefused closes the gap between what the
+// launch contract pins as reachable and what is actually reachable.
+//
+// The registry binds every capability its providers support and advertises only
+// the subset the configuration and the issue's state permit, and its Lookup
+// ignores that distinction on purpose: on a transport the agent cannot address
+// directly, advertisement is the only route to a call, so dispatch could stay
+// open and let each provider re-validate its own preconditions. Over loopback
+// HTTP that stops being true. The child's shell holds the endpoint token and
+// loopback is inside its sandbox, so it can name a capability that appeared in
+// no --tools list, in no --allowedTools list, and in no tools/list -- and every
+// set-equality check the launch contract performs would still pass, because none
+// of them can see a call the transport served.
+//
+// The unadvertised capability here would have run and reported success. It must
+// be indistinguishable from a name that does not exist.
+func TestABoundButUnadvertisedCapabilityIsRefused(t *testing.T) {
+	invoked := 0
+	registry := newRegistry().with("advertised", succeeds("visible")).
+		bindOnly("bound_only", func(context.Context) (capability.Result, *capability.Failure) {
+			invoked++
+			return capability.Result{Success: true, Payload: "reached"}, nil
+		})
+	server := endpoint(t)
+	registration, _ := register(t, server, registry)
+
+	listed := result(t, rpc(t, registration, registration.Token(), "tools/list", "{}"))
+	tools, _ := listed["tools"].([]any)
+	if len(tools) != 1 {
+		t.Fatalf("tools/list offered %v, want only the advertised capability", listed["tools"])
+	}
+
+	text, isError := toolOutcome(t, callTool(t, registration, registration.Token(), "bound_only"))
+	if !isError || text != "Unsupported client-side tool." {
+		t.Fatalf("an unadvertised capability answered %q (isError %v), want an unsupported-tool refusal", text, isError)
+	}
+	if invoked != 0 {
+		t.Fatalf("an unadvertised capability ran %d times", invoked)
+	}
+	// The advertised one is unaffected, so the gate is a filter and not a
+	// blanket refusal.
+	if text, isError := toolOutcome(t, callTool(t, registration, registration.Token(), "advertised")); isError || text != `"visible"` {
+		t.Fatalf("the advertised capability answered %q (isError %v)", text, isError)
 	}
 }
 

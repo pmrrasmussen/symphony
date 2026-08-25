@@ -16,9 +16,13 @@
 // JSON-RPC envelope, no streaming -- so replacing it with a socket later is a
 // change confined to this package.
 //
-// Trust boundary. The agent process is untrusted. It may call any advertised
-// tool with any arguments, in parallel, at any time, and it may be killed
-// mid-call. Nothing it sends is used for anything except selecting a capability
+// Trust boundary. The agent process is untrusted, and "the agent process" is
+// wider than the model's own tool calls: the child's shell holds the endpoint
+// token and loopback is inside its sandbox, so anything running in that process
+// can address this endpoint directly. It may call any advertised tool -- and
+// only an advertised one, which is why the advertisement gate lives in callTool
+// and not in a launch contract -- with any arguments, in parallel, at any time,
+// and it may be killed mid-call. Nothing it sends is used for anything except selecting a capability
 // by name and handing that capability its own arguments to validate. No provider
 // credential crosses the boundary: the only secret the child holds is a
 // per-registration bearer token that authorizes it to reach exactly one
@@ -29,8 +33,9 @@
 //
 // Nothing in this package logs. Its entire state -- endpoint URL, bearer token,
 // tool arguments, tool results -- is exactly what must never reach an operator
-// log or a domain.Event, and the CLI's own stream already reports every MCP call
-// it makes, so a log record here would add nothing but a disclosure risk.
+// log or a domain.Event, so a log record here would carry a disclosure risk that
+// a call record cannot repay: a call the agent CLI makes is already reported in
+// its own stream, and for a call made by other means see callTool.
 package mcpbridge
 
 import (
