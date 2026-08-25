@@ -129,16 +129,27 @@ func TestTheLaunchContractPinsExactlyTheAdvertisedCapabilities(t *testing.T) {
 			if strings.Join(contract.mcpServers, ",") != mcpServerName {
 				t.Fatalf("mcpServers=%v, want exactly %q", contract.mcpServers, mcpServerName)
 			}
-			var rendered mcpConfig
-			if err := json.Unmarshal([]byte(flagValue(t, contract.args, "--mcp-config")), &rendered); err != nil {
+			var mcp mcpConfig
+			if err := json.Unmarshal([]byte(flagValue(t, contract.args, "--mcp-config")), &mcp); err != nil {
 				t.Fatalf("MCP configuration is not valid JSON: %v", err)
 			}
-			server, ok := rendered.MCPServers[mcpServerName]
-			if !ok || len(rendered.MCPServers) != 1 {
-				t.Fatalf("MCP configuration=%+v", rendered)
+			server, ok := mcp.MCPServers[mcpServerName]
+			if !ok || len(mcp.MCPServers) != 1 {
+				t.Fatalf("MCP configuration=%+v", mcp)
 			}
 			if server.Type != "http" || server.URL != endpoint.url {
 				t.Fatalf("server=%+v", server)
+			}
+			// The payload's own permission allowlist must be the same surface
+			// the flags name. Under dontAsk anything not allowed is refused, so
+			// two disagreeing statements of what is permitted leave a reader
+			// unable to tell which one is authoritative.
+			var rendered policy
+			if err := json.Unmarshal([]byte(flagValue(t, contract.args, "--settings")), &rendered); err != nil {
+				t.Fatal(err)
+			}
+			if strings.Join(rendered.Permissions.Allow, ",") != tools {
+				t.Fatalf("permissions.allow=%v, want the whole tool surface %q", rendered.Permissions.Allow, tools)
 			}
 			// The credential travels by ${VAR} reference. A rendered token
 			// would put a bearer credential in argv, which is world-readable
@@ -703,7 +714,14 @@ func backendWithEndpoint(t *testing.T) (*Backend, *mcpbridge.Server) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = endpoint.Close(context.Background()) })
+	// Bounded, because Close waits for in-flight requests: a test that leaves an
+	// invocation blocked would otherwise hang the whole binary at cleanup
+	// instead of reporting its own failure.
+	t.Cleanup(func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = endpoint.Close(closeCtx)
+	})
 	return NewWithProviders(settingsFunc(), nil, nil, endpoint), endpoint
 }
 
@@ -982,18 +1000,22 @@ func definitions2names(definitions []capability.Definition) []string {
 // falsifiable form of the ordering every document in this repository asserts.
 //
 // The stale-token test above catches the next-turn revocation being deleted
-// outright, but not the mutation that actually threatens the invariant: moving
-// it to just after spawn. The parent wins that race against a starting child
-// every time, so a probe from the child cannot see the difference.
+// outright, but not the two mutations that actually threaten the invariant:
+// moving it to after spawn, and releasing the session's registration slot before
+// the revocation it started has finished. Neither is visible to a probe from the
+// child, because the parent wins that race against a starting child every time.
 //
-// This transcript removes the race. Turn one reports its result -- so a
-// continuation is requested -- and then makes a capability call that blocks
-// inside the invocation, holding the drain open. With the revocation before
-// spawn, turn two's child provably cannot exist until this test releases that
-// call: the launch is parked in the drain. With the revocation after spawn, turn
-// two's child starts immediately, concurrently with a capability call from the
-// previous turn against the same provider session -- which is the hazard, and
-// which the marker file below makes visible.
+// This transcript removes the race in both directions. Turn one makes a
+// capability call that blocks inside the invocation and then exits, so its own
+// stream goroutine begins retiring the registration and parks in the drain --
+// which the test waits for by polling until turn one's token stops
+// authenticating, the observable edge of a revocation that has started and not
+// finished. Only then is a continuation requested. With the ordering right, that
+// launch finds the slot still occupied and blocks on the same latch, so turn
+// two's child provably cannot exist until this test releases the call. Move the
+// revocation after spawn, or clear the slot before the revocation completes, and
+// turn two's child starts immediately -- concurrently with a capability call from
+// the previous turn against the same provider session, which is the hazard.
 func TestTheNextTurnCannotStartUntilThePreviousRegistrationIsFullyRetired(t *testing.T) {
 	if _, err := exec.LookPath("curl"); err != nil {
 		t.Skip("curl is needed for the child to hold a capability call open")
@@ -1010,15 +1032,19 @@ func TestTheNextTurnCannotStartUntilThePreviousRegistrationIsFullyRetired(t *tes
 	script := writeFakeClaude(t, dir, ""+
 		"if [ ! -f "+first+" ]; then\n"+
 		"  : > "+first+"\n"+
-		"  cat <<'EOF'\n"+init+"\n"+resultLine(false, "")+"\nEOF\n"+
 		"  url=$(grep -o 'http://[0-9.]*:[0-9]*/mcp' "+filepath.Join(dir, "args.txt")+" | head -1)\n"+
 		"  printf '%s' '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\""+
 		capability.NameGitHubPRContext+"\",\"arguments\":{}}}' > "+filepath.Join(dir, "held.body")+"\n"+
+		// The call is detached from the inherited stdout and stderr. A curl
+		// holding those keeps this turn's read loop from ever seeing EOF, so
+		// the turn could not end and nothing would retire its registration.
 		"  curl -sS -X POST -H \"Authorization: Bearer $"+endpointTokenEnvName+"\" -H 'Content-Type: application/json'"+
-		" --data-binary @"+filepath.Join(dir, "held.body")+" -o /dev/null \"$url\" &\n"+
-		// The shell stays alive so turn one's own stream goroutine is still in
-		// its read loop: nothing but the next turn's launch can retire it.
-		"  sleep 30\n"+
+		" --data-binary @"+filepath.Join(dir, "held.body")+" -o /dev/null \"$url\" >/dev/null 2>&1 &\n"+
+		"  cat <<'EOF'\n"+init+"\n"+resultLine(false, "")+"\nEOF\n"+
+		// Held open until the test has seen the invocation start, so this turn
+		// cannot end -- and its registration cannot be drained -- before there
+		// is something in flight for the drain to wait on.
+		"  while [ ! -f "+filepath.Join(dir, "in-flight")+" ]; do sleep 0.02; done\n"+
 		"else\n"+
 		"  : > "+marker+"\n"+
 		"  cat <<'EOF'\n"+init+"\n"+resultLine(false, "")+"\nEOF\n"+
@@ -1039,6 +1065,21 @@ func TestTheNextTurnCannotStartUntilThePreviousRegistrationIsFullyRetired(t *tes
 	case <-time.After(20 * time.Second):
 		t.Fatal("turn one never reached the capability invocation")
 	}
+	// The invocation is in flight, so turn one may now end. Its stream then
+	// retires the registration and parks in the drain; waiting for the token to
+	// stop authenticating is the observable edge of a revocation that has begun
+	// and cannot finish, which is what the next launch has to race.
+	url, token := endpointFromChild(t, dir)
+	if err := os.WriteFile(filepath.Join(dir, "in-flight"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(20 * time.Second)
+	for probeEndpoint(t, url, token) != http.StatusUnauthorized {
+		if time.Now().After(deadline) {
+			t.Fatal("turn one's stream never began retiring its registration")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 
 	continued := make(chan error, 1)
 	var second <-chan domain.Event
@@ -1047,16 +1088,16 @@ func TestTheNextTurnCannotStartUntilThePreviousRegistrationIsFullyRetired(t *tes
 		second, err = backend.Continue(context.Background(), session, "second turn")
 		continued <- err
 	}()
-	// The invocation is in flight, so the launch must be parked in the drain.
-	// Anything that got past it started a turn concurrently with a live
-	// capability call from the previous one.
+	// The invocation is in flight, so the launch must be parked behind it.
+	// Anything that got past started a turn concurrently with a live capability
+	// call from the previous one.
 	select {
 	case err := <-continued:
 		t.Fatalf("the next turn launched while a capability call from the previous turn was still in flight (err=%v)", err)
 	case <-time.After(750 * time.Millisecond):
 	}
 	if _, err := os.Stat(marker); err == nil {
-		t.Fatal("turn two's child ran before turn one's registration was retired")
+		t.Fatal("turn two's child ran before turn one's registration was fully retired")
 	}
 
 	close(release)
