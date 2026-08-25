@@ -104,7 +104,9 @@ starts it in `In Progress`, implementation publishes its pull request to
 `In Review`, a human moves it to `Merging`, and the next dispatch lands that
 same pull request and reconciles the issue to `Done`. This final dispatch is
 what distinguishes a full-lifecycle landing smoke from another implementation
-handoff exercise. Stop the service and remove all disposable artifacts when
+handoff exercise. Before cleanup, verify that the disposable source checkout
+is still on its default branch and has a clean worktree, proving the exercise
+remained isolated. Stop the service and remove all disposable artifacts when
 the run finishes.
 
 ## GitHub Actions smoke
