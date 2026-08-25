@@ -136,6 +136,11 @@ func run(args []string, stdout, stderr io.Writer) int {
 	// Optional host capabilities stay disabled until WORKFLOW.md supplies their
 	// fixed scope; resolved credentials are filtered from the Codex child.
 	backend, githubLifecycle := codex.NewWithIntegrations(settings, slog.New(log.Handler()))
+	// Terminal cleanup may only discard a worktree's local commits once Symphony
+	// itself verified them merged. The verifier is read-only and host-owned; when
+	// GitHub is not configured it always answers no and cleanup stays as strict
+	// as before.
+	ws.SetLandingVerifier(githubLifecycle)
 	go githubLifecycle.Run(ctx)
 	var t domain.Tracker = tracker
 	var a domain.AgentBackend = backend
@@ -166,8 +171,13 @@ func run(args []string, stdout, stderr io.Writer) int {
 		log.Warn("startup terminal cleanup query failed", "error", err)
 	} else {
 		for _, issue := range terminals {
-			if err := ws.Cleanup(ctx, issue); err != nil {
+			outcome, err := ws.Cleanup(ctx, issue)
+			if err != nil {
 				log.Warn("terminal workspace cleanup failed", "issue", issue.Identifier, "error", err)
+				continue
+			}
+			if outcome == domain.CleanupLanded {
+				log.Info("terminal workspace cleanup removed verified landed work", "issue", issue.Identifier)
 			}
 		}
 	}

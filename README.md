@@ -211,9 +211,13 @@ across restarts and bounded retries. Invalid or missing ownership state beside
 an existing workspace fails closed; follow the [workspace recovery
 procedure](docs/completion-markers.md) before redispatch.
 Review each worktree's changes before merging or cherry-picking them into your
-development branch. Terminal cleanup preserves worktrees with uncommitted,
-untracked, or newly committed changes rather than deleting work that needs
-review.
+development branch. Terminal cleanup preserves worktrees with uncommitted or
+untracked changes rather than deleting work that needs review, and preserves a
+newly committed worktree too unless Symphony itself can verify that exact
+commit as the merged head of the issue's pull request in the configured GitHub
+repository. That one verified case is how a completed, landed issue's worktree
+is removed instead of accumulating; anything unpublished, rewritten while
+merging, or unverifiable is kept for review.
 
 To let a Codex session hand an issue off safely, optionally configure
 `tracker.provider.handoff_state` (and, if useful, a fixed
@@ -346,9 +350,17 @@ agent:
    Turn off the PR-linked status automations in Linear → Settings → the team →
    GitHub integration / workflow automations; this is verifiable only in the
    Linear UI. If left enabled, Symphony does not silently re-dispatch the
-   reverted issue — it logs an `external tracker state change observed`
-   (`operation: external_reversion`) record naming the from/to states — but it
-   does not currently re-assert the handoff automatically. See the
+   reverted issue — it logs a warn-level `external tracker state change
+   observed` (`operation: external_reversion`) record naming the from/to
+   states — but it does not currently re-assert the handoff automatically. The
+   expected human review decisions out of `In Review` are not warnings: with
+   this repository's lifecycle configured, an approval to land
+   (`In Review -> Merging`, `operation: review_approved`) and a
+   changes-requested move (`In Review -> Rework`,
+   `operation: rework_requested`) are logged at info level as
+   `human review state change observed`. Any other destination — including one
+   the configured lifecycle cannot name unambiguously — keeps the warning. See
+   the
    [Linear tracker profile](docs/linear-tracker.md) and the
    [observability guide](docs/observability.md).
 

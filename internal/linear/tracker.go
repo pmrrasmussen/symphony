@@ -21,6 +21,7 @@ import (
 
 	"github.com/pmrrasmussen/symphony/internal/config"
 	"github.com/pmrrasmussen/symphony/internal/domain"
+	"github.com/pmrrasmussen/symphony/internal/observability"
 )
 
 const (
@@ -274,7 +275,7 @@ func (t *Tracker) logTransition(from handoffIssue, toState string) {
 		return
 	}
 	t.logger.Info("Linear transition",
-		"operation", "transition",
+		"operation", observability.OperationTransition,
 		"from_state", strings.TrimSpace(from.State.Name),
 		"to_state", strings.TrimSpace(toState),
 		"issue_id", from.ID,
@@ -289,7 +290,7 @@ func (t *Tracker) logTransitionSkip(from handoffIssue, toState string) {
 		return
 	}
 	t.logger.Debug("Linear transition skipped",
-		"operation", "transition",
+		"operation", observability.OperationTransition,
 		"from_state", strings.TrimSpace(from.State.Name),
 		"to_state", strings.TrimSpace(toState),
 		"issue_id", from.ID,

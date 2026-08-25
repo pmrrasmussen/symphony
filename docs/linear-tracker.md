@@ -106,6 +106,23 @@ active candidate. Symphony does not automatically re-assert the handoff; see
 [docs/observability.md](observability.md) for the log record and the deferred
 auto-reconcile follow-up.
 
+That warning is reserved for a change out of `handoff_state` that the
+configured lifecycle does not account for. The two human review decisions are
+expected lifecycle edges and are logged at info level as `human review state
+change observed`: `In Review -> Merging` (the approval that authorizes landing)
+as `operation: review_approved`, recognized by `github.merge_state`, and
+`In Review -> Rework` (changes requested) as `operation: rework_requested`,
+recognized as the single `active_states` entry that neither
+`tracker.provider.transitions.start` nor `github.merge_state` accounts for.
+
+Everything else warns, including a reactivation into a pre-review
+implementation state (the PMR-63 flap) and any destination this profile cannot
+name: `transitions.start` unset, landing unconfigured, or more than one
+remaining `active_states` candidate — add a parked `Blocked`, a dispatchable
+`Backlog`, or a dispatch entry state no start edge names, and Symphony stops
+naming the rework state rather than passing off parked work as an expected
+review decision.
+
 When neither `handoff_state` nor `followup_issue_creation` is configured,
 Symphony binds no Linear session for the Codex child and advertises no
 session-bound Linear tool. When either is configured, the service validates the
