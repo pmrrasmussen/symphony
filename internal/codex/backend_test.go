@@ -82,7 +82,7 @@ func TestStartDrainsStderrBeforeProcessFinalization(t *testing.T) {
 	script := writeAppServer(t, dir, `
 printf '%s\n' 'token=do-not-log-this' >&2
 `)
-	c, err := start(context.Background(), request(dir, script), nil, nil, nil, nil)
+	c, err := start(context.Background(), request(dir, script), nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -717,69 +717,6 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{}}'`
 	}
 }
 
-func TestGitHubToolHasOnlyStructuredHandoffFieldsNoScopeOrCredentialInput(t *testing.T) {
-	definition := githubToolDefinition()
-	schema, ok := definition["inputSchema"].(map[string]any)
-	if !ok || schema["type"] != "object" || schema["additionalProperties"] != false {
-		t.Fatalf("schema=%#v", definition["inputSchema"])
-	}
-	properties, ok := schema["properties"].(map[string]any)
-	if !ok {
-		t.Fatalf("properties=%#v", schema["properties"])
-	}
-	allowed := map[string]bool{"why": true, "what_changed": true, "on_call": true}
-	for name := range properties {
-		if !allowed[name] {
-			t.Fatalf("GitHub tool unexpectedly accepts field %q: %#v", name, schema)
-		}
-	}
-	required, ok := schema["required"].([]string)
-	if !ok || len(required) != 3 {
-		t.Fatalf("required=%#v", schema["required"])
-	}
-	for _, name := range required {
-		if !allowed[name] {
-			t.Fatalf("required field %q is not a structured handoff field", name)
-		}
-	}
-	// The schema (not the free-text description) must never expose a
-	// scope-selection or credential field.
-	encoded, err := json.Marshal(schema)
-	if err != nil || strings.Contains(string(encoded), "token") || strings.Contains(string(encoded), "owner") || strings.Contains(string(encoded), "repository") || strings.Contains(string(encoded), "branch") || strings.Contains(string(encoded), "pull_number") {
-		t.Fatalf("tool schema exposed host scope: %s err=%v", encoded, err)
-	}
-}
-
-func TestGitHubContextToolHasNoInput(t *testing.T) {
-	definition := githubContextToolDefinition()
-	schema, ok := definition["inputSchema"].(map[string]any)
-	if !ok || schema["type"] != "object" || schema["additionalProperties"] != false {
-		t.Fatalf("schema=%#v", definition["inputSchema"])
-	}
-	if _, hasProperties := schema["properties"]; hasProperties {
-		t.Fatalf("GitHub context tool unexpectedly accepts caller-controlled input: %#v", schema)
-	}
-	encoded, err := json.Marshal(definition)
-	if err != nil || strings.Contains(string(encoded), "token") || strings.Contains(string(encoded), "\"owner\"") || strings.Contains(string(encoded), "\"repository\"") {
-		t.Fatalf("tool definition exposed host scope: %s err=%v", encoded, err)
-	}
-}
-
-func TestGitHubLandToolHasNoInput(t *testing.T) {
-	definition := githubLandToolDefinition()
-	schema, ok := definition["inputSchema"].(map[string]any)
-	if !ok || schema["type"] != "object" || schema["additionalProperties"] != false {
-		t.Fatalf("schema=%#v", definition["inputSchema"])
-	}
-	if _, hasProperties := schema["properties"]; hasProperties {
-		t.Fatalf("GitHub land tool unexpectedly accepts caller-controlled input: %#v", schema)
-	}
-	encoded, err := json.Marshal(definition)
-	if err != nil || strings.Contains(string(encoded), "token") || strings.Contains(string(encoded), "\"owner\"") || strings.Contains(string(encoded), "\"repository\"") || strings.Contains(string(encoded), "\"method\"") {
-		t.Fatalf("tool definition exposed host scope: %s err=%v", encoded, err)
-	}
-}
-
 // TestGitHubLandToolAdvertisedOnlyForConfiguredMergeState exercises the
 // dispatch-time filter added in backend.go's Start: github_land_pr is
 // offered only when the session's issue is currently (per AgentRequest.Issue,
@@ -857,32 +794,6 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{}}'
 				t.Fatalf("issueState=%q advertised a Linear-mutating linear_graphql tool: %s", test.issueState, data)
 			}
 		})
-	}
-}
-
-func TestCreateFollowupIssueToolHasNoCallerControlledScopeFields(t *testing.T) {
-	definition := createFollowupIssueToolDefinition()
-	schema, ok := definition["inputSchema"].(map[string]any)
-	if !ok || schema["type"] != "object" || schema["additionalProperties"] != false {
-		t.Fatalf("schema=%#v", definition["inputSchema"])
-	}
-	properties, ok := schema["properties"].(map[string]any)
-	if !ok {
-		t.Fatalf("properties=%#v", schema["properties"])
-	}
-	for _, forbidden := range []string{"issue", "issue_id", "project", "project_id", "team", "team_id", "state", "state_id", "endpoint", "credential", "token", "parent_id"} {
-		if _, exists := properties[forbidden]; exists {
-			t.Fatalf("create_followup_issue tool exposed caller-controlled %q: %#v", forbidden, properties)
-		}
-	}
-	for _, allowed := range []string{"title", "description", "acceptance_criteria", "relationship"} {
-		if _, exists := properties[allowed]; !exists {
-			t.Fatalf("create_followup_issue tool is missing bounded field %q: %#v", allowed, properties)
-		}
-	}
-	required, _ := schema["required"].([]string)
-	if len(required) != 3 || required[0] != "title" || required[1] != "description" || required[2] != "acceptance_criteria" {
-		t.Fatalf("required=%#v", schema["required"])
 	}
 }
 

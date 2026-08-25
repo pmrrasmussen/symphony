@@ -12,9 +12,15 @@ import (
 	"strings"
 )
 
+// MaxFollowupIssueTitleRunes is the single source for both the check below and
+// the advertised create_followup_issue schema, which reads it from
+// internal/capability. MaxFollowupIssueBodyBytes bounds the rendered body the
+// description and acceptance criteria are combined into, so it is not a
+// per-field schema bound; an invariant test asserts the per-field schema bounds
+// cannot sum past it.
 const (
-	maxFollowupIssueTitleRunes       = 255
-	maxFollowupIssueDescriptionBytes = 20 << 10
+	MaxFollowupIssueTitleRunes = 255
+	MaxFollowupIssueBodyBytes  = 20 << 10
 )
 
 type followupIssueRef struct {
@@ -50,7 +56,7 @@ func (s *HandoffSession) CreateFollowupIssue(ctx context.Context, arguments json
 		return ToolResult{}, trackerError("handoff_request", "tool arguments have invalid field types")
 	}
 	title := strings.TrimSpace(input.Title)
-	if title == "" || len([]rune(title)) > maxFollowupIssueTitleRunes {
+	if title == "" || len([]rune(title)) > MaxFollowupIssueTitleRunes {
 		return ToolResult{}, trackerError("handoff_request", "follow-up issue title is invalid")
 	}
 	description := strings.TrimSpace(input.Description)
@@ -59,7 +65,7 @@ func (s *HandoffSession) CreateFollowupIssue(ctx context.Context, arguments json
 		return ToolResult{}, trackerError("handoff_request", "follow-up issue description and acceptance criteria are required")
 	}
 	body := description + "\n\n## Acceptance criteria\n\n" + acceptanceCriteria
-	if len([]byte(body)) > maxFollowupIssueDescriptionBytes {
+	if len([]byte(body)) > MaxFollowupIssueBodyBytes {
 		return ToolResult{}, trackerError("handoff_request", "follow-up issue description is too large")
 	}
 	relationship := strings.TrimSpace(input.Relationship)

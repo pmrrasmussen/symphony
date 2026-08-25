@@ -14,6 +14,7 @@ review handoff, rework, landing, and completion instructions. Read it, and
 - `internal/coordinator` — the scheduling core: polling, capacity, retries, and reconciliation.
 - `internal/linear` — the Linear GraphQL tracker adapter and the host-side review handoff, transitions, and bounded `create_followup_issue` tooling.
 - `internal/github` — the optional, fixed-repository GitHub PR publish/context/land adapter.
+- `internal/capability` — the agent-neutral registry of bounded session capabilities: definitions, availability, argument validation, invocation, and typed results/refusals.
 - `internal/codex` — the Codex app-server JSON-RPC backend and dynamic tool wiring.
 - `internal/workspace` — local Git worktree lifecycle, ownership, and recovery.
 - `internal/domain` — the shared, provider-agnostic issue/agent/workspace types.

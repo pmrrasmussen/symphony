@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/pmrrasmussen/symphony/internal/capability"
 	"github.com/pmrrasmussen/symphony/internal/config"
 	"github.com/pmrrasmussen/symphony/internal/domain"
 	githubhost "github.com/pmrrasmussen/symphony/internal/github"
@@ -93,7 +94,10 @@ func (b *Backend) Start(ctx context.Context, r domain.AgentRequest) (domain.Agen
 	r.TurnSandboxPolicy = localCommitSandbox(r)
 	secretNames := append(append([]string(nil), b.secretNames...), settings.HostSecretEnvNames...)
 	secretMatcher = withSecretValues(secretMatcher, settings.HostSecretValues)
-	c, err := start(ctx, r, secretNames, secretMatcher, handoff, githubSession)
+	// The registry is per session and holds these same provider session
+	// pointers, because every per-run idempotency latch lives in them.
+	capabilities := capability.Build(capability.Bindings{Settings: settings, Issue: r.Issue, Handoff: handoff, GitHub: githubSession})
+	c, err := start(ctx, r, secretNames, secretMatcher, capabilities)
 	if err != nil {
 		return domain.AgentSession{}, nil, err
 	}
@@ -106,21 +110,7 @@ func (b *Backend) Start(ctx context.Context, r domain.AgentRequest) (domain.Agen
 		return domain.AgentSession{}, nil, err
 	}
 	threadParams := map[string]any{"cwd": r.Workspace, "approvalPolicy": r.ApprovalPolicy, "sandbox": r.ThreadSandbox}
-	tools := []map[string]any{}
-	if handoff != nil && settings.Tracker.FollowupIssueCreation {
-		tools = append(tools, createFollowupIssueToolDefinition())
-	}
-	if githubSession != nil {
-		tools = append(tools, githubToolDefinition(), githubContextToolDefinition())
-		// github_land_pr is advertised only for a session bound to an issue
-		// currently in the exact configured Merging state; Land itself
-		// re-validates that Linear state immediately before any mutation, so
-		// this is a coarse dispatch-time filter, not the authority.
-		if mergeState := strings.TrimSpace(settings.GitHub.MergeState); mergeState != "" && strings.EqualFold(strings.TrimSpace(r.Issue.State), mergeState) {
-			tools = append(tools, githubLandToolDefinition())
-		}
-	}
-	if len(tools) > 0 {
+	if tools := dynamicTools(c.capabilities); len(tools) > 0 {
 		threadParams["dynamicTools"] = tools
 	}
 	// The cold-start handshake and thread/start use the generous start timeout:
@@ -193,8 +183,7 @@ type client struct {
 	startTimeout        time.Duration
 	turnTimeout         time.Duration
 	ctx                 context.Context
-	handoff             *linear.HandoffSession
-	github              *githubhost.Session
+	capabilities        *capability.Registry
 	mu                  sync.Mutex
 	writeMu             sync.Mutex
 	next                int
@@ -226,7 +215,7 @@ type rpc struct {
 	} `json:"error"`
 }
 
-func start(ctx context.Context, r domain.AgentRequest, secrets []string, secretMatcher func(string) bool, handoff *linear.HandoffSession, githubSession *githubhost.Session) (*client, error) {
+func start(ctx context.Context, r domain.AgentRequest, secrets []string, secretMatcher func(string) bool, capabilities *capability.Registry) (*client, error) {
 	command := strings.TrimSpace(r.Command)
 	if command == "" {
 		command = "codex app-server"
@@ -251,7 +240,7 @@ func start(ctx context.Context, r domain.AgentRequest, secrets []string, secretM
 	}
 	cmd.Stdout = outWriter
 	cmd.Stderr = stderrWriter
-	c := &client{cmd: cmd, in: in, workspace: r.Workspace, approval: r.ApprovalPolicy, policy: r.TurnSandboxPolicy, readTimeout: r.ReadTimeout, startTimeout: r.StartTimeout, turnTimeout: r.TurnTimeout, ctx: ctx, handoff: handoff, github: githubSession, pending: map[int]chan callResult{}, done: make(chan struct{}), exited: make(chan struct{})}
+	c := &client{cmd: cmd, in: in, workspace: r.Workspace, approval: r.ApprovalPolicy, policy: r.TurnSandboxPolicy, readTimeout: r.ReadTimeout, startTimeout: r.StartTimeout, turnTimeout: r.TurnTimeout, ctx: ctx, capabilities: capabilities, pending: map[int]chan callResult{}, done: make(chan struct{}), exited: make(chan struct{})}
 	cmd.Cancel = func() error { return c.killProcessGroup() }
 	if err := cmd.Start(); err != nil {
 		_ = out.Close()
@@ -645,56 +634,24 @@ func (c *client) emitItemEvent(method string, raw json.RawMessage) {
 	})
 }
 
-func createFollowupIssueToolDefinition() map[string]any {
-	return map[string]any{
-		"type": "function", "name": "create_followup_issue",
-		"description": "Capture meaningful out-of-scope work as a new Backlog Linear issue in the active issue's configured project and team, then continue the current issue. The follow-up is not a child and is not dispatchable until a human promotes it. relationship may only relate it to the current issue or mark it blocked by the current issue.",
-		"inputSchema": map[string]any{
-			"type": "object", "additionalProperties": false,
-			"properties": map[string]any{
-				"title":               map[string]any{"type": "string", "minLength": 1, "maxLength": 255},
-				"description":         map[string]any{"type": "string", "minLength": 1, "maxLength": 16000},
-				"acceptance_criteria": map[string]any{"type": "string", "minLength": 1, "maxLength": 4000},
-				"relationship":        map[string]any{"type": "string", "enum": []string{"related", "blocked_by_current"}},
-			},
-			"required": []string{"title", "description", "acceptance_criteria"},
-		},
+// dynamicTools wraps agent-neutral capability definitions in the app-server's
+// own dynamic-tool envelope. Order follows the registry, which is stable.
+func dynamicTools(registry *capability.Registry) []map[string]any {
+	definitions := registry.Definitions()
+	tools := make([]map[string]any, 0, len(definitions))
+	for _, definition := range definitions {
+		tools = append(tools, map[string]any{
+			"type": "function", "name": definition.Name,
+			"description": definition.Description, "inputSchema": definition.InputSchema,
+		})
 	}
+	return tools
 }
 
-func githubToolDefinition() map[string]any {
-	return map[string]any{
-		"type": "function", "name": "github_publish_pr",
-		"description": "Publish the current committed clean worktree to its fixed issue branch, create or reuse its pull request with a structured Why/What changed/On Call body, and hand the active Linear issue to review.",
-		"inputSchema": map[string]any{
-			"type": "object", "additionalProperties": false,
-			"properties": map[string]any{
-				// Bounds must match internal/github.maxPublishWhyBytes and friends.
-				"why":          map[string]any{"type": "string", "minLength": 1, "maxLength": 4096},
-				"what_changed": map[string]any{"type": "string", "minLength": 1, "maxLength": 8192},
-				"on_call":      map[string]any{"type": "string", "maxLength": 2048},
-			},
-			"required": []string{"why", "what_changed", "on_call"},
-		},
-	}
-}
-
-func githubContextToolDefinition() map[string]any {
-	return map[string]any{
-		"type": "function", "name": "github_pr_context",
-		"description": "Read bounded check status, effective review state, comment/review excerpts, and unresolved review-thread counts for the pull request already bound to this issue, repository, and branch. Read-only; it cannot select another repository, issue, branch, or pull request.",
-		"inputSchema": map[string]any{"type": "object", "additionalProperties": false},
-	}
-}
-
-func githubLandToolDefinition() map[string]any {
-	return map[string]any{
-		"type": "function", "name": "github_land_pr",
-		"description": "Merge the pull request already bound to this issue, repository, base, and branch using the configured merge method, once required checks pass, reviews have no effective changes-requested state, and no review thread is unresolved. Returns a non-terminal waiting result while required checks or GitHub's mergeability computation are pending; with github.update_stale_branch enabled, one clean stale-base update also waits for checks on its new head. A waiting result ends this run and Symphony itself redispatches landing later; a merged result ends this run for good. Never call this tool again after either outcome. Other hard gates (failing checks, requested changes, unresolved threads, a stale base, conflicts, or a closed/mismatched PR) refuse landing. No repository, issue, branch, PR, method, state, or credential input.",
-		"inputSchema": map[string]any{"type": "object", "additionalProperties": false},
-	}
-}
-
+// handleToolCall decodes one app-server tool call, runs the named capability,
+// and writes the protocol response. Every decision about what a capability is,
+// whether it accepts these arguments, and what it refuses belongs to the
+// registry; this function owns only the transport.
 func (c *client) handleToolCall(x rpc) {
 	var request struct {
 		Tool      string          `json:"tool"`
@@ -704,126 +661,60 @@ func (c *client) handleToolCall(x rpc) {
 		c.unsupportedTool(x.ID)
 		return
 	}
-	if request.Tool == "github_publish_pr" && c.github != nil {
-		input, err := githubhost.ParsePublishInput(request.Arguments)
-		if err != nil {
-			c.toolFailure(x.ID, "GitHub pull request publication arguments were rejected.")
-			return
-		}
-		callID := callIDText(x.ID)
-		started := c.emitCallStarted(callID, "github_publish_pr")
-		result, err := c.github.Publish(c.ctx, input)
-		if err != nil {
-			c.emitCallFinished(callID, "github_publish_pr", domain.ItemFailed, started)
-			c.toolFailure(x.ID, "GitHub pull request publication was rejected.")
-			return
-		}
-		c.emitCallFinished(callID, "github_publish_pr", domain.ItemCompleted, started)
-		content, _ := json.Marshal(map[string]any{"branch": result.Branch, "pull_request": result.URL, "number": result.Number, "body_updated": result.BodyUpdated})
-		c.sendServerResponse(x.ID, map[string]any{"success": true, "contentItems": []any{map[string]any{"type": "inputText", "text": string(content)}}})
+	bound, ok := c.capabilities.Lookup(request.Tool)
+	if !ok {
+		// No other client-side tool is bound: the agent has no Linear
+		// state-transition capability.
+		c.unsupportedTool(x.ID)
 		return
 	}
-	if request.Tool == "github_pr_context" && c.github != nil {
-		var args map[string]json.RawMessage
-		if json.Unmarshal(request.Arguments, &args) != nil || len(args) != 0 {
-			c.unsupportedTool(x.ID)
-			return
-		}
-		callID := callIDText(x.ID)
-		started := c.emitCallStarted(callID, "github_pr_context")
-		result, err := c.github.Context(c.ctx)
-		if err != nil {
-			c.emitCallFinished(callID, "github_pr_context", domain.ItemFailed, started)
-			c.toolFailure(x.ID, "GitHub pull request context request was rejected.")
-			return
-		}
-		content, err := json.Marshal(result)
-		if err != nil {
-			c.emitCallFinished(callID, "github_pr_context", domain.ItemFailed, started)
-			c.unsupportedTool(x.ID)
-			return
-		}
-		c.emitCallFinished(callID, "github_pr_context", domain.ItemCompleted, started)
-		c.sendServerResponse(x.ID, map[string]any{"success": true, "contentItems": []any{map[string]any{"type": "inputText", "text": string(content)}}})
+	// The capability's own name is used from here on, never the decoded wire
+	// value, so nothing an agent chooses can reach a log or an event.
+	name := bound.Definition().Name
+	invoke, failure := bound.Prepare(request.Arguments)
+	if failure != nil {
+		// A rejected argument list precedes the call, so it is not reported as one.
+		c.toolFailure(x.ID, failure.Message)
 		return
 	}
-	if request.Tool == "github_land_pr" && c.github != nil {
-		var args map[string]json.RawMessage
-		if json.Unmarshal(request.Arguments, &args) != nil || len(args) != 0 {
-			c.unsupportedTool(x.ID)
-			return
+	observed := bound.Lifecycle()
+	callID := callIDText(x.ID)
+	var started time.Time
+	if observed {
+		started = c.emitCallStarted(callID, name)
+	}
+	result, failure := invoke(c.ctx)
+	if failure != nil {
+		if observed {
+			c.emitCallFinished(callID, name, failure.Outcome, started)
 		}
-		callID := callIDText(x.ID)
-		started := c.emitCallStarted(callID, "github_land_pr")
-		if c.github.LandingResolved() {
-			// Landing already reached its terminal outcome in this run, so the
-			// capability is closed: refuse without invoking it again (PMR-78).
-			c.emitCallFinished(callID, "github_land_pr", domain.ItemDeclined, started)
-			c.toolFailure(x.ID, "GitHub landing already completed for this run.")
-			return
-		}
-		result, err := c.github.Land(c.ctx)
-		if err != nil {
-			c.emitCallFinished(callID, "github_land_pr", domain.ItemFailed, started)
-			// A retryable landing gate is non-terminal: name the exact gate so
-			// Codex can fix it, push, and call github_land_pr again in this turn.
-			// Every reason is a fixed/config-derived, bounded, secret-free string
-			// defined in the github package. Any other error keeps the generic
-			// refusal message.
-			var gate *githubhost.LandGateError
-			if errors.As(err, &gate) && gate.Retryable {
-				c.toolFailure(x.ID, "GitHub landing needs a fix: "+gate.Reason+".")
-				return
-			}
-			c.toolFailure(x.ID, "GitHub pull request landing was rejected.")
-			return
-		}
-		content, err := json.Marshal(result)
-		if err != nil {
-			c.emitCallFinished(callID, "github_land_pr", domain.ItemFailed, started)
-			c.unsupportedTool(x.ID)
-			return
-		}
-		c.emitCallFinished(callID, "github_land_pr", domain.ItemCompleted, started)
-		c.sendServerResponse(x.ID, map[string]any{"success": true, "contentItems": []any{map[string]any{"type": "inputText", "text": string(content)}}})
-		// A settled landing decision ends the run: no further model turn or tool
-		// call can advance it, so report it as a terminal event instead of
-		// letting the session spend turns on repeated landing calls (PMR-78).
-		// Reason is a fixed, bounded string owned by the github package.
-		switch result.Status {
-		case githubhost.LandWaiting:
-			c.emit(domain.Event{Kind: domain.EventLandingWaiting, At: time.Now(), Message: result.Reason})
-		case githubhost.LandMerged:
-			c.emit(domain.Event{Kind: domain.EventLandingResolved, At: time.Now()})
-		}
+		c.toolFailure(x.ID, failure.Message)
 		return
 	}
-	if request.Tool == "create_followup_issue" && c.handoff != nil {
-		result, err := c.handoff.CreateFollowupIssue(c.ctx, request.Arguments)
-		if err != nil {
-			// Do not return provider errors, issue data, or any credential-derived
-			// value to the child. The generic response is enough for the model to
-			// choose another path, while the normalized event informs the scheduler.
-			c.toolFailure(x.ID, "Linear follow-up issue creation was rejected.")
-			return
+	content, err := json.Marshal(result.Payload)
+	if err != nil {
+		if observed {
+			c.emitCallFinished(callID, name, domain.ItemFailed, started)
 		}
-		text, err := json.Marshal(result.Data)
-		if err != nil {
-			c.unsupportedTool(x.ID)
-			return
-		}
-		c.sendServerResponse(x.ID, map[string]any{"success": result.Success, "contentItems": []any{map[string]any{"type": "inputText", "text": string(text)}}})
+		c.unsupportedTool(x.ID)
 		return
 	}
-	// No other client-side tool is bound: the agent has no Linear state-transition tool.
-	c.unsupportedTool(x.ID)
+	if observed {
+		c.emitCallFinished(callID, name, domain.ItemCompleted, started)
+	}
+	c.sendServerResponse(x.ID, map[string]any{"success": result.Success, "contentItems": []any{map[string]any{"type": "inputText", "text": string(content)}}})
+	if result.Terminal != "" {
+		// A capability may settle the whole run. Reason is a fixed, bounded string
+		// owned by the provider.
+		c.emit(domain.Event{Kind: result.Terminal, At: time.Now(), Message: result.Reason})
+	}
 }
 
 // emitCallStarted and emitCallFinished report the lifecycle of Symphony's own
-// bound dynamic tools (the fixed "github_publish_pr"/"github_land_pr" capability
-// names, never a value read from the model's call arguments) so a slow GitHub
-// round trip is visible the same way an app-server item is. The call ID is the
-// protocol-assigned JSON-RPC request ID.
+// bound dynamic tools (a registry-owned capability name, never a value read
+// from the model's call arguments) so a slow provider round trip is visible the
+// same way an app-server item is. The call ID is the protocol-assigned JSON-RPC
+// request ID.
 func (c *client) emitCallStarted(callID, tool string) time.Time {
 	started := time.Now()
 	c.emit(domain.Event{Kind: domain.EventItem, At: started, ItemID: callID, ItemType: "dynamicToolCall", ToolName: tool, Outcome: domain.ItemStarted})
@@ -840,14 +731,12 @@ func (c *client) unsupportedTool(id any) {
 	c.toolFailure(id, "Unsupported client-side tool.")
 }
 
-// finalizeLanding fires the deferred Merging -> In Review transition once when
-// a Codex turn ends after a retryable github_land_pr gate but without a
-// successful landing. It is a safe no-op when there is no bound GitHub session,
-// when the bounded-fix feature is off, or when landing already resolved.
+// finalizeLanding settles capability state that outlives a single call once this
+// turn ends, however it ended. It is idempotent, so the three paths that can end
+// a turn -- turn/completed, turn/failed or turn/cancelled, and a hard Cancel --
+// all call it.
 func (c *client) finalizeLanding() {
-	if c.github != nil {
-		c.github.FinalizeLanding(c.ctx)
-	}
+	c.capabilities.TurnEnded(c.ctx)
 }
 
 // Tool failures are normal app-server responses: the model can inspect the
