@@ -1,10 +1,11 @@
 # Repository map
 
-Symphony is a long-running, Codex-only Linear issue runner. `WORKFLOW.md` is
-this repository's single executable source of delivery policy: its front
-matter configures the tracker lifecycle, capacity, and GitHub integration, and
-its prompt body gives state-specific start, implementation, validation,
-review handoff, rework, landing, and completion instructions. Read it, and
+Symphony is a long-running Linear issue runner for one configured agent
+backend, Codex or Claude Code (`agent.backend`). `WORKFLOW.md` is this
+repository's single executable source of delivery policy: its front matter
+configures the tracker lifecycle, capacity, and GitHub integration, and its
+prompt body gives state-specific start, implementation, validation, review
+handoff, rework, landing, and completion instructions. Read it, and
 [README.md](README.md), before starting issue work.
 
 ## Layout
@@ -17,6 +18,7 @@ review handoff, rework, landing, and completion instructions. Read it, and
 - `internal/agent` — routes new sessions to the configured `agent.backend` and pins continuation and cancellation to the backend that started each session.
 - `internal/capability` — the agent-neutral registry of bounded session capabilities: definitions, availability, argument validation, invocation, and typed results/refusals.
 - `internal/codex` — the Codex app-server JSON-RPC backend and dynamic tool wiring.
+- `internal/claude` — the Claude Code CLI backend: the fixed, non-configurable launch contract (tool surface, permission mode, settings sources, sandbox) re-applied on every turn, and the narrow `--print` stream decode.
 - `internal/workspace` — local Git worktree lifecycle, ownership, and recovery.
 - `internal/domain` — the shared, provider-agnostic issue/agent/workspace types.
 - `internal/observability` — structured log redaction and level policy.

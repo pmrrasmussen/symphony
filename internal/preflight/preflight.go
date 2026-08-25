@@ -3,6 +3,8 @@ package preflight
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -104,6 +106,22 @@ func run(ctx context.Context, workflowPath, logRoot string, environment map[stri
 		result.add("agent_command", StatusPassed, fmt.Sprintf("command syntax and executable availability are valid; the %s agent was not started", launch.Backend))
 	}
 
+	// An unauthenticated agent CLI otherwise surfaces only at dispatch, where it
+	// looks like a finished turn rather than a setup problem: the Claude CLI
+	// reports an auth failure as a result with is_error set.
+	if launch.Backend == config.ClaudeAgentBackend {
+		switch status, err := authenticated(ctx, launch.Command, authenticationTimeout); {
+		case err != nil:
+			result.add("agent_authentication", StatusFailed, err.Error())
+		case !status:
+			// The command is a wrapper, so there was nothing to ask. Say that
+			// rather than report an authenticated session that was never checked.
+			result.add("agent_authentication", StatusWarning, "authentication was not verified: the configured command is not a bare program name")
+		default:
+			result.add("agent_authentication", StatusPassed, "the agent CLI reports an authenticated session")
+		}
+	}
+
 	if err := hooks(settings.Hooks); err != nil {
 		result.add("hooks", StatusFailed, err.Error())
 	} else {
@@ -183,6 +201,66 @@ func executable(command, field string) error {
 		return errorsf("%s executable %q is unavailable", field, program)
 	}
 	return nil
+}
+
+// authenticationTimeout bounds the authentication probe. Reading a stored
+// login is local and immediate, so five seconds is far more than the command
+// needs; the budget exists because this is the only external call in a dry run
+// that is not a parse-only check, and a CLI blocked on a keychain prompt or a
+// hung token refresh would otherwise leave --dry-run waiting forever.
+const authenticationTimeout = 5 * time.Second
+
+// authenticated asks the agent CLI whether it holds a session. It is read-only,
+// which is what makes it safe in a dry run.
+//
+// Only the boolean is read. The command also reports the operator's email,
+// organization, and subscription, none of which may reach a check message.
+// The boolean reports whether authentication was actually established. A
+// wrapper command cannot be asked, and reporting that as success would claim a
+// check that never ran.
+//
+// The budget is a parameter so the bound itself is exercised by a test without
+// one waiting out the production value.
+// probeWaitDelay bounds how long the probe waits for its output pipes after the
+// command itself is gone.
+const probeWaitDelay = 500 * time.Millisecond
+
+func authenticated(ctx context.Context, command string, timeout time.Duration) (bool, error) {
+	fields := strings.Fields(command)
+	if len(fields) == 0 {
+		return false, errorsf("claude.command is empty")
+	}
+	if len(fields) > 1 {
+		return false, nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	probe := exec.CommandContext(ctx, fields[0], "auth", "status")
+	// Killing the probe on the deadline is not enough to return on it. The
+	// deadline kills the command itself, but Output waits for the output pipes
+	// to close, and any grandchild the command left behind still holds them --
+	// so without a WaitDelay the probe waits for that descendant instead of for
+	// its own budget, which is the hang this timeout exists to prevent.
+	probe.WaitDelay = probeWaitDelay
+	out, err := probe.Output()
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		// A probe that had to be killed is a failed check, not a pass: nothing
+		// was learned about the session.
+		return false, errorsf("claude.command did not report authentication status before its %s timeout expired", timeout)
+	}
+	if err != nil {
+		return false, errorsf("claude.command could not report authentication status")
+	}
+	var status struct {
+		LoggedIn bool `json:"loggedIn"`
+	}
+	if err := json.Unmarshal(out, &status); err != nil {
+		return false, errorsf("claude.command returned an unreadable authentication status")
+	}
+	if !status.LoggedIn {
+		return false, errorsf("claude.command reports no authenticated session; run its login command as the service user")
+	}
+	return true, nil
 }
 
 func hooks(h config.Hooks) error {

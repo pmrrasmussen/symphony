@@ -3,8 +3,9 @@
 Symphony writes one structured JSON log line per event to
 `<logs-root>/symphony.jsonl` (`--logs-root`, default `.symphony/logs`). This
 document covers the two log levels, what each adds, and how to follow the
-log during a live run without reading the raw Codex rollout, which can
-contain prompts, issue content, tool arguments, and other sensitive data.
+log during a live run without reading the agent's own transcript — the raw
+Codex rollout, or the Claude Code CLI's session JSONL — which can contain
+prompts, issue content, tool arguments, and other sensitive data.
 
 For a managed macOS repository service, this file is
 `.symphony/logs/symphony.jsonl`, separate from
@@ -148,9 +149,10 @@ diagnose a run that looks idle:
 * **Heartbeat and stall records** — every reconciliation pass for a still-active
   run logs `"msg":"agent heartbeat"` with `last_activity_age_ms` and, when one
   tool/item is outstanding, `outstanding_item_type`, `outstanding_item_id`, and
-  `outstanding_age_ms`. When `codex.stall_timeout_ms` fires, the existing
+  `outstanding_age_ms`. When the selected backend's `stall_timeout_ms`
+  (`codex.stall_timeout_ms` or `claude.stall_timeout_ms`) fires, the existing
   `"msg":"agent reconciled"` record (`"reason":"stalled"`) carries the same
-  outstanding-operation fields, so the log names what Codex was waiting on
+  outstanding-operation fields, so the log names what the agent was waiting on
   instead of only "no events for N minutes".
 * **Generic progress coalescing** — any app-server notification Symphony does
   not otherwise classify still logs as `"msg":"agent event"`, but only at
@@ -161,6 +163,47 @@ diagnose a run that looks idle:
 Empty rate-limit snapshots (the app-server sends these often) are never
 logged at any level; only a populated snapshot appears in
 `"msg":"agent rate limit"`.
+
+## The Claude backend
+
+With `agent.backend: claude` the records and the field vocabulary are the same,
+but four of them mean something slightly different, because the Claude Code
+CLI's `--print` stream is not the app-server protocol.
+
+* **Tool/item lifecycle** — the CLI emits no discrete tool start/complete
+  notifications and no protocol-supplied durations. The backend pairs each
+  `tool_use` with its `tool_result` by ID and times the pair itself, so
+  `duration_ms` on an `"msg":"agent item event"` record is measured by Symphony
+  rather than reported by the runtime, and is absent when a result arrives for a
+  call this process never saw start. The `item_type` values are deliberately the
+  same categories the Codex backend reports: `commandExecution` for the `Bash`
+  tool, `fileChange` for the file-editing tools (`Edit`, `Write`, and the
+  editing tools not on the current surface), `mcpToolCall` for any `mcp__*`
+  tool, and `toolCall` for everything else. `item_name` is the CLI's own fixed
+  tool name; nothing is derived from tool arguments or command bodies. A refused
+  call appears as `outcome: declined`, and the terminating result's own list of
+  refusals is logged as a diagnostic naming only the tool.
+* **Token usage** — the CLI reports usage per turn, while the coordinator keeps
+  a component-wise maximum across a run (app-server notifications are
+  cumulative). The backend therefore accumulates turns itself and reports a
+  running total, so `"msg":"agent usage"` still grows monotonically across the
+  run. Its input count folds `cache_creation_input_tokens` and
+  `cache_read_input_tokens` in with `input_tokens`: on a resumed session almost
+  all input arrives as cache reads, so `input_tokens` alone understates what the
+  model processed by orders of magnitude.
+* **Session start** — one `"msg":"agent session started"` record per *turn*, not
+  per run. `claude --print` runs a single turn and exits, so each continuation
+  is a new process with a new `pid` and an incremented `turn_id`, resumed under
+  the same `session_id`/`thread_id`. That record is emitted only after the CLI's
+  `system`/`init` event confirms the launch contract; a mismatch, or no init
+  event at all, fails the turn instead.
+* **Failure text** — a turn's outcome is read from the terminating `result`
+  event's `is_error` and `terminal_reason`, never its `subtype` (an
+  authentication failure arrives as `subtype: "success"` with `is_error` set).
+  Only that bounded reason, an API error status, or a stop reason reaches the
+  log; the result's own text does not. When a turn ends without any result
+  event, the tail of the child's stderr is reported as a diagnostic, truncated
+  to the shared redaction bound.
 
 ## Following the log
 
@@ -245,7 +288,25 @@ or model reasoning; or raw Codex protocol payloads. Item/tool lifecycle
 records are built by decoding only a fixed, narrow set of protocol fields
 (item type, item/call ID, an already-fixed tool name, status, and a
 protocol-computed duration) — arguments, command bodies, and outputs have no
-matching field and are never read into a log record. See
+matching field and are never read into a log record. The same holds for the
+Claude backend's stream: every event is decoded into a narrow struct with no
+member for `assistant.message.content[].text`, `tool_use.input`,
+`tool_result.content`, or `result.result`, so that content is discarded before
+anything is logged. The `agent_authentication` preflight check reads only the
+`loggedIn` boolean from `claude auth status`; the email, organization, and
+subscription that command also returns are neither read nor logged.
+
+**One caveat, and it is about Symphony's log only.** Everything above describes
+what Symphony writes. The Claude Code CLI keeps its own transcript: with
+`agent.backend: claude`, the full session — rendered prompts, issue
+descriptions, tool arguments and tool output — is persisted by the CLI to
+`~/.claude/projects/<cwd-slug>/<session-id>.jsonl`. That file is outside the
+worktree and is not removed by workspace cleanup, it is the Claude equivalent of
+the raw Codex rollout this document exists to let you avoid reading, and
+`--resume` depends on it, so it cannot be disabled. Redirecting
+`CLAUDE_CONFIG_DIR` relocates it but breaks the CLI's subscription
+authentication, so Symphony leaves it in place. Treat that directory with the
+same care as a credential file. See
 [internal/observability](../internal/observability) for the shared
 redaction and truncation boundary every log record passes through, and
 [architecture.md](architecture.md) for the broader trust model.

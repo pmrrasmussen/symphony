@@ -2,18 +2,31 @@
 
 This service follows the Symphony specification using a coordination core that
 only knows normalized issues, agent events, and workspace operations.  Linear
-GraphQL, Codex JSON-RPC, and local process execution are adapters behind
-`Tracker`, `AgentBackend`, and `WorkspaceExecutor` respectively.  Which
-`AgentBackend` a session starts on is configuration-driven (`agent.backend`);
-`codex` is the only accepted value today, and an unrecognized one is rejected
-at load rather than defaulted.
+GraphQL, Codex JSON-RPC, the Claude Code CLI, and local process execution are
+adapters behind `Tracker`, `AgentBackend`, and `WorkspaceExecutor`
+respectively.  Which `AgentBackend` a session starts on is configuration-driven
+(`agent.backend`): `codex` (the default) and `claude` are the accepted values,
+and an unrecognized one is rejected at load rather than defaulted.  Only the
+selected backend's launch contract has to be complete, so an absent `codex:` or
+`claude:` block fails a candidate only when that backend is the one selected.
+A `claude` workflow that also enables a Symphony session capability --
+`tracker.provider.handoff_state`, `tracker.provider.followup_issue_creation`,
+or a configured and enabled GitHub integration -- is rejected at load: the
+bridge that would expose those bounded capabilities to a Claude session does
+not exist yet, and refusing the configuration is preferred over dispatching an
+agent that silently cannot hand off, publish, or file a follow-up.  A `github:`
+block that does not resolve stays disabled, as it does under `codex`, so it
+never reaches that refusal -- which grants nothing, because a disabled
+integration has no capability to bridge.
 
 The initial implementation is intentionally for a trusted local machine.
 `WORKFLOW.md` is repository-owned, versioned policy and its hooks are trusted
-shell code.  Codex can make changes and execute commands according to its
-configured approval and sandbox policy; this service does not provide Docker,
-VM, SSH, distributed execution, or a database.  Linear credentials stay in
-the host process and are removed from Codex's environment.
+shell code.  The agent can make changes and execute commands according to the
+policy its backend runs under -- for Codex the configured approval and sandbox
+policy, for Claude the fixed launch contract described below; this service does
+not provide Docker, VM, SSH, distributed execution, or a database.  Linear
+credentials stay in the host process and are removed from the agent child's
+environment.
 
 On macOS, one repository may have one independently configured LaunchAgent.
 The LaunchAgent is machine-local instance configuration, not repository policy:
@@ -223,6 +236,77 @@ so the launcher remains the only source of writable paths, and unknown keys
 inside the policy are rejected so a misspelled field cannot silently change
 what the operator believes is configured.
 
+The Claude backend reaches a deliberately similar boundary by a different
+route, and none of it is configurable: the `claude:` block carries only a
+command, an optional model, and two timeout budgets, while the launch contract
+itself is fixed in `internal/claude`. Each turn is launched with
+`--print --output-format stream-json --verbose`, `--permission-mode dontAsk`
+(the only fail-closed non-interactive mode; the prompt occupies stdin, so a
+mode that can block on stdin is unusable, and `bypassPermissions` is the
+opposite of fail-closed), `--tools` and `--allowedTools` restricted to
+`Bash`/`Edit`/`Glob`/`Grep`/`Read`/`Write` with
+`--disallowedTools WebFetch,WebSearch`, `--strict-mcp-config`,
+`--setting-sources ""`, and an inline `--settings` payload. `--tools` is what
+removes a tool from the surface -- a permission allowlist alone still
+advertises it. `--strict-mcp-config` is load-bearing rather than hygienic:
+without it the child inherits the operator's own user-level MCP servers,
+credentials included. `--setting-sources ""` excludes user, project, and local
+settings, which matters because the workspace is a checkout of a repository
+that may ship `.claude/settings.json`, `CLAUDE.md`, skills, plugins, and hooks,
+and hooks run arbitrary commands -- discovery left enabled would let repository
+content widen the boundary the launcher fixes. The settings payload is
+marshaled from Go structs and passed inline because the CLI silently ignores a
+payload it cannot parse, so a hand-assembled string, or a file unreadable at
+launch, would leave a session running with no policy and no diagnostic. Every
+one of these is re-applied on every turn: `claude --print` runs one turn and
+exits, a continuation is a new process resumed by an ID Symphony assigned
+itself, and the CLI restores none of the contract on `--resume`.
+
+That payload sets `sandbox.enabled` with `failIfUnavailable: true` and
+`allowUnsandboxedCommands: false`, `filesystem.allowWrite` to the worktree plus
+the same two narrow Git metadata roots the Codex profile is granted, and
+`network.allowedDomains` to `["*"]`. `failIfUnavailable` is mandatory because
+the CLI otherwise fails open: verified on `claude` 2.1.245, a sandbox that
+cannot initialize is announced only as "Sandboxing is disabled for the rest of
+this session!" inside a tool result, after which the turn continues unconfined
+and exits 0. Verified to hold on the same version: Bash writes are confined
+(attempted writes to `$HOME` and to `$TMPDIR` failed with "operation not
+permitted" and created nothing), and per-domain network control works in both
+directions.
+
+Four limits are stated rather than implied. First, the sandbox governs `Bash`
+and its children, and Bash writes were verified confined; `Edit` and `Write`
+are not sandboxed and carry no path restriction at all, because the rendered
+payload allows the bare tool names `Bash`, `Edit`, `Glob`, `Grep`, `Read`, and
+`Write` under `defaultMode: dontAsk` -- a permission rule decides whether a
+tool exists, not where it may write. Whether the file-editing tools refuse an
+absolute path outside the worktree was not verified and is not claimed, and no
+check Symphony runs would notice: the post-run Git integrity check below
+re-verifies only the source repository's non-`symphony/*` branch heads and its
+primary index, so a write outside that repository is neither confined nor
+observed. Second, reads are not confined,
+exactly as for Codex. Third, `network.allowedDomains: ["*"]` is unrestricted
+outbound access, the same deliberate choice as the Codex profile's
+`networkAccess: true`; per-domain control exists and works but is not used to
+restrict anything. Fourth, the only confirmation that the contract applied is
+the CLI's own `system`/`init` event, which reports the working directory, tool
+surface, permission mode, and attached MCP servers: Symphony requires the tool
+surface and permission mode to match exactly, requires no MCP server, requires
+the reported working directory to resolve to the issue's workspace, and fails
+the turn closed otherwise or when no init event arrives at all -- but the event does not report sandbox state, so
+the sandbox's own status is not observable in the stream. Host Linear and
+GitHub secrets are stripped from the Claude child environment by variable name
+and by value, exactly as for Codex; everything else is inherited on purpose,
+because the CLI authenticates through the service user's own stored login.
+
+One consequence of running the CLI is not a boundary Symphony controls at all:
+the CLI persists its own full transcript -- rendered prompts, issue
+descriptions, and tool output -- to
+`~/.claude/projects/<cwd-slug>/<session-id>.jsonl`, outside the worktree and
+untouched by workspace cleanup. `--resume` reads it, so it cannot be disabled,
+and relocating it with `CLAUDE_CONFIG_DIR` breaks subscription authentication
+(verified). See [observability.md](observability.md).
+
 As a defense-in-depth backstop, after each run Symphony re-checks that the
 source repository's non-`symphony/*` branch heads and primary
 index are unchanged from a baseline captured at preparation, and alerts on
@@ -252,6 +336,12 @@ diverge from its source. Implementation baseline: upstream Symphony commit
 `7af5a7648c9fbffa08825fe0c0b18be00100aff3`. Codex app-server protocol was
 inspected from the locally installed Codex schema generated on 2026-07-18;
 upstream Codex HEAD at inspection was `56395bddaf26eb2829387ca6a417bf9128e5b239`.
+The Claude Code CLI's launch flags, `--print` stream-JSON event shapes, and
+sandbox behaviour -- including the fail-open degradation `failIfUnavailable`
+exists to prevent -- were inspected empirically against locally installed
+`claude` 2.1.245 on macOS. None of it is a published protocol schema, so a CLI
+upgrade can change it: re-verify the launch contract and the event decode
+against the new version rather than assuming they carried over.
 
 One bounded-run recovery detail is intentionally Go-specific: active issues
 continue on the same live Codex session, with a scheduler-controlled one-second
@@ -265,7 +355,11 @@ deliberately not that failure path: it finishes as a `waiting` run and gets a
 delayed, non-escalating `landing` retry instead of consuming turns and an
 agent-exhaustion attempt. Durable completion is
 reserved for a verified handoff or terminal tracker transition; an ordinary
-Codex turn completion is never enough to suppress an active issue.
+Codex turn completion is never enough to suppress an active issue. The same
+bound applies to a Claude session, where "the same session" is a resumed
+session ID rather than a live process: each turn is a new child resumed with
+`--resume`, and the inter-turn delay, turn limit, and exhaustion result are
+unchanged.
 
 The upstream workflow schema does not define a continuation-prompt setting.
 Accordingly, the workflow body remains the configured first-turn task prompt,

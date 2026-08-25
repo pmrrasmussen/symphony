@@ -34,6 +34,24 @@ func NewRouter(settings func() config.Settings, backends map[string]domain.Agent
 	return &Router{settings: settings, backends: backends, bound: map[string]domain.AgentBackend{}}
 }
 
+// Validate reports a registry that cannot serve every selectable backend. A
+// configuration naming a backend with no implementation would otherwise pass
+// both validation and preflight and fail only at the first dispatch, as a run
+// failure rather than a startup error.
+func Validate(backends map[string]domain.AgentBackend) error {
+	var missing []string
+	for _, name := range config.AgentBackends() {
+		if backends[name] == nil {
+			missing = append(missing, name)
+		}
+	}
+	if len(missing) > 0 {
+		sort.Strings(missing)
+		return fmt.Errorf("no agent backend implementation registered for %s", strings.Join(missing, ", "))
+	}
+	return nil
+}
+
 // Start runs the request on the backend it names, falling back to the configured
 // selection only when the caller did not resolve one. Honoring the request is
 // what keeps the launch parameters and the runtime consistent: the scheduler

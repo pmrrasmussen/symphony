@@ -1338,7 +1338,7 @@ func TestAgentBackendDefaultsToCodexAndFailsClosed(t *testing.T) {
 		}
 	})
 
-	for _, value := range []string{"claude", "Codex", "codex ", "", "docker"} {
+	for _, value := range []string{"Codex", "codex ", "", "docker", "Claude"} {
 		t.Run("rejects "+value, func(t *testing.T) {
 			_, err := Load(write(t, "backend: '"+value+"'"), "logs")
 			if err == nil {
@@ -1404,14 +1404,146 @@ func TestAgentLaunchResolvesTheSelectedBackendsContract(t *testing.T) {
 	// An unknown name yields no launch parameters rather than another backend's,
 	// which is what makes a stale or wrong lookup fail loudly instead of running
 	// something unintended.
-	unknown, known := s.AgentLaunchFor("claude")
+	unknown, known := s.AgentLaunchFor("docker")
 	if known {
 		t.Fatal("an unknown backend reported a known launch contract")
 	}
-	if unknown.Command != "" || unknown.TurnTimeout != 0 || unknown.StallTimeout != 0 || unknown.Backend != "claude" {
+	if unknown.Command != "" || unknown.TurnTimeout != 0 || unknown.StallTimeout != 0 || unknown.Backend != "docker" {
 		t.Fatalf("unknown backend launch=%+v", unknown)
 	}
 	if _, known := s.AgentLaunchFor(""); !known {
 		t.Fatal("an unset backend must resolve to the default contract")
+	}
+}
+
+// TestClaudeBackendConfiguration covers the claude block: its defaults, that a
+// typo is refused rather than silently defaulted, that only the selected
+// backend's launch contract has to be complete, and that a Claude workflow may
+// not yet enable Symphony session capabilities.
+func TestClaudeBackendConfiguration(t *testing.T) {
+	d := t.TempDir()
+	write := func(t *testing.T, body string) string {
+		t.Helper()
+		path := filepath.Join(d, strings.ReplaceAll(t.Name(), "/", "_")+".md")
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	const head = "---\ntracker: {kind: linear, provider: {api_key: k}, active_states: [Todo], terminal_states: [Done]}\npolling: {interval_ms: 100}\nworkspace: {root: work}\nhooks: {timeout_ms: 100}\n"
+
+	t.Run("defaults and no codex block required", func(t *testing.T) {
+		// A Claude workflow omits codex entirely; the codex requirements must not
+		// reject it.
+		w, err := Load(write(t, head+"agent: {backend: claude}\n---\nbody"), "logs")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if w.Config.Claude.Command != "claude" || w.Config.Claude.Model != "" {
+			t.Fatalf("claude=%+v", w.Config.Claude)
+		}
+		if w.Config.Claude.TurnTimeout != time.Hour || w.Config.Claude.StallTimeout != 5*time.Minute {
+			t.Fatalf("claude timeouts=%+v", w.Config.Claude)
+		}
+		launch := w.Config.AgentLaunch()
+		if launch.Backend != "claude" || launch.Command != "claude" || launch.TurnTimeout != time.Hour || launch.StallTimeout != 5*time.Minute {
+			t.Fatalf("launch=%+v", launch)
+		}
+		// Codex-only launch fields have no Claude analogue and must stay empty
+		// rather than leaking another backend's values.
+		if launch.ApprovalPolicy != "" || launch.ThreadSandbox != "" || launch.TurnSandboxPolicy != nil || launch.ReadTimeout != 0 || launch.StartTimeout != 0 {
+			t.Fatalf("claude launch carried codex fields: %+v", launch)
+		}
+	})
+
+	t.Run("explicit values", func(t *testing.T) {
+		w, err := Load(write(t, head+"agent: {backend: claude}\nclaude: {command: claude-next, model: sonnet, turn_timeout_ms: 1000, stall_timeout_ms: 200}\n---\nbody"), "logs")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if w.Config.Claude != (Claude{Command: "claude-next", Model: "sonnet", TurnTimeout: time.Second, StallTimeout: 200 * time.Millisecond}) {
+			t.Fatalf("claude=%+v", w.Config.Claude)
+		}
+	})
+
+	t.Run("unknown claude field is refused", func(t *testing.T) {
+		_, err := Load(write(t, head+"agent: {backend: claude}\nclaude: {commnad: claude}\n---\nbody"), "logs")
+		if err == nil || !strings.Contains(err.Error(), `unknown claude field "commnad"`) {
+			t.Fatalf("err=%v", err)
+		}
+	})
+
+	t.Run("empty command is refused", func(t *testing.T) {
+		if _, err := Load(write(t, head+"agent: {backend: claude}\nclaude: {command: '  '}\n---\nbody"), "logs"); err == nil {
+			t.Fatal("a blank claude command was accepted")
+		}
+	})
+
+	t.Run("session capabilities are refused until the bridge lands", func(t *testing.T) {
+		for _, capability := range []string{
+			"tracker: {kind: linear, provider: {api_key: k, handoff_state: In Review}, active_states: [Todo], terminal_states: [Done]}",
+			"tracker: {kind: linear, provider: {api_key: k, followup_issue_creation: true}, active_states: [Todo], terminal_states: [Done]}",
+		} {
+			body := "---\n" + capability + "\npolling: {interval_ms: 100}\nworkspace: {root: work}\nhooks: {timeout_ms: 100}\nagent: {backend: claude}\n---\nbody"
+			_, err := Load(write(t, body), "logs")
+			if err == nil || !strings.Contains(err.Error(), "cannot yet be combined with Symphony session capabilities") {
+				t.Fatalf("capability %q gave err=%v", capability, err)
+			}
+		}
+	})
+
+	t.Run("the same capabilities stay valid for codex", func(t *testing.T) {
+		body := "---\ntracker: {kind: linear, provider: {api_key: k, handoff_state: In Review}, active_states: [Todo], terminal_states: [Done]}\npolling: {interval_ms: 100}\nworkspace: {root: work}\nhooks: {timeout_ms: 100}\nagent: {backend: codex}\n---\nbody"
+		if _, err := Load(write(t, body), "logs"); err != nil {
+			t.Fatalf("codex workflow with capabilities was rejected: %v", err)
+		}
+	})
+
+	t.Run("an enabled github integration is refused", func(t *testing.T) {
+		// The github term of the refusal, isolated: no handoff_state and no
+		// followup_issue_creation, so only GitHub.Enabled can reject this.
+		t.Setenv("PMR50_GITHUB_TOKEN", "github-secret")
+		body := head + "github: {owner: pmrrasmussen, repository: symphony, token: $PMR50_GITHUB_TOKEN}\nagent: {backend: claude}\n---\nbody"
+		_, err := Load(write(t, body), "logs")
+		if err == nil || !strings.Contains(err.Error(), "cannot yet be combined with Symphony session capabilities") {
+			t.Fatalf("err=%v", err)
+		}
+	})
+
+	t.Run("a github block that does not resolve leaves the integration disabled", func(t *testing.T) {
+		// decodeGitHub disables the integration on any invalid value, so a present
+		// but unresolvable block is not a configured capability and does not reach
+		// the refusal. Nothing is silently granted: the capability is unavailable
+		// either way.
+		body := head + "github: {owner: pmrrasmussen, repository: symphony, token_file: absent-github-token}\nagent: {backend: claude}\n---\nbody"
+		w, err := Load(write(t, body), "logs")
+		if err != nil {
+			t.Fatalf("err=%v", err)
+		}
+		if w.Config.GitHub.Enabled {
+			t.Fatalf("github=%+v", w.Config.GitHub)
+		}
+	})
+}
+
+// TestEverySelectableBackendHasAValidatedLaunchContract fails when a name is
+// added to agentBackends without giving decode's launch-contract switch an arm
+// of its own. That switch defaulted to the Codex requirements, so a new backend
+// would have been validated against codex.command and the codex timeouts.
+func TestEverySelectableBackendHasAValidatedLaunchContract(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "WORKFLOW.md")
+	for _, backend := range AgentBackends() {
+		content := "---\ntracker: {kind: linear, provider: {api_key: k}, active_states: [Todo], terminal_states: [Done]}\nworkspace: {root: work}\nagent: {backend: " + backend + "}\n---\nbody"
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		w, err := Load(path, "logs")
+		if err != nil {
+			t.Fatalf("backend %q: %v", backend, err)
+		}
+		launch, known := w.Config.AgentLaunchFor(backend)
+		if !known || strings.TrimSpace(launch.Command) == "" || launch.TurnTimeout <= 0 || launch.StallTimeout <= 0 {
+			t.Fatalf("backend %q launch=%+v known=%v", backend, launch, known)
+		}
 	}
 }

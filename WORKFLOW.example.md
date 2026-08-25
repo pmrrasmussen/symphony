@@ -68,11 +68,12 @@ workspace:
 hooks:
   timeout_ms: 60000
 agent:
-  # Selects the agent runtime new sessions start on. codex is the only accepted
-  # value today; any other value fails the whole configuration candidate, and a
-  # workflow that omits the key runs on codex. A change takes effect for
-  # sessions started after the reload; an in-flight session keeps the backend
-  # it started on.
+  # Selects the agent runtime new sessions start on: codex (the Codex
+  # app-server) or claude (the Claude Code CLI). Any other value fails the whole
+  # configuration candidate, and a workflow that omits the key runs on codex. A
+  # change takes effect for sessions started after the reload; an in-flight
+  # session keeps the backend it started on. Only the selected backend's launch
+  # block below has to be complete.
   backend: codex
   # Four-agent operation: implementation/rework work can scale across the
   # available global capacity while max_concurrent_agents_by_state keeps
@@ -117,6 +118,55 @@ codex:
   # read_timeout_ms.
   start_timeout_ms: 120000
   stall_timeout_ms: 300000
+# Read only when agent.backend selects claude; with backend: codex above, this
+# block is ignored (and the codex: block is ignored under backend: claude).
+# Unknown keys inside it are refused rather than ignored, so a misspelled field
+# cannot leave a default silently in place.
+#
+# There is deliberately no approval_policy, thread_sandbox, or
+# turn_sandbox_policy counterpart here. Symphony fixes the Claude launch
+# contract itself and re-applies it on every turn -- the CLI restores none of it
+# on --resume -- so it cannot be widened from this file: a Bash/Edit/Glob/Grep/
+# Read/Write tool surface with WebFetch and WebSearch denied, a fail-closed
+# permission mode, no settings discovery at all (user, project, and local
+# sources are excluded, so a workspace repository shipping its own
+# .claude/settings.json or hooks cannot widen the boundary),
+# no MCP server, and a sandbox that refuses to start rather than degrading,
+# bounding *writes* to the worktree plus the same two narrow Git metadata roots
+# the codex profile is granted.
+#
+# The same honest limits apply as above, plus one that is narrower than it
+# sounds: *reads* are not confined, outbound network is unrestricted, and the
+# sandbox governs Bash but not Edit and Write. Those two are allowed by bare
+# tool name with no path restriction at all, so a write outside the worktree is
+# neither sandbox-confined nor detected by anything Symphony checks -- the
+# post-run Git integrity check looks only at the source repository's own branch
+# heads and primary index.
+#
+# The CLI also persists its own full transcript -- prompts, issue text, and tool
+# output -- under ~/.claude/projects/, outside the worktree; see README.md and
+# docs/observability.md.
+#
+# A claude workflow may not also configure tracker.provider.handoff_state,
+# tracker.provider.followup_issue_creation, or an enabled github: integration
+# below: no capability bridge to a Claude session exists yet, so that
+# combination is rejected at load instead of dispatching an agent that cannot
+# hand off or publish. (A github: block that does not resolve stays disabled and
+# so does not trigger the refusal; it grants nothing either way.) The service
+# user must already be logged in to the CLI; --dry-run checks that with a
+# read-only, time-bounded claude auth status.
+# claude:
+#   # argv, not a shell command: split on whitespace and executed directly, so
+#   # no shell, no quoting, no expansion, and no operators. codex.command above
+#   # runs through bash -lc, so quoting that works there breaks here. --dry-run
+#   # checks both with sh -n, which is a loose superset for this field.
+#   command: claude
+#   # Optional. Omit it to let the CLI select its own model.
+#   model: sonnet
+#   turn_timeout_ms: 3600000
+#   # There is no read_timeout_ms or start_timeout_ms counterpart: one turn is
+#   # one process, so there is no steady-state round trip to bound.
+#   stall_timeout_ms: 300000
 # Optional. Requires tracker.provider.handoff_state and a fine-grained token
 # restricted to exactly this repository.
 # github:

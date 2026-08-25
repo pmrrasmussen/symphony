@@ -122,6 +122,8 @@ type Tracker interface {
 }
 type AgentRequest struct {
 	Issue Issue
+	// Model optionally overrides the agent runtime's default model.
+	Model string
 	// Backend names the agent runtime this request must run on. The scheduler
 	// resolves the selection once, together with the command, sandbox, and
 	// timeout values below, and the router honors it rather than resolving the
