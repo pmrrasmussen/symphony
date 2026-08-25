@@ -72,6 +72,7 @@ Run these commands from the repository whose service you intend to manage:
 
 ```sh
 symphony service install
+symphony service migrate
 symphony service status
 symphony service restart
 symphony service uninstall
@@ -80,11 +81,14 @@ symphony service uninstall
 `install` is idempotent: an identical managed plist is left alone; a changed
 managed plist is reloaded only for that repository. It runs the normal
 workflow preflight and `plutil` validation before changing launchd. It refuses
-to overwrite an unmarked/manual plist. `status` emits a safe JSON description
-of the selected managed instance. `restart` uses launchd to restart only that
-instance, and `uninstall` unloads and removes only its managed plist. There is
-currently no `service list`; use `symphony tui` for the all-instance read-only
-view.
+to overwrite an unmarked/manual plist. `migrate` is the one explicit command
+that may replace such an unmarked plist, and only after it matches this
+repository exactly; see [migrating a hand-authored
+service](#migrating-a-hand-authored-service). `status` emits a safe JSON
+description of the selected managed instance. `restart` uses launchd to
+restart only that instance, and `uninstall` unloads and removes only its
+managed plist. There is currently no `service list`; use `symphony tui` for
+the all-instance read-only view.
 
 All commands accept the same selection/configuration flags when needed:
 
@@ -185,48 +189,135 @@ path as a service conflict and leaves the candidate registration untouched.
 
 ## Migrating a hand-authored service
 
-Older setups commonly have a repo-local executable and a hand-authored
-`~/Library/LaunchAgents/com.pmrrasmussen.symphony.plist`. Migrate one
-repository at a time so its existing workflow, credentials, logs, and
-workspaces remain intact.
+Older setups commonly have a repository-local executable and a hand-authored
+`~/Library/LaunchAgents/com.pmrrasmussen.symphony.plist`. `service install`
+deliberately refuses to overwrite that unmarked plist, and `service status`,
+`restart`, and `uninstall` report `refusing to manage unrelated LaunchAgent`
+for it. `symphony service migrate` is the supported, explicit way across that
+boundary. Running that command *is* the required operator intent: no other
+command adopts or replaces an unmanaged LaunchAgent.
 
-1. From the Symphony repository, run `./scripts/install` to create the shared
-   stable binary. Do not remove the existing binary yet; the old agent may
-   still be using it.
-2. In the repository being migrated, keep the current `WORKFLOW.md`,
-   `.symphony/logs`, and `.symphony/workspaces`. Ensure workflow credentials
-   are file references, then place or retain the credential files at the
-   conventional paths above (or plan explicit override flags).
-3. Stop and remove the old registration before installing the managed one.
-   For the legacy label, this is typically:
+```sh
+cd ~/repos/symphony
+./scripts/install
 
-   ```sh
-   launchctl bootout "gui/$(id -u)/com.pmrrasmussen.symphony" || true
-   rm ~/Library/LaunchAgents/com.pmrrasmussen.symphony.plist
-   ```
+cd ~/repos/foo
+symphony service migrate
+symphony service status
+```
 
-   Inspect the label and plist path first; do not remove an agent belonging to
-   another repository. This step matters because the installer intentionally
-   refuses duplicate workflow/status registrations and refuses to overwrite
-   unmarked plists.
-4. Register the repository, choosing a stable name when necessary:
+Migrate one repository at a time. Its existing `WORKFLOW.md`, credentials,
+`.symphony/logs`, and `.symphony/workspaces` are kept as they are; the managed
+registration adds only the canonical `--status-file` argument and the
+`.symphony/service` stdout/stderr files.
 
-   ```sh
-   cd ~/repos/foo
-   symphony service install --name foo
-   symphony service status
-   ```
+### How a legacy agent is detected
 
-   The resulting agent uses the canonical
-   `.symphony/service/status.json` argument. Existing structured logs and
-   workspaces stay where they were; the service adds its separate stdout and
-   stderr files under `.symphony/service`.
-5. Run `symphony tui` and verify that the new generated label appears with the
-   expected workflow, paths, and launchd state. The legacy label remains
-   discoverable by the TUI only until its plist is removed.
+`migrate` first validates the candidate managed installation exactly like
+`install` does: repository root, `WORKFLOW.md`, credential file references and
+permissions, the shared executable, the full workflow preflight, and `plutil`
+validation of the generated plist.
 
-If a transition must be rolled back, first uninstall only the managed service
-from that repository, then restore the prior plist from a known-good backup.
+It then looks only at LaunchAgents that convention-matching discovery already
+reads, and considers an *unmanaged* one to belong to this repository when it
+shares at least one repository path: the `WorkingDirectory`, the `--workflow`,
+the `--logs-root`, or the `--status-file`. Paths are compared with symlinks
+resolved, so a repository reached through a symlink is still the same
+repository. Anything else is unrelated and is never read further, moved, or
+unloaded.
+
+The single related agent must then match this repository exactly:
+
+| Checked | Requirement |
+| --- | --- |
+| Label | `com.pmrrasmussen.symphony` or `com.pmrrasmussen.symphony.<instance>`, equal to its own plist filename, in a parsable plist |
+| Repository | `WorkingDirectory` is this repository root |
+| Workflow | resolved `--workflow` is this repository's workflow |
+| Executable | an existing executable file named `symphony` (a repository-local one is fine) |
+| Log root | resolved `--logs-root` is `<repo>/.symphony/logs` |
+| Status file | absent, or already `<repo>/.symphony/service/status.json` |
+| Service logs | `StandardOutPath`/`StandardErrorPath` inside the repository |
+
+A partial match is a refusal, not a warning: a similar label or filename never
+makes an agent adoptable. Failures are reported as a list of concrete reasons,
+for example `refusing to migrate LaunchAgent <path>: workflow "..." is not
+...`. Two related unmanaged agents are refused as `ambiguous hand-authored
+Symphony LaunchAgents`; remove or correct all but one and rerun.
+
+Finally, because a plist on disk is not the same thing as a registered job,
+`migrate` enumerates the Symphony jobs launchd currently has loaded. Only three
+kinds are accounted for: the managed target, the legacy agent being replaced,
+and the services of *other* repositories whose LaunchAgents are on disk.
+Anything else -- most commonly a job still registered under a label whose plist
+was renamed or deleted, which keeps scheduling this repository even though no
+per-label check can see it -- refuses the migration:
+
+```text
+refusing to migrate while other Symphony services are loaded:
+com.pmrrasmussen.symphony; no LaunchAgent in ... accounts for them
+```
+
+Unload the named label with `launchctl bootout "gui/$(id -u)/<label>"`, or
+restore its LaunchAgent so it can be identified, then rerun. If launchd cannot
+be enumerated at all, `migrate` refuses as well: an unverified launchd is not
+evidence that nothing is running.
+
+### What migration does, and how to undo it
+
+Every check above runs first. Nothing on disk or in launchd changes until all
+of them pass, so a refused migration leaves no plist, backup, or registration
+altered.
+
+1. Boots out the legacy label and *verifies* it is gone. Absence has to be
+   positively observed: launchd stating that it has no such job -- `Could not
+   find service` from `print`, or `No such process` from `bootout` -- is the
+   only benign negative, and it is the normal result for a hand-authored plist
+   that sits on disk unloaded. A `bootout` that fails for any other reason, or
+   an observation that simply does not answer, aborts the migration before
+   anything is removed or installed, naming the label and the manual
+   `launchctl bootout` command to run first. An unload that launchd reports as
+   still in progress is retried briefly before being treated as a failure.
+2. Copies the legacy plist to
+   `<repo>/.symphony/service/<label>.plist.pre-migration.backup`. That path is
+   outside `~/Library/LaunchAgents`, so launchd can never load the replaced
+   registration again, and the file remains a known-good copy to restore from.
+3. Removes the legacy plist, writes the managed plist, bootstraps it, and
+   kickstarts it.
+
+If any step from 2 onwards fails, the replaced plist is written back to its
+original path with its original mode, and the error names the cause, the
+restored LaunchAgent, and the backup copy. A rollback re-bootstraps a
+registration only if that registration was loaded before the migration, so a
+failed `migrate` never *starts* a service the operator had deliberately
+stopped, and never leaves both a managed and a legacy scheduler loaded where
+one was loaded before. A managed plist that already existed at the target path
+is restored rather than removed. In the rare case where writing the plist back
+also fails, the error says so and names the backup to copy into place by
+hand.
+
+Rerunning `migrate` after a successful migration is a no-op that reports
+`already managed <label>`. From then on `service status`, `service restart`,
+`service install`, and `service uninstall` manage the repository instance
+normally, and `symphony tui` lists the new label with the expected workflow,
+paths, and launchd state.
+
+To undo a migration deliberately, run `symphony service uninstall` in that
+repository, copy the `.pre-migration.backup` file back to
+`~/Library/LaunchAgents/<label>.plist`, and bootstrap it with `launchctl`.
+
+If the legacy agent cannot or should not be adopted -- a different workflow, a
+different log root, or an agent belonging to another repository -- keep using
+the manual path instead: inspect the label and plist, then
+
+```sh
+launchctl bootout "gui/$(id -u)/com.pmrrasmussen.symphony" || true
+rm ~/Library/LaunchAgents/com.pmrrasmussen.symphony.plist
+cd ~/repos/foo
+symphony service install --name foo
+```
+
+Do not remove an agent belonging to another repository. Until the old plist is
+gone, `install` keeps refusing duplicate workflow/status registrations.
 
 ## Manual LaunchAgent reference
 
@@ -290,8 +381,9 @@ launchctl kickstart -k "gui/$(id -u)/com.pmrrasmussen.symphony.acme-api"
 
 This manual plist intentionally has no `SymphonyManaged` marker. Discovery and
 the TUI can inspect it, but `service install`, `service restart`, and `service
-uninstall` will not take it over. Remove it safely and use the managed setup
-when ready to migrate.
+uninstall` will not take it over. When it matches its repository exactly,
+`symphony service migrate` can adopt it; otherwise remove it safely and use
+the managed setup instead.
 
 ## Source-of-truth boundaries
 
@@ -301,7 +393,7 @@ when ready to migrate.
 | LaunchAgent | Machine-local configured instance: executable, working directory, safe path/credential references, and launchd registration. |
 | `status.json` | Redacted current runtime observation; potentially stale after a crash, never liveness authority. |
 | `symphony.jsonl` | Redacted event history for diagnostics, not authoritative current state. |
-| Service CLI | Explicit machine-level install, update, inspection, restart, and removal for one repository service. |
+| Service CLI | Explicit machine-level install, migration, update, inspection, restart, and removal for one repository service. |
 | TUI | Ephemeral read-only presentation of local discovery; it cannot mutate configuration or service state. |
 
 For the snapshot schema and freshness details, see
