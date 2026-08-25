@@ -41,7 +41,10 @@ const maxLine = 8 << 20
 const eventBuffer = 64
 
 // reservedTerminalSlots keeps space for the terminal event by dropping ordinary
-// progress once the buffer is nearly full.
+// progress once the buffer is nearly full. One slot is now provably enough,
+// because sink.emitTerminal admits exactly one terminal event per turn, but the
+// second is kept: it costs one buffered progress event and it is what makes the
+// reservation hold even if a turn ever gains a second outcome to report.
 const reservedTerminalSlots = 2
 
 // waitDelay bounds Wait's post-exit I/O wait. It is short because by the time it
@@ -174,9 +177,8 @@ func (b *Backend) run(ctx context.Context, s *session, r domain.AgentRequest, re
 	s.running = t
 	s.mu.Unlock()
 
-	events := make(chan domain.Event, eventBuffer)
-	go t.stream(s, r, turnNumber, events)
-	return events, nil
+	go t.stream(s, r, turnNumber)
+	return t.sink.events, nil
 }
 
 // turn is one child process.
@@ -195,6 +197,12 @@ type turn struct {
 	killOnce sync.Once
 	// closeIO closes the parent's ends of the pipes exactly once.
 	closeIO sync.Once
+
+	// sink is the only route from any goroutine to this turn's event channel. It
+	// belongs to the turn rather than to stream's locals because the read loop is
+	// not the only thing that can have something to report about a turn, and it is
+	// built with the turn so no holder of a turn can find it unable to emit.
+	sink *sink
 
 	mu     sync.Mutex
 	killed bool
@@ -243,7 +251,10 @@ func spawn(ctx context.Context, r domain.AgentRequest, args []string, secretName
 		return nil, err
 	}
 	opened = append(opened, stdin)
-	t := &turn{cmd: cmd, stdout: stdout, stderr: stderr, exited: make(chan struct{}), timeout: r.TurnTimeout}
+	t := &turn{
+		cmd: cmd, stdout: stdout, stderr: stderr, exited: make(chan struct{}), timeout: r.TurnTimeout,
+		sink: &sink{events: make(chan domain.Event, eventBuffer)},
+	}
 	cmd.Cancel = func() error { t.kill(); return nil }
 	// WaitDelay bounds how long Wait blocks on I/O after the process itself is
 	// gone, so a descendant still holding an inherited pipe cannot keep Wait
@@ -299,10 +310,14 @@ func (t *turn) cancelled() bool {
 	return t.killed
 }
 
-// stream reads the turn's stdout, normalizes it, and closes the channel after
-// exactly one terminal event.
-func (t *turn) stream(s *session, r domain.AgentRequest, turnNumber int, events chan<- domain.Event) {
-	defer close(events)
+// stream reads the turn's stdout, normalizes it, and ends the turn's event
+// stream. At most one terminal event reaches a consumer, however many goroutines
+// had something to report -- the sink's latch, not this loop, is what says so.
+func (t *turn) stream(s *session, r domain.AgentRequest, turnNumber int) {
+	// The channel is closed by the sink, from inside the sink's own mutex, so
+	// there is no ordering here to get wrong and no window in which an emit can
+	// find the channel closed. Closing it here instead would reintroduce one.
+	defer t.sink.close()
 	defer close(t.exited)
 	// Once this turn is over it must stop being the session's live process, or a
 	// later cancellation would signal a process group whose pid has been reaped
@@ -315,7 +330,7 @@ func (t *turn) stream(s *session, r domain.AgentRequest, turnNumber int, events 
 		s.mu.Unlock()
 	}()
 
-	emitter := &emitter{events: events}
+	emit := t.sink.emit
 	pending := map[string]pendingCall{}
 
 	// The turn budget is enforced here rather than by the context, so the
@@ -340,7 +355,6 @@ func (t *turn) stream(s *session, r domain.AgentRequest, turnNumber int, events 
 	}()
 
 	lines := newLineReader(t.stdout)
-	var sawTerminal bool
 	var initVerified bool
 	var readErr error
 	for {
@@ -371,13 +385,15 @@ func (t *turn) stream(s *session, r domain.AgentRequest, turnNumber int, events 
 				if refusal := verifyInit(event, r.Workspace); refusal != "" {
 					// The policy did not apply. Fail closed rather than run a
 					// turn under an unknown boundary.
-					emitter.emit(domain.Event{Kind: domain.EventFailed, At: time.Now(), Message: refusal})
-					sawTerminal = true
+					// Two refused init lines can arrive in a single read, and
+					// killing the child does not discard what is already
+					// buffered, so the latch is what keeps this to one failure.
+					t.sink.emitTerminal(domain.Event{Kind: domain.EventFailed, At: time.Now(), Message: refusal})
 					t.kill()
 					continue
 				}
 				initVerified = true
-				emitter.emit(domain.Event{
+				emit(domain.Event{
 					Kind: domain.EventSessionStarted, At: time.Now(),
 					SessionID: s.id, ThreadID: s.id, TurnID: strconv.Itoa(turnNumber),
 					PID: t.cmd.Process.Pid,
@@ -385,7 +401,7 @@ func (t *turn) stream(s *session, r domain.AgentRequest, turnNumber int, events 
 			case "permission_denied":
 				var event permissionDeniedEvent
 				_ = json.Unmarshal(line, &event)
-				emitter.emit(domain.Event{
+				emit(domain.Event{
 					Kind: domain.EventItem, At: time.Now(),
 					ItemID:   observability.Text(event.ToolUseID),
 					ItemType: itemType(event.ToolName),
@@ -401,7 +417,7 @@ func (t *turn) stream(s *session, r domain.AgentRequest, turnNumber int, events 
 					continue
 				}
 				pending[content.ID] = pendingCall{tool: content.Name, started: time.Now()}
-				emitter.emit(domain.Event{
+				emit(domain.Event{
 					Kind: domain.EventItem, At: time.Now(),
 					ItemID:   observability.Text(content.ID),
 					ItemType: itemType(content.Name),
@@ -432,7 +448,7 @@ func (t *turn) stream(s *session, r domain.AgentRequest, turnNumber int, events 
 				if known {
 					event.DurationMs = time.Since(call.started).Milliseconds()
 				}
-				emitter.emit(event)
+				emit(event)
 			}
 		case "rate_limit_event":
 			var event rateLimitEvent
@@ -443,13 +459,15 @@ func (t *turn) stream(s *session, r domain.AgentRequest, turnNumber int, events 
 			// window_seconds); the CLI's actionable fields are strings under
 			// different names, so an EventRateLimit here would be silently
 			// discarded and never reach a log.
-			emitter.emit(domain.Event{Kind: domain.EventDiagnostic, At: time.Now(),
+			emit(domain.Event{Kind: domain.EventDiagnostic, At: time.Now(),
 				Message: "claude reported a rate limit: " + observability.Text(firstNonEmpty(event.RateLimitInfo.Status, "unspecified")) +
 					" (" + observability.Text(firstNonEmpty(event.RateLimitInfo.RateLimitType, "unspecified")) + ")"})
 		case "result":
-			if sawTerminal {
-				// A refused init already ended this turn. Reading a later result
+			if t.sink.settled() {
+				// Something already ended this turn -- a refused init, or a
+				// terminal event raised off this loop. Reporting the result too
 				// would emit a second terminal event and misreport the reason.
+				// This is only a shortcut; emitTerminal below is what enforces it.
 				continue
 			}
 			var event resultEvent
@@ -462,27 +480,26 @@ func (t *turn) stream(s *session, r domain.AgentRequest, turnNumber int, events 
 			total := s.usage
 			s.mu.Unlock()
 			if total != (domain.Usage{}) {
-				emitter.emit(domain.Event{Kind: domain.EventUsage, At: time.Now(), Usage: total})
+				emit(domain.Event{Kind: domain.EventUsage, At: time.Now(), Usage: total})
 			}
 			for _, denial := range event.PermissionDenials {
-				emitter.emit(domain.Event{Kind: domain.EventDiagnostic, At: time.Now(),
+				emit(domain.Event{Kind: domain.EventDiagnostic, At: time.Now(),
 					Message: "claude denied a tool call: " + observability.Text(denial.ToolName)})
 			}
-			sawTerminal = true
 			if event.IsError {
 				// is_error is the authoritative failure signal: an
 				// authentication failure arrives with subtype "success".
-				emitter.emit(domain.Event{Kind: domain.EventFailed, At: time.Now(),
+				t.sink.emitTerminal(domain.Event{Kind: domain.EventFailed, At: time.Now(),
 					Message: "claude turn failed: " + observability.Text(firstNonEmpty(event.TerminalReason, event.APIErrorStatus, event.StopReason, "unspecified"))})
 				continue
 			}
 			if !initVerified {
 				// A turn that never announced its policy is not a turn whose
 				// boundary is known.
-				emitter.emit(domain.Event{Kind: domain.EventFailed, At: time.Now(), Message: "claude session refused: no init event was reported"})
+				t.sink.emitTerminal(domain.Event{Kind: domain.EventFailed, At: time.Now(), Message: "claude session refused: no init event was reported"})
 				continue
 			}
-			emitter.emit(domain.Event{Kind: domain.EventCompleted, At: time.Now()})
+			t.sink.emitTerminal(domain.Event{Kind: domain.EventCompleted, At: time.Now()})
 		}
 	}
 	<-stderrDone
@@ -491,29 +508,31 @@ func (t *turn) stream(s *session, r domain.AgentRequest, turnNumber int, events 
 	// inherited pipes.
 	_ = t.killProcessGroup()
 
-	if sawTerminal {
+	// The loop ended without a terminal event, so this is the last chance to
+	// report why -- unless this turn's outcome was already reported elsewhere.
+	if t.sink.settled() {
 		return
 	}
 	select {
 	case <-timedOut:
-		emitter.emit(domain.Event{Kind: domain.EventFailed, At: time.Now(), Message: "claude turn timeout"})
+		t.sink.emitTerminal(domain.Event{Kind: domain.EventFailed, At: time.Now(), Message: "claude turn timeout"})
 		return
 	default:
 	}
 	if t.cancelled() {
-		emitter.emit(domain.Event{Kind: domain.EventFailed, At: time.Now(), Message: "claude turn cancelled"})
+		t.sink.emitTerminal(domain.Event{Kind: domain.EventFailed, At: time.Now(), Message: "claude turn cancelled"})
 		return
 	}
 	if tail := stderr.text(); tail != "" {
-		emitter.emit(domain.Event{Kind: domain.EventDiagnostic, At: time.Now(), Message: tail})
+		emit(domain.Event{Kind: domain.EventDiagnostic, At: time.Now(), Message: tail})
 	}
 	switch {
 	case readErr != nil:
-		emitter.emit(domain.Event{Kind: domain.EventFailed, At: time.Now(), Message: "claude stdout read failed"})
+		t.sink.emitTerminal(domain.Event{Kind: domain.EventFailed, At: time.Now(), Message: "claude stdout read failed"})
 	case waitErr != nil:
-		emitter.emit(domain.Event{Kind: domain.EventFailed, At: time.Now(), Message: "claude exited without completing the turn: " + exitText(waitErr)})
+		t.sink.emitTerminal(domain.Event{Kind: domain.EventFailed, At: time.Now(), Message: "claude exited without completing the turn: " + exitText(waitErr)})
 	default:
-		emitter.emit(domain.Event{Kind: domain.EventFailed, At: time.Now(), Message: "claude exited without reporting a result"})
+		t.sink.emitTerminal(domain.Event{Kind: domain.EventFailed, At: time.Now(), Message: "claude exited without reporting a result"})
 	}
 }
 
@@ -548,26 +567,84 @@ func exitText(err error) string {
 	return "process error"
 }
 
-// emitter never blocks. A consumer stops reading as soon as it sees a terminal
+// sink owns a turn's event channel outright: every send, the terminal latch, and
+// the close itself happen under one mutex. Nothing about a turn's event stream is
+// left to an invariant about which goroutine does what.
+//
+// That the mutex is the guard, and not the select/default idiom the sends use, is
+// the whole point: default covers a full channel, not a closed one, and a send on
+// a closed channel panics unrecoverably and process-wide -- one late event would
+// kill every parallel session, not just its own turn. Because the close happens
+// here too, there is no state in which the channel is closed and the sink is not.
+//
+// No send ever blocks. A consumer stops reading as soon as it sees a terminal
 // event, so ordinary progress is dropped once the buffer is nearly full and the
 // terminal event keeps the reserved room.
-type emitter struct {
-	events chan<- domain.Event
+type sink struct {
+	mu       sync.Mutex
+	events   chan domain.Event
+	closed   bool
+	terminal bool
 }
 
-func (e *emitter) emit(event domain.Event) {
+// emit reports progress. A terminal event handed to it still goes through the
+// latch, so there is no path to an unclaimed outcome.
+func (s *sink) emit(event domain.Event) {
 	if terminal(event.Kind) {
-		select {
-		case e.events <- event:
-		default:
-		}
+		s.emitTerminal(event)
 		return
 	}
-	if len(e.events) >= cap(e.events)-reservedTerminalSlots {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || len(s.events) >= cap(s.events)-reservedTerminalSlots {
 		return
 	}
+	s.sendLocked(event)
+}
+
+// emitTerminal reports the turn's one outcome and reports whether this caller is
+// the one that settled it. Claiming and sending are a single operation on
+// purpose: a claim that could not deliver its event would leave the turn settled
+// with nothing to show for it, and the consumer would then see the stream close
+// with no outcome and report "closed before completion" instead of the real
+// reason. A second outcome is no better -- Coordinator.consume returns on the
+// first, so the run would be recorded as finished under that reason while the
+// child kept burning tokens until a cancellation arrived.
+func (s *sink) emitTerminal(event domain.Event) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || s.terminal {
+		return false
+	}
+	s.terminal = true
+	s.sendLocked(event)
+	return true
+}
+
+// settled reports whether the turn's outcome is already spoken for. It is only
+// ever a shortcut -- emitTerminal is what enforces the latch -- so a caller may
+// act on it, but must not treat a false as a reservation.
+func (s *sink) settled() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.terminal
+}
+
+// close ends the stream. It closes the channel under the mutex, so an emit is
+// either already done or sees closed; neither can be mid-send.
+func (s *sink) close() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return
+	}
+	s.closed = true
+	close(s.events)
+}
+
+func (s *sink) sendLocked(event domain.Event) {
 	select {
-	case e.events <- event:
+	case s.events <- event:
 	default:
 	}
 }

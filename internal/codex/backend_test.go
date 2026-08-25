@@ -578,7 +578,7 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{}}'
 		Tracker: config.Tracker{Provider: map[string]any{"api_key": "linear-token", "project_slug_id": "project-1", "endpoint": server.URL}, ActiveStates: []string{"todo"}, HandoffState: "In Review"},
 		GitHub:  config.GitHub{Enabled: true, Owner: "owner", Repository: "repo", BaseBranch: "main", Token: "github-token", Endpoint: server.URL, MergeState: "Merging", MergeMethod: "merge", RequiredChecks: []string{"ci"}},
 	}
-	b, _ := NewWithIntegrations(func() config.Settings { return settings }, nil)
+	b := integratedBackend(func() config.Settings { return settings })
 	_, events, err := b.Start(context.Background(), domain.AgentRequest{Issue: domain.Issue{ID: "active", Identifier: "PMR-5", State: "Merging"}, Workspace: dir, Prompt: "work", Command: "sh " + script, ApprovalPolicy: "never", ThreadSandbox: "workspace-write", TurnTimeout: time.Minute})
 	if err != nil {
 		t.Fatal(err)
@@ -774,7 +774,7 @@ IFS= read -r line
 printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn-1"}}}'
 printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{}}'
 `)
-			b, _ := NewWithIntegrations(func() config.Settings { return settings }, nil)
+			b := integratedBackend(func() config.Settings { return settings })
 			_, events, err := b.Start(context.Background(), domain.AgentRequest{Issue: domain.Issue{ID: "active", Identifier: "PMR-37", State: test.issueState}, Workspace: dir, Prompt: "work", Command: "sh " + script, ApprovalPolicy: "never", ThreadSandbox: "workspace-write", TurnTimeout: time.Minute})
 			if err != nil {
 				t.Fatal(err)
@@ -1166,6 +1166,15 @@ func request(dir, script string) domain.AgentRequest {
 	}
 }
 
+// integratedBackend builds a backend the way the host does: one Linear handoff
+// and one GitHub manager, handed to the backend that runs sessions. There is no
+// production constructor that mints providers for a single backend, so tests
+// that need both do the host's wiring themselves. Each test process gets its own
+// pair, which is exactly the one-per-process rule.
+func integratedBackend(snapshot func() config.Settings, secretNames ...string) *Backend {
+	return NewWithProviders(snapshot, linear.NewHandoff(snapshot), githubhost.New(snapshot, nil), secretNames...)
+}
+
 func writeAppServer(t *testing.T, dir, body string) string {
 	t.Helper()
 	script := filepath.Join(dir, "fake-app-server.sh")
@@ -1262,5 +1271,125 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{}}'
 	}
 	if strings.Contains(string(environment), "PMR80_KEY_FILE=") {
 		t.Fatal("child environment retained the credential file path; only the name blocklist can remove it for the api_key_file form")
+	}
+}
+
+// TestProvidersArePassedInAndNotConstructedPerBackend pins the backend half of
+// the ownership the host depends on: this backend never constructs a provider,
+// so it cannot be the source of a second githubhost.Manager, and it reports the
+// instance it was given. The manager holds the linked table Poll walks and the
+// exactly-once Linear completion guard, so a process holding two would poll a
+// table no session ever writes into -- an issue whose pull request merged would
+// never reconcile to Done. The process-level half of the invariant, that the
+// manager the host polls is the one bound to a backend, is asserted in
+// cmd/symphony where the wiring lives.
+//
+// The assertion is instance identity rather than an observed divergence because
+// the only state two managers would disagree about is written by Publish, which
+// needs the git runner internal/github injects in its own tests.
+func TestProvidersArePassedInAndNotConstructedPerBackend(t *testing.T) {
+	settings := func() config.Settings { return config.Settings{} }
+	handoff := linear.NewHandoff(settings)
+	manager := githubhost.New(settings, nil)
+	b := NewWithProviders(settings, handoff, manager)
+	if b.github != manager {
+		t.Fatal("backend bound a GitHub manager other than the one the host polls")
+	}
+	if b.handoff != handoff {
+		t.Fatal("backend bound a Linear handoff other than the host's")
+	}
+	// The backend must report the instance it holds, because that report is what
+	// the host attaches its landing verifier to and starts its poll loop on.
+	if b.GitHubManager() != manager {
+		t.Fatal("the backend reported a GitHub manager other than the one it uses")
+	}
+	// A nil provider stays nil: an unconfigured integration must not be
+	// implicitly constructed, because Start treats a bound manager as consent to
+	// prepare a GitHub session.
+	if linearOnly := NewWithLinearHandoff(settings); linearOnly.github != nil {
+		t.Fatal("the Linear-only constructor bound a GitHub manager")
+	}
+}
+
+// TestNewWithProvidersDrivesSessionCapabilitiesFromTheGivenProviders is the
+// behavioural half: the providers handed to the constructor, not providers it
+// built for itself, are what prepare a session and decide which capabilities
+// reach the app-server. Without this, a constructor that accepted and then
+// ignored its arguments would still satisfy the identity assertions above.
+func TestNewWithProvidersDrivesSessionCapabilitiesFromTheGivenProviders(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		var request map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		query, _ := request["query"].(string)
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.Contains(query, "SymphonyLinearHandoffIssue"):
+			_, _ = w.Write([]byte(`{"data":{"issue":{"id":"active","identifier":"PMR-93","title":"Own the providers","description":"safe","url":"https://linear.app/issue/PMR-93","project":{"slugId":"project-1"},"team":{"id":"team-1"},"state":{"id":"todo","name":"Todo"}}}}`))
+		case strings.Contains(query, "SymphonyLinearHandoffStates"):
+			_, _ = w.Write([]byte(`{"data":{"team":{"id":"team-1","states":{"nodes":[{"id":"review","name":"In Review"}]}}}}`))
+		default:
+			t.Fatalf("unexpected query: %s", query)
+		}
+	}))
+	defer server.Close()
+	settings := config.Settings{
+		Tracker: config.Tracker{Provider: map[string]any{"api_key": "linear-token", "project_slug_id": "project-1", "endpoint": server.URL}, ActiveStates: []string{"todo"}, HandoffState: "In Review"},
+		GitHub:  config.GitHub{Enabled: true, Owner: "owner", Repository: "repo", BaseBranch: "main", Token: "github-token", Endpoint: server.URL, MergeState: "Merging", MergeMethod: "merge", RequiredChecks: []string{"ci"}},
+	}
+	snapshot := func() config.Settings { return settings }
+	dir := t.TempDir()
+	captured := filepath.Join(dir, "thread-start.json")
+	environment := filepath.Join(dir, "environment")
+	script := writeAppServer(t, dir, `
+env > `+environment+`
+IFS= read -r line
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'
+IFS= read -r line
+IFS= read -r line
+printf '%s\n' "$line" > `+captured+`
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thread-1"}}}'
+IFS= read -r line
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn-1"}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{}}'
+`)
+	handoff := linear.NewHandoff(snapshot)
+	b := NewWithProviders(snapshot, handoff, githubhost.New(snapshot, nil), "PMR93_LINEAR_TOKEN")
+	t.Setenv("PMR93_LINEAR_TOKEN", "linear-token")
+	t.Setenv("PMR93_INHERITED_GITHUB_TOKEN", "prefix-github-token-suffix")
+	_, events, err := b.Start(context.Background(), domain.AgentRequest{Issue: domain.Issue{ID: "active", Identifier: "PMR-93", State: "Merging"}, Workspace: dir, Prompt: "work", Command: "sh " + script, ApprovalPolicy: "never", ThreadSandbox: "workspace-write", TurnTimeout: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range events {
+	}
+	params, err := os.ReadFile(captured)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The GitHub manager reached capability.Build (all three GitHub tools, land
+	// included for the configured Merging state) and so did the Linear handoff:
+	// without a prepared handoff the GitHub session is never prepared at all.
+	for _, tool := range []string{"github_publish_pr", "github_pr_context", "github_land_pr"} {
+		if !strings.Contains(string(params), tool) {
+			t.Fatalf("passed providers did not advertise %s: %s", tool, params)
+		}
+	}
+	if strings.Contains(string(params), "linear_graphql") {
+		t.Fatalf("advertised a Linear-mutating tool: %s", params)
+	}
+	child, err := os.ReadFile(environment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The passed providers also own secret filtering: the session-bound matcher
+	// they produce strips both the named credential and an unrelated variable
+	// that merely contains the GitHub token.
+	for _, leaked := range []string{"PMR93_LINEAR_TOKEN=", "PMR93_INHERITED_GITHUB_TOKEN="} {
+		if strings.Contains(string(child), leaked) {
+			t.Fatalf("child environment retained %q", leaked)
+		}
 	}
 }
