@@ -8,8 +8,29 @@ Usage: scripts/check <format|vet|test|race|all>
 EOF
 }
 
+# check_format asks Git which Go files the repository owns rather than walking
+# the tree. A walk also reaches gitignored checkouts of this same repository --
+# Symphony's own runtime workspaces under .symphony/workspaces and agent
+# worktrees under .claude/worktrees -- and lints whatever a dispatched agent
+# left mid-turn as if it were repository source. That makes this command fail on
+# a clean checkout, for a file no one is editing and that CI, which starts from
+# a fresh tree, never sees (PMR-89).
+#
+# The other stages need no equivalent: go vet and go test take ./..., which the
+# Go tool already resolves against this module's own packages. A nested checkout
+# carries its own go.mod, so it is not part of this module.
 check_format() {
-	unformatted=$(find . -name '*.go' -type f -exec gofmt -l {} +)
+	if ! tracked=$(git ls-files -- '*.go' | wc -l); then
+		printf 'scripts/check format needs a Git checkout to resolve repository source\n' >&2
+		return 1
+	fi
+	# A silent pass because the file list came back empty would be worse than a
+	# failure: it reports success without having checked anything.
+	if [ "$tracked" -eq 0 ]; then
+		printf 'no Go files are tracked in this checkout\n' >&2
+		return 1
+	fi
+	unformatted=$(git ls-files -z -- '*.go' | xargs -0 gofmt -l)
 	if [ -n "$unformatted" ]; then
 		printf 'The following files need gofmt:\n%s\n' "$unformatted" >&2
 		return 1
