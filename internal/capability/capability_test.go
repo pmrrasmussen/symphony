@@ -427,3 +427,52 @@ func TestTurnEndedIsSafeWithoutAGitHubSession(t *testing.T) {
 	nilRegistry.TurnEnded(nil)
 	Build(bindings(true, false, "Todo", "")).TurnEnded(nil)
 }
+
+// TestSecretMatcherCoversBothTheFrozenAndTheLiveForgeToken is the first
+// falsifiable test of the reload-drift scenario config.ReservedSecretEnvNames
+// names as filter 4's reason. It was argued but untested for two rounds.
+//
+// The two GitHub readers see different values by construction:
+// Session.MatchesSecret tests the config.GitHub frozen into it at
+// PrepareWithSettings, and Manager.MatchesSecret reads its settings callback
+// live. A WORKFLOW.md reload that rotates the forge token separates them, and
+// both values have to be stripped -- the frozen one is what this run's
+// capabilities will authenticate with, the live one is what the host process is
+// using now.
+//
+// It fails against a matcher that dispatches to the session when one exists
+// rather than asking every bound provider, which is how this function was
+// written until the switch was found to make the manager unreachable in the
+// common case.
+func TestSecretMatcherCoversBothTheFrozenAndTheLiveForgeToken(t *testing.T) {
+	const before, after = "forge-token-before-reload", "forge-token-after-reload"
+	settings := config.Settings{
+		GitHub: config.GitHub{Enabled: true, Owner: "owner", Repository: "repo", BaseBranch: "main",
+			Token: before, Endpoint: "https://api.github.com", MergeState: "Merging", MergeMethod: "merge"},
+	}
+	issue := domain.Issue{ID: "issue-1", Identifier: "PMR-94", State: "Merging"}
+	manager := githubhost.New(func() config.Settings { return settings }, nil)
+	handoff := &linear.HandoffSession{}
+	session := manager.PrepareWithSettings(settings.GitHub, issue, t.TempDir(), handoff)
+	if session == nil {
+		t.Fatal("no GitHub session was prepared, so this test would prove nothing")
+	}
+	matcher := SecretMatcher(Bindings{Settings: settings, Issue: issue, Handoff: handoff, GitHub: session}, manager)
+	if matcher == nil {
+		t.Fatal("bound providers produced no matcher")
+	}
+
+	// The reload. The session keeps the token it froze; the manager's callback
+	// now answers with the new one.
+	settings.GitHub.Token = after
+
+	if !matcher("prefix-" + before + "-suffix") {
+		t.Fatal("the token frozen into the session is no longer stripped, so this run's own credential reaches the child")
+	}
+	if !matcher("prefix-" + after + "-suffix") {
+		t.Fatal("the rotated token the host is now using is not stripped: the matcher consulted the session and never the manager")
+	}
+	if matcher("ordinary-value") {
+		t.Fatal("the matcher matches unrelated values")
+	}
+}

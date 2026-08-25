@@ -699,18 +699,22 @@ var reservedSecretEnvNames = []string{
 //     provider["api_key"], and decodeGitHub disables the integration outright
 //     for a literal inline token, so hostSecretValues sees both credentials in
 //     resolved form.
-//  4. capability.SecretMatcher removes the credential the providers bound to
-//     this run actually hold. Because of what filter 3 just resolved, no
-//     *loadable* configuration makes this the only filter that catches a
-//     credential today: for now it is defence-in-depth against a divergence
-//     between the two, and against a Settings assembled by anything other than
-//     Load, which carries no HostSecretValues at all. It stops being merely
-//     that as soon as a backend relaunches per turn with providers bound: a
-//     launcher reads the *live* settings callback for filters 2 and 3 on every
-//     turn while the matcher stays frozen at session build, so a reload that
-//     rotates a credential mid-run leaves the value the frozen providers still
-//     use covered by nothing else. internal/claude spawns one process per turn,
-//     which is exactly that shape.
+//  4. capability.SecretMatcher removes the credentials the providers bound to
+//     this run actually hold, asking every one of them. Because of what filter 3
+//     just resolved, no *loadable* configuration makes this the only filter that
+//     catches a credential today: for now it is defence-in-depth against a
+//     divergence between the two, and against a Settings assembled by anything
+//     other than Load, which carries no HostSecretValues at all. It stops being
+//     merely that as soon as a backend relaunches per turn with providers bound:
+//     a launcher re-reads the live settings callback for filters 2 and 3 on
+//     every turn, while a provider *session* holds the credential it froze at
+//     session build, so a reload that rotates a credential mid-run leaves the
+//     value the frozen session still authenticates with covered by nothing else.
+//     internal/claude spawns one process per turn, which is exactly that shape.
+//     Both sides of that divergence are covered rather than one: a bound
+//     githubhost.Manager is asked too, and it reads its callback live, so the
+//     rotated value is stripped alongside the frozen one. See SecretMatcher for
+//     why the Linear side has no such pair.
 //
 // A credential the launcher deliberately hands over -- the Claude backend's
 // capability endpoint token -- is appended after filtering, so no filter can

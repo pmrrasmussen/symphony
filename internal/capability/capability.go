@@ -140,28 +140,49 @@ type Bindings struct {
 // filter, or neither. Both backends call it, so the two cannot differ on which
 // provider credential is stripped -- they did before, in the same way twice.
 //
-// manager is the fallback for the case that made this a function rather than a
-// closure at each call site: githubhost.Manager.PrepareWithSettings returns nil
-// when no Linear handoff was prepared, so a run with github.enabled but no
-// handoff_state has a bound manager, no session, and -- until this existed -- a
-// live matcher that answered false for every candidate, including the forge
-// token itself. The manager reads its own settings callback rather than this
-// snapshot; that is the credential it would use for such a run, since no
-// session froze one.
+// Every bound provider is asked, and a match by any of them is a match. It is
+// deliberately not a dispatch to whichever is most specific: the three read
+// three different values, and the whole point of filter 4 is that a launcher
+// cannot know which of them a given run is holding.
+//
+// manager is why this is a function rather than a closure at each call site, and
+// it is asked for two distinct reasons:
+//
+//   - githubhost.Manager.PrepareWithSettings returns nil when no Linear handoff
+//     was prepared, so a run with github.enabled but no handoff_state has a bound
+//     manager, no session, and -- before this existed -- a live matcher that
+//     answered false for every candidate, the forge token included.
+//   - Session.MatchesSecret tests the config.GitHub frozen into it at
+//     PrepareWithSettings, while Manager.MatchesSecret reads its settings
+//     callback live. A WORKFLOW.md reload that rotates the forge token leaves the
+//     session holding the old value and the manager the new one, and *both* must
+//     be stripped: the session is what this run's capabilities will authenticate
+//     with, and the live value is what the host process is using now. An earlier
+//     version of this function returned the session's answer unconditionally
+//     whenever a session existed, which made the manager unreachable in the
+//     common case and left exactly that rotation uncovered -- the reload-drift
+//     case config.ReservedSecretEnvNames names as filter 4's reason.
+//
+// The Linear side has no equivalent pair: HandoffSession.MatchesSecret is
+// frozen the same way, but linear.Handoff exposes no live counterpart, so there
+// is nothing further to consult here. A rotated tracker key's new value is
+// covered by filter 3 instead, which internal/claude re-reads from the live
+// settings callback on every turn. The gap that leaves is the exact analogue of
+// the manager case above -- a Settings not produced by Load, carrying a tracker
+// key with no handoff prepared, has no filter 4 cover for it -- and closing it
+// would mean a live matcher on linear.Handoff that does not exist yet.
 func SecretMatcher(b Bindings, manager *githubhost.Manager) func(string) bool {
 	if b.Handoff == nil && b.GitHub == nil && manager == nil {
 		return nil
 	}
 	return func(candidate string) bool {
-		switch {
-		case b.Handoff != nil && b.Handoff.MatchesSecret(candidate):
+		if b.Handoff != nil && b.Handoff.MatchesSecret(candidate) {
 			return true
-		case b.GitHub != nil:
-			return b.GitHub.MatchesSecret(candidate)
-		case manager != nil:
-			return manager.MatchesSecret(candidate)
 		}
-		return false
+		if b.GitHub != nil && b.GitHub.MatchesSecret(candidate) {
+			return true
+		}
+		return manager != nil && manager.MatchesSecret(candidate)
 	}
 }
 

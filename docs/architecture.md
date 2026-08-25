@@ -258,8 +258,12 @@ part is defence-in-depth today rather than the sole cover for anything -- no
 loadable configuration separates it from the third -- and it becomes
 load-bearing as soon as a backend relaunches per turn with providers bound,
 because the first three parts are re-read from live settings on every turn while
-the matcher stays frozen at session build. The Claude backend, which spawns one
-process per turn, is exactly that shape; it also adds exactly one variable after
+a provider session holds the credential it froze at session build. Both sides of
+that divergence are covered: every bound provider is asked, including the
+process-wide GitHub manager, which reads its settings live, so a token rotated
+by a reload is stripped alongside the frozen one the run still authenticates
+with. The Claude backend, which spawns one process per turn, is exactly that
+shape; it also adds exactly one variable after
 filtering -- this turn's capability endpoint token, the credential it
 deliberately hands over -- and blocks that name on the way in so it can have no
 other source. Everything else is inherited on purpose: both CLIs authenticate
