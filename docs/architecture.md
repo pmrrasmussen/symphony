@@ -155,10 +155,14 @@ never includes tool arguments, command bodies, outputs, or raw payloads. See
 [observability.md](observability.md).
 
 When `workspace.source_root` is configured, `LocalWorkspaceExecutor` creates a
-detached Git worktree for each issue. This isolates Codex changes from the
-checkout running Symphony; a human must review and integrate the resulting
-changes. The source root must already have a commit, and Git worktrees require
-the local repository to be trusted. A workspace-write Codex turn is granted
+detached Git worktree for each issue. Before creating a new workspace, it
+refreshes and resolves `origin/main`, so the initial commit is independent of
+the source checkout's current branch, local `main`, index, and working tree.
+Existing issue workspaces are reused without fetching, rebasing, or resetting
+their history. This isolates Codex changes from the checkout running Symphony;
+a human must review and integrate the resulting changes. The source root must
+have a reachable `origin/main`, and Git worktrees require the local repository
+to be trusted. A workspace-write Codex turn is granted
 write access to only the two paths a detached-HEAD commit needs -- the source
 repository's shared object store and this linked worktree's own per-worktree
 metadata directory -- and never the rest of the common directory, so the agent

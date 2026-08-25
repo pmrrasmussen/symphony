@@ -5,8 +5,6 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
-	"github.com/pmrrasmussen/symphony/internal/config"
-	"github.com/pmrrasmussen/symphony/internal/domain"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,6 +12,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/pmrrasmussen/symphony/internal/config"
+	"github.com/pmrrasmussen/symphony/internal/domain"
 )
 
 func TestKeyAndWorkspaceRemainBelowRoot(t *testing.T) {
@@ -142,15 +143,7 @@ func TestPrepareCanonicalizesSymlinkedConfiguredRoot(t *testing.T) {
 }
 
 func TestPrepareUsesDetachedGitWorktree(t *testing.T) {
-	source := t.TempDir()
-	runGit(t, source, "init")
-	runGit(t, source, "config", "user.email", "test@example.invalid")
-	runGit(t, source, "config", "user.name", "Test")
-	if err := os.WriteFile(filepath.Join(source, "README.md"), []byte("source\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	runGit(t, source, "add", "README.md")
-	runGit(t, source, "commit", "-m", "initial")
+	source := newGitRepository(t)
 
 	root := filepath.Join(t.TempDir(), "workspaces")
 	s := config.Settings{Workspace: config.Workspace{Root: root, SourceRoot: source}, Hooks: config.Hooks{}}
@@ -195,6 +188,161 @@ func TestPrepareUsesDetachedGitWorktree(t *testing.T) {
 	}
 	if _, found, err := l.loadState(issue); err != nil || found {
 		t.Fatalf("workspace state should be removed only after successful cleanup: found=%t err=%v", found, err)
+	}
+}
+
+func TestPrepareUsesRefreshedOriginMainWithoutChangingSourceCheckout(t *testing.T) {
+	source := newGitRepository(t)
+	publisher := cloneRepository(t, source)
+	if err := os.WriteFile(filepath.Join(publisher, "remote.txt"), []byte("remote main\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, publisher, "add", "remote.txt")
+	runGit(t, publisher, "commit", "-m", "advance remote main")
+	runGit(t, publisher, "push", "origin", "main")
+	remoteMain := gitShow(t, publisher, "HEAD")
+
+	staleLocalMain := gitShow(t, source, "main")
+	if got := gitShow(t, source, "origin/main"); got != staleLocalMain {
+		t.Fatalf("fixture origin/main = %s, want stale local main %s", got, staleLocalMain)
+	}
+	runGit(t, source, "switch", "-c", "feature")
+	if err := os.WriteFile(filepath.Join(source, "feature.txt"), []byte("feature commit\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, source, "add", "feature.txt")
+	runGit(t, source, "commit", "-m", "feature work")
+	if err := os.WriteFile(filepath.Join(source, "README.md"), []byte("dirty source\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "untracked.txt"), []byte("untracked source\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sourceHead := gitShow(t, source, "HEAD")
+	sourceStatus := gitOutput(t, source, "status", "--porcelain=v1", "--untracked-files=all")
+
+	root := filepath.Join(t.TempDir(), "workspaces")
+	s := config.Settings{Workspace: config.Workspace{Root: root, SourceRoot: source}}
+	l := New(func() config.Settings { return s })
+	issue := domain.Issue{ID: "issue-70", Identifier: "PMR-70"}
+	ws, err := l.Prepare(context.Background(), issue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = l.Cleanup(context.Background(), issue) })
+
+	if got := gitShow(t, ws.Path, "HEAD"); got != remoteMain {
+		t.Fatalf("workspace HEAD = %s, want refreshed origin/main %s", got, remoteMain)
+	}
+	if got := gitShow(t, source, "origin/main"); got != remoteMain {
+		t.Fatalf("source origin/main = %s, want refreshed remote commit %s", got, remoteMain)
+	}
+	if got := gitShow(t, source, "main"); got != staleLocalMain {
+		t.Fatalf("local main moved from %s to %s", staleLocalMain, got)
+	}
+	if got := gitShow(t, source, "HEAD"); got != sourceHead {
+		t.Fatalf("source HEAD moved from %s to %s", sourceHead, got)
+	}
+	if got := gitOutput(t, source, "branch", "--show-current"); got != "feature" {
+		t.Fatalf("source branch = %q, want feature", got)
+	}
+	if got := gitOutput(t, source, "status", "--porcelain=v1", "--untracked-files=all"); got != sourceStatus {
+		t.Fatalf("source working state changed\nbefore=%q\nafter=%q", sourceStatus, got)
+	}
+	state, found, err := l.loadState(issue)
+	if err != nil || !found || state.BaseCommit != remoteMain {
+		t.Fatalf("workspace state=%+v found=%t err=%v, want base commit %s", state, found, err, remoteMain)
+	}
+}
+
+func TestPrepareExistingWorkspaceDoesNotRefreshOrReset(t *testing.T) {
+	source := newGitRepository(t)
+	publisher := cloneRepository(t, source)
+	root := filepath.Join(t.TempDir(), "workspaces")
+	s := config.Settings{Workspace: config.Workspace{Root: root, SourceRoot: source}}
+	l := New(func() config.Settings { return s })
+	issue := domain.Issue{ID: "issue-70", Identifier: "PMR-70"}
+	ws, err := l.Prepare(context.Background(), issue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { runGit(t, source, "worktree", "remove", "--force", ws.Path) })
+	runGit(t, ws.Path, "commit", "--allow-empty", "-m", "task history")
+	workspaceHead := gitShow(t, ws.Path, "HEAD")
+	trackedRemoteMain := gitShow(t, source, "origin/main")
+
+	if err := os.WriteFile(filepath.Join(publisher, "later.txt"), []byte("later remote main\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, publisher, "add", "later.txt")
+	runGit(t, publisher, "commit", "-m", "advance remote after workspace creation")
+	runGit(t, publisher, "push", "origin", "main")
+	if remoteMain := gitShow(t, publisher, "HEAD"); remoteMain == trackedRemoteMain {
+		t.Fatal("fixture did not advance remote main")
+	}
+
+	redispatched, err := l.Prepare(context.Background(), issue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if redispatched.CreatedNow {
+		t.Fatal("existing workspace was reported as newly created")
+	}
+	if redispatched.Path != ws.Path {
+		t.Fatalf("redispatched path = %q, want %q", redispatched.Path, ws.Path)
+	}
+	if got := gitShow(t, ws.Path, "HEAD"); got != workspaceHead {
+		t.Fatalf("existing workspace HEAD changed from %s to %s", workspaceHead, got)
+	}
+	if got := gitShow(t, source, "origin/main"); got != trackedRemoteMain {
+		t.Fatalf("existing workspace dispatch unexpectedly refreshed origin/main from %s to %s", trackedRemoteMain, got)
+	}
+}
+
+func TestPrepareFailsWhenOriginMainCannotBeRefreshed(t *testing.T) {
+	tests := []struct {
+		name        string
+		configure   func(*testing.T, string)
+		wantDetails string
+	}{
+		{name: "missing origin", wantDetails: "does not appear to be a git repository"},
+		{
+			name: "missing remote main",
+			configure: func(t *testing.T, source string) {
+				remote := filepath.Join(t.TempDir(), "remote.git")
+				runGit(t, filepath.Dir(remote), "init", "--bare", remote)
+				runGit(t, source, "remote", "add", "origin", remote)
+			},
+			wantDetails: "couldn't find remote ref refs/heads/main",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			source := t.TempDir()
+			runGit(t, source, "init")
+			runGit(t, source, "config", "user.email", "test@example.invalid")
+			runGit(t, source, "config", "user.name", "Test")
+			if err := os.WriteFile(filepath.Join(source, "README.md"), []byte("source\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			runGit(t, source, "add", "README.md")
+			runGit(t, source, "commit", "-m", "initial")
+			if test.configure != nil {
+				test.configure(t, source)
+			}
+
+			root := filepath.Join(t.TempDir(), "workspaces")
+			s := config.Settings{Workspace: config.Workspace{Root: root, SourceRoot: source}}
+			l := New(func() config.Settings { return s })
+			issue := domain.Issue{ID: "issue-70", Identifier: "PMR-70"}
+			_, err := l.Prepare(context.Background(), issue)
+			if err == nil || !strings.Contains(err.Error(), "refresh origin/main before creating workspace") || !strings.Contains(err.Error(), test.wantDetails) {
+				t.Fatalf("Prepare error = %v, want actionable origin/main refresh error containing %q", err, test.wantDetails)
+			}
+			if _, statErr := os.Stat(filepath.Join(root, Key(issue.Identifier))); !os.IsNotExist(statErr) {
+				t.Fatalf("workspace created despite refresh failure: %v", statErr)
+			}
+		})
 	}
 }
 
@@ -770,7 +918,12 @@ func gitShow(t *testing.T, dir string, rev string) string {
 
 func newGitRepository(t *testing.T) string {
 	t.Helper()
-	source := t.TempDir()
+	remote := filepath.Join(t.TempDir(), "remote.git")
+	runGit(t, filepath.Dir(remote), "init", "--bare", remote)
+	source := filepath.Join(t.TempDir(), "source")
+	if err := os.Mkdir(source, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	runGit(t, source, "init")
 	runGit(t, source, "config", "user.email", "test@example.invalid")
 	runGit(t, source, "config", "user.name", "Test")
@@ -779,7 +932,31 @@ func newGitRepository(t *testing.T) string {
 	}
 	runGit(t, source, "add", "README.md")
 	runGit(t, source, "commit", "-m", "initial")
+	runGit(t, source, "branch", "-M", "main")
+	runGit(t, source, "remote", "add", "origin", remote)
+	runGit(t, source, "push", "-u", "origin", "main")
+	runGit(t, remote, "symbolic-ref", "HEAD", "refs/heads/main")
 	return source
+}
+
+func cloneRepository(t *testing.T, source string) string {
+	t.Helper()
+	clone := filepath.Join(t.TempDir(), "clone")
+	remote := gitOutput(t, source, "remote", "get-url", "origin")
+	runGit(t, filepath.Dir(clone), "clone", remote, clone)
+	runGit(t, clone, "config", "user.email", "test@example.invalid")
+	runGit(t, clone, "config", "user.name", "Test")
+	return clone
+}
+
+func gitOutput(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %s: %v: %s", strings.Join(args, " "), err, out)
+	}
+	return strings.TrimSpace(string(out))
 }
 
 func runGit(t *testing.T, dir string, args ...string) {

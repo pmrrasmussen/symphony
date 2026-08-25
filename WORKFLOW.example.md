@@ -55,7 +55,8 @@ polling:
   interval_ms: 30000
 workspace:
   root: .symphony/workspaces
-  # Optional: populate each issue workspace as a detached Git worktree.
+  # Optional: create each new issue workspace as a detached Git worktree at a
+  # freshly fetched origin/main. Existing issue workspaces retain their history.
   source_root: .
 hooks:
   timeout_ms: 60000

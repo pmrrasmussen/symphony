@@ -136,7 +136,10 @@ outstanding operation. See [docs/observability.md](docs/observability.md) for
 
 For ongoing repository development, configure `workspace.source_root: .`.
 Symphony then creates one detached Git worktree per issue beneath
-`workspace.root`; the original checkout is never used as an agent workspace.
+`workspace.root`; each new worktree starts from a freshly fetched
+`origin/main`, while an existing issue worktree is reused at its current
+commit. The original checkout is never used as an agent workspace, and its
+branch, index, and working tree are not changed during preparation.
 Create focused issues in the configured Linear project and move them to `Todo`
 or `In Progress` to make them eligible. Symphony keeps active issues eligible
 across restarts and bounded retries. Invalid or missing ownership state beside
