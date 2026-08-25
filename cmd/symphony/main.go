@@ -302,10 +302,6 @@ func runTUI(args []string, input io.Reader, stdout, stderr io.Writer, discover t
 	return 0
 }
 
-// logStartupCredentialStatus records whether startup resolved the credentials
-// needed for Symphony's configured host integrations. It deliberately reports
-// only booleans: successful configuration resolution is not a remote
-// authentication check, and credentials must never appear in logs.
 // wire builds the agent backend registry together with the host providers those
 // backends share, and hands back the one GitHub manager this process may hold.
 // It exists as a seam rather than inline wiring so the sharing is asserted by a
@@ -332,6 +328,10 @@ func wire(settings func() config.Settings, logger *slog.Logger) (map[string]doma
 	return backends, sessions.GitHubManager()
 }
 
+// logStartupCredentialStatus records whether startup resolved the credentials
+// needed for Symphony's configured host integrations. It deliberately reports
+// only booleans: successful configuration resolution is not a remote
+// authentication check, and credentials must never appear in logs.
 func logStartupCredentialStatus(log *observability.Logger, settings config.Settings) {
 	log.Info("startup credential configuration",
 		"linear_credentials_configured", true,
