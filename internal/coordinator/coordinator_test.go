@@ -1433,17 +1433,63 @@ func TestReconciliationRefreshesStateCapacityForLaterAdmissions(t *testing.T) {
 	<-ws.after
 }
 
+func TestFourImplementationAndReworkIssuesRunConcurrently(t *testing.T) {
+	w := testSettings(t)
+	w.Config.Agent.MaxConcurrent = 4
+	w.Config.Tracker.ActiveStates = []string{"Todo", "In Progress", "Rework"}
+
+	issues := make([]domain.Issue, 5)
+	states := []string{"Todo", "In Progress", "Rework", "Rework", "In Progress"}
+	issueMap := make(map[string]domain.Issue, len(issues))
+	for index := range issues {
+		issues[index] = testIssue()
+		issues[index].ID = fmt.Sprintf("issue-%d", index+1)
+		issues[index].Identifier = fmt.Sprintf("ENG-%d", index+1)
+		issues[index].State = states[index]
+		issueMap[issues[index].ID] = issues[index]
+	}
+
+	tracker := &issueMapTracker{candidates: issues, issues: issueMap}
+	block := make(chan domain.Event)
+	agent := &fakeAgent{events: func() <-chan domain.Event { return block }, started: make(chan struct{}, 4)}
+	ws := &fakeWorkspace{after: make(chan struct{}, 4)}
+	c := testCoordinator(w.Config, tracker, agent, ws)
+
+	c.Tick(context.Background())
+	for range 4 {
+		<-agent.started
+	}
+	starts, _, _ := agent.counts()
+	if starts != 4 {
+		t.Fatalf("starts=%d, want four concurrent implementation/rework agents", starts)
+	}
+	c.mu.Lock()
+	admitted := len(c.admitted)
+	c.mu.Unlock()
+	if admitted != 4 {
+		t.Fatalf("admitted=%d, want the global four-agent capacity fully occupied", admitted)
+	}
+	if c.claim(issues[4], w.Config) {
+		t.Fatal("a fifth implementation issue exceeded the global four-agent capacity")
+	}
+
+	if err := c.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for range 4 {
+		<-ws.after
+	}
+}
+
 // TestMergingAndUnrelatedImplementationRunConcurrentlyUnderByStateCapacity
-// exercises the PMR-38 two-agent rollout end to end at the coordinator level:
-// one Merging landing agent and one unrelated implementation agent admit and
-// run at the same time, a queued retry timer for a third unrelated issue
-// never occupies a concurrency slot while it waits (so a later genuinely
-// free slot still admits a new candidate), and max_concurrent_agents_by_state
-// still refuses a second concurrent Merging issue even though overall
-// capacity has spare room.
+// exercises the active four-agent policy end to end at the coordinator level:
+// one Merging landing agent and unrelated implementation agents admit and run
+// at the same time, a queued retry timer never occupies a concurrency slot
+// while it waits, and max_concurrent_agents_by_state still refuses a second
+// concurrent Merging issue even though overall capacity has spare room.
 func TestMergingAndUnrelatedImplementationRunConcurrentlyUnderByStateCapacity(t *testing.T) {
 	w := testSettings(t)
-	w.Config.Agent.MaxConcurrent = 3
+	w.Config.Agent.MaxConcurrent = 4
 	w.Config.Tracker.ActiveStates = []string{"In Progress", "Merging"}
 	w.Config.Agent.ByState = map[string]int{"merging": 1}
 
@@ -1457,17 +1503,19 @@ func TestMergingAndUnrelatedImplementationRunConcurrentlyUnderByStateCapacity(t 
 	retryable.ID, retryable.Identifier, retryable.State = "retryable", "ENG-4", "In Progress"
 	extra := testIssue()
 	extra.ID, extra.Identifier, extra.State = "extra", "ENG-5", "In Progress"
+	fourth := testIssue()
+	fourth.ID, fourth.Identifier, fourth.State = "fourth", "ENG-6", "In Progress"
 
 	tracker := &issueMapTracker{
 		candidates: []domain.Issue{implementation, landing},
 		issues: map[string]domain.Issue{
 			implementation.ID: implementation, landing.ID: landing, secondLanding.ID: secondLanding,
-			retryable.ID: retryable, extra.ID: extra,
+			retryable.ID: retryable, extra.ID: extra, fourth.ID: fourth,
 		},
 	}
 	block := make(chan domain.Event)
-	agent := &fakeAgent{events: func() <-chan domain.Event { return block }, started: make(chan struct{}, 3)}
-	ws := &fakeWorkspace{after: make(chan struct{}, 3)}
+	agent := &fakeAgent{events: func() <-chan domain.Event { return block }, started: make(chan struct{}, 4)}
+	ws := &fakeWorkspace{after: make(chan struct{}, 4)}
 	c := testCoordinator(w.Config, tracker, agent, ws)
 	timer := &fakeTimer{}
 	c.timer = timer
@@ -1495,7 +1543,7 @@ func TestMergingAndUnrelatedImplementationRunConcurrentlyUnderByStateCapacity(t 
 	}
 
 	// A second concurrent Merging issue is refused by the per-state cap even
-	// though overall capacity (2 of 3) still has room.
+	// though overall capacity (2 of 4) still has room.
 	if c.claim(secondLanding, w.Config) {
 		t.Fatal("a second concurrent Merging issue must be refused by max_concurrent_agents_by_state")
 	}
@@ -1503,17 +1551,19 @@ func TestMergingAndUnrelatedImplementationRunConcurrentlyUnderByStateCapacity(t 
 	// The retry's reserved claim must not itself block a genuinely free
 	// general-capacity slot from admitting a new, unrelated candidate.
 	tracker.mu.Lock()
-	tracker.candidates = append(tracker.candidates, extra)
+	tracker.candidates = append(tracker.candidates, extra, fourth)
 	tracker.mu.Unlock()
 	c.Tick(context.Background())
 	<-agent.started
-	if starts, _, _ := agent.counts(); starts != 3 {
-		t.Fatalf("starts=%d, want the free general-capacity slot admitted despite the queued retry", starts)
+	<-agent.started
+	if starts, _, _ := agent.counts(); starts != 4 {
+		t.Fatalf("starts=%d, want both free general-capacity slots admitted despite the queued retry", starts)
 	}
 
 	if err := c.Shutdown(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+	<-ws.after
 	<-ws.after
 	<-ws.after
 	<-ws.after
