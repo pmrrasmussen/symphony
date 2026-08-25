@@ -53,3 +53,52 @@ func (failingHandler) WithGroup(string) slog.Handler            { return failing
 func (failingHandler) Handle(context.Context, slog.Record) error {
 	return errors.New("token=do-not-log-this")
 }
+
+// TestOperationVocabularyIsLoggedByName proves the bounded operation
+// vocabulary survives the redaction boundary as its own name: it is a defined
+// string type, so without an explicit allowance every `operation` field would
+// be flattened to an opaque placeholder and the tracker-edge trail would lose
+// the one field an operator filters on. An unbounded struct under the same key
+// still stays opaque.
+func TestOperationVocabularyIsLoggedByName(t *testing.T) {
+	var out bytes.Buffer
+	logger := New(slog.NewJSONHandler(&out, nil), nil)
+	logger.Info("Linear transition", "operation", OperationReviewApproved)
+	logger.Info("other record", "operation", struct{ Secret string }{Secret: "do-not-log-this"})
+	if got := out.String(); !strings.Contains(got, `"operation":"review_approved"`) {
+		t.Fatalf("bounded operation was not logged by name: %s", got)
+	}
+	if got := out.String(); strings.Contains(got, "do-not-log-this") || !strings.Contains(got, `"operation":"[OMITTED]"`) {
+		t.Fatalf("an unbounded operation value was not omitted: %s", got)
+	}
+}
+
+// TestUnknownOperationValueIsOmitted proves the closed set is enforced by
+// value, not merely by type: an Operation converted from arbitrary text would
+// otherwise bypass Text's scrubbing and truncation entirely and write whatever
+// it holds — control bytes and unbounded length included — straight into a
+// record.
+func TestUnknownOperationValueIsOmitted(t *testing.T) {
+	var out bytes.Buffer
+	logger := New(slog.NewJSONHandler(&out, nil), nil)
+	logger.Info("Linear transition", "operation", Operation(strings.Repeat("\x00", 200)+"\ntoken=do-not-log-this"))
+	got := out.String()
+	// The raw byte and its JSON escape are both checked: a NUL survives the
+	// handler as the escape text, not as the byte itself.
+	if strings.Contains(got, "do-not-log-this") || strings.Contains(got, "\u0000") || strings.Contains(got, `\u0000`) {
+		t.Fatalf("an operation outside the closed set reached the record: %q", got)
+	}
+	if !strings.Contains(got, `"operation":"[OMITTED]"`) {
+		t.Fatalf("an operation outside the closed set was not omitted: %q", got)
+	}
+	if len(got) > 256 {
+		t.Fatalf("an omitted operation still produced an unbounded record of %d bytes", len(got))
+	}
+	for operation := range known {
+		out.Reset()
+		logger.Info("Linear transition", "operation", operation)
+		if want := `"operation":"` + string(operation) + `"`; !strings.Contains(out.String(), want) {
+			t.Fatalf("vocabulary member %q was not logged by name: %s", operation, out.String())
+		}
+	}
+}

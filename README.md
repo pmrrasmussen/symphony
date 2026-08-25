@@ -339,9 +339,17 @@ agent:
    Turn off the PR-linked status automations in Linear → Settings → the team →
    GitHub integration / workflow automations; this is verifiable only in the
    Linear UI. If left enabled, Symphony does not silently re-dispatch the
-   reverted issue — it logs an `external tracker state change observed`
-   (`operation: external_reversion`) record naming the from/to states — but it
-   does not currently re-assert the handoff automatically. See the
+   reverted issue — it logs a warn-level `external tracker state change
+   observed` (`operation: external_reversion`) record naming the from/to
+   states — but it does not currently re-assert the handoff automatically. The
+   expected human review decisions out of `In Review` are not warnings: with
+   this repository's lifecycle configured, an approval to land
+   (`In Review -> Merging`, `operation: review_approved`) and a
+   changes-requested move (`In Review -> Rework`,
+   `operation: rework_requested`) are logged at info level as
+   `human review state change observed`. Any other destination — including one
+   the configured lifecycle cannot name unambiguously — keeps the warning. See
+   the
    [Linear tracker profile](docs/linear-tracker.md) and the
    [observability guide](docs/observability.md).
 

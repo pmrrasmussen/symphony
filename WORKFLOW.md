@@ -43,9 +43,12 @@ tracker:
     # the host performs the handoff. Operator prerequisite: disable Linear's
     # native GitHub PR-to-status automation for this team/project — it is an
     # external writer that races this handoff and can flap the issue back to an
-    # active state (In Review -> In Progress; PMR-63). Symphony logs any such
-    # external revert (operation: external_reversion) but does not re-assert the
-    # handoff itself; see README.md and docs/linear-tracker.md.
+    # active state (In Review -> In Progress; PMR-63). Symphony warns on any
+    # such external revert (operation: external_reversion) but does not
+    # re-assert the handoff itself. The expected human decisions out of In
+    # Review are logged as expected instead: In Review -> Merging as
+    # operation: review_approved and In Review -> Rework as
+    # operation: rework_requested. See README.md and docs/linear-tracker.md.
     handoff_state: In Review
   # The canonical lifecycle (PMR-38): Todo -> In Progress -> In Review <->
   # Rework -> Merging -> Done. Rework and Merging are active/dispatchable so a
