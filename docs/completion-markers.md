@@ -25,7 +25,9 @@ New writes use the `symphony.workspace-state/v2` schema:
 ```
 
 `issue_id` and `identifier` bind the file to one Linear issue. `base_commit`
-keeps terminal cleanup from deleting locally changed or committed work.
+keeps terminal cleanup from deleting locally changed work, and from deleting
+committed work unless Symphony verifies that exact commit as the merged pull
+request head (see [Terminal cleanup safety](#terminal-cleanup-safety)).
 `preparation` advances through `creating`, `hook_pending`, and `ready`; an
 interrupted pre-ready workspace is discarded and recreated before the
 after-create hook is retried. The source-worktree paths and common-directory
@@ -62,8 +64,9 @@ only when worktree safety checks allow it.
 
 ## Terminal cleanup safety
 
-Cleanup of a terminal issue's owned Git worktree is fail-closed. It removes the
-worktree only in these two cases:
+Cleanup of a terminal issue's owned Git worktree is fail-closed. Only the first
+two outcomes below remove anything; the remaining three preserve the worktree
+for a human:
 
 | Worktree | Result |
 | --- | --- |
@@ -87,6 +90,12 @@ request's head commit is the source branch tip, which GitHub does not rewrite
 when it squashes or rebases onto the base branch, so verified cleanup works
 under all three merge methods. The verification never merges,
 comments, or transitions anything.
+
+A removal deletes the whole worktree directory, including files Git ignores.
+`git status` does not report them, so a `.gitignore`d local file in a
+verified-landed worktree does not survive cleanup. Before verified cleanup
+existed a worktree holding local commits was always preserved, so in practice
+such files survived every completed run.
 
 ## Manual recovery
 

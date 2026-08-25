@@ -221,11 +221,22 @@ func (f *apiFixture) settings() config.GitHub {
 func (f *apiFixture) pullJSON() map[string]any {
 	return map[string]any{
 		"number": f.prNumber, "html_url": "https://github.com/owner/repo/pull/7",
-		"state": f.prState, "merged": f.prMerged, "body": f.prBody,
+		"state": f.prState, "merged": f.prMerged, "merged_at": f.mergedAt(), "body": f.prBody,
 		"mergeable": f.mergeable, "mergeable_state": f.mergeableState,
 		"head": map[string]any{"ref": f.prHeadRef, "sha": f.prSHA},
 		"base": map[string]any{"ref": f.prBaseRef},
 	}
+}
+
+// mergedAt mirrors GitHub's pull-request-simple schema, which the list
+// endpoint returns: it carries merged_at but no merged field. Landing
+// verification treats either as merged, and merged_at is the one that is
+// actually present in production, so the fixture must emit it.
+func (f *apiFixture) mergedAt() any {
+	if !f.prMerged {
+		return nil
+	}
+	return "2026-08-25T09:00:00Z"
 }
 
 func boolPtr(b bool) *bool { return &b }
