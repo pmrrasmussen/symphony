@@ -363,11 +363,13 @@ func (c *Coordinator) tick(ctx context.Context) error {
 			return ctx.Err()
 		}
 		// A candidate the tracker returns in an active state that Symphony itself
-		// just handed off to the review state has been reverted by an external
-		// actor (see PMR-63: Linear's native GitHub PR automation). Log the
-		// external delta so the flap is visible in the JSONL instead of only in
-		// Linear's history. Symphony does not itself re-assert the handoff here.
-		c.noteExternalReversion(i, s, now)
+		// just handed off to the review state was moved by someone else: a human
+		// review decision (approve for landing, or send back for rework), or an
+		// external reversion of the handoff (see PMR-63: Linear's native GitHub
+		// PR automation). Log the external delta, classified, so the edge is
+		// visible in the JSONL instead of only in Linear's history. Symphony does
+		// not itself re-assert the handoff here.
+		c.notePostHandoffStateChange(i, s, now)
 		if reason := ineligibleReason(i, s); reason != "" {
 			summary.rejected[reason]++
 			c.log.Debug("poll candidate rejected", "issue_identifier", i.Identifier, "reason", reason)
@@ -461,12 +463,16 @@ func (c *Coordinator) noteHandoffObservation(issue domain.Issue, s config.Settin
 	c.mu.Unlock()
 }
 
-// noteExternalReversion logs, exactly once, when an active candidate is an
-// issue Symphony recently handed off to the review state: an external actor
-// (not Symphony, which has no In Review -> active writer) reverted the handoff.
-// It consumes the observation so a single revert is reported once, and never
-// mutates the tracker — re-asserting the handoff is a documented follow-up.
-func (c *Coordinator) noteExternalReversion(i domain.Issue, s config.Settings, now time.Time) {
+// notePostHandoffStateChange logs, exactly once, when an active candidate is an
+// issue Symphony recently handed off to the review state. Every such change is
+// external — the review state is human-controlled and Symphony has no
+// In Review -> active writer — but not every one is a fault: the human approval
+// and rework decisions are the lifecycle working as designed and are logged as
+// expected changes, while an unexpected reactivation stays a warning. It
+// consumes the observation so a single change is reported once, and never
+// mutates the tracker — re-asserting a reverted handoff is a documented
+// follow-up.
+func (c *Coordinator) notePostHandoffStateChange(i domain.Issue, s config.Settings, now time.Time) {
 	if norm(s.Tracker.HandoffState) == "" || i.ID == "" {
 		return
 	}
@@ -479,14 +485,62 @@ func (c *Coordinator) noteExternalReversion(i domain.Issue, s config.Settings, n
 	if !ok || norm(i.State) == observation.state {
 		return
 	}
-	c.log.Warn("external tracker state change observed",
-		"operation", "external_reversion",
+	operation := postHandoffOperation(norm(i.State), s)
+	attrs := []any{
+		"operation", operation,
 		"issue_id", i.ID,
 		"issue_identifier", i.Identifier,
 		"from_state", observation.state,
 		"to_state", norm(i.State),
 		"since_handoff_ms", now.Sub(observation.at).Milliseconds(),
-	)
+	}
+	if operation == observability.OperationExternalReversion {
+		c.log.Warn("external tracker state change observed", attrs...)
+		return
+	}
+	c.log.Info("human review state change observed", attrs...)
+}
+
+// postHandoffOperation classifies one state change out of the review handoff
+// state that Symphony did not perform. Moving the issue into the configured
+// merge state is the documented human approval to land, and moving it into the
+// lifecycle's rework state is the documented human request for changes; both
+// are expected. Anything else contradicts the handoff by reactivating
+// handed-off work as though implementation had not happened (the PMR-63 flap of
+// the tracker's native PR-to-status automation) and stays an actionable
+// warning.
+func postHandoffOperation(to string, s config.Settings) observability.Operation {
+	switch {
+	case to != "" && to == norm(s.GitHub.MergeState):
+		return observability.OperationReviewApproved
+	case reworkDecision(to, s):
+		return observability.OperationReworkRequested
+	default:
+		return observability.OperationExternalReversion
+	}
+}
+
+// reworkDecision reports whether state is the lifecycle's human rework state:
+// an active state that no configured host transition edge touches. Every
+// pre-review implementation state appears in the host start policy (the
+// canonical Todo -> In Progress edge), so an active state outside that policy,
+// and outside the merge state, is one only a human review decision moves an
+// issue into. Without a configured start policy Symphony cannot tell the
+// pre-review states apart, so nothing qualifies and an unclassifiable change
+// keeps its warning.
+func reworkDecision(state string, s config.Settings) bool {
+	start := s.Tracker.HostTransitions.Start
+	// The state-only issue is just how the shared active-state check is spelled;
+	// no issue content is involved in the classification.
+	if state == "" || len(start) == 0 || !active(domain.Issue{State: state}, s) {
+		return false
+	}
+	for source, target := range start {
+		if norm(source) == state || norm(target) == state {
+			return false
+		}
+	}
+	return true
 }
 
 // sweepHandoffObservations discards handoff memories older than the retention
@@ -768,10 +822,10 @@ func (c *Coordinator) transitionToStarted(ctx context.Context, i domain.Issue, s
 		return target
 	}
 	if err := c.tracker.Transition(ctx, i, target); err != nil {
-		c.log.Warn("dispatch start transition failed", "operation", "start_transition", "issue_id", i.ID, "issue_identifier", i.Identifier, "from_state", norm(i.State), "to_state", norm(target), "error", err)
+		c.log.Warn("dispatch start transition failed", "operation", observability.OperationStartTransition, "issue_id", i.ID, "issue_identifier", i.Identifier, "from_state", norm(i.State), "to_state", norm(target), "error", err)
 		return ""
 	}
-	c.log.Info("issue moved to started state", "operation", "start_transition", "issue_id", i.ID, "issue_identifier", i.Identifier, "from_state", norm(i.State), "to_state", norm(target))
+	c.log.Info("issue moved to started state", "operation", observability.OperationStartTransition, "issue_id", i.ID, "issue_identifier", i.Identifier, "from_state", norm(i.State), "to_state", norm(target))
 	return target
 }
 

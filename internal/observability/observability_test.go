@@ -53,3 +53,22 @@ func (failingHandler) WithGroup(string) slog.Handler            { return failing
 func (failingHandler) Handle(context.Context, slog.Record) error {
 	return errors.New("token=do-not-log-this")
 }
+
+// TestOperationVocabularyIsLoggedByName proves the bounded operation
+// vocabulary survives the redaction boundary as its own name: it is a defined
+// string type, so without an explicit allowance every `operation` field would
+// be flattened to an opaque placeholder and the tracker-edge trail would lose
+// the one field an operator filters on. An unbounded struct under the same key
+// still stays opaque.
+func TestOperationVocabularyIsLoggedByName(t *testing.T) {
+	var out bytes.Buffer
+	logger := New(slog.NewJSONHandler(&out, nil), nil)
+	logger.Info("Linear transition", "operation", OperationReviewApproved)
+	logger.Info("other record", "operation", struct{ Secret string }{Secret: "do-not-log-this"})
+	if got := out.String(); !strings.Contains(got, `"operation":"review_approved"`) {
+		t.Fatalf("bounded operation was not logged by name: %s", got)
+	}
+	if got := out.String(); strings.Contains(got, "do-not-log-this") || !strings.Contains(got, `"operation":"[OMITTED]"`) {
+		t.Fatalf("an unbounded operation value was not omitted: %s", got)
+	}
+}

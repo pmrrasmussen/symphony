@@ -109,6 +109,10 @@ func safeAttr(attr slog.Attr) slog.Attr {
 		switch value.(type) {
 		case map[string]int64:
 			// Rate-limit summaries are generated from a fixed numeric allowlist.
+		case Operation:
+			// The operation vocabulary is a closed set of fixed literals, so it
+			// is logged by name instead of being omitted as an opaque value.
+			return slog.String(attr.Key, fmt.Sprint(value))
 		default:
 			if attr.Value.Kind() == slog.KindAny {
 				if attr.Key == "event" || attr.Key == "retry_kind" || attr.Key == "reason" {

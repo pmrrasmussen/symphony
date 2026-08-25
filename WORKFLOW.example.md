@@ -33,8 +33,11 @@ tracker:
     # it (or any state); the host performs every transition. Operator
     # prerequisite: disable the tracker's native GitHub PR-to-status automation
     # for this team/project — it races the handoff and can flap the issue back
-    # to an active state (PMR-63). Symphony logs any such external revert
-    # (operation: external_reversion); see README.md and docs/linear-tracker.md.
+    # to an active state (PMR-63). Symphony warns on any such external revert
+    # (operation: external_reversion), while the expected human decisions out
+    # of this state — approval to land (operation: review_approved) and changes
+    # requested (operation: rework_requested) — are logged as expected; see
+    # README.md and docs/linear-tracker.md.
     handoff_state: In Review
     # Optional, opt-in Codex client tool for capturing meaningful out-of-scope
     # work. It creates a parentless issue only in this project/team, always in

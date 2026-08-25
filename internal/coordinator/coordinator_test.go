@@ -1824,6 +1824,62 @@ func TestHealthyHandoffIsSweptWithoutExternalRevertLog(t *testing.T) {
 	}
 }
 
+// TestPostHandoffStateChangeIsClassified proves the human-controlled review
+// state's outbound edges are told apart in the log: moving the issue to the
+// merge state is the human approval that authorizes landing and moving it to
+// the rework state is a human review decision — both expected, both info —
+// while a reactivation into a pre-review implementation state stays the
+// actionable PMR-63 warning.
+func TestPostHandoffStateChangeIsClassified(t *testing.T) {
+	for _, tc := range []struct {
+		name, state, operation, message, level string
+	}{
+		{name: "approval", state: "Merging", operation: "review_approved", message: "human review state change observed", level: "INFO"},
+		{name: "rework", state: "Rework", operation: "rework_requested", message: "human review state change observed", level: "INFO"},
+		{name: "reversion", state: "In Progress", operation: "external_reversion", message: "external tracker state change observed", level: "WARN"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := testSettings(t)
+			w.Config.Tracker.HandoffState = "In Review"
+			w.Config.Tracker.ActiveStates = []string{"Todo", "In Progress", "Rework", "Merging"}
+			w.Config.Tracker.HostTransitions.Start = map[string]string{"todo": "In Progress"}
+			w.Config.GitHub.MergeState = "Merging"
+			moved := testIssue()
+			moved.State = tc.state
+			tracker := &fakeTracker{issue: moved}
+			var logs bytes.Buffer
+			c := New(tracker, &fakeAgent{}, &fakeWorkspace{}, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&logs, nil)))
+			c.clock = fakeClock{now: time.Date(2026, 8, 25, 12, 0, 0, 0, time.UTC)}
+
+			// Pre-claim so the poll only classifies the change instead of also
+			// launching a run, then record Symphony's own prior handoff (claiming
+			// clears any prior memory, so the observation must be set afterward).
+			if !c.claim(moved, w.Config) {
+				t.Fatal("pre-claim failed")
+			}
+			c.noteHandoffObservation(domain.Issue{ID: moved.ID, Identifier: moved.Identifier, State: "In Review"}, w.Config, c.clock.Now())
+
+			c.Tick(context.Background())
+
+			output := logs.String()
+			if !strings.Contains(output, `"msg":"`+tc.message+`"`) ||
+				!strings.Contains(output, `"operation":"`+tc.operation+`"`) ||
+				!strings.Contains(output, `"level":"`+tc.level+`"`) ||
+				!strings.Contains(output, `"from_state":"in review"`) ||
+				!strings.Contains(output, `"to_state":"`+norm(tc.state)+`"`) ||
+				!strings.Contains(output, `"issue_identifier":"ENG-1"`) {
+				t.Fatalf("post-handoff change to %s was not classified as %s: %s", tc.state, tc.operation, output)
+			}
+			if tc.operation != "external_reversion" && strings.Contains(output, "external_reversion") {
+				t.Fatalf("an expected human review decision was also logged as a reversion: %s", output)
+			}
+			if err := c.Shutdown(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
 func testCoordinator(settings config.Settings, tracker domain.Tracker, agent domain.AgentBackend, ws domain.WorkspaceExecutor) *Coordinator {
 	c := New(tracker, agent, ws, func() config.Settings { return settings }, nil)
 	c.clock = fakeClock{now: time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)}
