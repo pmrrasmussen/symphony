@@ -22,6 +22,7 @@ import (
 	"github.com/pmrrasmussen/symphony/internal/domain"
 	githubhost "github.com/pmrrasmussen/symphony/internal/github"
 	"github.com/pmrrasmussen/symphony/internal/linear"
+	"github.com/pmrrasmussen/symphony/internal/mcpbridge"
 	"github.com/pmrrasmussen/symphony/internal/observability"
 	"github.com/pmrrasmussen/symphony/internal/operator"
 	"github.com/pmrrasmussen/symphony/internal/preflight"
@@ -30,6 +31,11 @@ import (
 	"github.com/pmrrasmussen/symphony/internal/tui"
 	"github.com/pmrrasmussen/symphony/internal/workspace"
 )
+
+// endpointCloseTimeout bounds the capability endpoint's own shutdown. It is
+// separate from the scheduler's shutdown budget on purpose: see the deferred
+// close in run().
+const endpointCloseTimeout = 20 * time.Second
 
 func main() {
 	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
@@ -136,7 +142,27 @@ func run(args []string, stdout, stderr io.Writer) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	ws := workspace.New(settings)
-	backends, githubLifecycle := wire(settings, slog.New(log.Handler()))
+	backends, githubLifecycle, capabilityEndpoint, err := wire(settings, slog.New(log.Handler()))
+	if err != nil {
+		fmt.Fprintln(stderr, "symphony startup error:", err)
+		return 2
+	}
+	// Deferred rather than closed inline after Shutdown, so it happens on every
+	// path out of run() -- including the startup validation below, which would
+	// otherwise leave the listener behind. It still runs after the scheduler has
+	// shut down, so no session can be serving a capability call, and it gets a
+	// budget of its own: sharing the shutdown deadline would let a slow Shutdown
+	// turn this into a context-deadline error that reads as a report of leaked
+	// registrations that do not exist. Its error is reported rather than dropped
+	// because it counts registrations no session revoked, and each of those is a
+	// deferred tracker transition that silently never fired.
+	defer func() {
+		closeCtx, cancelClose := context.WithTimeout(context.Background(), endpointCloseTimeout)
+		defer cancelClose()
+		if err := capabilityEndpoint.Close(closeCtx); err != nil {
+			log.Error("capability endpoint shutdown reported unfinished sessions", "error", err)
+		}
+	}()
 	// Terminal cleanup may only discard a worktree's local commits once Symphony
 	// itself verified them merged. The verifier is read-only and host-owned; when
 	// GitHub is not configured it always answers no and cleanup stays as strict
@@ -312,20 +338,36 @@ func runTUI(args []string, input io.Reader, stdout, stderr io.Writer, discover t
 // completion guard, so a merged pull request would leave its Linear issue
 // unreconciled while the guard on the polled manager never fired.
 //
+// The same reasoning extends to the loopback MCP capability endpoint: it is one
+// listener for the daemon's lifetime, shared by every concurrent session and
+// separated by per-registration bearer tokens, so it is built here and handed
+// back for the caller to close rather than bound inside a backend that has
+// nothing to close it with.
+//
 // Optional host capabilities stay disabled until WORKFLOW.md supplies their
-// fixed scope; resolved credentials are filtered from the agent child. Claude
-// sessions get no Symphony capabilities yet -- configuration refuses that
-// combination -- so that backend is launch and lifecycle only, and it is
-// deliberately given no provider of its own.
-func wire(settings func() config.Settings, logger *slog.Logger) (map[string]domain.AgentBackend, *githubhost.Manager) {
+// fixed scope; resolved credentials are filtered from the agent child. No Claude
+// session can bind a capability yet -- configuration still refuses that
+// combination -- so the providers and the endpoint the Claude backend is given
+// here reach nothing, deliberately: the wiring lands before the prompt guidance
+// and the launch-time consistency guard that make it safe to enable.
+func wire(settings func() config.Settings, logger *slog.Logger) (map[string]domain.AgentBackend, *githubhost.Manager, *mcpbridge.Server, error) {
 	handoff := linear.NewHandoff(settings)
 	handoff.SetLogger(logger)
+	endpoint, err := mcpbridge.Listen()
+	if err != nil {
+		return nil, nil, nil, err
+	}
 	sessions := codex.NewWithProviders(settings, handoff, githubhost.New(settings, logger))
 	backends := map[string]domain.AgentBackend{
 		config.DefaultAgentBackend: sessions,
-		config.ClaudeAgentBackend:  claude.New(settings),
+		// The Claude backend is given the very providers Codex holds, never
+		// copies: sessions.GitHubManager() is read back out rather than passing
+		// github along, so a future backend that quietly minted its own would
+		// fail the one-manager assertion instead of splitting the linked pull
+		// request table in production.
+		config.ClaudeAgentBackend: claude.NewWithProviders(settings, handoff, sessions.GitHubManager(), endpoint),
 	}
-	return backends, sessions.GitHubManager()
+	return backends, sessions.GitHubManager(), endpoint, nil
 }
 
 // logStartupCredentialStatus records whether startup resolved the credentials

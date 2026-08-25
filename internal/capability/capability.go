@@ -96,12 +96,20 @@ func decodeNoInput(arguments json.RawMessage) *Failure {
 
 // entry pairs a capability with whether this session advertises it.
 //
-// Advertisement and dispatch are deliberately distinct. Advertising is a coarse
-// filter over what an agent is told about; dispatch stays open to every
+// Advertisement and dispatch are deliberately distinct here. Advertising is a
+// coarse filter over what an agent is told about; Lookup stays open to every
 // capability the session is bound to, because the provider re-validates its own
-// preconditions immediately before mutating anything. Narrowing dispatch to the
+// preconditions immediately before mutating anything. Narrowing Lookup to the
 // advertised set would move authority into the advertisement and skip that
 // re-validation.
+//
+// That is a statement about this registry, not about every transport over it. It
+// holds where advertisement is the agent's only route to a call, which is true of
+// the Codex app-server. It is not true of the MCP endpoint, whose address and
+// token the agent's own shell holds, so internal/mcpbridge refuses an
+// unadvertised name at the transport instead -- see Registration.advertises. The
+// re-validation above is why that refusal closes an observability gap rather
+// than an authority hole.
 type entry struct {
 	capability Capability
 	advertised bool

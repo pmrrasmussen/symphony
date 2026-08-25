@@ -127,17 +127,21 @@ func itemType(tool string) string {
 
 // verifyInit checks that the CLI applied the launch contract this backend asked
 // for. The settings payload is accepted silently even when it cannot be parsed,
-// and the sandbox reports its own state nowhere in the stream, so this echo is
-// the only confirmation available that the policy is in force.
+// the MCP configuration is accepted silently too, and the sandbox reports its own
+// state nowhere in the stream, so this echo is the only confirmation available
+// that the policy is in force.
+//
+// It takes the contract the turn was actually launched with rather than
+// recomputing what it should have been: see launchContract.
 //
 // It deliberately does not check the sandbox: the init event does not report it.
 // That limitation is stated in the documentation rather than papered over.
-func verifyInit(event initEvent, workspace string) string {
+func verifyInit(event initEvent, workspace string, contract launchContract) string {
 	if event.PermissionMode != permissionMode {
 		return "claude session refused: permission mode was not applied"
 	}
-	if len(event.MCPServers) != 0 {
-		return "claude session refused: an MCP server was attached"
+	if refusal := verifyMCPServers(event, contract.mcpServers); refusal != "" {
+		return refusal
 	}
 	if !sameDirectory(event.CWD, workspace) {
 		// A turn running somewhere other than this issue's worktree would write
@@ -145,7 +149,7 @@ func verifyInit(event initEvent, workspace string) string {
 		return "claude session refused: the reported working directory is not this issue's workspace"
 	}
 	expected := map[string]bool{}
-	for _, tool := range codingTools {
+	for _, tool := range contract.tools {
 		expected[tool] = true
 	}
 	for _, tool := range event.Tools {
@@ -156,6 +160,41 @@ func verifyInit(event initEvent, workspace string) string {
 	}
 	if len(expected) != 0 {
 		return "claude session refused: the expected tool surface was not applied"
+	}
+	return ""
+}
+
+// verifyMCPServers requires exactly the servers the contract asked for, each
+// reporting itself connected.
+//
+// A session with no capability endpoint requires zero servers, which is what
+// --strict-mcp-config is there to produce and what every session gets today; an
+// extra server means the child reached a configuration this launcher did not
+// write, credentials included.
+//
+// A session with an endpoint requires "connected" and not "pending", which is
+// what makes this fail closed. A pending or failed server is a session whose
+// capability tools are advertised in --tools -- so the model will be told they
+// exist and will call them -- while every call returns a client-level MCP
+// failure. Accepting that state would produce precisely the silent-breakage
+// shape this wiring exists to prevent: a turn that commits work, cannot publish
+// it, and reports EventCompleted.
+func verifyMCPServers(event initEvent, expected []string) string {
+	remaining := map[string]bool{}
+	for _, name := range expected {
+		remaining[name] = true
+	}
+	for _, server := range event.MCPServers {
+		if !remaining[server.Name] {
+			return "claude session refused: an MCP server was attached"
+		}
+		delete(remaining, server.Name)
+		if server.Status != "connected" {
+			return "claude session refused: the capability endpoint did not connect"
+		}
+	}
+	if len(remaining) != 0 {
+		return "claude session refused: the capability endpoint was not attached"
 	}
 	return ""
 }

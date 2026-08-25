@@ -183,11 +183,16 @@ func toolList(g *Registration) []map[string]any {
 // only the transport, the single-invocation gate, and the context the invocation
 // runs under.
 //
-// It emits no item events. The CLI's own stream already reports every MCP call
-// as a tool_use/tool_result pair named mcp__symphony__<tool>, which the backend
-// already pairs and classifies, so emitting here would double-count the same
-// call. That is also why the registry's Lifecycle flag is not consulted: this
-// transport has no lifecycle record to suppress.
+// It emits no item events, and that is a deliberate trade with a known cost. A
+// call the agent CLI makes is already reported in the CLI's own stream as a
+// tool_use/tool_result pair named mcp__symphony__<tool>, which the backend pairs
+// and classifies, so emitting here would double-count it. A call the child makes
+// by other means -- its shell holds the endpoint token, and loopback is inside
+// its sandbox -- appears in no stream and therefore in no item record at all.
+// The advertisement gate below is what bounds that: such a call can only reach a
+// capability the model was already permitted to call, so it grants no authority,
+// but it does go unrecorded. That is also why the registry's Lifecycle flag is
+// not consulted: this transport has no lifecycle record to suppress.
 //
 // Nothing decoded from the wire is echoed anywhere -- no log line, no event -- so
 // the registry-owned Definition().Name that internal/codex carries forward has
@@ -204,10 +209,11 @@ func (g *Registration) callTool(params json.RawMessage, respond func(map[string]
 		return
 	}
 	bound, ok := g.capabilities.Lookup(call.Name)
-	if !ok {
+	if !ok || !g.advertises(bound.Definition().Name) {
 		// Refused as a tool result, not a JSON-RPC error: an unknown name is
 		// something the model chose and can correct, and the refusal reveals
-		// nothing about what is configured.
+		// nothing about what is configured -- an unadvertised capability is
+		// indistinguishable from one that does not exist.
 		respond(unsupportedTool())
 		return
 	}
@@ -240,6 +246,38 @@ func (g *Registration) callTool(params json.RawMessage, respond func(map[string]
 		// string owned by the provider.
 		g.emit(domain.Event{Kind: result.Terminal, At: time.Now(), Message: result.Reason})
 	}
+}
+
+// advertises reports whether a resolved capability is one this registration
+// advertises, which over this transport is the same question as whether the
+// agent is allowed to call it.
+//
+// The registry's own Lookup deliberately ignores advertisement, because on the
+// Codex transport advertisement is only a filter over what the model is told
+// about: the model can call nothing the app-server did not advertise, so
+// dispatch could stay open and let each provider re-validate its own
+// preconditions. That reasoning does not survive this transport. The child's
+// shell holds the endpoint token and loopback is reachable from inside its
+// sandbox, so the child can address this endpoint directly and name a
+// capability that never appeared in --tools, in --allowedTools, or in
+// tools/list. Provider re-validation still holds -- a landing re-checks the
+// tracker state, a follow-up re-checks that creation is enabled -- so what the
+// gate closes is not an authority hole but the gap between what the launch
+// contract pins as reachable and what actually is. With it, the only
+// capabilities reachable by any means are the ones the model was already
+// permitted to call, which is what makes the set-equality the launch contract
+// checks a statement about reachability rather than only about advertisement.
+//
+// The membership test walks Definitions() rather than caching it, because a
+// registry's advertised set is fixed when it is built and the set is at most a
+// handful of entries.
+func (g *Registration) advertises(name string) bool {
+	for _, definition := range g.capabilities.Definitions() {
+		if definition.Name == name {
+			return true
+		}
+	}
+	return false
 }
 
 // arguments normalizes an absent argument object. MCP declares "arguments"
