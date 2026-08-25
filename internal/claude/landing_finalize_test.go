@@ -55,10 +55,15 @@ type landingRemote struct {
 	transitions []string // every state Linear was moved to, in order
 	comments    []string // every Linear comment body, in order
 	checkRuns   []map[string]any
-	reviews     []any
-	mergeable   any
-	merged      bool
-	merges      int
+	// checkRunsAfterFirstRead, when set, is served from the second required-check
+	// read onwards. It is what turns one session into "gate hit, then the fix
+	// turn's retry finds the check green", which no single fixed table can be.
+	checkRunsAfterFirstRead []map[string]any
+	checkReads              int
+	reviews                 []any
+	mergeable               any
+	merged                  bool
+	merges                  int
 	// landFixOff turns the bounded-fix feature off, which makes the same failing
 	// required check an immediate refusal instead of a retryable gate.
 	landFixOff bool
@@ -73,6 +78,19 @@ func newLandingRemote(t *testing.T) *landingRemote {
 	f.server = httptest.NewServer(http.HandlerFunc(f.serve))
 	t.Cleanup(f.server.Close)
 	return f
+}
+
+// retryableGateThenReady is the sequence the deferred fallback's landed guard
+// exists for, and the only state in which that guard is what decides the outcome:
+// the first landing attempt hits the retryable gate, and the fix turn's retry
+// finds the check green and merges. The turn then ends with a gate on record and
+// a merged pull request.
+func (f *landingRemote) retryableGateThenReady() {
+	f.mu.Lock()
+	f.checkRunsAfterFirstRead = []map[string]any{{"name": "ci/build", "status": "completed", "conclusion": "success"}}
+	f.reviews = []any{map[string]any{"user": map[string]any{"login": "alice"}, "state": "APPROVED", "body": "lgtm", "submitted_at": "t1"}}
+	f.mergeable = true
+	f.mu.Unlock()
 }
 
 // readyToLand makes every landing gate pass, so the landing merges and resolves.
@@ -135,7 +153,12 @@ func (f *landingRemote) serveGitHub(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/commits/head/status":
 		f.write(w, map[string]any{"state": "", "statuses": []any{}})
 	case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/commits/head/check-runs":
-		f.write(w, map[string]any{"check_runs": f.checkRuns})
+		f.checkReads++
+		runs := f.checkRuns
+		if f.checkRunsAfterFirstRead != nil && f.checkReads > 1 {
+			runs = f.checkRunsAfterFirstRead
+		}
+		f.write(w, map[string]any{"check_runs": runs})
 	case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/pulls/7/reviews":
 		f.write(w, f.reviews)
 	case r.Method == http.MethodPut && r.URL.Path == "/repos/owner/repo/pulls/7/merge":
@@ -246,6 +269,12 @@ func landingRegistry(t *testing.T, f *landingRemote, workspace string) (*capabil
 // reports is the ordinary one landing expects: the configured repository as
 // origin, nothing uncommitted, and a HEAD that already matches the published
 // pull request head, so no push path is involved.
+//
+// It is a stub, not a fake worktree, and nothing here asserts anything about the
+// git surface itself: it matches on the first two arguments only, ignores the
+// directory it is run in, and answers the base-branch rev-parse with a constant,
+// so the base-moved gate can never fire through it. internal/github owns the
+// tests for what landing asks git and what it does with the answers.
 func writeFakeGit(t *testing.T, dir string) {
 	t.Helper()
 	bin := filepath.Join(dir, "bin")
@@ -298,6 +327,20 @@ func landingChildBody(dir string) string {
 		"cp " + at("land.json") + " " + at("landed") + "\n"
 }
 
+// landRetryBody is a second github_land_pr call in the same turn, which is what a
+// fix turn does after a retryable gate. It is appended to landingChildBody, so the
+// marker landingChildBody writes is overwritten by this call's result and
+// waitForLanding waits for the retry rather than for the gate.
+func landRetryBody(dir string) string {
+	at := func(name string) string { return filepath.Join(dir, name) }
+	return "printf '%s' '" + `{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"` +
+		capability.NameGitHubLandPR + `","arguments":{}}}` + "' > " + at("retry.body") + "\n" +
+		"curl -sS -X POST -H \"Authorization: Bearer $" + endpointTokenEnvName + "\"" +
+		" -H 'Content-Type: application/json' --data-binary @" + at("retry.body") +
+		" -o " + at("retry.json") + " -w '%{http_code}' \"$url\" > " + at("retry.status") + "\n" +
+		"cp " + at("retry.json") + " " + at("landed") + "\n"
+}
+
 // waitForLanding blocks until the child's github_land_pr call has come back,
 // which is what puts the session in the only state a turn end has work to do in.
 func waitForLanding(t *testing.T, dir string) {
@@ -327,10 +370,15 @@ func waitForLanding(t *testing.T, dir string) {
 // after the kill. Twenty seconds is enough for that on an idle machine and not
 // on a loaded one, and a patience that expires is a false failure: what these
 // tests assert is what the tracker was told, never how quickly.
+//
+// It is not much more patience, though. A wedge reported as a two-minute stall is
+// a worse diagnostic than the same wedge reported in seconds, so this is roughly
+// twice the worst observed drain-then-finalize rather than an order of magnitude
+// above it.
 func drainLanding(t *testing.T, events <-chan domain.Event) []domain.Event {
 	t.Helper()
 	var collected []domain.Event
-	timeout := time.After(2 * time.Minute)
+	timeout := time.After(45 * time.Second)
 	for {
 		select {
 		case event, ok := <-events:
@@ -355,9 +403,16 @@ func requireCurl(t *testing.T) {
 // the real registry, returning everything a test needs to end that turn.
 func landingSession(t *testing.T, ctx context.Context, f *landingRemote, dir, ending string, turnTimeout time.Duration) (*Backend, domain.AgentSession, <-chan domain.Event) {
 	t.Helper()
+	return landingSessionWith(t, ctx, f, dir, landingChildBody(dir), ending, turnTimeout)
+}
+
+// landingSessionWith is landingSession with the child's MCP work spelled out, for
+// the one case that needs two landing calls in a turn.
+func landingSessionWith(t *testing.T, ctx context.Context, f *landingRemote, dir, body, ending string, turnTimeout time.Duration) (*Backend, domain.AgentSession, <-chan domain.Event) {
+	t.Helper()
 	writeFakeGit(t, dir)
 	registry, names := landingRegistry(t, f, workspaceOf(dir))
-	script := writeFakeClaude(t, dir, landingChildBody(dir)+
+	script := writeFakeClaude(t, dir, body+
 		"cat <<'EOF'\n"+landingInitLine(dir, names)+"\nEOF\n"+ending)
 	backend, _ := backendWithEndpoint(t)
 	r := request(t, dir, script)
@@ -380,6 +435,12 @@ func landingSession(t *testing.T, ctx context.Context, f *landingRemote, dir, en
 //
 // Exactly once matters as much as at least once: two finalizer runs are two
 // attempts at the same transition against a live tracker.
+//
+// The case set is this transport's own, and it is deliberately not the Codex
+// file's: a --print turn ends by closing its stream, so there is no protocol
+// notification to enumerate, and the turn timeout genuinely is a turn end here
+// (the turn's own shutdown retires the endpoint) where on Codex it is only a kill.
+// A hard Cancel is the one ending both transports share.
 func TestEveryTurnEndPathFiresTheDeferredLandingTransition(t *testing.T) {
 	requireCurl(t)
 	for name, test := range map[string]struct {
@@ -532,5 +593,36 @@ func TestTheDeferredTransitionSurvivesRunCancellation(t *testing.T) {
 	}
 	if len(comments) != 1 {
 		t.Fatalf("Linear comments=%v, want exactly one", comments)
+	}
+}
+
+// TestATurnEndAfterAGateThenAMergeLeavesTheIssueDone is the negative the landed
+// guard actually exists for, and the one the resolved-landing case above cannot
+// reach: there, no gate is ever hit, so the finalizer short-circuits on
+// retryableGateHit and never reads landed at all.
+//
+// Here the gate is hit, the fix turn's retry merges, and the turn ends with both
+// facts on record. Getting it wrong is the worst outcome in this area: a merged,
+// Done issue walked back to In Review carrying a comment that says landing fix
+// attempts were exhausted.
+func TestATurnEndAfterAGateThenAMergeLeavesTheIssueDone(t *testing.T) {
+	requireCurl(t)
+	dir := t.TempDir()
+	remote := newLandingRemote(t)
+	remote.retryableGateThenReady()
+	_, _, events := landingSessionWith(t, context.Background(), remote, dir,
+		landingChildBody(dir)+landRetryBody(dir),
+		"cat <<'EOF'\n"+resultLine(false, "")+"\nEOF\n", 0)
+	waitForLanding(t, dir)
+	drainLanding(t, events)
+	transitions, comments, merges := remote.observed()
+	if merges != 1 {
+		t.Fatalf("merges=%d, want exactly one", merges)
+	}
+	if len(transitions) != 1 || transitions[0] != "Done" {
+		t.Fatalf("Linear transitions=%v, want exactly one to Done", transitions)
+	}
+	if len(comments) != 0 {
+		t.Fatalf("a merged landing was commented on as a refusal: %v", comments)
 	}
 }

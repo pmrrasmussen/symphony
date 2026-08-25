@@ -50,10 +50,15 @@ type landingRemote struct {
 	transitions []string // every state Linear was moved to, in order
 	comments    []string // every Linear comment body, in order
 	checkRuns   []map[string]any
-	reviews     []any
-	mergeable   any
-	merged      bool
-	merges      int
+	// checkRunsAfterFirstRead, when set, is served from the second required-check
+	// read onwards. It is what turns one session into "gate hit, then the fix
+	// turn's retry finds the check green", which no single fixed table can be.
+	checkRunsAfterFirstRead []map[string]any
+	checkReads              int
+	reviews                 []any
+	mergeable               any
+	merged                  bool
+	merges                  int
 }
 
 func newLandingRemote(t *testing.T) *landingRemote {
@@ -70,6 +75,20 @@ func newLandingRemote(t *testing.T) *landingRemote {
 func (f *landingRemote) failingRequiredCheck() {
 	f.mu.Lock()
 	f.checkRuns = []map[string]any{{"name": "ci/build", "status": "completed", "conclusion": "failure"}}
+	f.mu.Unlock()
+}
+
+// retryableGateThenReady is the sequence the deferred fallback's landed guard
+// exists for, and the only state in which that guard is what decides the outcome:
+// the first landing attempt hits the retryable gate, and the fix turn's retry
+// finds the check green and merges. The turn then ends with a gate on record and
+// a merged pull request.
+func (f *landingRemote) retryableGateThenReady() {
+	f.failingRequiredCheck()
+	f.mu.Lock()
+	f.checkRunsAfterFirstRead = []map[string]any{{"name": "ci/build", "status": "completed", "conclusion": "success"}}
+	f.reviews = []any{map[string]any{"user": map[string]any{"login": "alice"}, "state": "APPROVED", "body": "lgtm", "submitted_at": "t1"}}
+	f.mergeable = true
 	f.mu.Unlock()
 }
 
@@ -133,7 +152,12 @@ func (f *landingRemote) serveGitHub(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/commits/head/status":
 		f.write(w, map[string]any{"state": "", "statuses": []any{}})
 	case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/commits/head/check-runs":
-		f.write(w, map[string]any{"check_runs": f.checkRuns})
+		f.checkReads++
+		runs := f.checkRuns
+		if f.checkRunsAfterFirstRead != nil && f.checkReads > 1 {
+			runs = f.checkRunsAfterFirstRead
+		}
+		f.write(w, map[string]any{"check_runs": runs})
 	case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/pulls/7/reviews":
 		f.write(w, f.reviews)
 	case r.Method == http.MethodPut && r.URL.Path == "/repos/owner/repo/pulls/7/merge":
@@ -221,6 +245,12 @@ func (f *landingRemote) write(w http.ResponseWriter, payload any) {
 // app-server. The worktree it reports is the ordinary one landing expects: the
 // configured repository as origin, nothing uncommitted, and a HEAD that already
 // matches the published pull request head, so no push path is involved.
+//
+// It is a stub, not a fake worktree, and nothing here asserts anything about the
+// git surface itself: it matches on the first two arguments only, ignores the
+// directory it is run in, and answers the base-branch rev-parse with a constant,
+// so the base-moved gate can never fire through it. internal/github owns the
+// tests for what landing asks git and what it does with the answers.
 func writeFakeGit(t *testing.T, dir string) {
 	t.Helper()
 	bin := filepath.Join(dir, "bin")
@@ -264,6 +294,17 @@ printf 'done\n' > ` + filepath.Join(dir, "landed") + `
 ` + ending
 }
 
+// landRetry is a second github_land_pr call in the same turn, which is what a fix
+// turn does after a retryable gate. It goes where an ending goes, so it composes:
+// landingScript(dir, "false", landRetry(dir, "true", turnCompleted)).
+func landRetry(dir, wantSuccess, ending string) string {
+	return `printf '%s\n' '{"jsonrpc":"2.0","id":100,"method":"item/tool/call","params":{"tool":"github_land_pr","arguments":{}}}'
+IFS= read -r line
+case "$line" in *'"success":` + wantSuccess + `'*) ;; *) exit 32;; esac
+printf 'retried\n' > ` + filepath.Join(dir, "retried") + `
+` + ending
+}
+
 const (
 	turnCompleted = `printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{}}'` + "\n"
 	turnFailed    = `printf '%s\n' '{"jsonrpc":"2.0","method":"turn/failed","params":{}}'` + "\n"
@@ -296,9 +337,13 @@ func waitForLanding(t *testing.T, dir string) {
 }
 
 // settle ends the session the way the coordinator always does, and waits for the
-// child to be reaped so a test's temporary directory outlives it. It doubles as
-// an idempotency assertion: Cancel is another turn-end path, and every count this
-// file checks is "exactly one" after it has also run.
+// child to be reaped so a test's temporary directory outlives it.
+//
+// On a path that has already cancelled the session it is a pure no-op -- Cancel
+// deleted the session from the backend's map and the second call returns on the
+// nil client -- so it asserts nothing there. Where it does assert something is
+// after a protocol turn end: Cancel is a second turn-end path over the same
+// session, and every count in this file is still "exactly one" after it.
 func settle(t *testing.T, b *Backend, session domain.AgentSession) {
 	t.Helper()
 	if err := b.Cancel(context.Background(), session); err != nil {
@@ -306,35 +351,49 @@ func settle(t *testing.T, b *Backend, session domain.AgentSession) {
 	}
 }
 
+// drainLanding drains a turn's stream under a bound. A bare `for range events`
+// would turn a stream that never closes into a package-timeout hang with no
+// failing test named, which is the one failure mode a wiring test must not have.
+// The patience is generous because a turn end here does real work before the
+// stream closes -- up to three tracker round trips -- and because what these
+// tests assert is what the tracker was told, never how quickly.
+func drainLanding(t *testing.T, events <-chan domain.Event) []domain.Event {
+	t.Helper()
+	var collected []domain.Event
+	timeout := time.After(45 * time.Second)
+	for {
+		select {
+		case event, ok := <-events:
+			if !ok {
+				return collected
+			}
+			collected = append(collected, event)
+		case <-timeout:
+			t.Fatalf("event stream did not close; collected %d events", len(collected))
+		}
+	}
+}
+
 // TestEveryTurnEndPathFiresTheDeferredLandingTransition is the coverage PMR-86
 // exists for. A turn that hit a retryable landing gate and then ended without
 // landing must return the issue to human review, and every way that turn can end
-// has to do it -- otherwise the issue sits in Merging holding a state-aware
-// capacity slot with nothing scheduled to move it.
+// has to do it.
 //
-// The turn timeout is deliberately expressed as "timeout, then the coordinator's
-// Cancel". On this transport the timeout itself only kills the child (see
-// client.turn); the transition comes from the Cancel the coordinator issues for
-// the terminal event that produces, and that is the path this asserts.
+// The case set is this transport's own, and it is deliberately not the Claude
+// file's: the app-server ends a turn with one of three protocol notifications,
+// which that transport has no equivalent of, and a hard Cancel is the one ending
+// both share. The turn timeout is covered separately, because on this transport
+// it is not a turn end at all -- see
+// TestATimedOutTurnFinalizesOnlyWhenTheRunIsStopped.
 func TestEveryTurnEndPathFiresTheDeferredLandingTransition(t *testing.T) {
 	for name, test := range map[string]struct {
-		ending  string
-		timeout time.Duration
-		cancel  bool
+		ending string
+		cancel bool
 	}{
 		"turn/completed": {ending: turnCompleted},
 		"turn/failed":    {ending: turnFailed},
 		"turn/cancelled": {ending: turnCancelled},
 		"hard cancel":    {ending: turnHangs, cancel: true},
-		// The bound is deliberately far larger than it needs to be. The
-		// child's landing call has to finish before the timeout fires --
-		// a timeout that fired mid-call would leave no gate hit and
-		// nothing to assert -- and that call is a git child plus several
-		// real HTTP round trips, which a loaded machine can stretch by an
-		// order of magnitude. Ten seconds is roughly fifty times its
-		// observed cost. It fails loudly rather than vacuously if it is
-		// ever not enough: waitForLanding says the call never came back.
-		"turn timeout": {ending: turnHangs, timeout: 10 * time.Second, cancel: true},
 	} {
 		t.Run(name, func(t *testing.T) {
 			dir := t.TempDir()
@@ -342,25 +401,24 @@ func TestEveryTurnEndPathFiresTheDeferredLandingTransition(t *testing.T) {
 			remote.failingRequiredCheck()
 			writeFakeGit(t, dir)
 			script := writeAppServer(t, dir, landingScript(dir, "false", test.ending))
-			r := landingRequest(remote, dir, script)
-			if test.timeout > 0 {
-				r.TurnTimeout = test.timeout
-			}
 			b := integratedBackend(func() config.Settings { return remote.settings() })
-			session, events, err := b.Start(context.Background(), r)
+			session, events, err := b.Start(context.Background(), landingRequest(remote, dir, script))
 			if err != nil {
 				t.Fatal(err)
 			}
 			waitForLanding(t, dir)
 			if test.cancel {
-				// Cancel is what the coordinator calls for a run it is stopping,
-				// whether the turn hung or timed out. It must have finalized the
-				// landing by the time it returns: the coordinator has no other
-				// handle on the session left afterwards.
+				// Cancel is what the coordinator calls for a run it is
+				// stopping. It must have finalized the landing by the time it
+				// returns: the coordinator has no other handle on the session
+				// left afterwards.
 				settle(t, b, session)
+				transitions, _, _ := remote.observed()
+				if len(transitions) != 1 || transitions[0] != "In Review" {
+					t.Fatalf("cancel returned with Linear transitions=%v, want exactly one to In Review", transitions)
+				}
 			}
-			for range events {
-			}
+			drainLanding(t, events)
 			settle(t, b, session)
 			transitions, comments, merges := remote.observed()
 			if len(transitions) != 1 || transitions[0] != "In Review" {
@@ -391,8 +449,7 @@ func TestATurnEndAfterAResolvedLandingLeavesTheIssueDone(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for range events {
-	}
+	drainLanding(t, events)
 	settle(t, b, session)
 	transitions, comments, merges := remote.observed()
 	if merges != 1 {
@@ -424,8 +481,7 @@ func TestATurnEndWithTheBoundedFixOffDefersNothing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for range events {
-	}
+	drainLanding(t, events)
 	settle(t, b, session)
 	transitions, comments, _ := remote.observed()
 	if len(transitions) != 1 || transitions[0] != "In Review" {
@@ -459,8 +515,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn-1"}}}'
 	if err != nil {
 		t.Fatal(err)
 	}
-	for range events {
-	}
+	drainLanding(t, events)
 	settle(t, b, session)
 	transitions, comments, merges := remote.observed()
 	if len(transitions) != 0 || len(comments) != 0 || merges != 0 {
@@ -494,13 +549,99 @@ func TestTheDeferredTransitionSurvivesRunCancellation(t *testing.T) {
 	if err := b.Cancel(context.Background(), session); err != nil {
 		t.Fatalf("cancel: %v", err)
 	}
-	for range events {
-	}
+	drainLanding(t, events)
 	transitions, comments, _ := remote.observed()
 	if len(transitions) != 1 || transitions[0] != "In Review" {
 		t.Fatalf("Linear transitions=%v, want exactly one to In Review after a cancelled run", transitions)
 	}
 	if len(comments) != 1 {
 		t.Fatalf("Linear comments=%v, want exactly one", comments)
+	}
+}
+
+// TestATimedOutTurnFinalizesOnlyWhenTheRunIsStopped is this transport's turn
+// timeout, and it is a separate test because the timeout is not a turn end here.
+// client.turn's timer emits a terminal failure and kills the child; it does not
+// finalize. So the timeout leaves the deferred transition owed, and the Cancel
+// the coordinator issues for that terminal event is what pays it -- against a
+// session whose process is already gone, which is the state no other case here
+// produces.
+//
+// Both halves are asserted, because only the pair says where the transition came
+// from: nothing after the timeout, everything after the Cancel. The bound is far
+// larger than it needs to be so that the child's landing call -- a git child plus
+// several real HTTP round trips, which a loaded machine can stretch by an order of
+// magnitude -- cannot still be in flight when the timer fires. If it ever is,
+// waitForLanding fails loudly rather than letting this pass vacuously.
+func TestATimedOutTurnFinalizesOnlyWhenTheRunIsStopped(t *testing.T) {
+	dir := t.TempDir()
+	remote := newLandingRemote(t)
+	remote.failingRequiredCheck()
+	writeFakeGit(t, dir)
+	script := writeAppServer(t, dir, landingScript(dir, "false", turnHangs))
+	r := landingRequest(remote, dir, script)
+	r.TurnTimeout = 10 * time.Second
+	b := integratedBackend(func() config.Settings { return remote.settings() })
+	session, events, err := b.Start(context.Background(), r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForLanding(t, dir)
+
+	// The stream closes when the turn timeout fires, so draining it is how this
+	// waits for the timeout rather than for a clock.
+	collected := drainLanding(t, events)
+	if len(collected) == 0 || collected[len(collected)-1].Kind != domain.EventFailed {
+		t.Fatalf("the turn timeout did not end the turn: %v", collected)
+	}
+	if transitions, comments, _ := remote.observed(); len(transitions) != 0 || len(comments) != 0 {
+		t.Fatalf("the timeout itself finalized: transitions=%v comments=%v", transitions, comments)
+	}
+
+	settle(t, b, session)
+	transitions, comments, merges := remote.observed()
+	if len(transitions) != 1 || transitions[0] != "In Review" {
+		t.Fatalf("Linear transitions=%v, want exactly one to In Review", transitions)
+	}
+	if len(comments) != 1 || !strings.Contains(comments[0], "required checks failed") {
+		t.Fatalf("Linear comments=%v, want exactly one naming the failed gate", comments)
+	}
+	if merges != 0 {
+		t.Fatalf("a refused landing merged %d times", merges)
+	}
+}
+
+// TestATurnEndAfterAGateThenAMergeLeavesTheIssueDone is the negative the landed
+// guard actually exists for, and the one the resolved-landing case above cannot
+// reach: there, no gate is ever hit, so the finalizer short-circuits on
+// retryableGateHit and never reads landed at all.
+//
+// Here the gate is hit, the fix turn's retry merges, and the turn ends with both
+// facts on record. Getting it wrong is the worst outcome in this area: a merged,
+// Done issue walked back to In Review carrying a comment that says landing fix
+// attempts were exhausted.
+func TestATurnEndAfterAGateThenAMergeLeavesTheIssueDone(t *testing.T) {
+	dir := t.TempDir()
+	remote := newLandingRemote(t)
+	remote.retryableGateThenReady()
+	writeFakeGit(t, dir)
+	// Two landing calls in one turn: the gate, then the retry that merges.
+	script := writeAppServer(t, dir, landingScript(dir, "false", landRetry(dir, "true", turnCompleted)))
+	b := integratedBackend(func() config.Settings { return remote.settings() })
+	session, events, err := b.Start(context.Background(), landingRequest(remote, dir, script))
+	if err != nil {
+		t.Fatal(err)
+	}
+	drainLanding(t, events)
+	settle(t, b, session)
+	transitions, comments, merges := remote.observed()
+	if merges != 1 {
+		t.Fatalf("merges=%d, want exactly one", merges)
+	}
+	if len(transitions) != 1 || transitions[0] != "Done" {
+		t.Fatalf("Linear transitions=%v, want exactly one to Done", transitions)
+	}
+	if len(comments) != 0 {
+		t.Fatalf("a merged landing was commented on as a refusal: %v", comments)
 	}
 }

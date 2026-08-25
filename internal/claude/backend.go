@@ -82,22 +82,6 @@ const reservedTerminalSlots = 2
 // be holding a pipe.
 const waitDelay = 2 * time.Second
 
-// finalizeBudget bounds the turn-ended finalizer, which runs detached from the
-// run's cancellation (see finalizerContext). Its work is a handful of sequential
-// Linear GraphQL round trips -- the deferred transition re-reads the issue,
-// resolves the team's states, transitions, re-reads to confirm, and comments --
-// so seconds is the right order of magnitude, and the bound has three ceilings to
-// stay under. A hard Cancel reaches the finalizer before it returns and the
-// coordinator waits only five seconds for Cancel, so anything longer finishes
-// after the coordinator has stopped waiting rather than instead of it. The
-// daemon's graceful shutdown deadline is twenty seconds (cmd/symphony), so the
-// budget must be the thing that ends a hung finalizer, not process exit halfway
-// through a transition. And the capability endpoint stops waiting for a finalizer
-// after thirty seconds, so this stays comfortably inside that too. Ten seconds
-// satisfies all three, and the Codex transport picks the same number for the same
-// reasons.
-const finalizeBudget = 10 * time.Second
-
 // Backend implements domain.AgentBackend on the Claude Code CLI.
 type Backend struct {
 	settings    func() config.Settings
@@ -121,8 +105,14 @@ type session struct {
 	// ctx is the run-lived context Start was given. Capability invocations run on
 	// it, never on a turn's or an HTTP request's context: a killed child cancels
 	// those instantly, which is exactly the case where aborting a merge already
-	// in flight would do the damage. The turn-ended finalizer is the one thing
-	// that does not run on it -- see finalizerContext.
+	// in flight would do the damage.
+	//
+	// The turn-ended finalizer is the one thing that does not run on it. The
+	// coordinator stops a run by cancelling this very context and only then
+	// cancelling the session, so it is routinely dead exactly when the deferred
+	// Merging -> In Review transition is owed (PMR-95). The endpoint derives that
+	// finalizer's context itself, dropping this one's cancellation and keeping its
+	// values -- see mcpbridge.finalizerBudget.
 	ctx context.Context
 
 	// registry is built once per run and holds the provider session pointers the
@@ -474,9 +464,13 @@ func reportRetirement(events *sink, expired error) {
 // expired, or a turn-ended finalizer that had not returned. Both are
 // operator-visible facts with no URL, token, argument, or result in them.
 //
-// The finalizer runs on none of the contexts in scope here: not a caller's, which
-// a Cancel bounds at seconds; not a turn's, which is already cancelled; and not
-// the run's, which by this point usually is too. See finalizerContext.
+// The context passed to the revocation is the run's, and it is deliberately not
+// the finalizer's: it carries values and nothing else. The endpoint derives the
+// finalizer's own budgeted context after its drain, because the drain ignores a
+// context by design and is bounded at two minutes, so anything minted here would
+// routinely be spent before the finalizer started (see mcpbridge.finalizerBudget).
+// That is also why nothing here has a cancel to defer: a defer that fired when
+// the revocation returned could cut a still-running transition short.
 //
 // only, when non-nil, retires that registration and nothing else. The turn's own
 // shutdown passes its own registration because by then the session may already
@@ -499,9 +493,7 @@ func (s *session) retireEndpoint(only *registration) error {
 	if target == nil {
 		return nil
 	}
-	finalizer, cancel := s.finalizerContext()
-	defer cancel()
-	owned, err := target.revoke(finalizer)
+	owned, err := target.revoke(s.ctx)
 	// The session's slot is cleared only now, after the revocation has finished.
 	// Clearing it first would open the window this ordering exists to close: a
 	// concurrent launch would find the slot empty, conclude there was nothing to
@@ -635,29 +627,7 @@ func (s *session) discardEndpoint(held *registration) {
 	if held == nil {
 		return
 	}
-	finalizer, cancel := s.finalizerContext()
-	defer cancel()
-	_, _ = held.revoke(finalizer)
-}
-
-// finalizerContext is the context the registry's turn-ended finalizer runs on: a
-// budgeted context detached from the run's cancellation.
-//
-// Detached, because the run's context is dead exactly when the finalizer matters.
-// The coordinator stops a run by cancelling the very context Start was given and
-// only then cancelling the session (Coordinator.stopRun, and Shutdown), so a
-// finalizer inheriting it could not issue the deferred Merging -> In Review
-// transition at all: the issue would stay in the configured Merging state,
-// holding a state-aware capacity slot, with nothing scheduled to move it
-// (PMR-95). The Codex transport detaches its own for the same reason.
-//
-// Budgeted, because a context with neither cancellation nor deadline would let a
-// hung tracker hold a revocation open for the daemon's lifetime. The budget is
-// also what ends an expired finalizer: the endpoint stops waiting for one after
-// its own bound and says so, but the finalizer itself keeps running, and this is
-// the only thing that stops it.
-func (s *session) finalizerContext() (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.WithoutCancel(s.ctx), finalizeBudget)
+	_, _ = held.revoke(s.ctx)
 }
 
 // turn is one child process.

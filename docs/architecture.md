@@ -376,7 +376,20 @@ on every path a turn can end on -- completion, failure, turn timeout, a hard
 cancellation, and a launch that never produced a child -- because a missed
 revocation is a credential lifetime leak rather than a leaked struct: the
 registration holds the GitHub session, so a stale one keeps a loopback-reachable,
-token-bearing capability set alive for the daemon's lifetime. `--setting-sources ""` excludes user, project, and local
+token-bearing capability set alive for the daemon's lifetime.
+
+That finalizer runs on a context of the endpoint's own making, not on the run's.
+Both are deliberate and both are operator-visible. The finalizer's work is the
+deferred `Merging -> In Review` transition, which is precisely the work a stopped
+run still owes its issue, so it must survive the cancellation that stopped the
+run -- the coordinator cancels the run's context before it cancels the session,
+and a finalizer inheriting that could never issue the transition. It is therefore
+derived after the drain, where a budget is spent on the finalizer and not on a
+two-minute wait that ignores contexts by design, and it is bounded at five
+seconds. The consequence to expect while operating: stopping a run, and shutting
+the daemon down with SIGTERM, can each still issue one tracker transition per
+affected session after the stop was requested. The alternative is an issue left
+in the configured merge state that no turn end will ever move. `--setting-sources ""` excludes user, project, and local
 settings, which matters because the workspace is a checkout of a repository
 that may ship `.claude/settings.json`, `CLAUDE.md`, skills, plugins, and hooks,
 and hooks run arbitrary commands -- discovery left enabled would let repository
