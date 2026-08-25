@@ -121,7 +121,14 @@ func endpoint(t *testing.T) *Server {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	t.Cleanup(func() { _ = server.Close(context.Background()) })
+	t.Cleanup(func() {
+		// Bounded: Shutdown waits for active requests, and a test that fails
+		// while an invocation is deliberately blocked would otherwise hang here
+		// instead of reporting.
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = server.Close(ctx)
+	})
 	return server
 }
 
@@ -521,6 +528,8 @@ func TestUnknownPathIsNotFound(t *testing.T) {
 func TestConcurrentCallsSerializePerRegistration(t *testing.T) {
 	entered := make(chan struct{}, 1)
 	release := make(chan struct{})
+	releaseOnce := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(releaseOnce)
 	var mu sync.Mutex
 	var running, peak int
 	slow := func(context.Context) (capability.Result, *capability.Failure) {
@@ -545,29 +554,36 @@ func TestConcurrentCallsSerializePerRegistration(t *testing.T) {
 	first := asyncCall(t, registration, "slow")
 	awaitSignal(t, entered, "the first invocation to start")
 
-	var wg sync.WaitGroup
-	refusals := make(chan string, 3)
-	for i := 0; i < 3; i++ {
-		wg.Add(1)
+	// Each probe reports an outcome rather than joining a wait group: a parallel
+	// call that is admitted instead of refused blocks inside the invocation, and
+	// waiting for it to finish would hang this test instead of failing it.
+	const probes = 3
+	outcomes := make(chan string, probes)
+	for i := 0; i < probes; i++ {
 		go func() {
-			defer wg.Done()
 			text, isError := toolOutcome(t, callTool(t, registration, registration.Token(), "slow"))
-			if !isError {
-				refusals <- "a parallel call ran instead of being refused"
-				return
-			}
-			if !strings.Contains(text, "already running") {
-				refusals <- "a parallel call was refused with " + text
+			switch {
+			case !isError:
+				outcomes <- "a parallel call ran instead of being refused"
+			case !strings.Contains(text, "already running"):
+				outcomes <- "a parallel call was refused with " + text
+			default:
+				outcomes <- ""
 			}
 		}()
 	}
-	wg.Wait()
-	close(refusals)
-	for problem := range refusals {
-		t.Fatal(problem)
+	for i := 0; i < probes; i++ {
+		select {
+		case problem := <-outcomes:
+			if problem != "" {
+				t.Fatal(problem)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("a parallel call was neither refused nor completed: invocations did not serialize")
+		}
 	}
 
-	close(release)
+	releaseOnce()
 	if text, isError := toolOutcome(t, await(t, first, "the in-flight call")); isError || text != `"done"` {
 		t.Fatalf("the in-flight call returned %q (isError %v)", text, isError)
 	}
@@ -589,6 +605,8 @@ func TestConcurrentCallsSerializePerRegistration(t *testing.T) {
 func TestRevokeDrainsInFlightWorkBeforeTurnEnded(t *testing.T) {
 	entered := make(chan struct{})
 	release := make(chan struct{})
+	releaseOnce := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(releaseOnce)
 	var mu sync.Mutex
 	returned := false
 	finalizedAfterReturn := false
@@ -628,7 +646,7 @@ func TestRevokeDrainsInFlightWorkBeforeTurnEnded(t *testing.T) {
 		t.Fatalf("the turn-ended finalizer ran %d times while a call was in flight", count)
 	}
 
-	close(release)
+	releaseOnce()
 	awaitSignal(t, revoked, "Revoke to return")
 	await(t, call, "the drained call")
 	mu.Lock()
@@ -674,6 +692,8 @@ func TestTerminalResultReachesTheOwningSink(t *testing.T) {
 func TestRevokedRegistrationCannotEmit(t *testing.T) {
 	entered := make(chan struct{})
 	release := make(chan struct{})
+	releaseOnce := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(releaseOnce)
 	registry := newRegistry().with("lands", func(context.Context) (capability.Result, *capability.Failure) {
 		close(entered)
 		<-release
@@ -695,7 +715,7 @@ func TestRevokedRegistrationCannotEmit(t *testing.T) {
 		return response.StatusCode == http.StatusUnauthorized
 	}, "the revoked token to stop authenticating")
 
-	close(release)
+	releaseOnce()
 	awaitSignal(t, revoked, "Revoke to return")
 	await(t, call, "the drained call")
 	if emitted := events.all(); len(emitted) != 0 {
