@@ -191,7 +191,13 @@ type handoffObservation struct {
 }
 
 type running struct {
-	issue     domain.Issue
+	issue domain.Issue
+	// backend names the agent runtime that started this run. Continuation and
+	// cancellation are routed by session, but the scheduler's own per-backend
+	// policy lookups (currently the stall budget) resolve current settings under
+	// this name, so a reload cannot start applying another backend's policy to a
+	// run already in flight.
+	backend   string
 	session   domain.AgentSession
 	last      time.Time
 	cancel    context.CancelFunc
@@ -685,7 +691,8 @@ func (c *Coordinator) reconcile(ctx context.Context) error {
 		c.mu.Lock()
 		last := r.last
 		c.mu.Unlock()
-		if reason == "" && s.Codex.StallTimeout > 0 && now.Sub(last) > s.Codex.StallTimeout {
+		stallTimeout := s.AgentLaunchFor(r.backend).StallTimeout
+		if reason == "" && stallTimeout > 0 && now.Sub(last) > stallTimeout {
 			reason = stopStalled
 		}
 		if reason == "" {
@@ -807,8 +814,9 @@ func (c *Coordinator) launch(parent context.Context, i domain.Issue, attempt int
 			c.finishFailure(parent, i, attempt, "prompt_render", err)
 			return
 		}
-		c.log.Debug("codex launch requested", "issue_id", i.ID, "issue_identifier", i.Identifier, "attempt", attempt)
-		session, events, err := c.agent.Start(ctx, domain.AgentRequest{Issue: i, Workspace: ws.Path, GitMetadataRoots: ws.GitMetadataRoots, Prompt: prompt, Command: s.Codex.Command, ApprovalPolicy: s.Codex.ApprovalPolicy, ThreadSandbox: s.Codex.ThreadSandbox, TurnSandboxPolicy: s.Codex.TurnSandboxPolicy, TurnTimeout: s.Codex.TurnTimeout, ReadTimeout: s.Codex.ReadTimeout, StartTimeout: s.Codex.StartTimeout})
+		launch := s.AgentLaunch()
+		c.log.Debug("agent launch requested", "issue_id", i.ID, "issue_identifier", i.Identifier, "attempt", attempt, "agent_backend", launch.Backend)
+		session, events, err := c.agent.Start(ctx, domain.AgentRequest{Issue: i, Workspace: ws.Path, GitMetadataRoots: ws.GitMetadataRoots, Prompt: prompt, Command: launch.Command, ApprovalPolicy: launch.ApprovalPolicy, ThreadSandbox: launch.ThreadSandbox, TurnSandboxPolicy: launch.TurnSandboxPolicy, TurnTimeout: launch.TurnTimeout, ReadTimeout: launch.ReadTimeout, StartTimeout: launch.StartTimeout})
 		if err != nil {
 			c.workspaces.AfterRun(context.Background(), ws, i)
 			c.unreserve(i.ID)
@@ -823,7 +831,7 @@ func (c *Coordinator) launch(parent context.Context, i domain.Issue, attempt int
 		}
 		now := c.clock.Now()
 		r := &running{
-			issue: i, session: session, last: now, cancel: cancel, workspace: ws,
+			issue: i, backend: launch.Backend, session: session, last: now, cancel: cancel, workspace: ws,
 			run: domain.Run{IssueID: i.ID, IssueIdentifier: i.Identifier, WorkspacePath: ws.Path, SessionID: session.ID, Attempt: attempt, TurnCount: 1, StartedAt: now},
 		}
 		c.mu.Lock()
@@ -1006,7 +1014,7 @@ func continuationGuidance(turn, maxTurns int) string {
 	// so continuation turns do not resend the repository task template.
 	return fmt.Sprintf(`Continuation guidance:
 
-- The previous Codex turn completed normally, but the tracker work item is still in an active state.
+- The previous agent turn completed normally, but the tracker work item is still in an active state.
 - This is continuation turn #%d of %d for the current agent run.
 - Resume from the current workspace and workpad state instead of restarting from scratch.
 - The original task instructions and prior turn context are already present in this thread, so do not restate them before acting.

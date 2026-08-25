@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/pmrrasmussen/symphony/internal/agent"
 	"github.com/pmrrasmussen/symphony/internal/codex"
 	"github.com/pmrrasmussen/symphony/internal/config"
 	"github.com/pmrrasmussen/symphony/internal/coordinator"
@@ -143,7 +144,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 	ws.SetLandingVerifier(githubLifecycle)
 	go githubLifecycle.Run(ctx)
 	var t domain.Tracker = tracker
-	var a domain.AgentBackend = backend
+	// Coordination talks to the router, not to a runtime: the router resolves
+	// agent.backend for each new session and pins continuation and cancellation
+	// to whichever backend started it.
+	var a domain.AgentBackend = agent.NewRouter(settings, map[string]domain.AgentBackend{"codex": backend})
 	var w domain.WorkspaceExecutor = ws
 	c := coordinator.New(t, a, w, settings, slog.New(log.Handler()))
 	var statusPublisher *status.Publisher

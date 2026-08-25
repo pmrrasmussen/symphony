@@ -19,7 +19,7 @@ func TestRunExercisesLifecycleWithoutCreatingConfiguredState(t *testing.T) {
 	if !result.OK() {
 		t.Fatalf("result=%+v", result)
 	}
-	for _, check := range []string{"workflow", "github_handoff", "tracker", "workspace_root", "workspace_source", "log_root", "codex_command", "hooks", "scheduler_lifecycle"} {
+	for _, check := range []string{"workflow", "github_handoff", "tracker", "workspace_root", "workspace_source", "log_root", "agent_command", "hooks", "scheduler_lifecycle"} {
 		if !hasCheck(result, check) {
 			t.Fatalf("missing %s check: %+v", check, result)
 		}
@@ -40,7 +40,7 @@ func TestRunReportsIndependentBoundaryFailures(t *testing.T) {
 	if result.OK() || result.Status != StatusFailed {
 		t.Fatalf("result=%+v", result)
 	}
-	for _, check := range []string{"codex_command", "hooks"} {
+	for _, check := range []string{"agent_command", "hooks"} {
 		found := false
 		for _, item := range result.Checks {
 			if item.Name == check && item.Status == StatusFailed {

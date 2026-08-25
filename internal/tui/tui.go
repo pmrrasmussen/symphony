@@ -272,7 +272,7 @@ func (m Model) writeConfig(b *strings.Builder, instance operator.Instance) {
 	if len(config.MaxConcurrentByState) > 0 {
 		fmt.Fprintf(b, "State capacity: %s\n", rateLimitsInt(config.MaxConcurrentByState))
 	}
-	fmt.Fprintf(b, "\nCodex: %s\nTimeouts: turn %s; read %s; start %s; stall %s\nSandbox policy: approval %s; thread %s\n", empty(config.CodexCommand), config.TurnTimeout, config.ReadTimeout, config.StartTimeout, config.StallTimeout, empty(config.CodexApprovalPolicy), empty(config.CodexThreadSandbox))
+	fmt.Fprintf(b, "\n%s: %s\nTimeouts: turn %s; read %s; start %s; stall %s\nSandbox policy: approval %s; thread %s\n", backendLabel(config.AgentBackend), empty(config.CodexCommand), config.TurnTimeout, config.ReadTimeout, config.StartTimeout, config.StallTimeout, empty(config.CodexApprovalPolicy), empty(config.CodexThreadSandbox))
 	fmt.Fprintf(b, "\nGitHub: %s/%s base %s; merge %s\nRequired checks: %s\n", empty(config.GitHubOwner), empty(config.GitHubRepository), empty(config.GitHubBaseBranch), empty(config.GitHubMergeMethod), comma(config.GitHubRequiredChecks))
 	fmt.Fprintf(b, "Credentials: Linear %s; GitHub %s\n", configured(config.Credentials.Tracker.Configured), configured(config.Credentials.GitHub.Configured))
 }
@@ -551,6 +551,16 @@ func configured(value bool) string {
 		return "configured"
 	}
 	return "not configured"
+}
+
+// backendLabel names the agent runtime line after the selected backend. A
+// status snapshot written before backend selection existed carries no value, so
+// it falls back to the neutral label rather than an empty one.
+func backendLabel(backend string) string {
+	if backend == "" {
+		return "Agent"
+	}
+	return strings.ToUpper(backend[:1]) + backend[1:]
 }
 
 func empty(value string) string {

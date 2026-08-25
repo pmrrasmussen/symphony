@@ -141,6 +141,40 @@ func TestReadSnapshotProjectsSafeRuntimeFields(t *testing.T) {
 	}
 }
 
+func TestEffectiveConfigReportsResolvedAgentBackendAlongsideCodexKeys(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Date(2026, 8, 25, 12, 0, 0, 0, time.UTC)
+	workflow := fixtureWorkflow(t, dir, "backend")
+	status := filepath.Join(dir, "backend-status.json")
+	write(t, status, `{"state":"running","updated_at":"2026-08-25T11:59:30Z"}`)
+	writePlist(t, dir, labelPrefix, workflow, filepath.Join(dir, "logs"), status)
+
+	instances, err := Discover(context.Background(), Options{
+		LaunchAgentsDir: dir, Now: func() time.Time { return now },
+		Inspector: fakeInspector{labelPrefix: {Loaded: true, PID: 21, Process: true}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if instances[0].Config == nil {
+		t.Fatalf("missing effective configuration: %#v", instances[0])
+	}
+	// The fixture omits agent.backend, so the projection must report the
+	// resolved default rather than an empty selection.
+	if got, want := instances[0].Config.AgentBackend, "codex"; got != want {
+		t.Fatalf("agent backend = %q, want %q", got, want)
+	}
+	encoded, err := json.Marshal(instances[0].Config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"agent_backend":"codex"`, `"codex_command":"go"`} {
+		if !strings.Contains(string(encoded), want) {
+			t.Fatalf("effective configuration JSON missing %s:\n%s", want, encoded)
+		}
+	}
+}
+
 func TestRecentLogReadsBoundedTail(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "symphony.jsonl")
 	write(t, path, strings.Repeat("x", maxRecentLogBytes+1)+"\n"+`{"time":"2026-08-25T12:00:00Z","level":"INFO","msg":"workspace prepared"}`+"\n")

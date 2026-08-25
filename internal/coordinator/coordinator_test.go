@@ -1689,6 +1689,57 @@ func TestStalledRunCancelsAndSchedulesRetry(t *testing.T) {
 	}
 }
 
+// TestStallBudgetIsResolvedUnderTheRunsBackendNotTheConfiguredOne pins the
+// pinning decision this scheduler makes: reload keeps publishing live policy,
+// but the stall budget for an in-flight run is read under the backend that
+// started it. Selecting a different backend mid-run must not silently disable
+// stall detection for a run the previous backend owns.
+func TestStallBudgetIsResolvedUnderTheRunsBackendNotTheConfiguredOne(t *testing.T) {
+	w := testSettings(t)
+	w.Config.Codex.StallTimeout = time.Second
+	current := w.Config
+	issue := testIssue()
+	tracker := &fakeTracker{issue: issue}
+	block := make(chan domain.Event)
+	agent := &fakeAgent{events: func() <-chan domain.Event { return block }, started: make(chan struct{}, 1)}
+	ws := &fakeWorkspace{after: make(chan struct{}, 1)}
+	c := New(tracker, agent, ws, func() config.Settings { return current }, nil)
+	clock := &mutableClock{now: time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)}
+	c.clock = clock
+	timer := &fakeTimer{signal: make(chan struct{}, 1)}
+	c.timer = timer
+
+	c.Tick(context.Background())
+	<-agent.started
+	waitForRunning(t, c, issue.Identifier)
+
+	// A reload now selects a backend that carries no stall budget of its own.
+	// Reading the budget under the current selection would leave this run
+	// unsupervised forever; reading it under the run's backend still stalls it.
+	changed := current
+	changed.Agent.Backend = "some-other-backend"
+	current = changed
+
+	clock.set(time.Date(2026, 7, 18, 12, 0, 2, 0, time.UTC))
+	c.Tick(context.Background())
+	<-ws.after
+	<-timer.signal
+
+	starts, _, cancels := agent.counts()
+	if starts != 1 || cancels != 1 {
+		t.Fatalf("starts=%d cancels=%d, want the stalled session cancelled once", starts, cancels)
+	}
+	c.mu.Lock()
+	retry := c.retries[issue.ID]
+	c.mu.Unlock()
+	if retry.reason != "stalled" {
+		t.Fatalf("retry=%+v, want a stalled retry", retry)
+	}
+	if err := c.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestReconciliationRefreshesStateCapacityForLaterAdmissions(t *testing.T) {
 	w := testSettings(t)
 	w.Config.Agent.MaxConcurrent = 2
