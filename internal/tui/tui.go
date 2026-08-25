@@ -45,47 +45,107 @@ type Model struct {
 	page      page
 	message   string
 	updatedAt time.Time
-	// styled draws the terminal dashboard. It stays off for redirected
-	// output, which keeps pipes, files, and tests on plain text.
-	styled bool
-	// width is the terminal width, or zero when it is not known and the
-	// frame should size itself to its content.
-	width int
+	// failed marks the last discovery as having failed, so the status line can
+	// say so in the color that means it.
+	failed bool
+	// layout draws the terminal dashboard. It stays off for redirected output,
+	// which keeps pipes, files, and tests on plain text.
+	layout bool
+	// color allows hue on the dashboard. NO_COLOR clears it without taking the
+	// dashboard, its keys, or its alternate screen away.
+	color bool
+	// width and height are the terminal dimensions, or zero when they are not
+	// known and the frame should size itself to its content and clamp nothing.
+	width  int
+	height int
 }
 
-// theme holds the styles one frame is drawn with. Every style is transparent
-// in the plain theme, so the same renderer serves both surfaces.
+// Layout bands. The dashboard has to read in a sixty-column tmux split as well
+// as on an ultrawide, and below the floor there is no honest arrangement of the
+// data at all.
+const (
+	splitWidth  = 120 // reserved for a side-by-side list and detail
+	narrowWidth = 80  // below this the two numeric columns drop
+	minWidth    = 60
+	minHeight   = 14
+)
+
+type band uint8
+
+const (
+	bandNarrow band = iota
+	bandStandard
+	bandWide
+)
+
+// bandFor picks the layout band for a width. An unknown width is treated as the
+// widest band, which keeps every width-unaware caller rendering every column.
+func bandFor(width int) band {
+	switch {
+	case width <= 0 || width >= splitWidth:
+		return bandWide
+	case width >= narrowWidth:
+		return bandStandard
+	default:
+		return bandNarrow
+	}
+}
+
+// theme holds the styles one frame is drawn with, named by what they mean
+// rather than by how they look, so a color decision lives in exactly one place.
+// Every style is transparent in the plain theme, which is what lets the same
+// renderer serve a terminal and a pipe.
 type theme struct {
-	styled  bool
-	width   int
-	title   lipgloss.Style
-	subtle  lipgloss.Style
-	heading lipgloss.Style
-	panel   lipgloss.Style
-	tab     lipgloss.Style
-	current lipgloss.Style
+	// layout draws the dashboard: rules, tables, and a frame fitted to the
+	// window. It stays off for redirected output, which keeps pipes, files, and
+	// tests on plain text.
+	layout bool
+	// color emits hue. NO_COLOR turns it off without taking the dashboard away.
+	color  bool
+	width  int
+	height int
+
+	primary  lipgloss.Style // titles and the selected row
+	muted    lipgloss.Style // metadata, timestamps, the hint bar
+	emphasis lipgloss.Style // column headers and the open tab
+	ok       lipgloss.Style
+	warn     lipgloss.Style
+	bad      lipgloss.Style
+	rule     lipgloss.Style // the horizontal separators
 }
 
 // newTheme uses the sixteen named ANSI colors rather than fixed RGB, so the
 // dashboard follows whatever palette the terminal is themed with and reads
 // correctly on both light and dark backgrounds without querying either.
-func newTheme(styled bool, width int) theme {
-	if !styled {
-		return theme{}
+func newTheme(layout, color bool, width, height int) theme {
+	style := theme{layout: layout, color: color, width: width, height: height}
+	if !layout {
+		return style
 	}
-	return theme{
-		styled:  true,
-		width:   width,
-		title:   lipgloss.NewStyle().Bold(true),
-		subtle:  lipgloss.NewStyle().Foreground(lipgloss.BrightBlack),
-		heading: lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Cyan),
-		panel: lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(lipgloss.BrightBlack).
-			Padding(0, 1),
-		tab:     lipgloss.NewStyle().Foreground(lipgloss.BrightBlack).Padding(0, 1),
-		current: lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Cyan).Padding(0, 1),
+	// Weight and dimming are not color, so they survive NO_COLOR: the hierarchy
+	// stays readable when only hue is given up.
+	style.primary = lipgloss.NewStyle().Bold(true)
+	style.emphasis = lipgloss.NewStyle().Bold(true)
+	style.muted = lipgloss.NewStyle().Faint(true)
+	style.rule = lipgloss.NewStyle().Faint(true)
+	if !color {
+		return style
 	}
+	style.muted = lipgloss.NewStyle().Foreground(lipgloss.BrightBlack)
+	style.emphasis = style.emphasis.Foreground(lipgloss.Cyan)
+	style.rule = lipgloss.NewStyle().Foreground(lipgloss.BrightBlack)
+	style.ok = lipgloss.NewStyle().Foreground(lipgloss.Green)
+	style.warn = lipgloss.NewStyle().Foreground(lipgloss.Yellow)
+	style.bad = lipgloss.NewStyle().Foreground(lipgloss.Red)
+	return style
+}
+
+// colorEnabled reports whether hue may be emitted. NO_COLOR is honored when it
+// is set to a non-empty value, per no-color.org. The dashboard itself stays,
+// because every state on it is paired with a word and a shape.
+func colorEnabled() bool {
+	value, present := os.LookupEnv("NO_COLOR")
+	return !(present && value != "")
 }
 
 // livenessLabel names a liveness for display. The raw stale value is fourteen
@@ -98,32 +158,51 @@ func livenessLabel(state operator.Liveness) string {
 	return string(state)
 }
 
-// liveness renders a liveness as a colored marker. Color is the fastest thing
-// to read on this screen, so it carries the same distinction as the word.
-func (t theme) liveness(state operator.Liveness) string {
-	label := livenessLabel(state)
-	if !t.styled {
-		return label
-	}
-	style := lipgloss.NewStyle()
+// livenessGlyph gives every state its own shape. One dot repeated on every row
+// is texture rather than information, and a shape that differs per state keeps
+// the distinction legible wherever color is unavailable.
+func livenessGlyph(state operator.Liveness) string {
 	switch state {
 	case operator.LivenessRunning:
-		style = style.Foreground(lipgloss.Green)
+		return "\u25cf"
 	case operator.LivenessStopped:
-		style = style.Foreground(lipgloss.BrightBlack)
+		return "\u25cb"
 	case operator.LivenessStale:
-		style = style.Foreground(lipgloss.Yellow)
+		return "\u25d0"
 	default:
-		style = style.Foreground(lipgloss.Red)
+		return "\u2715"
 	}
-	return style.Render("● " + label)
 }
 
-// checks colors a findings summary by its worst severity. The styled form is
+func (t theme) livenessStyle(state operator.Liveness) lipgloss.Style {
+	switch state {
+	case operator.LivenessRunning:
+		return t.ok
+	case operator.LivenessStopped:
+		return t.muted
+	case operator.LivenessStale:
+		return t.warn
+	default:
+		return t.bad
+	}
+}
+
+// liveness renders a liveness as a shape and a word, colored to agree with
+// both. Color is the fastest thing to read on this screen, and the glyph and
+// the word are what remain when it is gone.
+func (t theme) liveness(state operator.Liveness) string {
+	label := livenessLabel(state)
+	if !t.layout {
+		return label
+	}
+	return t.livenessStyle(state).Render(livenessGlyph(state) + " " + label)
+}
+
+// checks colors a findings summary by its worst severity. The dashboard form is
 // abbreviated because this cell is the widest on the row and wrapped once the
 // window narrowed.
 func (t theme) checks(findings []operator.Finding) string {
-	if !t.styled {
+	if !t.layout {
 		return findingsIndicator(findings)
 	}
 	errors, warnings := 0, 0
@@ -134,28 +213,25 @@ func (t theme) checks(findings []operator.Finding) string {
 		}
 		warnings++
 	}
-	summary := "ok"
+	summary, style := "ok", t.ok
 	switch {
 	case errors > 0 && warnings > 0:
-		summary = fmt.Sprintf("%d err, %d warn", errors, warnings)
+		summary, style = fmt.Sprintf("%d err, %d warn", errors, warnings), t.bad
 	case errors > 0:
-		summary = fmt.Sprintf("%d err", errors)
+		summary, style = fmt.Sprintf("%d err", errors), t.bad
 	case warnings > 0:
-		summary = fmt.Sprintf("%d warn", warnings)
-	}
-	style := lipgloss.NewStyle().Foreground(lipgloss.Green)
-	switch {
-	case errors > 0:
-		style = style.Foreground(lipgloss.Red)
-	case warnings > 0:
-		style = style.Foreground(lipgloss.Yellow)
+		summary, style = fmt.Sprintf("%d warn", warnings), t.warn
 	}
 	return style.Render(summary)
 }
 
 // tabs renders the detail page strip with the open page marked, which the
-// header never showed before.
+// header never showed before. The keys that drive it live in the hint bar, so
+// the strip itself stays one line.
 func (t theme) tabs(current page) string {
+	if !t.layout {
+		return "[s] Status  [c] Config  [v] Validation  [Tab] next  [r] refresh  [q] back"
+	}
 	labels := []struct {
 		page  page
 		label string
@@ -164,32 +240,105 @@ func (t theme) tabs(current page) string {
 		{configPage, "Config"},
 		{validationPage, "Validation"},
 	}
-	if !t.styled {
-		return "[s] Status  [c] Config  [v] Validation  [Tab] next  [r] refresh  [q] back"
-	}
 	rendered := make([]string, 0, len(labels))
 	for _, entry := range labels {
+		style := t.muted.Padding(0, 1)
 		if entry.page == current {
-			rendered = append(rendered, t.current.Render(entry.label))
-			continue
+			style = t.emphasis.Padding(0, 1)
 		}
-		rendered = append(rendered, t.tab.Render(entry.label))
+		rendered = append(rendered, style.Render(entry.label))
 	}
-	strip := lipgloss.JoinHorizontal(lipgloss.Top, rendered...)
-	return strip + "\n" + t.subtle.Render("s/c/v jump · Tab next · r refresh · q back")
+	return lipgloss.JoinHorizontal(lipgloss.Top, rendered...)
 }
 
-// frame wraps body text in a panel sized to the terminal, and returns it
-// unchanged when there is nothing to draw a panel with.
-func (t theme) frame(body string) string {
-	if !t.styled {
-		return body
+// horizontalRule draws one separator across the frame. Rules rather than a
+// border: the terminal edge already frames the app, so a second frame drawn
+// just inside it separates nothing and costs two columns and two rows.
+func (t theme) horizontalRule() string {
+	width := t.width
+	if width <= 0 {
+		width = narrowWidth
 	}
-	panel := t.panel
-	if t.width > 0 {
-		panel = panel.Width(t.width)
+	return t.rule.Render(strings.Repeat("\u2500", width))
+}
+
+// mainBudget is how many rows the main area may draw. Zero means the height is
+// unknown -- a pipe, or a caller that never saw a window size -- and that
+// nothing should be clamped.
+func (t theme) mainBudget(header string) int {
+	if !t.layout || t.height <= 0 {
+		return 0
 	}
-	return panel.Render(strings.TrimRight(body, "\n"))
+	// Two rules, the status line, and the hint bar.
+	return t.height - lipgloss.Height(header) - 4
+}
+
+// frame assembles the four sections every full-screen view shares: persistent
+// context at the top, the main area, one line of ephemeral feedback, and the
+// hint bar. Their order and positions are fixed, because a layout the eye can
+// learn is most of what makes one feel calm.
+func (t theme) frame(header, main, status, hints string) string {
+	return lipgloss.JoinVertical(lipgloss.Left,
+		header,
+		t.horizontalRule(),
+		main,
+		t.horizontalRule(),
+		status,
+		hints,
+	) + "\n"
+}
+
+// window returns the run of items that fits in limit rows, positioned so that
+// index stays visible, and reports how many it left out. This is not scrolling:
+// no offset is retained between frames. It only guarantees that the row the
+// user has selected is one they can see.
+func window[T any](items []T, index, limit int) ([]T, int) {
+	if limit <= 0 || len(items) <= limit {
+		return items, 0
+	}
+	if limit == 1 {
+		return nil, len(items)
+	}
+	// One row of the budget goes to the line that reports the remainder.
+	size := limit - 1
+	start := 0
+	if index >= size {
+		start = index - size + 1
+	}
+	return items[start : start+size], len(items) - size
+}
+
+// clamp keeps the first items that fit and reports how many it dropped, so a
+// long log or a busy coordinator cannot push the hint bar off the screen. A
+// limit of zero or less means the height is unknown and clamps nothing.
+func clamp[T any](items []T, limit int) ([]T, int) {
+	return window(items, 0, limit)
+}
+
+// more reports what clamp dropped. Silent truncation would read as a complete
+// screen, which is the one thing an operator view must never do.
+func (t theme) more(hidden int) string {
+	if hidden <= 0 {
+		return ""
+	}
+	return t.muted.Render(fmt.Sprintf("+%d more", hidden))
+}
+
+// tooSmall reports whether the window is below the size any honest layout
+// needs. Naming the requirement beats drawing a wrapped, unreadable frame.
+func (t theme) tooSmall() bool {
+	if !t.layout {
+		return false
+	}
+	return (t.width > 0 && t.width < minWidth) || (t.height > 0 && t.height < minHeight)
+}
+
+func (t theme) tooSmallFrame() string {
+	message := t.warn.Render(fmt.Sprintf("terminal too small: need %dx%d", minWidth, minHeight))
+	if t.width > 0 && t.height > 0 {
+		return lipgloss.Place(t.width, t.height, lipgloss.Center, lipgloss.Center, message)
+	}
+	return message + "\n"
 }
 
 // New builds an overview model from an already-discovered, sorted instance
@@ -275,8 +424,10 @@ func normalizeKey(key string) string {
 func (m *Model) Refresh(instances []operator.Instance, err error, now time.Time) {
 	if err != nil {
 		m.message = "refresh failed: " + err.Error()
+		m.failed = true
 		return
 	}
+	m.failed = false
 	m.instances = append(m.instances[:0], instances...)
 	sort.Slice(m.instances, func(i, j int) bool { return m.instances[i].ID < m.instances[j].ID })
 	if m.selected >= len(m.instances) {
@@ -296,7 +447,10 @@ func (m *Model) Refresh(instances []operator.Instance, err error, now time.Time)
 // never prints config credentials, arbitrary environment variables, prompts,
 // protocol payloads, or log attributes.
 func (m Model) View(now time.Time) string {
-	style := newTheme(m.styled, m.width)
+	style := newTheme(m.layout, m.color, m.width, m.height)
+	if style.tooSmall() {
+		return style.tooSmallFrame()
+	}
 	if m.page == overviewPage {
 		return m.overview(now, style)
 	}
@@ -313,7 +467,7 @@ func (m Model) View(now time.Time) string {
 	case validationPage:
 		m.writeValidation(&b, instance)
 	}
-	if !style.styled {
+	if !style.layout {
 		var plain strings.Builder
 		fmt.Fprintf(&plain, "Symphony operator view  %s\n", instance.ID)
 		fmt.Fprintf(&plain, "state: %s  launchd: %s  refreshed: %s\n\n", livenessLabel(instance.Liveness), launchdText(instance.Launchd), formatAge(now, m.updatedAt))
@@ -321,17 +475,38 @@ func (m Model) View(now time.Time) string {
 		return plain.String() + b.String()
 	}
 	header := lipgloss.JoinVertical(lipgloss.Left,
-		style.title.Render("Symphony operator view")+"  "+style.heading.Render(instance.ID),
-		style.subtle.Render(fmt.Sprintf("%s · launchd %s · refreshed %s",
-			livenessLabel(instance.Liveness), launchdText(instance.Launchd), formatAge(now, m.updatedAt))),
-	)
-	return lipgloss.JoinVertical(lipgloss.Left,
-		header,
-		"",
+		style.primary.Render("Symphony operator view")+"  "+style.emphasis.Render(instance.ID),
+		style.liveness(instance.Liveness)+style.muted.Render(" · launchd "+launchdText(instance.Launchd)),
 		style.tabs(m.page),
-		"",
-		style.frame(b.String()),
-	) + "\n"
+	)
+	body := strings.TrimRight(b.String(), "\n")
+	if style.width > 0 {
+		// These pages are prose, so they wrap rather than truncate -- and they
+		// wrap before the budget is counted, because a line that becomes two
+		// after the count would push the hint bar off the screen.
+		body = lipgloss.NewStyle().Width(style.width).Render(body)
+	}
+	lines, hidden := clamp(strings.Split(body, "\n"), style.mainBudget(header))
+	main := strings.Join(lines, "\n")
+	if note := style.more(hidden); note != "" {
+		main += "\n" + note
+	}
+	return style.frame(header, main, m.statusLine(now, style),
+		style.muted.Render("s/c/v page · Tab next · r refresh · q back"))
+}
+
+// statusLine is the frame's one line of ephemeral feedback: what the last
+// refresh did, and how long ago it happened. Errors take the line in the color
+// that means it, rather than being appended somewhere quieter.
+func (m Model) statusLine(now time.Time, style theme) string {
+	text := "refreshed " + formatAge(now, m.updatedAt)
+	if m.message != "" && m.message != "refreshed" {
+		text = m.message + " · " + text
+	}
+	if m.failed {
+		return style.bad.Render(text)
+	}
+	return style.muted.Render(text)
 }
 
 func (m Model) overview(now time.Time, style theme) string {
@@ -348,7 +523,7 @@ func (m Model) overview(now time.Time, style theme) string {
 			invalid++
 		}
 	}
-	if !style.styled {
+	if !style.layout {
 		var b strings.Builder
 		fmt.Fprintf(&b, "Symphony operator view\n%d instances: %d running, %d stopped, %d stale, %d invalid  refreshed: %s\n\n", len(m.instances), running, stopped, stale, invalid, formatAge(now, m.updatedAt))
 		if m.message != "" {
@@ -371,69 +546,102 @@ func (m Model) overview(now time.Time, style theme) string {
 		b.WriteString("up/down or j/k: select  Enter: inspect  r: refresh  q: quit\n")
 		return b.String()
 	}
-	sections := []string{
-		lipgloss.JoinVertical(lipgloss.Left,
-			style.title.Render("Symphony operator view"),
-			style.subtle.Render(fmt.Sprintf("%d instances · %d running · %d stopped · %d stale · %d invalid · refreshed %s",
-				len(m.instances), running, stopped, stale, invalid, formatAge(now, m.updatedAt))),
-		),
-		"",
+	header := lipgloss.JoinVertical(lipgloss.Left,
+		style.primary.Render("Symphony operator view"),
+		style.muted.Render(fmt.Sprintf("%d instances · %d running · %d stopped · %d stale · %d invalid",
+			len(m.instances), running, stopped, stale, invalid)),
+	)
+	main := style.muted.Render("No convention-matching LaunchAgents were found.")
+	if len(m.instances) > 0 {
+		main = m.instanceTable(style, style.mainBudget(header))
 	}
-	if m.message != "" {
-		sections = append(sections, style.subtle.Render(m.message), "")
-	}
-	if len(m.instances) == 0 {
-		sections = append(sections, style.frame("No convention-matching LaunchAgents were found."))
-	} else {
-		sections = append(sections, m.instanceTable(style))
-	}
-	sections = append(sections, "", style.subtle.Render("j/k select · ⏎ inspect · r refresh · q quit"))
-	return lipgloss.JoinVertical(lipgloss.Left, sections...) + "\n"
+	return style.frame(header, main, m.statusLine(now, style),
+		style.muted.Render("j/k select · ⏎ inspect · r refresh · q quit"))
 }
 
 // instanceTable draws the overview as a real table, so the column widths are
 // computed from the content rather than hand-counted. The old header was a
 // literal string and had drifted one column out of step with its rows.
-func (m Model) instanceTable(style theme) string {
-	rows := make([][]string, 0, len(m.instances))
-	for index, instance := range m.instances {
-		marker := "  "
-		name := instance.ID
-		if style.width > 0 {
-			name = truncate(name, max(24, style.width/3))
+//
+// Which columns appear depends on the width band. The two numeric columns go
+// first: they are one keypress away on the Status page, and below eighty
+// columns they cost the identifier the room it needs to stay legible.
+func (m Model) instanceTable(style theme, budget int) string {
+	numeric := bandFor(style.width) != bandNarrow
+	headers := []string{"INSTANCE", "STATE"}
+	if numeric {
+		headers = append(headers, "AGENTS", "RETRIES")
+	}
+	headers = append(headers, "CHECKS")
+
+	// The table spends three rows on its own border and header, so only what is
+	// left of the budget can go to instances.
+	shown, hidden := window(m.instances, m.selected, budget-3)
+	selected := m.selected
+	if hidden > 0 {
+		selected = m.selected - (len(m.instances) - hidden - len(shown))
+	}
+
+	nameWidth := 0
+	if style.width > 0 {
+		// PMR-88 measured a twenty-four column pin here as most of the old
+		// seventy-six column floor, so the narrow band lowers it.
+		floor := 24
+		if !numeric {
+			floor = 16
 		}
-		if index == m.selected {
+		nameWidth = max(floor, style.width/3)
+	}
+
+	rows := make([][]string, 0, len(shown))
+	for index, instance := range shown {
+		marker, name := "  ", instance.ID
+		if nameWidth > 0 {
+			name = truncate(name, nameWidth)
+		}
+		if index == selected {
 			// A marker and weight rather than a row background: the state and
 			// checks cells carry their own foreground colors, and a row
 			// background does not reach inside them, which renders patchy.
 			marker = "▸ "
-			name = style.title.Render(name)
+			name = style.primary.Render(name)
 		}
 		active, capacity, retries := instanceActivity(instance)
-		rows = append(rows, []string{
-			marker + name,
-			style.liveness(instance.Liveness),
-			fmt.Sprintf("%d/%d", active, capacity),
-			fmt.Sprintf("%d", retries),
-			style.checks(instance.Findings),
-		})
+		row := []string{marker + name, style.liveness(instance.Liveness)}
+		if numeric {
+			row = append(row, fmt.Sprintf("%d/%d", active, capacity), fmt.Sprintf("%d", retries))
+		}
+		rows = append(rows, append(row, style.checks(instance.Findings)))
 	}
+
 	rendered := table.New().
 		Border(lipgloss.RoundedBorder()).
-		BorderStyle(lipgloss.NewStyle().Foreground(lipgloss.BrightBlack)).
+		BorderStyle(style.rule).
 		BorderColumn(false).
-		Headers("INSTANCE", "STATE", "AGENTS", "RETRIES", "CHECKS").
+		Headers(headers...).
 		Rows(rows...).
-		StyleFunc(func(row, _ int) lipgloss.Style {
+		StyleFunc(func(row, column int) lipgloss.Style {
+			cell := lipgloss.NewStyle().Padding(0, 1)
 			if row == table.HeaderRow {
-				return lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Cyan).Padding(0, 1)
+				cell = style.emphasis.Padding(0, 1)
 			}
-			return lipgloss.NewStyle().Padding(0, 1)
+			// Numerics right-align so magnitudes line up down the column.
+			if numeric && (column == 2 || column == 3) {
+				cell = cell.Align(lipgloss.Right)
+			}
+			return cell
 		})
-	if style.width > 0 {
-		rendered = rendered.Width(style.width)
+	drawn := rendered.String()
+	if style.width > 0 && lipgloss.Width(drawn) > style.width {
+		// Only constrain the table when its natural width would overflow.
+		// Forcing the full width otherwise spreads five columns of short values
+		// across the window and strands each number far from its header.
+		drawn = rendered.Width(style.width).Wrap(false).String()
 	}
-	return rendered.String()
+	if note := style.more(hidden); note != "" {
+		return drawn + "\n" + note
+	}
+	return drawn
 }
 
 // instanceActivity reads the agent and retry counts an instance publishes,
@@ -539,6 +747,7 @@ func Run(ctx context.Context, input io.Reader, output io.Writer, discover Discov
 	model := New(instances, time.Now())
 	if err != nil {
 		model.message = "initial discovery failed: " + err.Error()
+		model.failed = true
 	}
 	if isTerminal(output) {
 		return runInteractive(ctx, input, output, discover, model)
@@ -597,7 +806,8 @@ func runPlain(ctx context.Context, input io.Reader, output io.Writer, discover D
 // runInteractive drives the same Model from a terminal. Interruption is a
 // normal way to close a read-only view, so it is not reported as a failure.
 func runInteractive(ctx context.Context, input io.Reader, output io.Writer, discover Discover, model Model) error {
-	model.styled = true
+	model.layout = true
+	model.color = colorEnabled()
 	view := &app{model: model, discover: discover, ctx: ctx}
 	program := tea.NewProgram(view,
 		tea.WithContext(ctx),
@@ -623,8 +833,6 @@ type app struct {
 	model    Model
 	discover Discover
 	ctx      context.Context
-	width    int
-	height   int
 }
 
 // tickMsg asks for a scheduled refresh.
@@ -660,9 +868,9 @@ func (a *app) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		a.model.Refresh(message.instances, message.err, time.Now())
 		return a, nil
 	case tea.WindowSizeMsg:
-		a.width, a.height = message.Width, message.Height
-		// The renderer sizes its panels and table to the window.
-		a.model.width = message.Width
+		// The renderer sizes its rules and table to the width and budgets its
+		// rows against the height.
+		a.model.width, a.model.height = message.Width, message.Height
 		return a, nil
 	case tea.KeyPressMsg:
 		return a.press(message.String())
