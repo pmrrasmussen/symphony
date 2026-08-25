@@ -268,18 +268,23 @@ func TestHeartbeatAndStallRecordOutstandingOperation(t *testing.T) {
 
 func TestCleanupStatusClassifiesWorkspaceOutcome(t *testing.T) {
 	tests := []struct {
-		name string
-		err  error
-		want string
+		name    string
+		outcome domain.CleanupOutcome
+		err     error
+		want    string
 	}{
-		{name: "clean", err: nil, want: "clean"},
+		{name: "clean", outcome: domain.CleanupClean, err: nil, want: "clean"},
+		{name: "landed", outcome: domain.CleanupLanded, err: nil, want: "landed"},
 		{name: "dirty", err: errors.New("refusing to remove Git workspace with uncommitted or untracked changes"), want: "dirty"},
 		{name: "committed", err: fmt.Errorf("refusing to remove Git workspace whose HEAD %s differs from recorded base commit %s", "abc", "def"), want: "committed"},
+		{name: "unverifiable landing stays committed", err: fmt.Errorf("refusing to remove Git workspace whose HEAD %s differs from recorded base commit %s; merged landing could not be verified", "abc", "def"), want: "committed"},
 		{name: "blocked", err: errors.New("refusing to remove workspace without durable ownership state"), want: "blocked"},
+		// A refused cleanup never reports a removal outcome, even if one leaks in.
+		{name: "landed outcome never masks a refusal", outcome: domain.CleanupLanded, err: errors.New("refusing to remove Git workspace with uncommitted or untracked changes"), want: "dirty"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if got := cleanupStatus(test.err); got != test.want {
+			if got := cleanupStatus(test.outcome, test.err); got != test.want {
 				t.Fatalf("cleanupStatus=%q, want %q", got, test.want)
 			}
 		})
@@ -674,7 +679,7 @@ func (f *fakeWorkspace) AfterRun(context.Context, domain.Workspace, domain.Issue
 		f.after <- struct{}{}
 	}
 }
-func (f *fakeWorkspace) Cleanup(context.Context, domain.Issue) error {
+func (f *fakeWorkspace) Cleanup(context.Context, domain.Issue) (domain.CleanupOutcome, error) {
 	f.mu.Lock()
 	f.cleanups++
 	cleaned := f.cleaned
@@ -682,7 +687,7 @@ func (f *fakeWorkspace) Cleanup(context.Context, domain.Issue) error {
 	if cleaned != nil {
 		cleaned <- struct{}{}
 	}
-	return nil
+	return domain.CleanupClean, nil
 }
 func (f *fakeWorkspace) Execute(context.Context, domain.Workspace, string, []string) ([]byte, error) {
 	return nil, nil

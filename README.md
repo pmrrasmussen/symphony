@@ -200,9 +200,13 @@ across restarts and bounded retries. Invalid or missing ownership state beside
 an existing workspace fails closed; follow the [workspace recovery
 procedure](docs/completion-markers.md) before redispatch.
 Review each worktree's changes before merging or cherry-picking them into your
-development branch. Terminal cleanup preserves worktrees with uncommitted,
-untracked, or newly committed changes rather than deleting work that needs
-review.
+development branch. Terminal cleanup preserves worktrees with uncommitted or
+untracked changes rather than deleting work that needs review, and preserves a
+newly committed worktree too unless Symphony itself can verify that exact
+commit as the merged head of the issue's pull request in the configured GitHub
+repository. That one verified case is how a completed, landed issue's worktree
+is removed instead of accumulating; anything unpublished, rewritten while
+merging, or unverifiable is kept for review.
 
 To let a Codex session hand an issue off safely, optionally configure
 `tracker.provider.handoff_state` (and, if useful, a fixed

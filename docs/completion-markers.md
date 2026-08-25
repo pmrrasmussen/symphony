@@ -60,6 +60,30 @@ recorded as an explicit blocked/exhausted run and retried with normal backoff;
 it remains dispatchable without a tracker edit. Terminal issues are cleaned up
 only when worktree safety checks allow it.
 
+## Terminal cleanup safety
+
+Cleanup of a terminal issue's owned Git worktree is fail-closed. It removes the
+worktree only in these two cases:
+
+| Worktree | Result |
+| --- | --- |
+| Clean, HEAD still at the recorded `base_commit` | Removed, logged `status: clean`. |
+| Clean, HEAD is a local commit that a landing verification confirms is the merged pull request head for this issue | Removed, logged `status: landed`. |
+| Uncommitted or untracked changes | Preserved, logged `status: dirty`. |
+| Clean, HEAD is a local commit that is not verifiably merged | Preserved, logged `status: committed`. |
+| Unowned, replaced, or unverifiable source identity | Preserved, logged `status: blocked`. |
+
+The landing verification is host-owned, read-only, and reachable from every
+cleanup path — end of run, terminal reconciliation, retry, and the startup
+sweep after a restart — because it re-reads GitHub instead of relying on
+in-process memory of the landing. It asks one question: does the configured
+repository have exactly one pull request for this issue's `symphony/<issue>`
+branch, is it merged, and is its head commit the commit still checked out in
+the worktree? Only an exact match permits removal, so a squashed, amended, or
+rebased merge head, an unconfigured GitHub integration, and any request failure
+all keep the committed work for manual review. The verification never merges,
+comments, or transitions anything.
+
 ## Manual recovery
 
 State ownership errors require deliberate operator action:

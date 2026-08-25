@@ -140,11 +140,53 @@ func (m *Manager) PrepareWithSettings(s config.GitHub, issue domain.Issue, works
 	if !s.Enabled || handoff == nil || strings.TrimSpace(issue.ID) == "" || strings.TrimSpace(issue.Identifier) == "" || strings.TrimSpace(workspace) == "" {
 		return nil
 	}
-	branch := "symphony/" + strings.Trim(unsafeBranch.ReplaceAllString(strings.ToLower(issue.Identifier), "-"), "-.")
-	if branch == "symphony/" {
+	branch, ok := issueBranch(issue)
+	if !ok {
 		return nil
 	}
 	return &Session{manager: m, settings: s, issue: issue, workspace: workspace, branch: branch, linear: handoff}
+}
+
+// issueBranch derives the one deterministic branch name Symphony ever uses for
+// an issue. It is the single definition shared by session preparation and the
+// read-only landing verification, so neither can look at a different branch.
+func issueBranch(issue domain.Issue) (string, bool) {
+	branch := "symphony/" + strings.Trim(unsafeBranch.ReplaceAllString(strings.ToLower(issue.Identifier), "-"), "-.")
+	if branch == "symphony/" {
+		return "", false
+	}
+	return branch, true
+}
+
+// VerifyLanded implements domain.LandingVerifier for terminal workspace
+// cleanup. It is strictly read-only: it resolves the one deterministic pull
+// request for the issue's bound branch in the configured repository and reports
+// true only when that pull request is merged and its head commit is exactly the
+// commit still checked out in the workspace. A squashed, amended, rebased, or
+// otherwise rewritten head, a closed-unmerged or missing pull request, a
+// disabled GitHub integration, and any request failure all report false or an
+// error, so cleanup keeps the committed work for manual review.
+func (m *Manager) VerifyLanded(ctx context.Context, issue domain.Issue, commit string) (bool, error) {
+	s := m.settings().GitHub
+	commit = strings.TrimSpace(commit)
+	if !s.Enabled || commit == "" {
+		return false, nil
+	}
+	branch, ok := issueBranch(issue)
+	if !ok {
+		return false, nil
+	}
+	pr, found, err := m.findPull(ctx, s, branch)
+	if err != nil {
+		m.logger.Warn("GitHub landing verification failed", "issue_id", issue.ID, "issue_identifier", issue.Identifier, "repository", s.Owner+"/"+s.Repository)
+		return false, err
+	}
+	if !found || !(pr.Merged || pr.MergedAt != nil) || !strings.EqualFold(strings.TrimSpace(pr.Head.SHA), commit) {
+		m.logger.Info("GitHub landing unverified; workspace commits are preserved", "issue_id", issue.ID, "issue_identifier", issue.Identifier, "repository", s.Owner+"/"+s.Repository, "workspace_commit", shortSHA(commit))
+		return false, nil
+	}
+	m.logger.Info("GitHub landing verified for workspace cleanup", "issue_id", issue.ID, "issue_identifier", issue.Identifier, "repository", s.Owner+"/"+s.Repository, "pr_number", pr.Number, "workspace_commit", shortSHA(commit))
+	return true, nil
 }
 
 type Session struct {
