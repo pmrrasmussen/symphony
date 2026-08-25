@@ -32,6 +32,11 @@ import (
 	"github.com/pmrrasmussen/symphony/internal/workspace"
 )
 
+// endpointCloseTimeout bounds the capability endpoint's own shutdown. It is
+// separate from the scheduler's shutdown budget on purpose: see the deferred
+// close in run().
+const endpointCloseTimeout = 20 * time.Second
+
 func main() {
 	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
 }
@@ -142,6 +147,22 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "symphony startup error:", err)
 		return 2
 	}
+	// Deferred rather than closed inline after Shutdown, so it happens on every
+	// path out of run() -- including the startup validation below, which would
+	// otherwise leave the listener behind. It still runs after the scheduler has
+	// shut down, so no session can be serving a capability call, and it gets a
+	// budget of its own: sharing the shutdown deadline would let a slow Shutdown
+	// turn this into a context-deadline error that reads as a report of leaked
+	// registrations that do not exist. Its error is reported rather than dropped
+	// because it counts registrations no session revoked, and each of those is a
+	// deferred tracker transition that silently never fired.
+	defer func() {
+		closeCtx, cancelClose := context.WithTimeout(context.Background(), endpointCloseTimeout)
+		defer cancelClose()
+		if err := capabilityEndpoint.Close(closeCtx); err != nil {
+			log.Error("capability endpoint shutdown reported unfinished sessions", "error", err)
+		}
+	}()
 	// Terminal cleanup may only discard a worktree's local commits once Symphony
 	// itself verified them merged. The verifier is read-only and host-owned; when
 	// GitHub is not configured it always answers no and cleanup stays as strict
@@ -204,13 +225,6 @@ func run(args []string, stdout, stderr io.Writer) int {
 	defer cancel()
 	if err := c.Shutdown(shutdownCtx); err != nil {
 		log.Error("graceful shutdown timed out", "error", err)
-	}
-	// The endpoint closes after the scheduler, so no session can still be
-	// serving a capability call. Its error is reported rather than dropped
-	// because it counts registrations no session revoked, and each of those is a
-	// deferred tracker transition that silently never fired.
-	if err := capabilityEndpoint.Close(shutdownCtx); err != nil {
-		log.Error("capability endpoint shutdown reported unfinished sessions", "error", err)
 	}
 	if statusPublisher != nil {
 		if err := statusPublisher.Write(status.Stopped, c.Snapshot()); err != nil {

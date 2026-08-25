@@ -89,7 +89,16 @@ type permissionsPolicy struct {
 // profile makes -- and leaves outbound network unrestricted, matching the Codex
 // profile's deliberate networkAccess: true. Reads are not confined, exactly as
 // for Codex.
-func buildPolicy(r domain.AgentRequest) (policy, error) {
+//
+// allowed is the session's whole tool surface, capability tools included, and it
+// is passed in rather than read from codingTools so the payload cannot describe
+// a narrower permission set than the flags do. Under defaultMode dontAsk
+// anything not allowed is refused, and while --allowedTools evidently supplies
+// the rule on its own -- a real-binary run with capability tools allowed only by
+// flag saw no denials -- this file's doctrine is that policy is pinned in the
+// payload. Two disagreeing representations of "what is permitted" would leave a
+// reader unable to tell which one is authoritative.
+func buildPolicy(r domain.AgentRequest, allowed []string) (policy, error) {
 	roots, err := writeRoots(r)
 	if err != nil {
 		return policy{}, err
@@ -108,7 +117,7 @@ func buildPolicy(r domain.AgentRequest) (policy, error) {
 		},
 		Permissions: permissionsPolicy{
 			DefaultMode: permissionMode,
-			Allow:       append([]string(nil), codingTools...),
+			Allow:       append([]string(nil), allowed...),
 			Deny:        append([]string(nil), deniedTools...),
 		},
 	}, nil
@@ -205,16 +214,9 @@ type launchContract struct {
 // endpoint existed, which is what keeps the wiring inert rather than merely
 // unused.
 func launchArgs(r domain.AgentRequest, sessionID string, resume bool, endpoint *capabilityEndpoint) (launchContract, error) {
-	rendered, err := buildPolicy(r)
-	if err != nil {
-		return launchContract{}, err
-	}
-	settings, err := json.Marshal(rendered)
-	if err != nil {
-		return launchContract{}, fmt.Errorf("render claude policy: %w", err)
-	}
 	contract := launchContract{tools: append([]string(nil), codingTools...)}
 	var mcp []byte
+	var err error
 	if endpoint != nil && len(endpoint.names) > 0 {
 		for _, name := range endpoint.names {
 			// Explicit names, never the mcp__symphony__* glob the CLI also
@@ -231,6 +233,16 @@ func launchArgs(r domain.AgentRequest, sessionID string, resume bool, endpoint *
 		if err != nil {
 			return launchContract{}, fmt.Errorf("render claude capability endpoint: %w", err)
 		}
+	}
+	// The settings payload is rendered after the tool surface is known, because
+	// its permission allowlist is that surface.
+	rendered, err := buildPolicy(r, contract.tools)
+	if err != nil {
+		return launchContract{}, err
+	}
+	settings, err := json.Marshal(rendered)
+	if err != nil {
+		return launchContract{}, fmt.Errorf("render claude policy: %w", err)
 	}
 	tools := strings.Join(contract.tools, ",")
 	contract.args = []string{

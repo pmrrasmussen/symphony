@@ -519,10 +519,16 @@ func decode(raw map[string]any, base, path, logRoot string, sources *sourceSnaps
 		if strings.TrimSpace(s.Claude.Command) == "" || s.Claude.TurnTimeout <= 0 || s.Claude.StallTimeout <= 0 {
 			return s, errors.New("invalid configuration: non-positive duration or agent limit")
 		}
-		// The private capability bridge does not exist yet, so a Claude session
-		// has no way to reach Symphony's bounded capabilities. Refuse the
-		// configuration rather than run an agent that silently cannot publish a
-		// pull request or file a follow-up.
+		// The transport exists and is wired: internal/claude prepares the same
+		// provider sessions internal/codex does, builds the same registry, and
+		// serves it over the private loopback MCP endpoint. What is missing is
+		// the prompt side. DeliveryInstructions names bare tool names, which is
+		// what a Codex dynamic tool is called and not what an MCP tool is
+		// called, and nothing yet cross-checks at launch that a capability the
+		// prompt promises is one the built registry advertises. Lifting this
+		// refusal before both exist passes every gate in the repository while
+		// the host tells the model to call a tool it cannot reach, and the turn
+		// then ends as a completed turn with committed, unpublished work.
 		if s.LinearSessionCapabilityEnabled() || s.GitHub.Enabled {
 			return s, errors.New("invalid configuration: agent.backend claude cannot yet be combined with Symphony session capabilities (tracker.provider.handoff_state, tracker.provider.followup_issue_creation, or an enabled github integration)")
 		}

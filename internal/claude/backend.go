@@ -271,11 +271,22 @@ func (b *Backend) Cancel(ctx context.Context, agentSession domain.AgentSession) 
 	if active != nil {
 		active.kill()
 	}
-	// A hard cancel may pre-empt every ordinary turn-end path, so the registry's
-	// turn-ended finalizer has to fire here too -- it is what performs the
-	// deferred Merging -> In Review transition after a retryable landing gate.
-	// Revoke is idempotent and drains before finalizing, so this races the turn's
-	// own shutdown safely and only one of the two reports the outcome.
+	// A hard cancel retires the endpoint here rather than leaving it to the
+	// turn's own shutdown, and the reason is narrower than it looks. The turn's
+	// shutdown does normally get there: killing the turn closes the parent's
+	// pipe ends, so the read loop ends even when a descendant escaped the
+	// process group, and in practice its retirement runs microseconds later.
+	// What this call adds is that it is ordered before the wait below, so the
+	// guarantee holds on the path where that wait does not complete -- ctx is
+	// bounded at five seconds by the coordinator, and on that branch Cancel
+	// returns having waited for nothing. It also covers the window stream's own
+	// LIFO defers open: s.running is cleared before the retirement defer runs,
+	// so a cancel arriving in between finds no live turn and would otherwise
+	// return with the registration still live.
+	//
+	// Revoke is idempotent and drains before finalizing, so this races the
+	// turn's shutdown safely, only one of the two reports the outcome, and the
+	// loser blocks until the winner is done.
 	problems := []error{s.retireEndpoint(nil)}
 	if active == nil {
 		return errors.Join(problems...)
@@ -299,10 +310,25 @@ func (b *Backend) Cancel(ctx context.Context, agentSession domain.AgentSession) 
 // finalizing, because that is what makes "fully retired before the next
 // registration exists" true however the race resolves.
 type registration struct {
-	bridge *mcpbridge.Registration
+	bridge endpointRegistration
 	once   sync.Once
 	err    error
 }
+
+// endpointRegistration is the whole of what this backend uses one registration
+// for. *mcpbridge.Registration satisfies it. Naming the surface is what makes
+// the expiry paths reachable from a test: mcpbridge's drain and finalizer bounds
+// are private and are only ever the production constants, so a real registration
+// cannot be made to return ErrDrainExpired or ErrFinalizerExpired inside a test's
+// patience, and the latch that decides which retirement path owns reporting them
+// would otherwise only ever run its nil-error case.
+type endpointRegistration interface {
+	URL() string
+	Token() string
+	Revoke(ctx context.Context) error
+}
+
+var _ endpointRegistration = (*mcpbridge.Registration)(nil)
 
 // revoke retires the registration and reports whether this caller is the one
 // that performed it, and therefore owns reporting err.
@@ -315,6 +341,19 @@ func (g *registration) revoke(ctx context.Context) (bool, error) {
 	return owned, g.err
 }
 
+// reportRetirement forwards an expired revocation to a turn's event stream. Both
+// sentinel reasons are fixed strings that name no URL, token, argument, or
+// result, so the endpoint's no-logging doctrine survives reporting them -- and
+// not reporting them is worse than the risk: nothing in mcpbridge logs, so an
+// invariant the code knowingly gave up on would otherwise be invisible.
+func reportRetirement(events *sink, expired error) {
+	if expired == nil {
+		return
+	}
+	events.emit(domain.Event{Kind: domain.EventDiagnostic, At: time.Now(),
+		Message: "claude capability endpoint revocation: " + expired.Error()})
+}
+
 // retireEndpoint revokes whatever registration the session currently holds and
 // reports the outcome, which is only ever non-nil when Revoke gave up on an
 // invariant it exists to hold: an invocation still in flight when the drain
@@ -323,8 +362,12 @@ func (g *registration) revoke(ctx context.Context) (bool, error) {
 //
 // The finalizer runs on the run-lived session context rather than on a caller's,
 // exactly as the Codex transport's does: a Cancel context is bounded at seconds
-// and a turn context is already cancelled, and the finalizer's own work -- a
-// Linear transition -- needs a context that is still live.
+// and a turn context is already cancelled. That is the better of the available
+// contexts, not a live one -- on a hard cancel the coordinator has usually
+// already cancelled the run context too, so the deferred transition runs on a
+// dead context on this backend exactly as it does on Codex. Fixing that means
+// giving a session a context that outlives its run, which is a change to both
+// backends and is tracked separately.
 //
 // only, when non-nil, retires that registration and nothing else. The turn's own
 // shutdown passes its own registration because by then the session may already
@@ -332,19 +375,28 @@ func (g *registration) revoke(ctx context.Context) (bool, error) {
 // authority mid-run.
 func (s *session) retireEndpoint(only *registration) error {
 	s.mu.Lock()
-	held := s.endpoint
-	if only == nil || held == only {
-		s.endpoint = nil
+	target := s.endpoint
+	if only != nil {
+		target = only
 	}
 	s.mu.Unlock()
-	target := only
-	if target == nil {
-		target = held
-	}
 	if target == nil {
 		return nil
 	}
 	owned, err := target.revoke(s.ctx)
+	// The session's slot is cleared only now, after the revocation has finished.
+	// Clearing it first would open the window this ordering exists to close: a
+	// concurrent launch would find the slot empty, conclude there was nothing to
+	// retire, and start the next turn's child while this registration was still
+	// draining. Because the slot stays occupied, that launch finds this
+	// registration instead and blocks on the same latch until it is fully
+	// retired. The compare is what keeps a slow loser from clearing the slot the
+	// next turn has since claimed.
+	s.mu.Lock()
+	if s.endpoint == target {
+		s.endpoint = nil
+	}
+	s.mu.Unlock()
 	if !owned {
 		// Another path performed the revocation and has already reported this
 		// outcome. Reporting it again would double-count one expiry.
@@ -386,12 +438,15 @@ func (b *Backend) run(ctx context.Context, s *session, r domain.AgentRequest, re
 	retired := s.retireEndpoint(nil)
 	endpoint, held, err := b.bindEndpoint(s, events)
 	if err != nil {
-		return nil, err
+		return nil, errors.Join(err, retired)
 	}
 	contract, err := launchArgs(r, s.id, resume, endpoint)
 	if err != nil {
 		s.discardEndpoint(held)
-		return nil, err
+		// retired is joined in rather than dropped: no turn will exist to carry
+		// it as a diagnostic, and an expired drain or finalizer has no other
+		// route to an operator at all.
+		return nil, errors.Join(err, retired)
 	}
 	environment := filteredEnv(b.secretNames, b.settings, s.secretMatcher, endpoint)
 	// The spawn happens under the session lock so a cancellation cannot arrive
@@ -404,7 +459,7 @@ func (b *Backend) run(ctx context.Context, s *session, r domain.AgentRequest, re
 	if !resume {
 		s.request = r
 	}
-	t, err := spawn(ctx, r, contract, environment, events)
+	t, err := spawn(ctx, r, contract, environment, events, endpoint)
 	if err != nil {
 		s.mu.Unlock()
 		// Nothing will ever read this registration's stream, and no turn will
@@ -413,20 +468,17 @@ func (b *Backend) run(ctx context.Context, s *session, r domain.AgentRequest, re
 		// loopback-reachable, token-bearing capability set would stay live for
 		// the daemon's lifetime.
 		s.discardEndpoint(held)
-		return nil, err
+		return nil, errors.Join(err, retired)
 	}
 	t.registration = held
 	s.running = t
 	s.endpoint = held
 	s.mu.Unlock()
 
-	if retired != nil {
-		// The previous turn's revocation gave up on an ordering invariant. Its
-		// own stream is closed by now, so this turn's is where an operator can
-		// still see it. Both sentinel reasons are fixed strings.
-		events.emit(domain.Event{Kind: domain.EventDiagnostic, At: time.Now(),
-			Message: "claude capability endpoint revocation: " + retired.Error()})
-	}
+	// The previous turn's revocation may have given up on an ordering invariant.
+	// Its own stream is closed by now, so this turn's is where an operator can
+	// still see it.
+	reportRetirement(events, retired)
 	go t.stream(s, r, turnNumber)
 	return t.sink.events, nil
 }
@@ -498,13 +550,17 @@ type turn struct {
 	// registration is this turn's capability-endpoint authority, retired when the
 	// turn ends however it ends. It is nil for a turn with no endpoint.
 	registration *registration
+	// endpointURL and endpointToken are kept only so child output can be
+	// scrubbed of them. See withoutEndpoint.
+	endpointURL   string
+	endpointToken string
 
 	mu     sync.Mutex
 	killed bool
 }
 
 // spawn starts the CLI with the prompt on stdin and a scrubbed environment.
-func spawn(ctx context.Context, r domain.AgentRequest, contract launchContract, environment []string, events *sink) (*turn, error) {
+func spawn(ctx context.Context, r domain.AgentRequest, contract launchContract, environment []string, events *sink, endpoint *capabilityEndpoint) (*turn, error) {
 	command := strings.TrimSpace(r.Command)
 	if command == "" {
 		command = "claude"
@@ -549,6 +605,9 @@ func spawn(ctx context.Context, r domain.AgentRequest, contract launchContract, 
 	t := &turn{
 		cmd: cmd, stdout: stdout, stderr: stderr, exited: make(chan struct{}), timeout: r.TurnTimeout,
 		sink: events, contract: contract,
+	}
+	if endpoint != nil {
+		t.endpointURL, t.endpointToken = endpoint.url, endpoint.token
 	}
 	cmd.Cancel = func() error { t.kill(); return nil }
 	// WaitDelay bounds how long Wait blocks on I/O after the process itself is
@@ -599,6 +658,28 @@ func (t *turn) closePipes() {
 	})
 }
 
+// withoutEndpoint removes this turn's endpoint address and bearer token from
+// child output before any of it becomes an event.
+//
+// observability.Text redacts credential-shaped text -- a Bearer header, a
+// token= parameter -- and a loopback URL is neither, so a CLI that prints its
+// MCP configuration or an MCP connect error to stderr would otherwise put the
+// endpoint address in a diagnostic and a log. The address is not a credential
+// on its own, since the token is what authorizes anything, but "the endpoint
+// URL and token appear in no log line or event" is the property this endpoint
+// was built to hold and it costs nothing to keep.
+func (t *turn) withoutEndpoint(text string) string {
+	if text == "" {
+		return ""
+	}
+	for _, secret := range []string{t.endpointToken, t.endpointURL} {
+		if secret != "" {
+			text = strings.ReplaceAll(text, secret, "[redacted]")
+		}
+	}
+	return text
+}
+
 func (t *turn) cancelled() bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -624,12 +705,7 @@ func (t *turn) stream(s *session, r domain.AgentRequest, turnNumber int) {
 	// It retires only this turn's own registration: by now the session may
 	// already hold the next turn's, and revoking that one would strip a live
 	// turn of its authority mid-run.
-	defer func() {
-		if expired := s.retireEndpoint(t.registration); expired != nil {
-			t.sink.emit(domain.Event{Kind: domain.EventDiagnostic, At: time.Now(),
-				Message: "claude capability endpoint revocation: " + expired.Error()})
-		}
-	}()
+	defer func() { reportRetirement(t.sink, s.retireEndpoint(t.registration)) }()
 	// Once this turn is over it must stop being the session's live process, or a
 	// later cancellation would signal a process group whose pid has been reaped
 	// and possibly recycled.
@@ -834,7 +910,7 @@ func (t *turn) stream(s *session, r domain.AgentRequest, turnNumber int) {
 		t.sink.emitTerminal(domain.Event{Kind: domain.EventFailed, At: time.Now(), Message: "claude turn cancelled"})
 		return
 	}
-	if tail := stderr.text(); tail != "" {
+	if tail := t.withoutEndpoint(stderr.text()); tail != "" {
 		emit(domain.Event{Kind: domain.EventDiagnostic, At: time.Now(), Message: tail})
 	}
 	switch {
