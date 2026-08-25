@@ -45,6 +45,9 @@ const (
 	// instead of the failure backoff (PMR-78).
 	retryLanding      retryKind = "landing"
 	continuationDelay           = time.Second
+	// defaultLandingRetryDelay is the landing redispatch floor when neither
+	// github.poll_interval_ms nor polling.interval_ms is configured.
+	defaultLandingRetryDelay = 30 * time.Second
 )
 
 // handoffObservationFloor is the lower bound for how long the coordinator
@@ -163,12 +166,19 @@ type Coordinator struct {
 	// an external actor (for example Linear's native GitHub PR automation)
 	// reverting that handoff to an active state instead of silently
 	// re-dispatching it. It is in-process only and discarded safely on restart.
-	handoffs  map[string]handoffObservation
-	nextRetry uint64
-	stopping  bool
-	ctx       context.Context
-	cancel    context.CancelFunc
-	wg        sync.WaitGroup
+	handoffs map[string]handoffObservation
+	// landingWaits counts consecutive non-terminal landing waits for a claimed
+	// issue. It escalates the delayed landing redispatch so a gate that never
+	// settles (a genuinely long check run, or a required_checks name that does
+	// not match any GitHub job) backs off toward agent.max_retry_backoff_ms
+	// instead of respawning a session at the GitHub poll cadence forever. It is
+	// cleared with the claim, so any other landing outcome resets it (PMR-78).
+	landingWaits map[string]int
+	nextRetry    uint64
+	stopping     bool
+	ctx          context.Context
+	cancel       context.CancelFunc
+	wg           sync.WaitGroup
 }
 
 // handoffObservation is the coordinator's memory of one host-driven transition
@@ -223,7 +233,7 @@ func New(t domain.Tracker, a domain.AgentBackend, w domain.WorkspaceExecutor, se
 		timer: realTimer{}, clock: realClock{}, log: observability.FromSlog(logger),
 		running: map[string]*running{}, claimed: map[string]bool{},
 		claimState: map[string]string{}, admitted: map[string]string{}, retries: map[string]retryState{},
-		handoffs: map[string]handoffObservation{},
+		handoffs: map[string]handoffObservation{}, landingWaits: map[string]int{},
 	}
 }
 
@@ -253,11 +263,17 @@ type RunningSnapshot struct {
 }
 
 type RetrySnapshot struct {
-	IssueIdentifier string    `json:"issue_identifier"`
-	Attempt         int       `json:"attempt"`
-	Kind            string    `json:"kind"`
-	Reason          string    `json:"reason"`
-	Due             time.Time `json:"due_at"`
+	IssueIdentifier string `json:"issue_identifier"`
+	Attempt         int    `json:"attempt"`
+	Kind            string `json:"kind"`
+	Reason          string `json:"reason"`
+	// WaitAttempt is the number of consecutive landing waits behind a
+	// "landing" retry. It is the operator's "this landing is stuck" signal:
+	// the agent attempt deliberately stays put for a non-failure, so a climbing
+	// wait count (and the growing delay it drives) is what distinguishes a slow
+	// check run from a gate that will never settle (PMR-78).
+	WaitAttempt int       `json:"wait_attempt,omitempty"`
+	Due         time.Time `json:"due_at"`
 }
 
 // OutstandingOperationSnapshot identifies the one safe app-server operation
@@ -282,7 +298,7 @@ func (c *Coordinator) Snapshot() Snapshot {
 		snapshot.Running = append(snapshot.Running, RunningSnapshot{IssueIdentifier: run.issue.Identifier, IssueState: run.issue.State, SessionID: run.session.ID, ThreadID: run.session.ThreadID, TurnID: run.session.TurnID, Attempt: run.run.Attempt, TurnCount: run.run.TurnCount, StartedAt: run.run.StartedAt, LastEventAt: run.last, Usage: run.run.Usage, RateLimit: copyRateLimit(run.rateLimit), OutstandingOperation: item})
 	}
 	for _, retry := range c.retries {
-		snapshot.Retrying = append(snapshot.Retrying, RetrySnapshot{IssueIdentifier: retry.issue.Identifier, Attempt: retry.attempt, Kind: string(retry.kind), Reason: retry.reason, Due: retry.due})
+		snapshot.Retrying = append(snapshot.Retrying, RetrySnapshot{IssueIdentifier: retry.issue.Identifier, Attempt: retry.attempt, Kind: string(retry.kind), Reason: retry.reason, WaitAttempt: c.landingWaits[retry.issue.ID], Due: retry.due})
 	}
 	sort.Slice(snapshot.Running, func(i, j int) bool { return snapshot.Running[i].IssueIdentifier < snapshot.Running[j].IssueIdentifier })
 	sort.Slice(snapshot.Retrying, func(i, j int) bool {
@@ -357,6 +373,7 @@ func (c *Coordinator) Shutdown(ctx context.Context) error {
 		delete(c.retries, id)
 		delete(c.claimed, id)
 		delete(c.claimState, id)
+		delete(c.landingWaits, id)
 	}
 	c.mu.Unlock()
 	c.cancelAll(ctx, runs)
@@ -850,6 +867,9 @@ func (c *Coordinator) runTurns(ctx context.Context, r *running, events <-chan do
 			// Landing already merged the pull request and reconciled the issue.
 			// End the run here even when this refresh still reports the pre-merge
 			// state, so no later turn or landing tool call is possible (PMR-78).
+			// This issue will never be polled or retried again, so the workspace
+			// must be released here exactly as on the terminal-state path above.
+			c.cleanupWorkspace(ctx, current)
 			return true, current, nil
 		}
 		if turnCount >= settings.Agent.MaxTurns {
@@ -1259,34 +1279,57 @@ func (c *Coordinator) finishLandingWait(ctx context.Context, i domain.Issue, att
 		c.release(i.ID)
 		return
 	}
-	delay := landingRetryDelay(c.settings())
-	c.log.Info("landing wait retry scheduled", "operation", "landing_waiting", "issue_id", i.ID, "issue_identifier", i.Identifier, "reason", reason, "attempt", attempt, "delay_ms", delay.Milliseconds())
-	c.scheduleRetry(ctx, i, domain.Workspace{}, attempt, retryLanding, "landing_waiting", delay)
+	s := c.settings()
+	c.mu.Lock()
+	c.landingWaits[i.ID]++
+	waits := c.landingWaits[i.ID]
+	c.mu.Unlock()
+	delay := landingRetryDelay(s, waits)
+	if !c.scheduleRetry(ctx, i, domain.Workspace{}, attempt, retryLanding, "landing_waiting", delay) {
+		return
+	}
+	c.log.Info("landing wait retry scheduled", "operation", "landing_waiting", "issue_id", i.ID, "issue_identifier", i.Identifier, "reason", reason, "attempt", attempt, "wait_attempt", waits, "delay_ms", delay.Milliseconds())
 }
 
-// landingRetryDelay is the bounded delay before a waiting landing is
-// redispatched: the configured GitHub poll interval (the cadence at which
-// GitHub state is expected to change), falling back to the tracker poll
-// interval, and never longer than the configured retry backoff ceiling.
-func landingRetryDelay(s config.Settings) time.Duration {
-	delay := s.GitHub.PollInterval
-	if delay <= 0 {
-		delay = s.Polling.Interval
+// landingRetryDelay bounds the wait before a landing is redispatched. Its floor
+// is the configured GitHub poll interval -- the cadence at which the GitHub
+// state being waited on can change -- and it escalates with the number of
+// consecutive waits toward agent.max_retry_backoff_ms, so a gate that never
+// settles cannot respawn a session every poll interval forever. The coordinator
+// deliberately does not itself give up on a stuck landing: returning the issue
+// to review is the landing capability's own bounded, commented authority
+// (github_land_pr's merge_state -> In Review fallback), and a Merging issue that
+// stops making progress stays visible on the board with a climbing wait_attempt.
+// The floor is never undercut, so a small backoff ceiling cannot turn landing
+// into a tighter GitHub poll than the configured interval.
+func landingRetryDelay(s config.Settings, waits int) time.Duration {
+	floor := s.GitHub.PollInterval
+	if floor <= 0 {
+		floor = s.Polling.Interval
 	}
-	if delay <= 0 {
-		delay = continuationDelay
+	if floor <= 0 {
+		// The same fallback the GitHub linked-PR poll loop uses when no interval
+		// is configured (see internal/github.Manager.Run).
+		floor = defaultLandingRetryDelay
 	}
-	if ceiling := s.Agent.MaxRetryBackoff; ceiling > 0 && delay > ceiling {
-		delay = ceiling
+	// backoff already caps its escalation at the ceiling, and the poll floor
+	// always wins: a small max_retry_backoff_ms must never make landing poll
+	// GitHub faster than its configured interval.
+	delay := floor
+	if escalated := backoff(waits, s.Agent.MaxRetryBackoff); escalated > delay {
+		delay = escalated
 	}
 	return delay
 }
 
-func (c *Coordinator) scheduleRetry(ctx context.Context, i domain.Issue, ws domain.Workspace, attempt int, kind retryKind, reason string, delay time.Duration) {
+// scheduleRetry arms one delayed redispatch and reports whether it did: a
+// shutdown or a released claim declines it, so a caller that logs the retry
+// separately can stay truthful.
+func (c *Coordinator) scheduleRetry(ctx context.Context, i domain.Issue, ws domain.Workspace, attempt int, kind retryKind, reason string, delay time.Duration) bool {
 	c.mu.Lock()
 	if c.stopping || !c.claimed[i.ID] {
 		c.mu.Unlock()
-		return
+		return false
 	}
 	if previous, ok := c.retries[i.ID]; ok && previous.timer != nil {
 		previous.timer.Stop()
@@ -1307,6 +1350,7 @@ func (c *Coordinator) scheduleRetry(ctx context.Context, i domain.Issue, ws doma
 	}
 	c.mu.Unlock()
 	c.log.Info("agent retry scheduled", "issue_id", i.ID, "issue_identifier", i.Identifier, "retry_kind", kind, "reason", reason, "attempt", attempt, "due", state.due)
+	return true
 }
 
 func (c *Coordinator) runRetry(id string, generation uint64) {
@@ -1356,6 +1400,17 @@ func (c *Coordinator) runRetry(id string, generation uint64) {
 	// The retry still owns its claim, but another admitted run used the slot
 	// after we refreshed it. Keep that duplicate-prevention claim and retry
 	// with the prescribed bounded backoff instead of dropping the work.
+	if retry.kind == retryLanding {
+		// A contended landing slot is no more an agent failure than the wait
+		// itself: keep the attempt (it feeds the rendered prompt) and the
+		// landing cadence, so a queued landing never polls GitHub faster than
+		// the configured interval (PMR-78).
+		c.mu.Lock()
+		waits := c.landingWaits[id]
+		c.mu.Unlock()
+		c.scheduleRetry(ctx, issue, retry.workspace, retry.attempt, retryLanding, "landing_slot_unavailable", landingRetryDelay(s, waits))
+		return
+	}
 	attempt := retry.attempt + 1
 	c.scheduleRetry(ctx, issue, retry.workspace, attempt, retry.kind, "no available orchestrator slots", backoff(attempt, s.Agent.MaxRetryBackoff))
 }
@@ -1415,6 +1470,7 @@ func (c *Coordinator) release(id string) {
 	delete(c.claimState, id)
 	delete(c.admitted, id)
 	delete(c.retries, id)
+	delete(c.landingWaits, id)
 	c.mu.Unlock()
 }
 

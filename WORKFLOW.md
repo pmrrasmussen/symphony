@@ -99,6 +99,11 @@ github:
   repository: symphony
   base_branch: main
   token_file: $SYMPHONY_GITHUB_TOKEN_FILE
+  # Paces the linked pull-request poll loop, and is also the floor for the
+  # delayed landing redispatch after github_land_pr reports a non-terminal
+  # wait. Consecutive waits escalate that delay toward
+  # agent.max_retry_backoff_ms, so a gate that never settles backs off instead
+  # of respawning a landing session every interval.
   poll_interval_ms: 30000
   # Landing capability (PMR-37, activated for real dispatch by PMR-38). A
   # session bound to an issue currently in Merging receives the zero-argument

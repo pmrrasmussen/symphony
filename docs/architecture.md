@@ -115,9 +115,14 @@ again. Missing or pending required checks, or undetermined mergeability,
 return a non-terminal waiting result without mutating Linear. A waiting result
 is settled by the host, not by the model (PMR-78): it ends the logical run at
 once, releases the concurrency slot, keeps the issue in `merge_state`, and the
-coordinator schedules one delayed landing redispatch (`github.poll_interval_ms`,
-bounded by `agent.max_retry_backoff_ms`) whose timer holds only the
-duplicate-prevention claim. A terminal result -- merged, already merged, or a
+coordinator schedules one delayed landing redispatch whose timer holds only the
+duplicate-prevention claim. That delay starts at `github.poll_interval_ms` and
+escalates with the number of consecutive waits toward
+`agent.max_retry_backoff_ms`, so an unsettling gate degrades to a slow poll
+rather than a permanent per-interval respawn; the wait count is reset with the
+claim and surfaced as `wait_attempt`. A redispatch that finds the state's
+concurrency limit taken keeps that same cadence and attempt instead of
+escalating as a failure would. A terminal result -- merged, already merged, or a
 completed reconciliation -- ends the run the same way and closes
 `github_land_pr` for that run, so no later turn or duplicate tool call can
 re-invoke it; `Land` itself stays idempotent purely as the recovery path. With

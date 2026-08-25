@@ -906,7 +906,7 @@ func TestLandingWaitEndsRunWithoutTurnsAndSchedulesBoundedLandingRetry(t *testin
 	if _, marks, cleanups, _ := ws.counts(); marks != 0 || cleanups != 0 {
 		t.Fatalf("landing wait marks=%d cleanups=%d, want neither completion nor cleanup", marks, cleanups)
 	}
-	for _, want := range []string{`"msg":"agent landing waiting"`, `"operation":"landing_waiting"`, `"reason":"required checks are pending"`, `"msg":"landing wait retry scheduled"`, `"status":"waiting"`, `"retry_kind":"landing"`} {
+	for _, want := range []string{`"msg":"agent landing waiting"`, `"operation":"landing_waiting"`, `"reason":"required checks are pending"`, `"msg":"landing wait retry scheduled"`, `"wait_attempt":1`, `"status":"waiting"`, `"retry_kind":"landing"`} {
 		waitForSubstring(t, &log, want, time.Second)
 	}
 	if records := log.String(); strings.Contains(records, "turn_limit_exhausted") || strings.Contains(records, `"msg":"agent run retry scheduled"`) {
@@ -944,6 +944,9 @@ func TestLandingResolvedEndsRunWithoutAnotherTurn(t *testing.T) {
 	if timer.scheduled() != 0 {
 		t.Fatalf("terminal landing scheduled %d retries, want none", timer.scheduled())
 	}
+	if _, _, cleanups, _ := ws.counts(); cleanups != 1 {
+		t.Fatalf("cleanups=%d, want the workspace released even though the refresh still reports the issue active", cleanups)
+	}
 	records := log.String()
 	if !strings.Contains(records, `"msg":"agent landing resolved"`) || !strings.Contains(records, `"operation":"landing_resolved"`) {
 		t.Fatalf("log missing the landing resolution record: %s", records)
@@ -969,6 +972,157 @@ func waitForRelease(t *testing.T, c *Coordinator, id string) {
 			t.Fatalf("run for %s never released its claim (claimed=%v running=%d)", id, claimed, running)
 		}
 		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+// TestLandingWaitRedispatchesWithEscalatingDelay drives the mechanism itself:
+// the delayed landing retry relaunches the same attempt in a fresh session, and
+// a gate that stays unsettled backs off instead of respawning at a fixed
+// cadence forever. Adapted from the PMR-78 review probe.
+func TestLandingWaitRedispatchesWithEscalatingDelay(t *testing.T) {
+	w := testSettings(t)
+	w.Config.Agent.MaxTurns = 20
+	w.Config.Agent.MaxRetryBackoff = 10 * time.Minute
+	// A poll interval below the first backoff step so escalation is visible.
+	w.Config.GitHub.PollInterval = 5 * time.Second
+	issue := testIssue()
+	var log syncBuffer
+	agent := &fakeAgent{events: landingWaitingEvents}
+	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{}, 4)}
+	c := New(&fakeTracker{issue: issue}, agent, ws, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&log, nil)))
+	c.clock = fakeClock{now: time.Date(2026, 8, 25, 9, 41, 0, 0, time.UTC)}
+	timer := &fakeTimer{signal: make(chan struct{}, 4)}
+	c.timer = timer
+
+	c.Tick(context.Background())
+	<-ws.after
+	<-timer.signal
+
+	// Firing the landing timer must relaunch landing, not fail the issue.
+	timer.fire(0)
+	<-ws.after
+	<-timer.signal
+
+	starts, continues, cancels := agent.counts()
+	if starts != 2 || continues != 0 || cancels != 2 {
+		t.Fatalf("starts=%d continues=%d cancels=%d, want two dispatches, no continuation turn, one cancel each", starts, continues, cancels)
+	}
+	c.mu.Lock()
+	retry, ok := c.retries[issue.ID]
+	waits, claimed, admitted := c.landingWaits[issue.ID], c.claimed[issue.ID], len(c.admitted)
+	c.mu.Unlock()
+	if !ok || retry.kind != retryLanding || retry.reason != "landing_waiting" || retry.attempt != 0 {
+		t.Fatalf("retry=%+v ok=%v, want a second landing retry on the same attempt", retry, ok)
+	}
+	if waits != 2 || !claimed || admitted != 0 {
+		t.Fatalf("waits=%d claimed=%v admitted=%d", waits, claimed, admitted)
+	}
+	if len(timer.delays) != 2 || timer.delays[0] != 10*time.Second || timer.delays[1] != 20*time.Second {
+		t.Fatalf("landing retry delays=%v, want an escalating sequence", timer.delays)
+	}
+	waitForSubstring(t, &log, `"wait_attempt":2`, time.Second)
+	if records := log.String(); strings.Contains(records, "turn_limit_exhausted") {
+		t.Fatalf("repeated landing waits escalated into an agent failure: %s", records)
+	}
+	if snapshot := c.Snapshot(); len(snapshot.Retrying) != 1 || snapshot.Retrying[0].WaitAttempt != 2 || snapshot.Retrying[0].Attempt != 0 {
+		t.Fatalf("snapshot retrying=%+v, want wait_attempt 2 on attempt 0", snapshot.Retrying)
+	}
+	if err := c.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	c.mu.Lock()
+	leaked, leakedWaits := c.claimed[issue.ID], len(c.landingWaits)
+	c.mu.Unlock()
+	if leaked || leakedWaits != 0 {
+		t.Fatalf("shutdown leaked claim=%v landing waits=%d", leaked, leakedWaits)
+	}
+}
+
+// TestCapacityBlockedLandingRetryKeepsItsCadence covers the redispatch that
+// loses the state's single landing slot: it stays a landing retry on the same
+// attempt at the landing cadence, instead of becoming a faster failure-backoff
+// retry that would poll GitHub harder than configured. Adapted from the PMR-78
+// review probe.
+func TestCapacityBlockedLandingRetryKeepsItsCadence(t *testing.T) {
+	w := testSettings(t)
+	w.Config.Agent.MaxTurns = 20
+	w.Config.Agent.MaxConcurrent = 1
+	w.Config.Agent.MaxRetryBackoff = 10 * time.Minute
+	w.Config.GitHub.PollInterval = 30 * time.Second
+	issue := testIssue()
+	agent := &fakeAgent{events: landingWaitingEvents}
+	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{}, 4)}
+	c := testCoordinator(w.Config, &fakeTracker{issue: issue}, agent, ws)
+	timer := &fakeTimer{signal: make(chan struct{}, 4)}
+	c.timer = timer
+
+	c.Tick(context.Background())
+	<-ws.after
+	<-timer.signal
+
+	// Another issue takes the only orchestrator slot before the timer fires.
+	c.mu.Lock()
+	c.admitted["other"] = "todo"
+	c.mu.Unlock()
+
+	timer.fire(0)
+	<-timer.signal
+
+	c.mu.Lock()
+	retry := c.retries[issue.ID]
+	claimed := c.claimed[issue.ID]
+	c.mu.Unlock()
+	if !claimed {
+		t.Fatal("capacity-blocked landing retry dropped its claim")
+	}
+	if retry.kind != retryLanding || retry.reason != "landing_slot_unavailable" || retry.attempt != 0 {
+		t.Fatalf("retry=%+v, want a landing retry on the same attempt", retry)
+	}
+	if len(timer.delays) != 2 || timer.delays[1] != 30*time.Second {
+		t.Fatalf("delays=%v, want the landing cadence rather than a failure backoff", timer.delays)
+	}
+	if starts, _, _ := agent.counts(); starts != 1 {
+		t.Fatalf("starts=%d, want no dispatch while the slot is taken", starts)
+	}
+	if err := c.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLandingRetryDelayFloorsEscalatesAndCaps(t *testing.T) {
+	settings := config.Settings{
+		Polling: config.Polling{Interval: time.Minute},
+		Agent:   config.Agent{MaxRetryBackoff: 90 * time.Second},
+		GitHub:  config.GitHub{PollInterval: 30 * time.Second},
+	}
+	for _, test := range []struct {
+		name     string
+		settings config.Settings
+		waits    int
+		want     time.Duration
+	}{
+		{name: "first wait uses the github poll floor", settings: settings, waits: 1, want: 30 * time.Second},
+		{name: "escalates past the floor", settings: settings, waits: 3, want: 40 * time.Second},
+		{name: "capped by the retry ceiling", settings: settings, waits: 9, want: 90 * time.Second},
+		{
+			name:     "the poll floor is never undercut by a small ceiling",
+			settings: config.Settings{Agent: config.Agent{MaxRetryBackoff: 5 * time.Second}, GitHub: config.GitHub{PollInterval: 30 * time.Second}},
+			waits:    4,
+			want:     30 * time.Second,
+		},
+		{
+			name:     "falls back to the tracker poll interval",
+			settings: config.Settings{Polling: config.Polling{Interval: 2 * time.Minute}, Agent: config.Agent{MaxRetryBackoff: 10 * time.Minute}},
+			waits:    1,
+			want:     2 * time.Minute,
+		},
+		{name: "unconfigured intervals use the documented default", settings: config.Settings{}, waits: 1, want: 30 * time.Second},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := landingRetryDelay(test.settings, test.waits); got != test.want {
+				t.Fatalf("landingRetryDelay(waits=%d)=%s, want %s", test.waits, got, test.want)
+			}
+		})
 	}
 }
 
