@@ -19,8 +19,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pmrrasmussen/symphony/internal/capability"
 	"github.com/pmrrasmussen/symphony/internal/config"
 	"github.com/pmrrasmussen/symphony/internal/domain"
+	githubhost "github.com/pmrrasmussen/symphony/internal/github"
+	"github.com/pmrrasmussen/symphony/internal/linear"
 	"github.com/pmrrasmussen/symphony/internal/observability"
 )
 
@@ -862,12 +865,77 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{}}'
 	if err != nil {
 		t.Fatal(err)
 	}
-	for range events {
+	var dynamicToolCalls []domain.Event
+	for event := range events {
+		if event.ItemType == "dynamicToolCall" {
+			dynamicToolCalls = append(dynamicToolCalls, event)
+		}
 	}
 	// One read and one Backlog-state resolution bind the session, followed by
 	// one re-read before mutation (ensureMutable) and the create mutation.
 	if graphQLCalls != 4 {
 		t.Fatalf("GraphQL calls=%d want prepare+state+ensure+create=4", graphQLCalls)
+	}
+	// create_followup_issue is deliberately not reported as a dynamicToolCall
+	// (see docs/observability.md): a reported call would be tracked as an
+	// outstanding operation and would surface in heartbeat and stall records.
+	if len(dynamicToolCalls) != 0 {
+		t.Fatalf("follow-up creation emitted %d dynamicToolCall events: %+v", len(dynamicToolCalls), dynamicToolCalls)
+	}
+}
+
+// TestDynamicToolsWrapEveryDefinitionInTheAppServerEnvelope pins the wire shape
+// this adapter owns. The definitions themselves are asserted in
+// internal/capability; what is asserted here is that each one reaches the
+// app-server as a function tool whose schema is carried under "inputSchema".
+// Without this, renaming or dropping that key would advertise tools with no
+// schema at all -- no additionalProperties:false, no length bound -- and leave
+// only the provider-side parsers between a model and unbounded arguments.
+func TestDynamicToolsWrapEveryDefinitionInTheAppServerEnvelope(t *testing.T) {
+	settings := config.Settings{}
+	settings.Tracker.FollowupIssueCreation = true
+	settings.GitHub.MergeState = "Merging"
+	registry := capability.Build(capability.Bindings{
+		Settings: settings,
+		Issue:    domain.Issue{Identifier: "PMR-1", State: "Merging"},
+		Handoff:  &linear.HandoffSession{},
+		GitHub:   &githubhost.Session{},
+	})
+	tools := dynamicTools(registry)
+	if len(tools) != 4 {
+		t.Fatalf("wrapped %d tools, want 4", len(tools))
+	}
+	for _, tool := range tools {
+		if tool["type"] != "function" {
+			t.Fatalf("tool type=%#v, want \"function\": %#v", tool["type"], tool)
+		}
+		name, ok := tool["name"].(string)
+		if !ok || name == "" {
+			t.Fatalf("tool name=%#v", tool["name"])
+		}
+		if description, ok := tool["description"].(string); !ok || description == "" {
+			t.Fatalf("%s description=%#v", name, tool["description"])
+		}
+		schema, ok := tool["inputSchema"].(map[string]any)
+		if !ok {
+			t.Fatalf("%s carries no inputSchema: %#v", name, tool)
+		}
+		if schema["type"] != "object" || schema["additionalProperties"] != false {
+			t.Fatalf("%s schema=%#v", name, schema)
+		}
+		for key := range tool {
+			switch key {
+			case "type", "name", "description", "inputSchema":
+			default:
+				t.Fatalf("%s carries unexpected envelope field %q", name, key)
+			}
+		}
+	}
+}
+
+func TestDynamicToolsIsEmptyWithoutCapabilities(t *testing.T) {
+	if tools := dynamicTools(capability.Build(capability.Bindings{})); len(tools) != 0 {
+		t.Fatalf("wrapped %d tools without any bound capability", len(tools))
 	}
 }
 

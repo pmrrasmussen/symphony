@@ -194,6 +194,29 @@ func TestAdvertisedBoundsMatchTheProviderThatEnforcesThem(t *testing.T) {
 	if total := description + acceptance + separatorBytes; total > linear.MaxFollowupIssueBodyBytes {
 		t.Fatalf("advertised body bounds sum to %d, past the provider bound %d", total, linear.MaxFollowupIssueBodyBytes)
 	}
+	// The two body bounds are advertised values in their own right, not just
+	// summands, so pin them: widening one silently narrows what the other may use.
+	if description != 16000 || acceptance != 4000 {
+		t.Fatalf("follow-up body bounds = %d/%d, want 16000/4000", description, acceptance)
+	}
+	// Every bounded string field is also required to be non-empty at the schema
+	// level, so an empty value is refused before it reaches a provider.
+	for _, bounded := range []struct {
+		definition Definition
+		fields     []string
+	}{
+		{publish, []string{"why", "what_changed"}},
+		{followup, []string{"title", "description", "acceptance_criteria"}},
+	} {
+		definition := bounded.definition
+		fields := bounded.fields
+		properties := definition.InputSchema["properties"].(map[string]any)
+		for _, field := range fields {
+			if property := properties[field].(map[string]any); property["minLength"] != 1 {
+				t.Fatalf("%s %s minLength = %#v, want 1", definition.Name, field, property["minLength"])
+			}
+		}
+	}
 }
 
 // schemaBound reads a maxLength out of an advertised schema.
@@ -338,6 +361,62 @@ func TestEveryDefinitionIsNamedByARegistryConstant(t *testing.T) {
 		if strings.TrimSpace(definition.Description) == "" {
 			t.Fatalf("%s has no description", definition.Name)
 		}
+	}
+}
+
+// TestLifecycleReportingPerCapability pins which capabilities are reported as
+// dynamicToolCall item records. This used to be structural -- the follow-up
+// branch simply contained no emission -- and is now one boolean per capability,
+// so it needs an assertion. A wrong value here changes what the coordinator
+// tracks as an outstanding operation, and therefore heartbeat and stall records.
+func TestLifecycleReportingPerCapability(t *testing.T) {
+	registry := Build(bindings(true, true, "Merging", "Merging"))
+	for name, want := range map[string]bool{
+		NameCreateFollowupIssue: false,
+		NameGitHubPublishPR:     true,
+		NameGitHubPRContext:     true,
+		NameGitHubLandPR:        true,
+	} {
+		bound, ok := registry.Lookup(name)
+		if !ok {
+			t.Fatalf("%s not registered", name)
+		}
+		if got := bound.Lifecycle(); got != want {
+			t.Fatalf("%s Lifecycle() = %v, want %v", name, got, want)
+		}
+	}
+}
+
+// TestLandingOutcomeCarriesAReasonOnlyWhileWaiting keeps the reason channel
+// closed for a resolved landing. Before the registry existed the resolved event
+// could not carry a message at all; now Reason is a generic field, so the
+// guarantee needs an assertion.
+func TestLandingOutcomeCarriesAReasonOnlyWhileWaiting(t *testing.T) {
+	waiting, reason := landingOutcome(githubhost.LandResult{Status: githubhost.LandWaiting, Reason: "required checks are pending"})
+	if waiting != domain.EventLandingWaiting || reason != "required checks are pending" {
+		t.Fatalf("waiting outcome = %q reason = %q", waiting, reason)
+	}
+	resolved, reason := landingOutcome(githubhost.LandResult{Status: githubhost.LandMerged, Reason: "merged by an earlier attempt"})
+	if resolved != domain.EventLandingResolved || reason != "" {
+		t.Fatalf("resolved outcome = %q reason = %q, want no reason", resolved, reason)
+	}
+	if kind, reason := landingOutcome(githubhost.LandResult{}); kind != "" || reason != "" {
+		t.Fatalf("unknown status produced outcome %q reason %q", kind, reason)
+	}
+}
+
+func TestNothingIsRegisteredWithoutAHandoffSession(t *testing.T) {
+	// Follow-up creation is bound to a handoff session; enabling the setting
+	// without one must register nothing rather than a capability that would
+	// dereference a missing session when invoked.
+	b := bindings(true, false, "Todo", "")
+	b.Handoff = nil
+	registry := Build(b)
+	if _, ok := registry.Lookup(NameCreateFollowupIssue); ok {
+		t.Fatal("follow-up creation registered without a handoff session")
+	}
+	if definitions := registry.Definitions(); len(definitions) != 0 {
+		t.Fatalf("advertised %v without any bound provider session", names(definitions))
 	}
 }
 
