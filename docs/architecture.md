@@ -178,9 +178,19 @@ write access to only the two paths a detached-HEAD commit needs -- the source
 repository's shared object store and this linked worktree's own per-worktree
 metadata directory -- and never the rest of the common directory, so the agent
 cannot write the source repository's branch refs (including the primary branch)
-or the primary working tree's index. This does not grant network access or a
-GitHub credential. As a defense-in-depth backstop, after each run Symphony
-re-checks that the source repository's non-`symphony/*` branch heads and primary
+or the primary working tree's index. This grants no credential of any kind:
+host-owned Linear and GitHub secrets are stripped from the Codex child
+environment by name and by value. Network authority is separate and
+repository-owned: `codex.turn_sandbox_policy` is forwarded verbatim as each
+turn's sandbox policy, and this repository configures `type: workspaceWrite`
+with `networkAccess: true` so repository validation that binds a local loopback
+listener can run (PMR-80). That setting lifts only the socket restriction --
+writes stay confined to the same workspace and narrowed Git roots, and the
+agent has no host credential to spend on the network it can reach. Omitting
+the key keeps the narrowed workspace-write grant with sockets denied.
+
+As a defense-in-depth backstop, after each run Symphony re-checks that the
+source repository's non-`symphony/*` branch heads and primary
 index are unchanged from a baseline captured at preparation, and alerts on
 drift. The host still owns all GitHub publishing authority. Workspace state below the configured
 root records durable ownership and Git cleanup identity; it never suppresses an

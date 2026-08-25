@@ -72,6 +72,18 @@ codex:
   command: codex app-server
   approval_policy: never
   thread_sandbox: workspace-write
+  # Per-turn sandbox policy, forwarded verbatim to Codex. workspaceWrite keeps
+  # every write inside the issue's own worktree (plus the two narrow Git
+  # metadata roots Symphony grants for a local commit); networkAccess only
+  # lifts the socket restriction, so repository validation that binds a local
+  # loopback listener -- Go httptest servers, for example -- can run. It
+  # broadens no filesystem authority, and host-owned Linear/GitHub credentials
+  # are still stripped from the Codex child environment, so the agent has no
+  # credential to spend on the network it can now reach. Omit the key to keep
+  # the launcher's narrowed workspace-write grant with sockets denied.
+  turn_sandbox_policy:
+    type: workspaceWrite
+    networkAccess: true
   turn_timeout_ms: 3600000
   # read_timeout_ms bounds every steady-state JSON-RPC round trip; keep it small
   # so a hung session is detected mid-turn.

@@ -382,6 +382,10 @@ func decode(raw map[string]any, base, path, logRoot string, sources *sourceSnaps
 	if err != nil {
 		return Settings{}, err
 	}
+	turnSandboxPolicy, err := sandboxPolicy(codex)
+	if err != nil {
+		return Settings{}, err
+	}
 	turnTimeout, err := durationMS(codex, "turn_timeout_ms", 3_600_000)
 	if err != nil {
 		return Settings{}, err
@@ -435,7 +439,7 @@ func decode(raw map[string]any, base, path, logRoot string, sources *sourceSnaps
 		Workspace: Workspace{Root: workspaceRoot, SourceRoot: sourceRoot},
 		Hooks:     Hooks{AfterCreate: afterCreate, BeforeRun: beforeRun, AfterRun: afterRun, BeforeRemove: beforeRemove, Timeout: hookTimeout},
 		Agent:     Agent{MaxConcurrent: maxConcurrent, MaxTurns: maxTurns, MaxRetryBackoff: maxRetryBackoff, ByState: byState},
-		Codex:     Codex{Command: command, ApprovalPolicy: approvalPolicy, ThreadSandbox: threadSandbox, TurnSandboxPolicy: codex["turn_sandbox_policy"], TurnTimeout: turnTimeout, ReadTimeout: readTimeout, StartTimeout: startTimeout, StallTimeout: stallTimeout},
+		Codex:     Codex{Command: command, ApprovalPolicy: approvalPolicy, ThreadSandbox: threadSandbox, TurnSandboxPolicy: turnSandboxPolicy, TurnTimeout: turnTimeout, ReadTimeout: readTimeout, StartTimeout: startTimeout, StallTimeout: stallTimeout},
 		GitHub:    githubSettings,
 		// Keep only the names of environment variables that carry host
 		// credentials. The Codex launcher uses this metadata to prevent those
@@ -1152,6 +1156,32 @@ func cloneValue(value any) any {
 	default:
 		return value
 	}
+}
+
+// sandboxPolicy validates the optional per-turn sandbox policy. The value is
+// forwarded verbatim as turn/start's sandboxPolicy, so a malformed shape must
+// fail configuration validation instead of surfacing as an opaque app-server
+// rejection mid-run. Absence stays nil so the launcher's own narrowed
+// workspace-write grant remains the effective policy (PMR-65, PMR-80).
+func sandboxPolicy(codex map[string]any) (any, error) {
+	v, exists := codex["turn_sandbox_policy"]
+	if !exists || v == nil {
+		return nil, nil
+	}
+	policy, ok := v.(map[string]any)
+	if !ok {
+		return nil, errors.New("invalid configuration: codex.turn_sandbox_policy must be an object")
+	}
+	kind, ok := policy["type"].(string)
+	if !ok || strings.TrimSpace(kind) == "" {
+		return nil, errors.New("invalid configuration: codex.turn_sandbox_policy.type must be a non-empty string")
+	}
+	if network, exists := policy["networkAccess"]; exists {
+		if _, ok := network.(bool); !ok {
+			return nil, errors.New("invalid configuration: codex.turn_sandbox_policy.networkAccess must be a boolean")
+		}
+	}
+	return policy, nil
 }
 
 func object(parent map[string]any, key string) (map[string]any, error) {

@@ -1165,3 +1165,83 @@ func TestConcurrentReadersNeverObserveMixedSnapshots(t *testing.T) {
 		t.Error(message)
 	}
 }
+
+// TestRepositoryWorkflowGrantsLoopbackWithinWorkspaceWrite pins the effective
+// Codex sandbox policy this repository's own canonical WORKFLOW.md launches
+// turns with (PMR-80): workspace-scoped writes with sockets allowed, so a
+// worker can run repository validation that binds a local loopback listener.
+// The policy previously survived only as an uncommitted operator-local edit.
+func TestRepositoryWorkflowGrantsLoopbackWithinWorkspaceWrite(t *testing.T) {
+	dir := t.TempDir()
+	for variable, name := range map[string]string{"SYMPHONY_LINEAR_API_KEY_FILE": "linear-key", "SYMPHONY_GITHUB_TOKEN_FILE": "github-token"} {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte("test-secret"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv(variable, path)
+	}
+	w, err := Load(filepath.Join("..", "..", "WORKFLOW.md"), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w.Config.Codex.ThreadSandbox != "workspace-write" {
+		t.Fatalf("thread sandbox=%q want workspace-write", w.Config.Codex.ThreadSandbox)
+	}
+	policy, ok := w.Config.Codex.TurnSandboxPolicy.(map[string]any)
+	if !ok {
+		t.Fatalf("turn sandbox policy type=%T want an object", w.Config.Codex.TurnSandboxPolicy)
+	}
+	if policy["type"] != "workspaceWrite" || policy["networkAccess"] != true {
+		t.Fatalf("turn sandbox policy=%#v want workspaceWrite with networkAccess enabled", policy)
+	}
+	// Network access must not come bundled with broader filesystem authority:
+	// the launcher owns writableRoots and grants only the narrowed Git roots.
+	if roots, exists := policy["writableRoots"]; exists {
+		t.Fatalf("canonical workflow configures writable roots %#v; filesystem authority must stay with the launcher's narrowed grant", roots)
+	}
+}
+
+func TestTurnSandboxPolicyShapeIsValidated(t *testing.T) {
+	for name, codex := range map[string]string{
+		"not an object":              "{turn_sandbox_policy: workspaceWrite}",
+		"missing type":               "{turn_sandbox_policy: {networkAccess: true}}",
+		"blank type":                 "{turn_sandbox_policy: {type: '   '}}",
+		"non-string type":            "{turn_sandbox_policy: {type: 7}}",
+		"non-boolean network access": "{turn_sandbox_policy: {type: workspaceWrite, networkAccess: 'true'}}",
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("LINEAR_API_KEY", "secret")
+			p := filepath.Join(t.TempDir(), "WORKFLOW.md")
+			content := "---\ntracker: {kind: linear, provider: {api_key: $LINEAR_API_KEY}, active_states: [Todo], terminal_states: [Done]}\ncodex: " + codex + "\n---\nprompt"
+			if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			w, err := Load(p, "")
+			if err == nil {
+				t.Fatalf("accepted invalid turn sandbox policy as %#v", w.Config.Codex.TurnSandboxPolicy)
+			}
+			if !strings.Contains(err.Error(), "codex.turn_sandbox_policy") {
+				t.Fatalf("error=%v want it to name codex.turn_sandbox_policy", err)
+			}
+		})
+	}
+}
+
+// TestOmittedTurnSandboxPolicyStaysNil keeps absence distinguishable from an
+// empty object: a nil policy is what lets the launcher substitute its own
+// narrowed workspace-write grant instead of forwarding a meaningless one.
+func TestOmittedTurnSandboxPolicyStaysNil(t *testing.T) {
+	t.Setenv("LINEAR_API_KEY", "secret")
+	p := filepath.Join(t.TempDir(), "WORKFLOW.md")
+	content := "---\ntracker: {kind: linear, provider: {api_key: $LINEAR_API_KEY}, active_states: [Todo], terminal_states: [Done]}\ncodex: {thread_sandbox: workspace-write}\n---\nprompt"
+	if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	w, err := Load(p, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w.Config.Codex.TurnSandboxPolicy != nil {
+		t.Fatalf("turn sandbox policy=%#v want nil when the key is omitted", w.Config.Codex.TurnSandboxPolicy)
+	}
+}

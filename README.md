@@ -153,6 +153,30 @@ govern later admissions, while current state and stall policies continue to be
 applied by reconciliation. `--logs-root` selects the process log destination at
 startup and is not a reloadable `WORKFLOW.md` field.
 
+`codex.thread_sandbox` sets the session's sandbox mode and the optional
+`codex.turn_sandbox_policy` object is validated and then forwarded verbatim as
+every turn's sandbox policy. This repository configures the policy a worker
+needs to run its own validation:
+
+```yaml
+codex:
+  thread_sandbox: workspace-write
+  turn_sandbox_policy:
+    type: workspaceWrite
+    networkAccess: true
+```
+
+`workspaceWrite` keeps every write inside the issue's own Git worktree, plus
+only the two narrow Git metadata roots Symphony grants so a detached-HEAD
+commit can succeed. `networkAccess: true` lifts only the socket restriction, so
+repository tests that bind a local loopback listener -- Go `httptest` servers,
+for example -- can run; it broadens no filesystem authority. Host-owned Linear
+and GitHub credentials are still removed from the Codex child environment by
+name and by value, so the agent has no host credential to spend on the network
+it can reach, and all publishing authority stays with the host. Omit
+`turn_sandbox_policy` to keep the narrowed workspace-write grant with sockets
+denied.
+
 Prompt templates use strict, lowercase variables: `issue` (for example
 `{{.issue.identifier}}`) and `attempt` (nil on the first run, then a 1-based
 retry/continuation number). Template errors fail only that run attempt.

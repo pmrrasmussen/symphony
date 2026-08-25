@@ -301,10 +301,12 @@ func start(ctx context.Context, r domain.AgentRequest, secrets []string, secretM
 // localCommitSandbox extends only workspace-write turns with the narrow Git
 // roots Symphony validated for this linked worktree: the source repository's
 // shared object store and this worktree's own per-worktree metadata directory.
-// The worker still has no network or GitHub credential, while a detached-HEAD
-// git commit can write its objects, HEAD, index, and reflog. The rest of the
-// source common directory (branch refs, the primary index, other worktrees)
-// stays outside the grant, so an agent cannot mutate source branches (PMR-65).
+// The worker still has no GitHub credential -- host-owned Linear and GitHub
+// secrets never reach the child environment, whatever network the configured
+// policy allows -- while a detached-HEAD git commit can write its objects,
+// HEAD, index, and reflog. The rest of the source common directory (branch
+// refs, the primary index, other worktrees) stays outside the grant, so an
+// agent cannot mutate source branches (PMR-65).
 func localCommitSandbox(r domain.AgentRequest) any {
 	grants := uniquePaths(r.GitMetadataRoots)
 	if len(grants) == 0 || r.ThreadSandbox != "workspace-write" {
