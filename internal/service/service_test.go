@@ -184,6 +184,19 @@ func TestInstallStartFailureRestoresExistingService(t *testing.T) {
 	}
 }
 
+func TestInstallStartFailureRemovesNewPlist(t *testing.T) {
+	_, options, runner := serviceFixture(t)
+	runner.fail = "launchctl kickstart"
+	_, changed, err := Install(context.Background(), options)
+	if err == nil || changed || !strings.Contains(err.Error(), "start com.pmrrasmussen.symphony.owner-repository") {
+		t.Fatalf("changed=%v err=%v", changed, err)
+	}
+	target := filepath.Join(options.LaunchAgentsDir, "com.pmrrasmussen.symphony.owner-repository.plist")
+	if _, statErr := os.Stat(target); !os.IsNotExist(statErr) {
+		t.Fatalf("new plist remained after failed start: %v", statErr)
+	}
+}
+
 func TestInstallDoesNotChangeExistingLaunchAgentsPermissions(t *testing.T) {
 	_, options, _ := serviceFixture(t)
 	if err := os.Chmod(options.LaunchAgentsDir, 0o755); err != nil {

@@ -657,6 +657,9 @@ func reload(ctx context.Context, runner Runner, d desired, old []byte) error {
 
 func restoreAfterReloadFailure(ctx context.Context, runner Runner, d desired, old []byte, operation string, cause error) error {
 	if old == nil {
+		if err := os.Remove(d.PlistPath); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("%s %s: %w (remove failed installation plist: %v)", operation, d.Label, cause, err)
+		}
 		return fmt.Errorf("%s %s: %w", operation, d.Label, cause)
 	}
 	if err := atomicWrite(d.PlistPath, old, 0o600); err != nil {
