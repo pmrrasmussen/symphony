@@ -19,7 +19,11 @@ type Issue struct {
 	Dispatchable                                                           bool
 	CreatedAt, UpdatedAt                                                   *time.Time
 }
-type Usage struct{ InputTokens, OutputTokens, TotalTokens int64 }
+type Usage struct {
+	InputTokens  int64 `json:"input_tokens"`
+	OutputTokens int64 `json:"output_tokens"`
+	TotalTokens  int64 `json:"total_tokens"`
+}
 type EventKind string
 
 const (

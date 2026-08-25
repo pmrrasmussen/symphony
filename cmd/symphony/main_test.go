@@ -42,6 +42,23 @@ func TestRunAcceptsPositionalWorkflowForDryRun(t *testing.T) {
 	}
 }
 
+func TestRunAcceptsStatusFileFlagInDryRun(t *testing.T) {
+	dir := t.TempDir()
+	workflow := filepath.Join(dir, "workflow.md")
+	statusFile := filepath.Join(dir, "runtime", "status.json")
+	content := "---\ntracker: {kind: linear, provider: {project_slug_id: preflight, api_key: dummy}, active_states: [Todo], terminal_states: [Done]}\nworkspace: {root: " + filepath.Join(dir, "workspaces") + ", source_root: " + dir + "}\ncodex: {command: go}\n---\n{{.issue.identifier}}"
+	if err := os.WriteFile(workflow, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"--dry-run", "--status-file", statusFile, workflow}, &stdout, &stderr); code != 0 {
+		t.Fatalf("exit=%d stderr=%s stdout=%s", code, stderr.String(), stdout.String())
+	}
+	if _, err := os.Stat(statusFile); !os.IsNotExist(err) {
+		t.Fatalf("dry run created status file: %v", err)
+	}
+}
+
 func TestRunRetainsWorkflowFlagAndRejectsAmbiguousPaths(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	if code := run([]string{"--workflow", "one.md", "two.md"}, &stdout, &stderr); code != 2 {

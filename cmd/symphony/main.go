@@ -21,6 +21,7 @@ import (
 	"github.com/pmrrasmussen/symphony/internal/linear"
 	"github.com/pmrrasmussen/symphony/internal/observability"
 	"github.com/pmrrasmussen/symphony/internal/preflight"
+	"github.com/pmrrasmussen/symphony/internal/status"
 	"github.com/pmrrasmussen/symphony/internal/workspace"
 )
 
@@ -29,12 +30,14 @@ func main() {
 }
 
 func run(args []string, stdout, stderr io.Writer) int {
-	var workflowPath, logs, logLevelFlag string
+	processStartedAt := time.Now()
+	var workflowPath, logs, logLevelFlag, statusFile string
 	var dry bool
 	flags := flag.NewFlagSet("symphony", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	flags.StringVar(&workflowPath, "workflow", "WORKFLOW.md", "path to WORKFLOW.md")
 	flags.StringVar(&logs, "logs-root", ".symphony/logs", "structured log root")
+	flags.StringVar(&statusFile, "status-file", "", "local runtime status JSON path (optional; see docs/runtime-status.md)")
 	flags.StringVar(&logLevelFlag, "log-level", "info", "structured log level: info (concise, default) or debug (adds poll admission detail, tool/item lifecycle, and heartbeat/stall records; see docs/observability.md)")
 	flags.BoolVar(&dry, "dry-run", false, "validate the full scheduler lifecycle without live side effects")
 	if err := flags.Parse(args); err != nil {
@@ -129,6 +132,27 @@ func run(args []string, stdout, stderr io.Writer) int {
 	var a domain.AgentBackend = backend
 	var w domain.WorkspaceExecutor = ws
 	c := coordinator.New(t, a, w, settings, slog.New(log.Handler()))
+	var statusPublisher *status.Publisher
+	var stopStatus context.CancelFunc
+	var statusDone chan struct{}
+	if statusFile != "" {
+		path, err := filepath.Abs(statusFile)
+		if err != nil {
+			log.Warn("runtime status snapshots disabled", "error", err)
+		} else if statusPublisher, err = status.New(path, status.Metadata{PID: os.Getpid(), StartedAt: processStartedAt, WorkflowPath: s.WorkflowPath, LogRoot: s.LogRoot}); err != nil {
+			log.Warn("runtime status snapshots disabled", "error", err)
+		} else {
+			statusCtx, cancelStatus := context.WithCancel(context.Background())
+			stopStatus = cancelStatus
+			statusDone = make(chan struct{})
+			go func() {
+				defer close(statusDone)
+				statusPublisher.Run(statusCtx, status.DefaultInterval, c.Snapshot, func(err error) {
+					log.Warn("runtime status snapshot write failed", "error", err)
+				})
+			}()
+		}
+	}
 	if terminals, err := tracker.ListTerminal(ctx, settings().Tracker.TerminalStates); err != nil {
 		log.Warn("startup terminal cleanup query failed", "error", err)
 	} else {
@@ -140,10 +164,19 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 	c.Start(ctx)
 	<-ctx.Done()
+	if stopStatus != nil {
+		stopStatus()
+		<-statusDone
+	}
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	if err := c.Shutdown(shutdownCtx); err != nil {
 		log.Error("graceful shutdown timed out", "error", err)
+	}
+	if statusPublisher != nil {
+		if err := statusPublisher.Write(status.Stopped, c.Snapshot()); err != nil {
+			log.Warn("final runtime status snapshot write failed", "error", err)
+		}
 	}
 	return 0
 }
