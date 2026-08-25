@@ -1123,12 +1123,13 @@ func normalizedRateLimit(raw map[string]any) map[string]int64 {
 
 // cleanupWorkspace removes a terminal issue's workspace and reports the
 // lifecycle outcome an operator needs to know without reading the workspace
-// package's own error text: a clean removal, or why the workspace was kept
+// package's own error text: a clean removal, a removal that discarded local
+// commits Symphony verified as merged, or why the workspace was kept
 // (uncommitted/untracked changes, or local commits ahead of the recorded base
 // revision that a human should review before it is discarded).
 func (c *Coordinator) cleanupWorkspace(ctx context.Context, issue domain.Issue) {
-	err := c.workspaces.Cleanup(ctx, issue)
-	status := cleanupStatus(err)
+	outcome, err := c.workspaces.Cleanup(ctx, issue)
+	status := cleanupStatus(outcome, err)
 	attrs := []any{"issue_id", issue.ID, "issue_identifier", issue.Identifier, "status", status}
 	if err != nil {
 		attrs = append(attrs, "error", err)
@@ -1138,13 +1139,17 @@ func (c *Coordinator) cleanupWorkspace(ctx context.Context, issue domain.Issue) 
 	c.log.Info("workspace cleanup", attrs...)
 }
 
-// cleanupStatus classifies a Cleanup error into the fixed clean/dirty/committed
-// vocabulary the workspace package's own refusal messages already describe. It
-// only ever matches fixed, secret-free substrings the workspace package
-// controls, never issue or workspace content.
-func cleanupStatus(err error) string {
+// cleanupStatus classifies a Cleanup result into the fixed
+// clean/landed/dirty/committed vocabulary the workspace package's own outcome
+// and refusal messages already describe. It only ever reports a workspace-owned
+// outcome constant or matches fixed, secret-free substrings the workspace
+// package controls, never issue or workspace content.
+func cleanupStatus(outcome domain.CleanupOutcome, err error) string {
 	if err == nil {
-		return "clean"
+		if outcome == domain.CleanupLanded {
+			return string(domain.CleanupLanded)
+		}
+		return string(domain.CleanupClean)
 	}
 	switch msg := err.Error(); {
 	case strings.Contains(msg, "uncommitted or untracked changes"):
