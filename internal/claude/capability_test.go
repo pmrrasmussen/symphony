@@ -366,6 +366,17 @@ func TestEveryTurnEndPathRetiresTheRegistrationExactlyOnce(t *testing.T) {
 				if err := backend.Cancel(context.Background(), session); err != nil {
 					t.Fatalf("cancel: %v", err)
 				}
+				// Asserted before the stream is drained, because Cancel's own
+				// guarantee is that a returned Cancel has already retired the
+				// session's authority -- not that the turn's shutdown will get
+				// round to it. A caller that has cancelled a session has no
+				// other handle on it left to wait for.
+				if ended := registry.ended(); ended != 1 {
+					t.Fatalf("cancel returned with the turn-ended finalizer having run %d times, want exactly 1", ended)
+				}
+				if url, token := endpointFromChild(t, dir); probeEndpoint(t, url, token) != http.StatusUnauthorized {
+					t.Fatal("cancel returned while the turn's token still authenticated")
+				}
 			}
 			collected := drain(t, events)
 			if last := lastKind(t, collected); last.Kind != test.want {
@@ -379,6 +390,50 @@ func TestEveryTurnEndPathRetiresTheRegistrationExactlyOnce(t *testing.T) {
 				t.Fatalf("the turn's token still authenticates after the turn ended: HTTP %d", status)
 			}
 		})
+	}
+}
+
+// TestASessionWithNothingAdvertisedRunsAsIfTheEndpointDidNotExist is the other
+// half of the byte-identical claim, and the half an argument-vector golden
+// cannot make: the child's environment must be untouched too. A registration is
+// still created -- it is what runs the registry's turn-ended finalizer, which the
+// Codex transport also runs unconditionally -- but it must be unreachable by
+// construction, with no MCP configuration and no token anywhere the child can
+// see it.
+func TestASessionWithNothingAdvertisedRunsAsIfTheEndpointDidNotExist(t *testing.T) {
+	dir := t.TempDir()
+	registry := &scriptedRegistry{}
+	script := writeFakeClaude(t, dir, "cat <<'EOF'\n"+initLine(dir, allCodingTools)+"\n"+
+		resultLine(false, "")+"\nEOF\n")
+
+	backend, endpoint := backendWithEndpoint(t)
+	_, events, err := startWithRegistry(t, backend, context.Background(), request(t, dir, script), registry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lastKind(t, drain(t, events)).Kind != domain.EventCompleted {
+		t.Fatal("a session with nothing advertised did not complete")
+	}
+	args := readArgs(t, dir)
+	if hasFlag(args, "--mcp-config") {
+		t.Fatalf("an unadvertised session was handed an MCP configuration: %v", args)
+	}
+	if got := flagValue(t, args, "--tools"); got != strings.Join(codingTools, ",") {
+		t.Fatalf("--tools=%q, want exactly the coding tools", got)
+	}
+	for _, entry := range strings.Split(readFile(t, filepath.Join(dir, "env.txt")), "\n") {
+		if strings.HasPrefix(entry, endpointTokenEnvName+"=") {
+			t.Fatalf("an unadvertised session handed the child an endpoint token: %q", entry)
+		}
+	}
+	// The registration exists and is retired all the same, which is what keeps
+	// the turn-ended finalizer firing on a session whose capabilities are all
+	// unadvertised.
+	if ended := registry.ended(); ended != 1 {
+		t.Fatalf("turn-ended finalizer ran %d times, want exactly 1", ended)
+	}
+	if err := endpoint.Close(context.Background()); err != nil {
+		t.Fatalf("the turn left a registration behind: %v", err)
 	}
 }
 
