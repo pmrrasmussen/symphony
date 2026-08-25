@@ -12,9 +12,10 @@ selected backend's launch contract has to be complete, so an absent `codex:` or
 A `claude` workflow that also enables a Symphony session capability --
 `tracker.provider.handoff_state`, `tracker.provider.followup_issue_creation`,
 or a configured and enabled GitHub integration -- is rejected at load: the
-bridge that would expose those bounded capabilities to a Claude session does
-not exist yet, and refusing the configuration is preferred over dispatching an
-agent that silently cannot hand off, publish, or file a follow-up.  A `github:`
+bridge that would expose those bounded capabilities to a Claude session
+(`internal/mcpbridge`) is not wired into that backend yet, and refusing the
+configuration is preferred over dispatching an agent that silently cannot hand
+off, publish, or file a follow-up.  A `github:`
 block that does not resolve stays disabled, as it does under `codex`, so it
 never reaches that refusal -- which grants nothing, because a disabled
 integration has no capability to bridge.
