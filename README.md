@@ -240,8 +240,11 @@ a liveness authority; see [docs/runtime-status.md](docs/runtime-status.md).
 Use `symphony tui` for a read-only terminal view across convention-matching
 local Symphony LaunchAgents. It reads launchd observation, each instance's
 safe status snapshot, normalized effective configuration, validation findings,
-and a bounded redacted structured-log tail. `r` refreshes local observations;
-the command does not start, stop, pause, or connect to a Symphony daemon or
+and a bounded redacted structured-log tail. In a terminal it reads single
+keypresses, re-reads local observations every five seconds, and refreshes on
+demand with `r`; redirected output instead prints plain frames driven by
+line-buffered input and never polls. The command does not start, stop, pause,
+or connect to a Symphony daemon or
 remote Linear, GitHub, or Codex service. It requires no central registry; see
 [the macOS repository-services guide](docs/macos-services.md) for the
 multi-repository operator workflow.
