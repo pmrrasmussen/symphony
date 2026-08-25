@@ -60,11 +60,10 @@ workspace:
 hooks:
   timeout_ms: 60000
 agent:
-  # Two-agent operation: one implementation/rework agent may run concurrently
-  # with one landing agent. max_concurrent_agents_by_state additionally caps
-  # Merging at exactly one landing agent even though more agents are allowed
-  # overall.
-  max_concurrent_agents: 2
+  # Four-agent operation: implementation/rework work can scale across the
+  # available global capacity while max_concurrent_agents_by_state keeps
+  # landing serialized at exactly one Merging agent.
+  max_concurrent_agents: 4
   max_concurrent_agents_by_state:
     Merging: 1
   max_turns: 20

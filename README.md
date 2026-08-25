@@ -34,9 +34,9 @@ depends on the agent. A Codex session then:
    other hard gate returns the issue to `In Review`; a successful or
    already-completed merge reconciles the issue to `Done`.
 
-Two-agent operation: one implementation/rework agent may run concurrently
-with one landing agent (`agent.max_concurrent_agents: 2`,
-`agent.max_concurrent_agents_by_state: {Merging: 1}`), while a delayed retry
+Four-agent operation allows up to four implementation/rework sessions to run
+concurrently (`agent.max_concurrent_agents: 4`). Landing remains serialized
+(`agent.max_concurrent_agents_by_state: {Merging: 1}`), while a delayed retry
 never occupies a concurrency slot as it waits.
 
 See `WORKFLOW.md`'s prompt body for the full per-state start, implementation,
@@ -284,7 +284,7 @@ agent:
    [Linear tracker profile](docs/linear-tracker.md) and the
    [observability guide](docs/observability.md).
 
-Until all three are complete, Symphony keeps running safely: two-agent
+Until all four are complete, Symphony keeps running safely: four-agent
 capacity and the `Todo`/`In Progress`/review-handoff path already work today,
 an issue simply never reaches `Rework` or `Merging` in Linear (Linear itself
 has no such state to move it to), `github_land_pr` is never advertised, and
