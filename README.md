@@ -134,6 +134,12 @@ Codex tool/item lifecycle records, and heartbeat/stall records naming the
 outstanding operation. See [docs/observability.md](docs/observability.md) for
 `tail`/`jq` examples and the full level and redaction contract.
 
+For a local TUI or another operator client, optionally pass `--status-file`
+with a separate path for each process (the repository-local convention is
+`.symphony/runtime/status.json`). It is an atomically replaced owner-only,
+versioned runtime snapshot, not a liveness authority; see
+[docs/runtime-status.md](docs/runtime-status.md).
+
 For ongoing repository development, configure `workspace.source_root: .`.
 Symphony then creates one detached Git worktree per issue beneath
 `workspace.root`; each new worktree starts from a freshly fetched

@@ -194,30 +194,43 @@ func New(t domain.Tracker, a domain.AgentBackend, w domain.WorkspaceExecutor, se
 // It excludes issue bodies, prompts, workspace paths, raw events, and tracker
 // identifiers that may be provider-specific.
 type Snapshot struct {
-	Claimed  int
-	Running  []RunningSnapshot
-	Retrying []RetrySnapshot
+	Claimed  int               `json:"claimed"`
+	Running  []RunningSnapshot `json:"running"`
+	Retrying []RetrySnapshot   `json:"retrying"`
+	Stopping bool              `json:"stopping"`
 }
 
 type RunningSnapshot struct {
-	IssueIdentifier string
-	SessionID       string
-	ThreadID        string
-	TurnID          string
-	Attempt         int
-	TurnCount       int
-	StartedAt       time.Time
-	LastEventAt     time.Time
-	Usage           domain.Usage
-	RateLimit       map[string]int64
+	IssueIdentifier      string                        `json:"issue_identifier"`
+	IssueState           string                        `json:"issue_state"`
+	SessionID            string                        `json:"session_id"`
+	ThreadID             string                        `json:"thread_id"`
+	TurnID               string                        `json:"turn_id"`
+	Attempt              int                           `json:"attempt"`
+	TurnCount            int                           `json:"turn_count"`
+	StartedAt            time.Time                     `json:"started_at"`
+	LastEventAt          time.Time                     `json:"last_activity_at"`
+	Usage                domain.Usage                  `json:"usage"`
+	RateLimit            map[string]int64              `json:"rate_limit,omitempty"`
+	OutstandingOperation *OutstandingOperationSnapshot `json:"outstanding_operation,omitempty"`
 }
 
 type RetrySnapshot struct {
-	IssueIdentifier string
-	Attempt         int
-	Kind            string
-	Reason          string
-	Due             time.Time
+	IssueIdentifier string    `json:"issue_identifier"`
+	Attempt         int       `json:"attempt"`
+	Kind            string    `json:"kind"`
+	Reason          string    `json:"reason"`
+	Due             time.Time `json:"due_at"`
+}
+
+// OutstandingOperationSnapshot identifies the one safe app-server operation
+// that has started but not finished. It intentionally excludes arguments,
+// command bodies, outputs, and the protocol item's opaque identifier.
+type OutstandingOperationSnapshot struct {
+	Type      string    `json:"type"`
+	Name      string    `json:"name,omitempty"`
+	StartedAt time.Time `json:"started_at"`
+	AgeMS     int64     `json:"age_ms"`
 }
 
 // Snapshot copies the coordinator's public operational metadata while holding
@@ -225,9 +238,11 @@ type RetrySnapshot struct {
 func (c *Coordinator) Snapshot() Snapshot {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	snapshot := Snapshot{Claimed: len(c.claimed), Running: make([]RunningSnapshot, 0, len(c.running)), Retrying: make([]RetrySnapshot, 0, len(c.retries))}
+	now := c.clock.Now()
+	snapshot := Snapshot{Claimed: len(c.claimed), Running: make([]RunningSnapshot, 0, len(c.running)), Retrying: make([]RetrySnapshot, 0, len(c.retries)), Stopping: c.stopping}
 	for _, run := range c.running {
-		snapshot.Running = append(snapshot.Running, RunningSnapshot{IssueIdentifier: run.issue.Identifier, SessionID: run.session.ID, ThreadID: run.session.ThreadID, TurnID: run.session.TurnID, Attempt: run.run.Attempt, TurnCount: run.run.TurnCount, StartedAt: run.run.StartedAt, LastEventAt: run.last, Usage: run.run.Usage, RateLimit: copyRateLimit(run.rateLimit)})
+		item := snapshotOutstanding(run.outstanding, now)
+		snapshot.Running = append(snapshot.Running, RunningSnapshot{IssueIdentifier: run.issue.Identifier, IssueState: run.issue.State, SessionID: run.session.ID, ThreadID: run.session.ThreadID, TurnID: run.session.TurnID, Attempt: run.run.Attempt, TurnCount: run.run.TurnCount, StartedAt: run.run.StartedAt, LastEventAt: run.last, Usage: run.run.Usage, RateLimit: copyRateLimit(run.rateLimit), OutstandingOperation: item})
 	}
 	for _, retry := range c.retries {
 		snapshot.Retrying = append(snapshot.Retrying, RetrySnapshot{IssueIdentifier: retry.issue.Identifier, Attempt: retry.attempt, Kind: string(retry.kind), Reason: retry.reason, Due: retry.due})
@@ -237,6 +252,17 @@ func (c *Coordinator) Snapshot() Snapshot {
 		return snapshot.Retrying[i].IssueIdentifier < snapshot.Retrying[j].IssueIdentifier
 	})
 	return snapshot
+}
+
+func snapshotOutstanding(operation *outstandingOp, now time.Time) *OutstandingOperationSnapshot {
+	if operation == nil {
+		return nil
+	}
+	age := now.Sub(operation.Since).Milliseconds()
+	if age < 0 {
+		age = 0
+	}
+	return &OutstandingOperationSnapshot{Type: operation.ItemType, Name: operation.ToolName, StartedAt: operation.Since, AgeMS: age}
 }
 
 func (c *Coordinator) Start(parent context.Context) {
@@ -635,7 +661,9 @@ func (c *Coordinator) launch(parent context.Context, i domain.Issue, attempt int
 			return
 		}
 		s := c.settings()
-		c.transitionToStarted(ctx, i, s)
+		if state := c.transitionToStarted(ctx, i, s); state != "" {
+			i.State = state
+		}
 		prompt, err := render(s, i, attempt)
 		if err != nil {
 			c.workspaces.AfterRun(context.Background(), ws, i)
@@ -731,19 +759,20 @@ func (c *Coordinator) launch(parent context.Context, i domain.Issue, attempt int
 //   - fail-safe: a failed transition is logged and never blocks the run or
 //     causes a double dispatch — the session starts regardless, and the poll
 //     loop retries or reconciles the tracker state on a later tick.
-func (c *Coordinator) transitionToStarted(ctx context.Context, i domain.Issue, s config.Settings) {
+func (c *Coordinator) transitionToStarted(ctx context.Context, i domain.Issue, s config.Settings) string {
 	target, ok := s.Tracker.HostTransitions.Start[norm(i.State)]
 	if !ok || strings.TrimSpace(target) == "" {
-		return
+		return ""
 	}
 	if strings.EqualFold(strings.TrimSpace(i.State), strings.TrimSpace(target)) {
-		return
+		return target
 	}
 	if err := c.tracker.Transition(ctx, i, target); err != nil {
 		c.log.Warn("dispatch start transition failed", "operation", "start_transition", "issue_id", i.ID, "issue_identifier", i.Identifier, "from_state", norm(i.State), "to_state", norm(target), "error", err)
-		return
+		return ""
 	}
 	c.log.Info("issue moved to started state", "operation", "start_transition", "issue_id", i.ID, "issue_identifier", i.Identifier, "from_state", norm(i.State), "to_state", norm(target))
+	return target
 }
 
 func (c *Coordinator) runTurns(ctx context.Context, r *running, events <-chan domain.Event, settings config.Settings) (ended bool, current domain.Issue, err error) {
