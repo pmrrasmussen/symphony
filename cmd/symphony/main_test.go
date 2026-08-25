@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/pmrrasmussen/symphony/internal/config"
+	githubhost "github.com/pmrrasmussen/symphony/internal/github"
 	"github.com/pmrrasmussen/symphony/internal/observability"
 	"github.com/pmrrasmussen/symphony/internal/operator"
 	"github.com/pmrrasmussen/symphony/internal/preflight"
@@ -152,5 +153,41 @@ func TestLogStartupCredentialStatusReportsConfigurationWithoutSecrets(t *testing
 	}
 	if strings.Contains(output.String(), "github-secret") {
 		t.Fatalf("credential appeared in log: %s", output.String())
+	}
+}
+
+// TestWireGivesTheHostTheGitHubManagerItsBackendsUse asserts the process-level
+// invariant the whole provider-ownership seam exists for: the manager this
+// process polls and verifies landings on is the very instance bound to the
+// backend that runs sessions. Two managers would each own a linked-pull-request
+// table and an exactly-once completion guard, so the poll loop would walk a
+// table no session writes into and a merged pull request would leave its Linear
+// issue unreconciled. Every wired backend that reports a manager must report
+// that same one, so a second capability-bearing backend given a manager of its
+// own fails here rather than in production -- provided it exposes the manager
+// it holds, which is the reason codex.Backend does. A backend reporting none is
+// fine, since that is an unwired integration, but no backend reporting one at
+// all is not: the invariant would then be silently unasserted.
+func TestWireGivesTheHostTheGitHubManagerItsBackendsUse(t *testing.T) {
+	settings := func() config.Settings { return config.Settings{} }
+	backends, polled := wire(settings, slog.Default())
+	if polled == nil {
+		t.Fatal("wire returned no GitHub manager, so the host has nothing to poll or verify landings with")
+	}
+	bound := 0
+	for name, backend := range backends {
+		holder, ok := backend.(interface {
+			GitHubManager() *githubhost.Manager
+		})
+		if !ok {
+			continue
+		}
+		if holder.GitHubManager() != polled {
+			t.Fatalf("backend %q runs sessions against a GitHub manager the host neither polls nor verifies landings on", name)
+		}
+		bound++
+	}
+	if bound == 0 {
+		t.Fatal("no wired backend reported a bound GitHub manager, so the one-manager-per-process invariant is unasserted")
 	}
 }

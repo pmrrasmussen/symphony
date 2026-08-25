@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"math"
 	"os"
 	"os/exec"
@@ -47,27 +46,51 @@ func New(secretNames ...string) *Backend {
 	return &Backend{sessions: map[string]*client{}, secretNames: uniquePaths(names)}
 }
 
+// NewWithProviders binds already-built host providers to this backend instead
+// of constructing them. Both are process-wide and neither belongs to Codex, but
+// the GitHub manager is why this seam has to exist: one manager owns the linked
+// pull request table its poll loop walks and the exactly-once Linear completion
+// guard, so a process holding two of them would poll one table while sessions
+// write into the other, and a merged pull request would complete its issue
+// twice or never. While the manager could only be obtained by constructing a
+// Codex backend, no other backend could be given the one the host polls.
+// A nil provider leaves its capabilities unbound, exactly as an unconfigured
+// integration does.
+//
+// settings must be the same callback the two providers were built from. It is a
+// separate parameter only because neither provider exposes the closure it
+// captured, and Go cannot compare closures, so this cannot be enforced here:
+// Start freezes one settings snapshot for the session (which capabilities exist,
+// and the config.GitHub the session is bound to) while the manager independently
+// reads its own callback for Enabled, MatchesSecret, and the read-only
+// VerifyLanded. Feeding them different callbacks makes those disagree -- a
+// session that froze GitHub as disabled beside a landing verifier that sees it
+// enabled would let terminal cleanup discard local commits for an issue no
+// session ever published.
+func NewWithProviders(settings func() config.Settings, handoff *linear.Handoff, github *githubhost.Manager, secretNames ...string) *Backend {
+	b := New(secretNames...)
+	b.settings = settings
+	b.handoff = handoff
+	b.github = github
+	return b
+}
+
 // NewWithLinearHandoff enables the sole supported client-side tool. The
 // Linear adapter owns its configuration and HTTP transport; Codex sees only a
 // session-bound capability once the policy has been validated.
 func NewWithLinearHandoff(settings func() config.Settings, secretNames ...string) *Backend {
-	b := New(secretNames...)
-	b.settings = settings
-	b.handoff = linear.NewHandoff(settings)
-	return b
+	return NewWithProviders(settings, linear.NewHandoff(settings), nil, secretNames...)
 }
 
-// NewWithIntegrations enables the fixed-scope Linear and optional GitHub
-// capabilities and returns the GitHub manager so the host can poll linked PRs.
-func NewWithIntegrations(settings func() config.Settings, logger *slog.Logger, secretNames ...string) (*Backend, *githubhost.Manager) {
-	b := NewWithLinearHandoff(settings, secretNames...)
-	if b.handoff != nil {
-		b.handoff.SetLogger(logger)
-	}
-	manager := githubhost.New(settings, logger)
-	b.github = manager
-	return b, manager
-}
+// GitHubManager reports the manager this backend was given. The host reads its
+// poll loop and landing-verifier target back out of the backend rather than
+// keeping a local of its own, so the instance it polls cannot drift from the
+// instance sessions write into: there is deliberately no constructor that mints
+// a manager for a single backend, because every such call would produce a
+// second linked-pull-request table no poll loop walks. It is nil when GitHub is
+// unwired, which leaves cleanup verification and polling as strict as they were
+// before the integration existed.
+func (b *Backend) GitHubManager() *githubhost.Manager { return b.github }
 func (b *Backend) Start(ctx context.Context, r domain.AgentRequest) (domain.AgentSession, <-chan domain.Event, error) {
 	settings := config.Settings{}
 	if b.settings != nil {
