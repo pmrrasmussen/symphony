@@ -3,6 +3,7 @@ package coordinator
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -404,18 +405,28 @@ func TestSnapshotCopiesOnlySafeOperationalMetadata(t *testing.T) {
 	c := New(&fakeTracker{}, &fakeAgent{}, &fakeWorkspace{}, func() config.Settings { return config.Settings{} }, nil)
 	now := time.Now()
 	c.claimed["provider-id"] = true
-	c.running["provider-id"] = &running{issue: domain.Issue{ID: "provider-id", Identifier: "PMR-6", Description: "must-not-appear"}, session: domain.AgentSession{ID: "session", ThreadID: "thread", TurnID: "turn"}, last: now, run: domain.Run{Attempt: 2, TurnCount: 1, StartedAt: now, Usage: domain.Usage{InputTokens: 1}}, rateLimit: map[string]int64{"remaining": 2}}
+	c.stopping = true
+	c.running["provider-id"] = &running{issue: domain.Issue{ID: "provider-id", Identifier: "PMR-6", State: "In Progress", Description: "must-not-appear"}, session: domain.AgentSession{ID: "session", ThreadID: "thread", TurnID: "turn"}, last: now, run: domain.Run{Attempt: 2, TurnCount: 1, StartedAt: now, Usage: domain.Usage{InputTokens: 1}}, rateLimit: map[string]int64{"remaining": 2}, outstanding: &outstandingOp{ItemID: "must-not-appear", ItemType: "dynamicToolCall", ToolName: "github_publish_pr", Since: now.Add(-time.Second)}}
 	c.retries["retry-id"] = retryState{issue: domain.Issue{ID: "retry-id", Identifier: "PMR-9", Description: "must-not-appear"}, attempt: 3, kind: retryAgent, reason: "agent_event", due: now}
 	snapshot := c.Snapshot()
-	if snapshot.Claimed != 1 || len(snapshot.Running) != 1 || len(snapshot.Retrying) != 1 {
+	if snapshot.Claimed != 1 || !snapshot.Stopping || len(snapshot.Running) != 1 || len(snapshot.Retrying) != 1 {
 		t.Fatalf("snapshot=%+v", snapshot)
 	}
-	if snapshot.Running[0].IssueIdentifier != "PMR-6" || snapshot.Running[0].RateLimit["remaining"] != 2 || snapshot.Retrying[0].IssueIdentifier != "PMR-9" {
+	if snapshot.Running[0].IssueIdentifier != "PMR-6" || snapshot.Running[0].IssueState != "In Progress" || snapshot.Running[0].RateLimit["remaining"] != 2 || snapshot.Running[0].OutstandingOperation == nil || snapshot.Running[0].OutstandingOperation.Type != "dynamicToolCall" || snapshot.Running[0].OutstandingOperation.Name != "github_publish_pr" || snapshot.Retrying[0].IssueIdentifier != "PMR-9" {
 		t.Fatalf("snapshot=%+v", snapshot)
 	}
 	snapshot.Running[0].RateLimit["remaining"] = 99
 	if c.running["provider-id"].rateLimit["remaining"] != 2 {
 		t.Fatal("snapshot mutated live coordinator state")
+	}
+	encoded, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, prohibited := range []string{"must-not-appear", "item_id"} {
+		if strings.Contains(string(encoded), prohibited) {
+			t.Fatalf("snapshot leaked %q: %s", prohibited, encoded)
+		}
 	}
 }
 
