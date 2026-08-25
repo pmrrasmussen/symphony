@@ -135,20 +135,31 @@ codex:
 # bounding *writes* to the worktree plus the same two narrow Git metadata roots
 # the codex profile is granted.
 #
-# The same honest limits apply as above: *reads* are not confined, outbound
-# network is unrestricted, and the file-editing tools are bounded by the tool
-# surface and permission rules rather than by the sandbox, which governs Bash.
+# The same honest limits apply as above, plus one that is narrower than it
+# sounds: *reads* are not confined, outbound network is unrestricted, and the
+# sandbox governs Bash but not Edit and Write. Those two are allowed by bare
+# tool name with no path restriction at all, so a write outside the worktree is
+# neither sandbox-confined nor detected by anything Symphony checks -- the
+# post-run Git integrity check looks only at the source repository's own branch
+# heads and primary index.
+#
 # The CLI also persists its own full transcript -- prompts, issue text, and tool
 # output -- under ~/.claude/projects/, outside the worktree; see README.md and
 # docs/observability.md.
 #
 # A claude workflow may not also configure tracker.provider.handoff_state,
-# tracker.provider.followup_issue_creation, or the github: block below: no
-# capability bridge to a Claude session exists yet, so that combination is
-# rejected at load instead of dispatching an agent that cannot hand off or
-# publish. The service user must already be logged in to the CLI; --dry-run
-# checks that with a read-only claude auth status.
+# tracker.provider.followup_issue_creation, or an enabled github: integration
+# below: no capability bridge to a Claude session exists yet, so that
+# combination is rejected at load instead of dispatching an agent that cannot
+# hand off or publish. (A github: block that does not resolve stays disabled and
+# so does not trigger the refusal; it grants nothing either way.) The service
+# user must already be logged in to the CLI; --dry-run checks that with a
+# read-only, time-bounded claude auth status.
 # claude:
+#   # argv, not a shell command: split on whitespace and executed directly, so
+#   # no shell, no quoting, no expansion, and no operators. codex.command above
+#   # runs through bash -lc, so quoting that works there breaks here. --dry-run
+#   # checks both with sh -n, which is a loose superset for this field.
 #   command: claude
 #   # Optional. Omit it to let the CLI select its own model.
 #   model: sonnet

@@ -4,6 +4,7 @@ package preflight
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -109,7 +110,7 @@ func run(ctx context.Context, workflowPath, logRoot string, environment map[stri
 	// looks like a finished turn rather than a setup problem: the Claude CLI
 	// reports an auth failure as a result with is_error set.
 	if launch.Backend == config.ClaudeAgentBackend {
-		switch status, err := authenticated(launch.Command); {
+		switch status, err := authenticated(ctx, launch.Command, authenticationTimeout); {
 		case err != nil:
 			result.add("agent_authentication", StatusFailed, err.Error())
 		case !status:
@@ -202,6 +203,13 @@ func executable(command, field string) error {
 	return nil
 }
 
+// authenticationTimeout bounds the authentication probe. Reading a stored
+// login is local and immediate, so five seconds is far more than the command
+// needs; the budget exists because this is the only external call in a dry run
+// that is not a parse-only check, and a CLI blocked on a keychain prompt or a
+// hung token refresh would otherwise leave --dry-run waiting forever.
+const authenticationTimeout = 5 * time.Second
+
 // authenticated asks the agent CLI whether it holds a session. It is read-only,
 // which is what makes it safe in a dry run.
 //
@@ -210,7 +218,10 @@ func executable(command, field string) error {
 // The boolean reports whether authentication was actually established. A
 // wrapper command cannot be asked, and reporting that as success would claim a
 // check that never ran.
-func authenticated(command string) (bool, error) {
+//
+// The budget is a parameter so the bound itself is exercised by a test without
+// one waiting out the production value.
+func authenticated(ctx context.Context, command string, timeout time.Duration) (bool, error) {
 	fields := strings.Fields(command)
 	if len(fields) == 0 {
 		return false, errorsf("claude.command is empty")
@@ -218,7 +229,14 @@ func authenticated(command string) (bool, error) {
 	if len(fields) > 1 {
 		return false, nil
 	}
-	out, err := exec.Command(fields[0], "auth", "status").Output()
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, fields[0], "auth", "status").Output()
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		// A probe that had to be killed is a failed check, not a pass: nothing
+		// was learned about the session.
+		return false, errorsf("claude.command did not report authentication status before its %s timeout expired", timeout)
+	}
 	if err != nil {
 		return false, errorsf("claude.command could not report authentication status")
 	}

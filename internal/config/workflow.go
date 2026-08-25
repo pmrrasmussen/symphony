@@ -524,12 +524,20 @@ func decode(raw map[string]any, base, path, logRoot string, sources *sourceSnaps
 		// configuration rather than run an agent that silently cannot publish a
 		// pull request or file a follow-up.
 		if s.LinearSessionCapabilityEnabled() || s.GitHub.Enabled {
-			return s, errors.New("invalid configuration: agent.backend claude cannot yet be combined with Symphony session capabilities (tracker.provider.handoff_state, tracker.provider.followup_issue_creation, or the github block)")
+			return s, errors.New("invalid configuration: agent.backend claude cannot yet be combined with Symphony session capabilities (tracker.provider.handoff_state, tracker.provider.followup_issue_creation, or an enabled github integration)")
 		}
-	default:
+	case DefaultAgentBackend:
 		if strings.TrimSpace(s.Codex.Command) == "" || s.Codex.TurnTimeout <= 0 || s.Codex.ReadTimeout <= 0 || s.Codex.StartTimeout <= 0 {
 			return s, errors.New("invalid configuration: non-positive duration or agent limit")
 		}
+	default:
+		// Unreachable for a loaded workflow, because backend was already checked
+		// against agentBackends. It is an error rather than the Codex arm so that
+		// adding a name to agentBackends without giving it an arm here fails
+		// loudly instead of validating the new backend against codex.command and
+		// the codex timeouts -- the same reason AgentLaunchFor answers false for a
+		// name it does not know.
+		return s, fmt.Errorf("invalid configuration: agent.backend %q has no validated launch contract", s.Agent.Backend)
 	}
 	if s.Workspace.SourceRoot != "" {
 		info, err := os.Stat(s.Workspace.SourceRoot)

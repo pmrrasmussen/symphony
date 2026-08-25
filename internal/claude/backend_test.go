@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -635,4 +636,180 @@ func contains(values []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// TestATurnEndsEvenWhenADescendantEscapesTheProcessGroup is the regression that
+// matters most. A group kill cannot reach a process that left the group -- via
+// setsid, nohup, or any double fork -- and such a process keeps the inherited
+// stdout write end open. Reading would then never see EOF, so the turn would
+// hang forever with no terminal event and no closed channel, and the timeout
+// would be unenforceable. Closing the parent's pipe ends is what ends the read.
+func TestATurnEndsEvenWhenADescendantEscapesTheProcessGroup(t *testing.T) {
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Skip("python3 is needed to detach a descendant from the process group")
+	}
+	dir := t.TempDir()
+	script := writeFakeClaude(t, dir, "cat <<'EOF'\n"+initLine(dir, allCodingTools)+"\nEOF\n"+
+		// The grandchild leaves the process group and holds the inherited stdout
+		// open well past the turn timeout.
+		"python3 -c 'import os,time; os.setsid(); time.sleep(60)' &\n"+
+		"sleep 60\n")
+	r := request(t, dir, script)
+	r.TurnTimeout = 400 * time.Millisecond
+
+	backend := New(settingsFunc())
+	_, events, err := backend.Start(context.Background(), r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// drain fails the test if the stream never closes, which is exactly the
+	// defect: before the fix this blocked until the grandchild exited.
+	collected := drain(t, events)
+	failure := lastKind(t, collected)
+	if failure.Kind != domain.EventFailed || !strings.Contains(failure.Message, "timeout") {
+		t.Fatalf("terminal event=%+v", failure)
+	}
+}
+
+// TestCancelAfterATurnFinishesSignalsNothing covers the pid-reuse hazard: the
+// group kill deliberately bypasses Go's post-Wait guard, so a session that kept
+// pointing at a reaped turn could signal an unrelated process group once the pid
+// was recycled.
+func TestCancelAfterATurnFinishesSignalsNothing(t *testing.T) {
+	dir := t.TempDir()
+	script := writeFakeClaude(t, dir, "cat <<'EOF'\n"+initLine(dir, allCodingTools)+"\n"+resultLine(false, "")+"\nEOF\n")
+	backend := New(settingsFunc())
+	session, events, err := backend.Start(context.Background(), request(t, dir, script))
+	if err != nil {
+		t.Fatal(err)
+	}
+	drain(t, events)
+
+	backend.mu.Lock()
+	live := backend.sessions[session.ID]
+	backend.mu.Unlock()
+	if live == nil {
+		t.Fatal("session was forgotten while it was still resumable")
+	}
+	live.mu.Lock()
+	running := live.running
+	live.mu.Unlock()
+	if running != nil {
+		t.Fatal("a finished turn is still the session's live process; cancelling it would signal a reaped pid")
+	}
+	if err := backend.Cancel(context.Background(), session); err != nil {
+		t.Fatalf("cancel after a finished turn: %v", err)
+	}
+}
+
+// TestOnlyOneTerminalEventIsReported keeps the documented contract true: a
+// refused init ends the turn, and a result arriving afterwards must not add a
+// second terminal event -- which also reported the wrong reason.
+func TestOnlyOneTerminalEventIsReported(t *testing.T) {
+	dir := t.TempDir()
+	badInit := `{"type":"system","subtype":"init","cwd":"` + workspaceOf(dir) + `","permissionMode":"acceptEdits","tools":[` + allCodingTools + `],"mcp_servers":[]}`
+	script := writeFakeClaude(t, dir, "cat <<'EOF'\n"+badInit+"\n"+resultLine(false, "")+"\nEOF\n")
+	backend := New(settingsFunc())
+	_, events, err := backend.Start(context.Background(), request(t, dir, script))
+	if err != nil {
+		t.Fatal(err)
+	}
+	collected := drain(t, events)
+	var terminals []domain.Event
+	for _, event := range collected {
+		switch event.Kind {
+		case domain.EventCompleted, domain.EventFailed, domain.EventBlocked,
+			domain.EventLandingWaiting, domain.EventLandingResolved:
+			terminals = append(terminals, event)
+		}
+	}
+	if len(terminals) != 1 {
+		t.Fatalf("%d terminal events: %v", len(terminals), kinds(collected))
+	}
+	if !strings.Contains(terminals[0].Message, "permission mode") {
+		t.Fatalf("terminal event misreports the reason: %+v", terminals[0])
+	}
+}
+
+// TestARateLimitReportIsObservable guards against the signal being emitted in a
+// shape the scheduler discards.
+func TestARateLimitReportIsObservable(t *testing.T) {
+	dir := t.TempDir()
+	script := writeFakeClaude(t, dir, "cat <<'EOF'\n"+initLine(dir, allCodingTools)+"\n"+
+		`{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"output_tokens","utilization":0.97}}`+"\n"+
+		resultLine(false, "")+"\nEOF\n")
+	backend := New(settingsFunc())
+	_, events, err := backend.Start(context.Background(), request(t, dir, script))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var reported bool
+	for _, event := range drain(t, events) {
+		if event.Kind == domain.EventDiagnostic && strings.Contains(event.Message, "rate limit") {
+			reported = true
+			if !strings.Contains(event.Message, "rejected") || !strings.Contains(event.Message, "output_tokens") {
+				t.Fatalf("rate limit report lost its detail: %q", event.Message)
+			}
+		}
+		// EventRateLimit would be dropped by the scheduler's numeric allowlist,
+		// so emitting it here would make the signal invisible.
+		if event.Kind == domain.EventRateLimit {
+			t.Fatalf("rate limit emitted in a shape the scheduler discards: %+v", event)
+		}
+	}
+	if !reported {
+		t.Fatal("a rate limit report never reached an event")
+	}
+}
+
+// TestTheModelAndDenyFlagsArePassed covers two flags the documentation
+// enumerates that no other test constrained.
+func TestTheModelAndDenyFlagsArePassed(t *testing.T) {
+	dir := t.TempDir()
+	script := writeFakeClaude(t, dir, "cat <<'EOF'\n"+initLine(dir, allCodingTools)+"\n"+resultLine(false, "")+"\nEOF\n")
+	r := request(t, dir, script)
+	r.Model = "sonnet"
+
+	backend := New(settingsFunc())
+	session, events, err := backend.Start(context.Background(), r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	drain(t, events)
+	first := readArgs(t, dir)
+	if got := flagValue(t, first, "--model"); got != "sonnet" {
+		t.Fatalf("--model=%q", got)
+	}
+	if got := flagValue(t, first, "--disallowedTools"); got != strings.Join(deniedTools, ",") {
+		t.Fatalf("--disallowedTools=%q", got)
+	}
+	// Both must survive a resume, like every other part of the contract.
+	events, err = backend.Continue(context.Background(), session, "again")
+	if err != nil {
+		t.Fatal(err)
+	}
+	drain(t, events)
+	second := readArgs(t, dir)
+	if got := flagValue(t, second, "--model"); got != "sonnet" {
+		t.Fatalf("resumed --model=%q", got)
+	}
+	if got := flagValue(t, second, "--disallowedTools"); got != strings.Join(deniedTools, ",") {
+		t.Fatalf("resumed --disallowedTools=%q", got)
+	}
+}
+
+// TestNoModelFlagWithoutAConfiguredModel keeps an unset model from becoming an
+// empty flag value.
+func TestNoModelFlagWithoutAConfiguredModel(t *testing.T) {
+	dir := t.TempDir()
+	script := writeFakeClaude(t, dir, "cat <<'EOF'\n"+initLine(dir, allCodingTools)+"\n"+resultLine(false, "")+"\nEOF\n")
+	backend := New(settingsFunc())
+	_, events, err := backend.Start(context.Background(), request(t, dir, script))
+	if err != nil {
+		t.Fatal(err)
+	}
+	drain(t, events)
+	if hasFlag(readArgs(t, dir), "--model") {
+		t.Fatal("an unset model still passed --model")
+	}
 }

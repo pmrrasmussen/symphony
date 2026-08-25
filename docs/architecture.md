@@ -11,10 +11,13 @@ selected backend's launch contract has to be complete, so an absent `codex:` or
 `claude:` block fails a candidate only when that backend is the one selected.
 A `claude` workflow that also enables a Symphony session capability --
 `tracker.provider.handoff_state`, `tracker.provider.followup_issue_creation`,
-or the `github` block -- is rejected at load: the bridge that would expose
-those bounded capabilities to a Claude session does not exist yet, and refusing
-the configuration is preferred over dispatching an agent that silently cannot
-hand off, publish, or file a follow-up.
+or a configured and enabled GitHub integration -- is rejected at load: the
+bridge that would expose those bounded capabilities to a Claude session does
+not exist yet, and refusing the configuration is preferred over dispatching an
+agent that silently cannot hand off, publish, or file a follow-up.  A `github:`
+block that does not resolve stays disabled, as it does under `codex`, so it
+never reaches that refusal -- which grants nothing, because a disabled
+integration has no capability to bridge.
 
 The initial implementation is intentionally for a trusted local machine.
 `WORKFLOW.md` is repository-owned, versioned policy and its hooks are trusted
@@ -272,10 +275,16 @@ permitted" and created nothing), and per-domain network control works in both
 directions.
 
 Four limits are stated rather than implied. First, the sandbox governs `Bash`
-and its children; `Edit` and `Write` are bounded by the tool surface and the
-permission rules, and the post-run Git integrity check below remains the
-backstop -- whether the file-editing tools refuse an absolute path outside the
-worktree was not verified and is not claimed. Second, reads are not confined,
+and its children, and Bash writes were verified confined; `Edit` and `Write`
+are not sandboxed and carry no path restriction at all, because the rendered
+payload allows the bare tool names `Bash`, `Edit`, `Glob`, `Grep`, `Read`, and
+`Write` under `defaultMode: dontAsk` -- a permission rule decides whether a
+tool exists, not where it may write. Whether the file-editing tools refuse an
+absolute path outside the worktree was not verified and is not claimed, and no
+check Symphony runs would notice: the post-run Git integrity check below
+re-verifies only the source repository's non-`symphony/*` branch heads and its
+primary index, so a write outside that repository is neither confined nor
+observed. Second, reads are not confined,
 exactly as for Codex. Third, `network.allowedDomains: ["*"]` is unrestricted
 outbound access, the same deliberate choice as the Codex profile's
 `networkAccess: true`; per-domain control exists and works but is not used to

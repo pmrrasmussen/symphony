@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestRunExercisesLifecycleWithoutCreatingConfiguredState(t *testing.T) {
@@ -120,5 +121,138 @@ func TestAgentCommandCheckNamesTheSelectedBackendsField(t *testing.T) {
 	}
 	if err := executable("$(echo codex)", "codex.command"); err == nil || !strings.Contains(err.Error(), "codex.command executable must be a literal program name") {
 		t.Fatalf("non-literal program failure=%v", err)
+	}
+}
+
+// The account details the CLI reports alongside the boolean. They are declared
+// once here so every authentication test can assert that none of them reaches
+// an operator-visible string.
+const (
+	authEmail        = "operator@example.com"
+	authOrganization = "example-org-9f3a"
+	authSubscription = "plan-7c21"
+)
+
+func authStatusJSON(loggedIn string) string {
+	return `{"loggedIn":` + loggedIn + `,"email":"` + authEmail + `","organization":"` + authOrganization + `","subscription":"` + authSubscription + `"}`
+}
+
+// writeAuthCommand writes a scripted stand-in for the agent CLI. A real
+// `claude` is never invoked from a test: the probe is about how preflight reads
+// a response, not about this machine's login.
+func writeAuthCommand(t *testing.T, body string) string {
+	t.Helper()
+	script := filepath.Join(t.TempDir(), "fake-agent-cli.sh")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\n"+body), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return script
+}
+
+// TestAuthenticationProbeReportsEachOutcomeWithoutClaimingAnUncheckedPass
+// covers every branch of the probe. The pass is the dangerous one: a wrapper
+// command, an unreadable answer, a non-zero exit, and a probe that had to be
+// killed must all be distinguishable from a session that was actually verified.
+func TestAuthenticationProbeReportsEachOutcomeWithoutClaimingAnUncheckedPass(t *testing.T) {
+	t.Run("authenticated session", func(t *testing.T) {
+		command := writeAuthCommand(t, `printf '%s' '`+authStatusJSON("true")+`'`)
+		status, err := authenticated(context.Background(), command, authenticationTimeout)
+		if err != nil || !status {
+			t.Fatalf("status=%v err=%v", status, err)
+		}
+	})
+
+	t.Run("no authenticated session", func(t *testing.T) {
+		command := writeAuthCommand(t, `printf '%s' '`+authStatusJSON("false")+`'`)
+		status, err := authenticated(context.Background(), command, authenticationTimeout)
+		if status || err == nil || !strings.Contains(err.Error(), "no authenticated session") {
+			t.Fatalf("status=%v err=%v", status, err)
+		}
+		assertNoAccountDetails(t, err.Error())
+	})
+
+	t.Run("unreadable answer", func(t *testing.T) {
+		command := writeAuthCommand(t, `printf '%s' 'logged in as `+authEmail+`'`)
+		status, err := authenticated(context.Background(), command, authenticationTimeout)
+		if status || err == nil || !strings.Contains(err.Error(), "unreadable authentication status") {
+			t.Fatalf("status=%v err=%v", status, err)
+		}
+		// The CLI's own output must not be quoted into the failure.
+		assertNoAccountDetails(t, err.Error())
+	})
+
+	t.Run("non-zero exit", func(t *testing.T) {
+		command := writeAuthCommand(t, "exit 3")
+		status, err := authenticated(context.Background(), command, authenticationTimeout)
+		if status || err == nil || !strings.Contains(err.Error(), "could not report authentication status") {
+			t.Fatalf("status=%v err=%v", status, err)
+		}
+	})
+
+	t.Run("wrapper command is not probed and is not a pass", func(t *testing.T) {
+		status, err := authenticated(context.Background(), "sh -c exit", authenticationTimeout)
+		if status || err != nil {
+			t.Fatalf("status=%v err=%v", status, err)
+		}
+	})
+
+	t.Run("a hanging CLI fails the check instead of hanging the dry run", func(t *testing.T) {
+		command := writeAuthCommand(t, "sleep 60")
+		start := time.Now()
+		status, err := authenticated(context.Background(), command, 50*time.Millisecond)
+		if status || err == nil || !strings.Contains(err.Error(), "did not report authentication status") {
+			t.Fatalf("status=%v err=%v", status, err)
+		}
+		if elapsed := time.Since(start); elapsed > 30*time.Second {
+			t.Fatalf("probe waited for the command rather than its budget: %v", elapsed)
+		}
+	})
+
+	t.Run("empty command", func(t *testing.T) {
+		if _, err := authenticated(context.Background(), "   ", authenticationTimeout); err == nil || !strings.Contains(err.Error(), "claude.command is empty") {
+			t.Fatalf("err=%v", err)
+		}
+	})
+}
+
+// TestAuthenticationCheckKeepsAccountDetailsOutOfEveryResult is the whole-result
+// version of the same promise: `claude auth status` reports the operator's
+// email, organization, and subscription, and only the boolean may be read.
+func TestAuthenticationCheckKeepsAccountDetailsOutOfEveryResult(t *testing.T) {
+	command := writeAuthCommand(t, `printf '%s' '`+authStatusJSON("true")+`'`)
+	dir := t.TempDir()
+	workflow := filepath.Join(dir, "WORKFLOW.md")
+	content := "---\n" +
+		"tracker:\n  kind: linear\n  provider: {project_slug_id: preflight, api_key: not-a-live-key}\n  active_states: [Todo]\n  terminal_states: [Done]\n" +
+		"workspace: {root: " + filepath.Join(dir, "workspaces") + ", source_root: " + dir + "}\n" +
+		"agent: {backend: claude}\n" +
+		"claude: {command: \"" + command + "\"}\n" +
+		"---\nWork on {{.issue.identifier}}"
+	if err := os.WriteFile(workflow, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	result := Run(context.Background(), workflow, filepath.Join(dir, "logs"))
+	found := false
+	for _, check := range result.Checks {
+		assertNoAccountDetails(t, check.Message)
+		if check.Name == "agent_authentication" {
+			found = true
+			if check.Status != StatusPassed {
+				t.Fatalf("agent_authentication=%+v", check)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("a claude workflow produced no agent_authentication check: %+v", result)
+	}
+}
+
+func assertNoAccountDetails(t *testing.T, message string) {
+	t.Helper()
+	for _, detail := range []string{authEmail, authOrganization, authSubscription} {
+		if strings.Contains(message, detail) {
+			t.Fatalf("check text exposed an account detail %q: %s", detail, message)
+		}
 	}
 }

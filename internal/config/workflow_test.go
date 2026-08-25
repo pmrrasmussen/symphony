@@ -1498,4 +1498,52 @@ func TestClaudeBackendConfiguration(t *testing.T) {
 			t.Fatalf("codex workflow with capabilities was rejected: %v", err)
 		}
 	})
+
+	t.Run("an enabled github integration is refused", func(t *testing.T) {
+		// The github term of the refusal, isolated: no handoff_state and no
+		// followup_issue_creation, so only GitHub.Enabled can reject this.
+		t.Setenv("PMR50_GITHUB_TOKEN", "github-secret")
+		body := head + "github: {owner: pmrrasmussen, repository: symphony, token: $PMR50_GITHUB_TOKEN}\nagent: {backend: claude}\n---\nbody"
+		_, err := Load(write(t, body), "logs")
+		if err == nil || !strings.Contains(err.Error(), "cannot yet be combined with Symphony session capabilities") {
+			t.Fatalf("err=%v", err)
+		}
+	})
+
+	t.Run("a github block that does not resolve leaves the integration disabled", func(t *testing.T) {
+		// decodeGitHub disables the integration on any invalid value, so a present
+		// but unresolvable block is not a configured capability and does not reach
+		// the refusal. Nothing is silently granted: the capability is unavailable
+		// either way.
+		body := head + "github: {owner: pmrrasmussen, repository: symphony, token_file: absent-github-token}\nagent: {backend: claude}\n---\nbody"
+		w, err := Load(write(t, body), "logs")
+		if err != nil {
+			t.Fatalf("err=%v", err)
+		}
+		if w.Config.GitHub.Enabled {
+			t.Fatalf("github=%+v", w.Config.GitHub)
+		}
+	})
+}
+
+// TestEverySelectableBackendHasAValidatedLaunchContract fails when a name is
+// added to agentBackends without giving decode's launch-contract switch an arm
+// of its own. That switch defaulted to the Codex requirements, so a new backend
+// would have been validated against codex.command and the codex timeouts.
+func TestEverySelectableBackendHasAValidatedLaunchContract(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "WORKFLOW.md")
+	for _, backend := range AgentBackends() {
+		content := "---\ntracker: {kind: linear, provider: {api_key: k}, active_states: [Todo], terminal_states: [Done]}\nworkspace: {root: work}\nagent: {backend: " + backend + "}\n---\nbody"
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		w, err := Load(path, "logs")
+		if err != nil {
+			t.Fatalf("backend %q: %v", backend, err)
+		}
+		launch, known := w.Config.AgentLaunchFor(backend)
+		if !known || strings.TrimSpace(launch.Command) == "" || launch.TurnTimeout <= 0 || launch.StallTimeout <= 0 {
+			t.Fatalf("backend %q launch=%+v known=%v", backend, launch, known)
+		}
+	}
 }

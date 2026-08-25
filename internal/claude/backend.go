@@ -44,6 +44,11 @@ const eventBuffer = 64
 // progress once the buffer is nearly full.
 const reservedTerminalSlots = 2
 
+// waitDelay bounds Wait's post-exit I/O wait. It is short because by the time it
+// applies the process is already gone and only an escaped descendant can still
+// be holding a pipe.
+const waitDelay = 2 * time.Second
+
 // Backend implements domain.AgentBackend on the Claude Code CLI.
 type Backend struct {
 	settings    func() config.Settings
@@ -183,6 +188,14 @@ type turn struct {
 
 	timeout time.Duration
 
+	// killOnce bounds the process-group signal to one delivery per turn. The
+	// group kill deliberately bypasses Go's post-Wait guard, so repeating it
+	// after the child is reaped could signal an unrelated group once the pid is
+	// recycled.
+	killOnce sync.Once
+	// closeIO closes the parent's ends of the pipes exactly once.
+	closeIO sync.Once
+
 	mu     sync.Mutex
 	killed bool
 }
@@ -204,21 +217,40 @@ func spawn(ctx context.Context, r domain.AgentRequest, args []string, secretName
 	// a killed turn can leave background shell commands behind otherwise.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
+	// Go closes a command's parent-side pipes in Start and Wait, so a failure
+	// between creating one and reaching Start would leak the descriptors -- and
+	// this only happens under descriptor exhaustion, where a leak compounds.
+	var opened []io.Closer
+	closeOpened := func() {
+		for _, pipe := range opened {
+			_ = pipe.Close()
+		}
+	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, err
 	}
+	opened = append(opened, stdout)
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
+		closeOpened()
 		return nil, err
 	}
+	opened = append(opened, stderr)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
+		closeOpened()
 		return nil, err
 	}
+	opened = append(opened, stdin)
 	t := &turn{cmd: cmd, stdout: stdout, stderr: stderr, exited: make(chan struct{}), timeout: r.TurnTimeout}
-	cmd.Cancel = func() error { return t.killProcessGroup() }
+	cmd.Cancel = func() error { t.kill(); return nil }
+	// WaitDelay bounds how long Wait blocks on I/O after the process itself is
+	// gone, so a descendant still holding an inherited pipe cannot keep Wait
+	// from returning.
+	cmd.WaitDelay = waitDelay
 	if err := cmd.Start(); err != nil {
+		closeOpened()
 		return nil, err
 	}
 	// The prompt goes on stdin, never in the arguments: several launch flags are
@@ -241,11 +273,24 @@ func (t *turn) killProcessGroup() error {
 	return nil
 }
 
+// kill terminates the turn. Killing the process group is not sufficient on its
+// own: a descendant that leaves the group -- setsid, nohup, any double fork --
+// keeps the inherited stdout write end open, so the reader would never see EOF
+// and the turn would hang with no terminal event and no closed channel. Closing
+// the parent's ends of the pipes is what actually ends the read.
 func (t *turn) kill() {
 	t.mu.Lock()
 	t.killed = true
 	t.mu.Unlock()
-	_ = t.killProcessGroup()
+	t.killOnce.Do(func() { _ = t.killProcessGroup() })
+	t.closePipes()
+}
+
+func (t *turn) closePipes() {
+	t.closeIO.Do(func() {
+		_ = t.stdout.Close()
+		_ = t.stderr.Close()
+	})
 }
 
 func (t *turn) cancelled() bool {
@@ -259,6 +304,16 @@ func (t *turn) cancelled() bool {
 func (t *turn) stream(s *session, r domain.AgentRequest, turnNumber int, events chan<- domain.Event) {
 	defer close(events)
 	defer close(t.exited)
+	// Once this turn is over it must stop being the session's live process, or a
+	// later cancellation would signal a process group whose pid has been reaped
+	// and possibly recycled.
+	defer func() {
+		s.mu.Lock()
+		if s.running == t {
+			s.running = nil
+		}
+		s.mu.Unlock()
+	}()
 
 	emitter := &emitter{events: events}
 	pending := map[string]pendingCall{}
@@ -270,6 +325,8 @@ func (t *turn) stream(s *session, r domain.AgentRequest, turnNumber int, events 
 	if t.timeout > 0 {
 		timer = time.AfterFunc(t.timeout, func() {
 			close(timedOut)
+			// kill closes the pipes as well, which is what unblocks the read
+			// loop below and lets this turn report its own timeout.
 			t.kill()
 		})
 		defer timer.Stop()
@@ -380,12 +437,21 @@ func (t *turn) stream(s *session, r domain.AgentRequest, turnNumber int, events 
 		case "rate_limit_event":
 			var event rateLimitEvent
 			_ = json.Unmarshal(line, &event)
-			emitter.emit(domain.Event{Kind: domain.EventRateLimit, At: time.Now(), RateLimit: map[string]any{
-				"status":          observability.Text(event.RateLimitInfo.Status),
-				"rate_limit_type": observability.Text(event.RateLimitInfo.RateLimitType),
-				"utilization":     event.RateLimitInfo.Utilization,
-			}})
+			// This is reported as a diagnostic rather than EventRateLimit on
+			// purpose. The scheduler normalizes rate-limit payloads through a
+			// fixed numeric allowlist (limit, remaining, used, reset_seconds,
+			// window_seconds); the CLI's actionable fields are strings under
+			// different names, so an EventRateLimit here would be silently
+			// discarded and never reach a log.
+			emitter.emit(domain.Event{Kind: domain.EventDiagnostic, At: time.Now(),
+				Message: "claude reported a rate limit: " + observability.Text(firstNonEmpty(event.RateLimitInfo.Status, "unspecified")) +
+					" (" + observability.Text(firstNonEmpty(event.RateLimitInfo.RateLimitType, "unspecified")) + ")"})
 		case "result":
+			if sawTerminal {
+				// A refused init already ended this turn. Reading a later result
+				// would emit a second terminal event and misreport the reason.
+				continue
+			}
 			var event resultEvent
 			_ = json.Unmarshal(line, &event)
 			// The CLI reports usage per turn while the scheduler keeps a

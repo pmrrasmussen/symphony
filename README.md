@@ -418,6 +418,17 @@ silently in place. There is no read or start timeout budget: a turn is a single
 process that exits when the turn ends, so there is no steady-state round trip
 to bound.
 
+`command` is **argv, not a shell command**: it is split on whitespace and its
+first field is executed directly, so there is no shell, no quoting, no variable
+expansion, and no operators or redirection. That is deliberate -- the inline
+`--settings` payload described below is JSON that a shell would word-split -- but
+it means `claude.command` and `codex.command` are not the same kind of field:
+`codex.command` runs through `bash -lc`, so quoting that works there breaks
+here. Note also that `--dry-run` validates both fields with `sh -n`, a shell
+syntax check, which is a loose superset for this backend: it accepts quoting
+that the Claude launcher passes through as literal argument text rather than
+interpreting.
+
 The block deliberately has no approval-policy, sandbox-mode, or sandbox-policy
 counterpart to `codex:`. What a Codex operator configures per repository is
 instead fixed by Symphony and cannot be widened from `WORKFLOW.md`:
@@ -479,11 +490,18 @@ directions, an allowed domain succeeding and a denied one failing.
 
 Four limits of that boundary, stated rather than implied:
 
-1. The sandbox governs `Bash` and its children. `Edit` and `Write` are governed
-   by the tool surface and the permission rules, and Symphony's existing
-   post-run Git integrity check remains the backstop. Whether the file-editing
-   tools themselves refuse an absolute path outside the worktree was not
-   verified, so it is not claimed here.
+1. The sandbox governs `Bash` and its children, and Bash writes were verified
+   confined. `Edit` and `Write` are **not** sandboxed and have no path
+   restriction beyond existing: the rendered payload is
+   `permissions.allow: ["Bash","Edit","Glob","Grep","Read","Write"]` with
+   `defaultMode: dontAsk` -- bare tool names, which decide whether a tool
+   exists, not where it may write. Whether the file-editing tools themselves
+   refuse an absolute path outside the worktree was not verified, so it is not
+   claimed here. Nor would Symphony detect such a write: the post-run Git
+   integrity check re-verifies only the source repository's non-`symphony/*`
+   branch heads and its primary index, so it catches a write into the source
+   checkout's Git state and nothing else. A write to a path outside the
+   repository entirely is neither confined nor observed.
 2. Reads are **not** confined, exactly as for Codex: a worker can read any file
    the user running Symphony can, including credential files outside the
    worktree.
@@ -499,15 +517,21 @@ Four limits of that boundary, stated rather than implied:
    event arrives. The event does **not** report sandbox state, so the sandbox's
    own status is not observable in the stream.
 
-So the operative boundary has the same shape as the Codex one: writes confined,
-no host Linear or GitHub credential in the child environment (stripped by
-variable name and by value, exactly as for Codex), but local reads and outbound
-network both available. What protects host credentials from exfiltration is that
-no untrusted input reaches the worker, not the sandbox.
+So the operative boundary has nearly the same shape as the Codex one: Bash
+writes confined, no host Linear or GitHub credential in the child environment
+(stripped by variable name and by value, exactly as for Codex), but local reads
+and outbound network both available -- and, unlike the Codex profile, the
+file-editing tools sitting outside the sandbox entirely, per limit 1. What
+protects host credentials from exfiltration is that no untrusted input reaches
+the worker, not the sandbox.
 
 A Claude workflow that also enables a Symphony session capability --
 `tracker.provider.handoff_state`, `tracker.provider.followup_issue_creation`,
-or the `github` block -- is **rejected at load**. The bridge that would expose
+or a **configured and enabled** GitHub integration -- is **rejected at load**.
+A `github:` block that does not resolve (an unreadable `token_file`, say) leaves
+the integration disabled, exactly as it does under `codex`, and so does not
+reach that refusal; nothing is granted either way, because a disabled
+integration has no capability to expose. The bridge that would expose
 those bounded capabilities to a Claude session does not exist yet, and refusing
 the configuration is preferred over running an agent that silently cannot hand
 off, publish a pull request, or file a follow-up. A Claude backend is therefore
@@ -522,7 +546,11 @@ surfaces only at dispatch, where it looks like a finished turn rather than a
 setup problem -- the CLI reports an authentication failure as a result event
 with `is_error` set. A multi-word `claude.command` is a wrapper or a test stub
 with no reliable way to be asked for status, so the check does not probe it and
-does not fail on it: a pass is then evidence of nothing.
+does not fail on it: a pass is then evidence of nothing. The probe is bounded at
+five seconds -- every other preflight probe is a `sh -n` syntax check, a `PATH`
+lookup, or a `stat`, so this is the one call that runs a foreign program, and a
+CLI blocked on a keychain prompt or a token refresh must fail the check rather
+than leave `--dry-run` waiting.
 
 **Operator prerequisite:** the user the Symphony process runs as must already be
 logged in to the Claude Code CLI. Symphony passes it no credential and performs
