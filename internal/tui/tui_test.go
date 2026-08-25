@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	tea "charm.land/bubbletea/v2"
 
@@ -273,5 +274,101 @@ func TestWindowSizeIsRecordedForTheRenderer(t *testing.T) {
 	}
 	if view.width != 120 || view.height != 40 {
 		t.Fatalf("recorded %dx%d, want 120x40", view.width, view.height)
+	}
+}
+
+// styledFixture builds a styled model wide enough that no panel wraps, so
+// these tests exercise styling rather than line breaking.
+func styledFixture(instances []operator.Instance, now time.Time) Model {
+	model := New(instances, now)
+	model.styled = true
+	model.width = 120
+	return model
+}
+
+func TestStyledFramesKeepAssertedPhrasesContiguous(t *testing.T) {
+	now := time.Date(2026, 8, 25, 12, 0, 0, 0, time.UTC)
+	instance := operator.Instance{
+		ID:       "com.pmrrasmussen.symphony",
+		Liveness: operator.LivenessRunning,
+		Config:   &operator.EffectiveConfig{MaxTurns: 20, Credentials: operator.Credentials{Tracker: operator.CredentialPresence{Configured: true, EnvironmentNames: []string{"SECRET_ENV"}}}},
+		Snapshot: &operator.Snapshot{Coordinator: operator.RuntimeSnapshot{Running: []operator.RunningSnapshot{{
+			IssueIdentifier: "PMR-75",
+			IssueState:      "In Progress",
+			TurnCount:       4,
+			Usage:           operator.Usage{InputTokens: 12, OutputTokens: 3, TotalTokens: 15},
+		}}}},
+	}
+	model := styledFixture([]operator.Instance{instance}, now)
+	model.page = statusPage
+	status := model.View(now)
+	for _, want := range []string{"PMR-75 (In Progress)", "turns 4/20", "tokens: input 12, output 3, total 15"} {
+		if !strings.Contains(status, want) {
+			t.Fatalf("styled status page broke %q:\n%s", want, status)
+		}
+	}
+	model.page = configPage
+	config := model.View(now)
+	if !strings.Contains(config, "Credentials: Linear configured; GitHub not configured") {
+		t.Fatalf("styled config page broke the credential line:\n%s", config)
+	}
+	// The styling must not become a new way to leak a credential reference.
+	if strings.Contains(config, "SECRET_ENV") {
+		t.Fatalf("styled config page exposed a credential reference:\n%s", config)
+	}
+	if !strings.Contains(config, "\x1b") {
+		t.Fatal("styled frame carries no styling at all")
+	}
+}
+
+func TestStyledOverviewMarksSelectionAndShortensStale(t *testing.T) {
+	now := time.Date(2026, 8, 25, 12, 0, 0, 0, time.UTC)
+	model := styledFixture([]operator.Instance{
+		{ID: "alpha", Liveness: operator.LivenessRunning},
+		{ID: "beta", Liveness: operator.LivenessStale},
+	}, now)
+	model.selected = 1
+	view := model.View(now)
+	if !strings.Contains(view, "▸") {
+		t.Fatalf("no selection marker:\n%s", view)
+	}
+	// The raw value is fourteen characters and used to overflow the column.
+	if strings.Contains(view, string(operator.LivenessStale)) {
+		t.Fatalf("overview printed the raw stale value:\n%s", view)
+	}
+	if !strings.Contains(view, "stale") {
+		t.Fatalf("overview lost the stale state:\n%s", view)
+	}
+}
+
+func TestNarrowWindowKeepsEveryColumnHeader(t *testing.T) {
+	now := time.Date(2026, 8, 25, 12, 0, 0, 0, time.UTC)
+	model := styledFixture([]operator.Instance{
+		{ID: "com.pmrrasmussen.symphony", Liveness: operator.LivenessRunning},
+		{ID: "com.pmrrasmussen.symphony.acme-web", Liveness: operator.LivenessStopped},
+	}, now)
+	model.width = 80
+	view := model.View(now)
+	for _, header := range []string{"INSTANCE", "STATE", "AGENTS", "RETRIES", "CHECKS"} {
+		if !strings.Contains(view, header) {
+			t.Fatalf("80 columns truncated the %s header:\n%s", header, view)
+		}
+	}
+}
+
+func TestTruncateCutsOnRuneBoundaries(t *testing.T) {
+	// Byte slicing split the last character and mismeasured the width.
+	if got := truncate("aaaa", 3); got != "aa…" {
+		t.Fatalf("truncate(ascii)=%q, want %q", got, "aa…")
+	}
+	got := truncate("ααααα", 3)
+	if got != "αα…" {
+		t.Fatalf("truncate(multibyte)=%q, want %q", got, "αα…")
+	}
+	if !utf8.ValidString(got) {
+		t.Fatalf("truncate produced invalid UTF-8: %q", got)
+	}
+	if got := truncate("short", 10); got != "short" {
+		t.Fatalf("truncate widened a short value to %q", got)
 	}
 }

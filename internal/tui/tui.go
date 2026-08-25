@@ -15,6 +15,8 @@ import (
 	"time"
 
 	tea "charm.land/bubbletea/v2"
+	lipgloss "charm.land/lipgloss/v2"
+	"charm.land/lipgloss/v2/table"
 
 	"github.com/pmrrasmussen/symphony/internal/operator"
 )
@@ -43,6 +45,151 @@ type Model struct {
 	page      page
 	message   string
 	updatedAt time.Time
+	// styled draws the terminal dashboard. It stays off for redirected
+	// output, which keeps pipes, files, and tests on plain text.
+	styled bool
+	// width is the terminal width, or zero when it is not known and the
+	// frame should size itself to its content.
+	width int
+}
+
+// theme holds the styles one frame is drawn with. Every style is transparent
+// in the plain theme, so the same renderer serves both surfaces.
+type theme struct {
+	styled  bool
+	width   int
+	title   lipgloss.Style
+	subtle  lipgloss.Style
+	heading lipgloss.Style
+	panel   lipgloss.Style
+	tab     lipgloss.Style
+	current lipgloss.Style
+}
+
+// newTheme uses the sixteen named ANSI colors rather than fixed RGB, so the
+// dashboard follows whatever palette the terminal is themed with and reads
+// correctly on both light and dark backgrounds without querying either.
+func newTheme(styled bool, width int) theme {
+	if !styled {
+		return theme{}
+	}
+	return theme{
+		styled:  true,
+		width:   width,
+		title:   lipgloss.NewStyle().Bold(true),
+		subtle:  lipgloss.NewStyle().Foreground(lipgloss.BrightBlack),
+		heading: lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Cyan),
+		panel: lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.BrightBlack).
+			Padding(0, 1),
+		tab:     lipgloss.NewStyle().Foreground(lipgloss.BrightBlack).Padding(0, 1),
+		current: lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Cyan).Padding(0, 1),
+	}
+}
+
+// livenessLabel names a liveness for display. The raw stale value is fourteen
+// characters and overflowed its column, and it says nothing the short form
+// does not.
+func livenessLabel(state operator.Liveness) string {
+	if state == operator.LivenessStale {
+		return "stale"
+	}
+	return string(state)
+}
+
+// liveness renders a liveness as a colored marker. Color is the fastest thing
+// to read on this screen, so it carries the same distinction as the word.
+func (t theme) liveness(state operator.Liveness) string {
+	label := livenessLabel(state)
+	if !t.styled {
+		return label
+	}
+	style := lipgloss.NewStyle()
+	switch state {
+	case operator.LivenessRunning:
+		style = style.Foreground(lipgloss.Green)
+	case operator.LivenessStopped:
+		style = style.Foreground(lipgloss.BrightBlack)
+	case operator.LivenessStale:
+		style = style.Foreground(lipgloss.Yellow)
+	default:
+		style = style.Foreground(lipgloss.Red)
+	}
+	return style.Render("● " + label)
+}
+
+// checks colors a findings summary by its worst severity. The styled form is
+// abbreviated because this cell is the widest on the row and wrapped once the
+// window narrowed.
+func (t theme) checks(findings []operator.Finding) string {
+	if !t.styled {
+		return findingsIndicator(findings)
+	}
+	errors, warnings := 0, 0
+	for _, finding := range findings {
+		if finding.Severity == operator.SeverityError {
+			errors++
+			continue
+		}
+		warnings++
+	}
+	summary := "ok"
+	switch {
+	case errors > 0 && warnings > 0:
+		summary = fmt.Sprintf("%d err, %d warn", errors, warnings)
+	case errors > 0:
+		summary = fmt.Sprintf("%d err", errors)
+	case warnings > 0:
+		summary = fmt.Sprintf("%d warn", warnings)
+	}
+	style := lipgloss.NewStyle().Foreground(lipgloss.Green)
+	switch {
+	case errors > 0:
+		style = style.Foreground(lipgloss.Red)
+	case warnings > 0:
+		style = style.Foreground(lipgloss.Yellow)
+	}
+	return style.Render(summary)
+}
+
+// tabs renders the detail page strip with the open page marked, which the
+// header never showed before.
+func (t theme) tabs(current page) string {
+	labels := []struct {
+		page  page
+		label string
+	}{
+		{statusPage, "Status"},
+		{configPage, "Config"},
+		{validationPage, "Validation"},
+	}
+	if !t.styled {
+		return "[s] Status  [c] Config  [v] Validation  [Tab] next  [r] refresh  [q] back"
+	}
+	rendered := make([]string, 0, len(labels))
+	for _, entry := range labels {
+		if entry.page == current {
+			rendered = append(rendered, t.current.Render(entry.label))
+			continue
+		}
+		rendered = append(rendered, t.tab.Render(entry.label))
+	}
+	strip := lipgloss.JoinHorizontal(lipgloss.Top, rendered...)
+	return strip + "\n" + t.subtle.Render("s/c/v jump · Tab next · r refresh · q back")
+}
+
+// frame wraps body text in a panel sized to the terminal, and returns it
+// unchanged when there is nothing to draw a panel with.
+func (t theme) frame(body string) string {
+	if !t.styled {
+		return body
+	}
+	panel := t.panel
+	if t.width > 0 {
+		panel = panel.Width(t.width)
+	}
+	return panel.Render(strings.TrimRight(body, "\n"))
 }
 
 // New builds an overview model from an already-discovered, sorted instance
@@ -149,17 +296,15 @@ func (m *Model) Refresh(instances []operator.Instance, err error, now time.Time)
 // never prints config credentials, arbitrary environment variables, prompts,
 // protocol payloads, or log attributes.
 func (m Model) View(now time.Time) string {
+	style := newTheme(m.styled, m.width)
 	if m.page == overviewPage {
-		return m.overview(now)
+		return m.overview(now, style)
 	}
 	if len(m.instances) == 0 {
 		return "Symphony operator view\n\nNo configured Symphony instances.\n\nq: quit\n"
 	}
 	instance := m.instances[m.selected]
 	var b strings.Builder
-	fmt.Fprintf(&b, "Symphony operator view  %s\n", instance.ID)
-	fmt.Fprintf(&b, "state: %s  launchd: %s  refreshed: %s\n\n", instance.Liveness, launchdText(instance.Launchd), formatAge(now, m.updatedAt))
-	fmt.Fprintf(&b, "[s] Status  [c] Config  [v] Validation  [Tab] next  [r] refresh  [q] back\n\n")
 	switch m.page {
 	case statusPage:
 		m.writeStatus(&b, instance, now)
@@ -168,11 +313,28 @@ func (m Model) View(now time.Time) string {
 	case validationPage:
 		m.writeValidation(&b, instance)
 	}
-	return b.String()
+	if !style.styled {
+		var plain strings.Builder
+		fmt.Fprintf(&plain, "Symphony operator view  %s\n", instance.ID)
+		fmt.Fprintf(&plain, "state: %s  launchd: %s  refreshed: %s\n\n", livenessLabel(instance.Liveness), launchdText(instance.Launchd), formatAge(now, m.updatedAt))
+		fmt.Fprintf(&plain, "%s\n\n", style.tabs(m.page))
+		return plain.String() + b.String()
+	}
+	header := lipgloss.JoinVertical(lipgloss.Left,
+		style.title.Render("Symphony operator view")+"  "+style.heading.Render(instance.ID),
+		style.subtle.Render(fmt.Sprintf("%s · launchd %s · refreshed %s",
+			livenessLabel(instance.Liveness), launchdText(instance.Launchd), formatAge(now, m.updatedAt))),
+	)
+	return lipgloss.JoinVertical(lipgloss.Left,
+		header,
+		"",
+		style.tabs(m.page),
+		"",
+		style.frame(b.String()),
+	) + "\n"
 }
 
-func (m Model) overview(now time.Time) string {
-	var b strings.Builder
+func (m Model) overview(now time.Time, style theme) string {
 	running, stopped, stale, invalid := 0, 0, 0, 0
 	for _, instance := range m.instances {
 		switch instance.Liveness {
@@ -186,33 +348,105 @@ func (m Model) overview(now time.Time) string {
 			invalid++
 		}
 	}
-	fmt.Fprintf(&b, "Symphony operator view\n%d instances: %d running, %d stopped, %d stale, %d invalid  refreshed: %s\n\n", len(m.instances), running, stopped, stale, invalid, formatAge(now, m.updatedAt))
+	if !style.styled {
+		var b strings.Builder
+		fmt.Fprintf(&b, "Symphony operator view\n%d instances: %d running, %d stopped, %d stale, %d invalid  refreshed: %s\n\n", len(m.instances), running, stopped, stale, invalid, formatAge(now, m.updatedAt))
+		if m.message != "" {
+			fmt.Fprintf(&b, "%s\n\n", m.message)
+		}
+		if len(m.instances) == 0 {
+			b.WriteString("No convention-matching LaunchAgents were found.\n\n")
+		} else {
+			b.WriteString("  INSTANCE                              STATE      AGENTS    RETRIES  CHECKS\n")
+			for index, instance := range m.instances {
+				mark := " "
+				if index == m.selected {
+					mark = ">"
+				}
+				active, capacity, retries := instanceActivity(instance)
+				fmt.Fprintf(&b, "%s %-36s %-10s %2d/%-3d    %-7d  %s\n", mark, truncate(instance.ID, 36), livenessLabel(instance.Liveness), active, capacity, retries, findingsIndicator(instance.Findings))
+			}
+			b.WriteString("\n")
+		}
+		b.WriteString("up/down or j/k: select  Enter: inspect  r: refresh  q: quit\n")
+		return b.String()
+	}
+	sections := []string{
+		lipgloss.JoinVertical(lipgloss.Left,
+			style.title.Render("Symphony operator view"),
+			style.subtle.Render(fmt.Sprintf("%d instances · %d running · %d stopped · %d stale · %d invalid · refreshed %s",
+				len(m.instances), running, stopped, stale, invalid, formatAge(now, m.updatedAt))),
+		),
+		"",
+	}
 	if m.message != "" {
-		fmt.Fprintf(&b, "%s\n\n", m.message)
+		sections = append(sections, style.subtle.Render(m.message), "")
 	}
 	if len(m.instances) == 0 {
-		b.WriteString("No convention-matching LaunchAgents were found.\n\n")
+		sections = append(sections, style.frame("No convention-matching LaunchAgents were found."))
 	} else {
-		b.WriteString("  INSTANCE                              STATE      AGENTS    RETRIES  CHECKS\n")
-		for index, instance := range m.instances {
-			mark := " "
-			if index == m.selected {
-				mark = ">"
-			}
-			capacity, active, retries := 0, 0, 0
-			if instance.Config != nil {
-				capacity = instance.Config.MaxConcurrentAgents
-			}
-			if instance.Snapshot != nil {
-				active = len(instance.Snapshot.Coordinator.Running)
-				retries = len(instance.Snapshot.Coordinator.Retrying)
-			}
-			fmt.Fprintf(&b, "%s %-36s %-10s %2d/%-3d    %-7d  %s\n", mark, truncate(instance.ID, 36), instance.Liveness, active, capacity, retries, findingsIndicator(instance.Findings))
-		}
-		b.WriteString("\n")
+		sections = append(sections, m.instanceTable(style))
 	}
-	b.WriteString("up/down or j/k: select  Enter: inspect  r: refresh  q: quit\n")
-	return b.String()
+	sections = append(sections, "", style.subtle.Render("j/k select · ⏎ inspect · r refresh · q quit"))
+	return lipgloss.JoinVertical(lipgloss.Left, sections...) + "\n"
+}
+
+// instanceTable draws the overview as a real table, so the column widths are
+// computed from the content rather than hand-counted. The old header was a
+// literal string and had drifted one column out of step with its rows.
+func (m Model) instanceTable(style theme) string {
+	rows := make([][]string, 0, len(m.instances))
+	for index, instance := range m.instances {
+		marker := "  "
+		name := instance.ID
+		if style.width > 0 {
+			name = truncate(name, max(24, style.width/3))
+		}
+		if index == m.selected {
+			// A marker and weight rather than a row background: the state and
+			// checks cells carry their own foreground colors, and a row
+			// background does not reach inside them, which renders patchy.
+			marker = "▸ "
+			name = style.title.Render(name)
+		}
+		active, capacity, retries := instanceActivity(instance)
+		rows = append(rows, []string{
+			marker + name,
+			style.liveness(instance.Liveness),
+			fmt.Sprintf("%d/%d", active, capacity),
+			fmt.Sprintf("%d", retries),
+			style.checks(instance.Findings),
+		})
+	}
+	rendered := table.New().
+		Border(lipgloss.RoundedBorder()).
+		BorderStyle(lipgloss.NewStyle().Foreground(lipgloss.BrightBlack)).
+		BorderColumn(false).
+		Headers("INSTANCE", "STATE", "AGENTS", "RETRIES", "CHECKS").
+		Rows(rows...).
+		StyleFunc(func(row, _ int) lipgloss.Style {
+			if row == table.HeaderRow {
+				return lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Cyan).Padding(0, 1)
+			}
+			return lipgloss.NewStyle().Padding(0, 1)
+		})
+	if style.width > 0 {
+		rendered = rendered.Width(style.width)
+	}
+	return rendered.String()
+}
+
+// instanceActivity reads the agent and retry counts an instance publishes,
+// tolerating the snapshot and configuration both being absent.
+func instanceActivity(instance operator.Instance) (active, capacity, retries int) {
+	if instance.Config != nil {
+		capacity = instance.Config.MaxConcurrentAgents
+	}
+	if instance.Snapshot != nil {
+		active = len(instance.Snapshot.Coordinator.Running)
+		retries = len(instance.Snapshot.Coordinator.Retrying)
+	}
+	return active, capacity, retries
 }
 
 func (m Model) writeStatus(b *strings.Builder, instance operator.Instance, now time.Time) {
@@ -363,6 +597,7 @@ func runPlain(ctx context.Context, input io.Reader, output io.Writer, discover D
 // runInteractive drives the same Model from a terminal. Interruption is a
 // normal way to close a read-only view, so it is not reported as a failure.
 func runInteractive(ctx context.Context, input io.Reader, output io.Writer, discover Discover, model Model) error {
+	model.styled = true
 	view := &app{model: model, discover: discover, ctx: ctx}
 	program := tea.NewProgram(view,
 		tea.WithContext(ctx),
@@ -425,8 +660,9 @@ func (a *app) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		a.model.Refresh(message.instances, message.err, time.Now())
 		return a, nil
 	case tea.WindowSizeMsg:
-		// Recorded for the styled renderer, which sizes itself to the window.
 		a.width, a.height = message.Width, message.Height
+		// The renderer sizes its panels and table to the window.
+		a.model.width = message.Width
 		return a, nil
 	case tea.KeyPressMsg:
 		return a.press(message.String())
@@ -453,7 +689,11 @@ func (a *app) press(pressed string) (tea.Model, tea.Cmd) {
 	return a, nil
 }
 
-func (a *app) View() tea.View { return tea.NewView(a.model.View(time.Now())) }
+func (a *app) View() tea.View {
+	view := tea.NewView(a.model.View(time.Now()))
+	view.AltScreen = true
+	return view
+}
 
 func launchdText(status operator.LaunchdStatus) string {
 	if !status.Loaded {
@@ -572,9 +812,19 @@ func empty(value string) string {
 	return value
 }
 
+// truncate shortens a value to a display width. It counts display cells and
+// cuts on rune boundaries, so a multibyte identifier is neither mismeasured
+// nor split part way through a character.
 func truncate(value string, max int) string {
-	if len(value) <= max {
+	if max <= 0 {
+		return ""
+	}
+	if lipgloss.Width(value) <= max {
 		return value
 	}
-	return value[:max-1] + "…"
+	runes := []rune(value)
+	if len(runes) > max-1 {
+		runes = runes[:max-1]
+	}
+	return string(runes) + "…"
 }
