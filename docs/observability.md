@@ -87,6 +87,31 @@ ones — comes from one bounded vocabulary of fixed literals
 (`internal/observability`), so a log query can rely on the field's values
 instead of matching per-call-site strings.
 
+Landing decisions Symphony settles for the agent are visible at info level
+too, so a pending GitHub gate is never mistaken for an agent problem. A
+non-terminal landing wait logs `"msg":"agent landing waiting"` with
+`operation: landing_waiting` and the bounded, host-generated `reason`
+(`required checks are pending`, `github has not yet computed mergeability`, …),
+followed by `"msg":"landing wait retry scheduled"` (same `operation`, plus
+`attempt`, `wait_attempt`, and `delay_ms`; it is logged only once the retry was
+actually armed) and the ordinary `"msg":"agent retry scheduled"` record carrying
+`retry_kind: landing`. A landing retry is always identified by that
+`retry_kind`; its `reason` is `landing_waiting`, or `landing_slot_unavailable`
+when the redispatch had to queue behind the state's concurrency limit. The
+`wait_attempt` count is the "this landing is stuck" signal — the agent `attempt`
+deliberately stays put for a non-failure, while consecutive waits escalate
+`delay_ms` from `github.poll_interval_ms` toward `agent.max_retry_backoff_ms`
+and also appear as `wait_attempt` in the coordinator snapshot's `retrying`
+entries. The run itself finishes as
+`"status":"waiting"` in `"msg":"agent logical run finished"` — deliberately
+distinct from the `blocked`/`failed` statuses and from an agent failure's
+warn-level `"msg":"agent run retry scheduled"` (`reason: turn_limit_exhausted`
+and friends). A terminal landing logs `"msg":"agent landing resolved"` with
+`operation: landing_resolved`, and the hard-gate fallback keeps its existing
+`"msg":"Linear transition"` record with `operation: landing_refused`. Together
+these four records distinguish waiting, the delayed retry, a hard refusal, and
+an agent failure without reading the Codex rollout.
+
 At startup, the info log also records `startup credential configuration` with
 `linear_credentials_configured` and `github_credentials_configured` booleans.
 They confirm that the required Linear credential and any configured GitHub

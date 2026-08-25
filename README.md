@@ -80,9 +80,13 @@ depends on the agent. A Codex session then:
    `In Review`.
 4. Is dispatched again, with only the bounded zero-argument `github_land_pr`
    tool, when a human moves the issue to `Merging`: that move is itself the
-   approval to land. Pending checks wait without changing Linear state; any
-   other hard gate returns the issue to `In Review`; a successful or
-   already-completed merge reconciles the issue to `Done`.
+   approval to land. Pending checks wait without changing Linear state: the
+   run ends there and Symphony itself redispatches landing after the
+   configured `github.poll_interval_ms` (escalating toward
+   `agent.max_retry_backoff_ms` while the gate stays unsettled), so a wait
+   spends no further model turns. Any other hard gate returns the issue to `In Review`; a successful or
+   already-completed merge reconciles the issue to `Done` and closes the
+   landing tool for that run.
 
 Four-agent operation allows up to four implementation/rework sessions to run
 concurrently (`agent.max_concurrent_agents: 4`). Landing remains serialized
@@ -310,12 +314,24 @@ pull request, required checks, effective review state (moving the issue to
 approval; no separate approving review is required), unresolved review
 threads, mergeability, and current base immediately before merging, and
 transitions only the bound issue to `Done` on success. Pending checks wait
-without changing Linear state. With `github.update_stale_branch: true`, one
+without changing Linear state, and a wait is settled host-side rather than by
+the model: the run ends immediately, releases its concurrency slot, and the
+coordinator schedules one delayed landing redispatch, so a pending gate can
+never consume `agent.max_turns` or an agent-exhaustion retry. That redispatch
+starts at `github.poll_interval_ms` and escalates with each consecutive wait
+toward `agent.max_retry_backoff_ms`, so a gate that never settles — including a
+`required_checks` name that matches no GitHub job — backs off to a slow poll
+with a climbing `wait_attempt` in the log and snapshot instead of respawning a
+session every interval. Symphony never gives up on it by itself: returning the
+issue to review remains the landing capability's own bounded fallback.
+A terminal result (merged, already merged, or a completed reconciliation) ends
+the run the same way and closes `github_land_pr` for it, so a normal landing
+invokes the capability exactly once. With `github.update_stale_branch: true`, one
 clean stale-base update also waits for checks on its new head; any other hard
-gate falls back to the configured `merge_state -> In Review` transition.
-Duplicate landing calls, and a GitHub merge that succeeds despite a failed Linear
-completion, are reconciled idempotently rather than merging or transitioning
-twice. Symphony never merges a pull request outside this narrow, explicitly
+gate falls back to the configured `merge_state -> In Review` transition exactly
+once. Duplicate landing calls, and a GitHub merge that succeeds despite a failed
+Linear completion, remain reconciled idempotently as a recovery path rather than
+merging or transitioning twice. Symphony never merges a pull request outside this narrow, explicitly
 configured capability.
 
 ## Operator prerequisites for the canonical lifecycle

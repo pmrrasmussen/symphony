@@ -97,6 +97,10 @@ codex:
 #   base_branch: main
 #   token_file: $SYMPHONY_GITHUB_TOKEN_FILE
 #   # Alternatively: token: $SYMPHONY_GITHUB_TOKEN
+#   # Paces the linked pull-request poll loop, and is also the floor for the
+#   # delayed landing redispatch after github_land_pr reports a non-terminal
+#   # wait (pending checks or undetermined mergeability). Consecutive waits
+#   # escalate that delay toward agent.max_retry_backoff_ms.
 #   poll_interval_ms: 30000
 #   # Optional landing capability. A session bound to an issue currently in
 #   # this exact Linear state receives a zero-argument github_land_pr tool;
