@@ -5,10 +5,12 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
 
+	"github.com/pmrrasmussen/symphony/internal/config"
 	"github.com/pmrrasmussen/symphony/internal/operator"
 )
 
@@ -322,4 +324,21 @@ func fmtError(err error) string {
 		return ""
 	}
 	return err.Error()
+}
+
+// TestReservedNamesCoverTheServiceCredentialVariables holds two lists together
+// that live in different packages for different reasons: the plist variables
+// this installer hands to the daemon, and config.ReservedSecretEnvNames, the
+// names no agent child may inherit. The direction is opposite but the names must
+// agree -- a credential variable this installer exports into the daemon that the
+// reserved list does not carry would be inherited by every agent child, whatever
+// the workflow configured. Neither list can import the other's role, so this is
+// what keeps "one definition" honest across the split.
+func TestReservedNamesCoverTheServiceCredentialVariables(t *testing.T) {
+	reserved := config.ReservedSecretEnvNames()
+	for _, name := range []string{linearKeyEnvironment, githubKeyEnvironment} {
+		if !slices.Contains(reserved, name) {
+			t.Fatalf("the LaunchAgent sets %s but config.ReservedSecretEnvNames does not block it, so every agent child would inherit it: %v", name, reserved)
+		}
+	}
 }

@@ -1568,3 +1568,44 @@ func boundBackend(t *testing.T) (*Backend, string, config.Settings) {
 	t.Cleanup(func() { _ = endpoint.Close(context.Background()) })
 	return NewWithProviders(snapshot, linear.NewHandoff(snapshot), githubhost.New(snapshot, nil), endpoint), t.TempDir(), settings
 }
+
+// TestABoundGitHubManagerWithoutAHandoffStillStripsItsToken is the counterpart
+// to internal/codex's test of the same name, and the same hole: a workflow with
+// github.enabled but no handoff_state prepares no Linear handoff, so
+// githubhost.Manager.PrepareWithSettings returns no session, so the session's
+// matcher had nothing to consult and answered false for every candidate --
+// including the forge token the bound manager holds. Both backends built that
+// matcher themselves, identically, which is why capability.SecretMatcher now
+// owns it and takes the manager as its fallback.
+func TestABoundGitHubManagerWithoutAHandoffStillStripsItsToken(t *testing.T) {
+	settings := config.Settings{
+		Tracker: config.Tracker{Provider: map[string]any{"api_key": "provider-tracker-key"}, ActiveStates: []string{"Todo"}},
+		GitHub: config.GitHub{Enabled: true, Owner: "owner", Repository: "repo", BaseBranch: "main",
+			Token: "provider-forge-token", Endpoint: "https://api.github.com", MergeState: "Merging", MergeMethod: "merge"},
+	}
+	snapshot := func() config.Settings { return settings }
+	dir := t.TempDir()
+	script := writeFakeClaude(t, dir, "cat <<'EOF'\n"+initLine(dir, allCodingTools)+"\n"+resultLine(false, "")+"\nEOF\n")
+	t.Setenv("PMR94_INHERITED_FORGE", "prefix-provider-forge-token-suffix")
+	t.Setenv("PMR94_KEPT", "ordinary-value")
+
+	// No handoff provider at all, so nothing can prepare a GitHub session: the
+	// manager is the only thing that knows this token.
+	backend := NewWithProviders(snapshot, nil, githubhost.New(snapshot, nil), nil)
+	r := request(t, dir, script)
+	r.Issue = domain.Issue{ID: "issue-1", Identifier: "PMR-94", State: "Todo"}
+	_, events, err := backend.Start(context.Background(), r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lastKind(t, drain(t, events)).Kind != domain.EventCompleted {
+		t.Fatal("the session did not complete")
+	}
+	environment := readFile(t, filepath.Join(dir, "env.txt"))
+	if strings.Contains(environment, "provider-forge-token") {
+		t.Fatal("a bound GitHub manager's token reached the child because no session was prepared to match it")
+	}
+	if !strings.Contains(environment, "ordinary-value") {
+		t.Fatal("the manager fallback removed unrelated variables")
+	}
+}

@@ -11,7 +11,10 @@ handoff, rework, landing, and completion instructions. Read it, and
 ## Layout
 
 - `cmd/symphony` — the CLI entry point (`--workflow`, `--dry-run`, `--logs-root`, `--log-level`).
-- `internal/config` — loads and validates `WORKFLOW.md`.
+- `internal/config` — loads and validates `WORKFLOW.md`, and owns the reserved
+  host credential variable names plus the one description of the four-part filter
+  both backends apply to an agent child environment (`ReservedSecretEnvNames`).
+  The other three parts are derived and applied by the backends.
 - `internal/coordinator` — the scheduling core: polling, capacity, retries, and reconciliation.
 - `internal/linear` — the Linear GraphQL tracker adapter and the host-side review handoff, transitions, and bounded `create_followup_issue` tooling.
 - `internal/github` — the optional, fixed-repository GitHub PR publish/context/land adapter.

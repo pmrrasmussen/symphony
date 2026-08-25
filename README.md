@@ -216,12 +216,15 @@ repository enables it, not the limit of what it permits. Omit
 `turn_sandbox_policy` to leave outbound access denied.
 
 Host-owned Linear and GitHub secrets are absent from the Codex child
-**environment**: Symphony strips them by variable name and by value before
-launch, so no host credential is handed to the worker as a variable, and all
-publishing authority stays with the host. That guarantee covers the
-environment, not reachability and not files on disk. With both local reads and
-outbound network available to the worker, what protects host credentials from
-exfiltration is that no untrusted input reaches the worker -- the issue text
+**environment**: Symphony strips them before launch by reserved name, by
+configured name, by configured value, and by the credential the run's bound
+providers hold, so no host credential is handed to the worker as a variable, and
+all publishing authority stays with the host. The same filter applies to both
+backends; [docs/architecture.md](docs/architecture.md) describes it in full.
+That guarantee covers the environment, not reachability and not files on disk.
+With both local reads and outbound network available to the worker, what
+protects host credentials from exfiltration is that no untrusted input reaches
+the worker -- the issue text
 and repository content it acts on are operator-owned -- rather than the sandbox
 itself.
 
@@ -565,7 +568,8 @@ Five limits of that boundary, stated rather than implied:
 
 So the operative boundary has nearly the same shape as the Codex one: Bash
 writes confined, no host Linear or GitHub credential in the child environment
-(stripped by variable name and by value, exactly as for Codex), but local reads
+(stripped by the same filter as Codex, described in
+[docs/architecture.md](docs/architecture.md)), but local reads
 and outbound network both available -- and, unlike the Codex profile, the
 file-editing tools sitting outside the sandbox entirely, per limit 1. What
 protects host credentials from exfiltration is that no untrusted input reaches

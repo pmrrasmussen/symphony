@@ -1393,3 +1393,251 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{}}'
 		}
 	}
 }
+
+// TestNoHostCredentialReachesTheChildEnvironment is this backend's whole-boundary
+// proof of the guarantee config.ReservedSecretEnvNames documents. Its counterpart
+// is internal/claude's TestHostSecretsNeverReachTheChild, so a filter cannot hold
+// on one transport and not the other.
+//
+// The reserved names are written out here rather than read from
+// config.ReservedSecretEnvNames, deliberately: a test that iterates the list
+// asserts nothing about its contents, and dropping an entry would leave it
+// green. Before this test, dropping any of the five left this whole package
+// green -- LINEAR_API_KEY included, because the one test that set it gave it a
+// value that a configured HostSecretValues entry also matched, so the name
+// filter was never what removed it.
+//
+// The provider case is the acceptance criterion in full: PMR94_INHERITED_FORGE
+// and PMR94_INHERITED_TRACKER carry the bound GitHub and Linear sessions' own
+// credentials under names no list mentions, and neither credential appears in
+// HostSecretEnvNames or HostSecretValues, so only the session's provider matcher
+// can see them.
+func TestNoHostCredentialReachesTheChildEnvironment(t *testing.T) {
+	tracker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		var query struct {
+			Query string `json:"query"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&query); err != nil {
+			t.Error(err)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.Contains(query.Query, "SymphonyLinearHandoffIssue"):
+			_, _ = w.Write([]byte(`{"data":{"issue":{"id":"issue-1","identifier":"PMR-94","title":"Filter","description":"safe",` +
+				`"url":"https://linear.app/issue/PMR-94","project":{"slugId":"project-1"},"team":{"id":"team-1"},` +
+				`"state":{"id":"todo","name":"Todo"}}}}`))
+		case strings.Contains(query.Query, "SymphonyLinearHandoffStates"):
+			_, _ = w.Write([]byte(`{"data":{"team":{"id":"team-1","states":{"nodes":[{"id":"review","name":"In Review"}]}}}}`))
+		default:
+			t.Errorf("unexpected query: %s", query.Query)
+		}
+	}))
+	defer tracker.Close()
+
+	// Filter 1: the reserved names, whatever the workflow says. Each value is
+	// unique and is matched by no other filter, so only the name can remove it.
+	reserved := map[string]string{
+		"LINEAR_API_KEY":               "reserved-linear-key-value",
+		"SYMPHONY_LINEAR_API_KEY_FILE": "/private/reserved-linear-key-path",
+		"GITHUB_TOKEN":                 "reserved-forge-token-value",
+		"SYMPHONY_GITHUB_TOKEN":        "reserved-symphony-forge-token-value",
+		"SYMPHONY_GITHUB_TOKEN_FILE":   "/private/reserved-forge-token-path",
+	}
+	for name, value := range reserved {
+		t.Setenv(name, value)
+	}
+	// Filter 2: a configured name. Filter 3: a configured value under a name no
+	// list mentions. Filter 4: the bound provider session's own credential,
+	// under a name no list mentions and with no configured value at all.
+	t.Setenv("PMR94_CONFIGURED_NAME", "configured-name-value")
+	t.Setenv("PMR94_PADDED_NAME", "padded-name-value")
+	t.Setenv("PMR94_INHERITED_CONFIGURED", "Bearer configured-secret-value")
+	t.Setenv("PMR94_INHERITED_FORGE", "prefix-provider-forge-token-suffix")
+	t.Setenv("PMR94_INHERITED_TRACKER", "wraps provider-tracker-key inside")
+	t.Setenv("PMR94_KEPT", "ordinary-value")
+
+	settings := config.Settings{
+		Tracker: config.Tracker{
+			Provider:     map[string]any{"api_key": "provider-tracker-key", "project_slug_id": "project-1", "endpoint": tracker.URL},
+			ActiveStates: []string{"Todo"}, HandoffState: "In Review",
+		},
+		GitHub: config.GitHub{Enabled: true, Owner: "owner", Repository: "repo", BaseBranch: "main",
+			Token: "provider-forge-token", Endpoint: tracker.URL, MergeState: "Merging", MergeMethod: "merge"},
+		// The padded name is the parity case: internal/claude's filteredEnv trims
+		// and skips empties, and this backend must not be looser about the same
+		// hand-assembled Settings that filter 4 exists for.
+		HostSecretEnvNames: []string{"PMR94_CONFIGURED_NAME", "  PMR94_PADDED_NAME  ", "   "},
+		HostSecretValues:   []string{"configured-secret-value"},
+	}
+	dir := t.TempDir()
+	environment := filepath.Join(dir, "environment")
+	script := writeAppServer(t, dir, `
+env > `+environment+`
+IFS= read -r line
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'
+IFS= read -r line
+IFS= read -r line
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thread-1"}}}'
+IFS= read -r line
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn-1"}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{}}'
+`)
+	b := integratedBackend(func() config.Settings { return settings })
+	r := request(dir, script)
+	r.Issue = domain.Issue{ID: "issue-1", Identifier: "PMR-94", State: "Todo"}
+	if _, events, err := b.Start(context.Background(), r); err != nil {
+		t.Fatal(err)
+	} else {
+		for range events {
+		}
+	}
+	child := readChildEnvironment(t, environment)
+	names := childEnvironmentNames(child)
+	for name, value := range reserved {
+		if slices.Contains(names, name) {
+			t.Fatalf("child environment retained reserved variable %s", name)
+		}
+		if strings.Contains(child, value) {
+			t.Fatalf("child environment retained the value of reserved variable %s", name)
+		}
+	}
+	for _, leaked := range []string{"configured-name-value", "padded-name-value",
+		"configured-secret-value", "provider-forge-token", "provider-tracker-key"} {
+		if strings.Contains(child, leaked) {
+			t.Fatalf("child environment retained %q", leaked)
+		}
+	}
+	if !strings.Contains(child, "ordinary-value") {
+		t.Fatal("the host credential filter removed unrelated variables")
+	}
+}
+
+// childEnvironmentNames reads the variable names out of `env` output, so an
+// absence assertion on one name cannot be satisfied by another name that merely
+// ends with it -- GITHUB_TOKEN inside SYMPHONY_GITHUB_TOKEN, for example.
+//
+// Only a line whose prefix is shaped like a variable name counts, because a
+// developer or CI machine can hold a multi-line value whose continuation lines
+// would otherwise read as names and produce a confusing failure.
+func childEnvironmentNames(child string) []string {
+	var names []string
+	for _, line := range strings.Split(child, "\n") {
+		if name, _, found := strings.Cut(line, "="); found && environmentName(name) {
+			names = append(names, name)
+		}
+	}
+	return names
+}
+
+func environmentName(candidate string) bool {
+	if candidate == "" {
+		return false
+	}
+	for i, r := range candidate {
+		digit := r >= '0' && r <= '9'
+		if !(r == '_' || r >= 'A' && r <= 'Z' || r >= 'a' && r <= 'z' || digit && i > 0) {
+			return false
+		}
+	}
+	return true
+}
+
+func readChildEnvironment(t *testing.T, path string) string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(data)
+}
+
+// TestABoundGitHubManagerWithoutAHandoffStillStripsItsToken closes a hole the
+// provider matcher had from the day it was written, in both backends
+// identically. githubhost.Manager.PrepareWithSettings returns nil when no Linear
+// handoff was prepared, so a workflow with github.enabled but no handoff_state
+// and no followup_issue_creation leaves a bound manager, no session -- and, until
+// capability.SecretMatcher took the manager as its fallback, a matcher that was
+// live and answered false for every candidate, the forge token included.
+//
+// It was never a leak through a loaded workflow, because HostSecretValues covers
+// the same token there. It is a leak for any Settings not produced by Load,
+// which is the case filter 4 exists for, so leaving it would have made the
+// documented reason false.
+func TestABoundGitHubManagerWithoutAHandoffStillStripsItsToken(t *testing.T) {
+	settings := config.Settings{
+		// No handoff_state and no followup_issue_creation: nothing prepares a
+		// Linear handoff, so nothing prepares a GitHub session either.
+		Tracker: config.Tracker{Provider: map[string]any{"api_key": "provider-tracker-key"}, ActiveStates: []string{"Todo"}},
+		GitHub: config.GitHub{Enabled: true, Owner: "owner", Repository: "repo", BaseBranch: "main",
+			Token: "provider-forge-token", Endpoint: "https://api.github.com", MergeState: "Merging", MergeMethod: "merge"},
+	}
+	t.Setenv("PMR94_INHERITED_FORGE", "prefix-provider-forge-token-suffix")
+	t.Setenv("PMR94_KEPT", "ordinary-value")
+	dir := t.TempDir()
+	environment := filepath.Join(dir, "environment")
+	script := writeAppServer(t, dir, `
+env > `+environment+`
+IFS= read -r line
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'
+IFS= read -r line
+IFS= read -r line
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thread-1"}}}'
+IFS= read -r line
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn-1"}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{}}'
+`)
+	b := integratedBackend(func() config.Settings { return settings })
+	r := request(dir, script)
+	r.Issue = domain.Issue{ID: "issue-1", Identifier: "PMR-94", State: "Todo"}
+	if _, events, err := b.Start(context.Background(), r); err != nil {
+		t.Fatal(err)
+	} else {
+		for range events {
+		}
+	}
+	child := readChildEnvironment(t, environment)
+	if strings.Contains(child, "provider-forge-token") {
+		t.Fatal("a bound GitHub manager's token reached the child because no session was prepared to match it")
+	}
+	if !strings.Contains(child, "ordinary-value") {
+		t.Fatal("the manager fallback removed unrelated variables")
+	}
+}
+
+// TestAMalformedEntryIsDroppedAndOnlyValuesReachTheMatcher pins the two smaller
+// halves of backend parity with internal/claude, which has the same test over
+// its own filterEntries. Neither case is reachable through os.Environ(), which
+// is why the loop takes an explicit entry list.
+//
+// The name half matters beyond tidiness: a matcher fed a whole entry would strip
+// any variable whose *name* happened to contain a credential-shaped string,
+// silently removing something the child needs.
+func TestAMalformedEntryIsDroppedAndOnlyValuesReachTheMatcher(t *testing.T) {
+	var offered []string
+	kept := filterEntries(
+		[]string{"MALFORMED_NO_EQUALS", "PMR94_KEEP=ordinary", "PMR94_SECRET=carries-the-token"},
+		nil,
+		func(candidate string) bool {
+			offered = append(offered, candidate)
+			return strings.Contains(candidate, "the-token")
+		},
+	)
+	if slices.Contains(kept, "MALFORMED_NO_EQUALS") {
+		t.Fatalf("an entry carrying no \"=\" was forwarded to the child: %v", kept)
+	}
+	if slices.Contains(kept, "PMR94_SECRET=carries-the-token") {
+		t.Fatalf("a matched value survived: %v", kept)
+	}
+	if !slices.Contains(kept, "PMR94_KEEP=ordinary") {
+		t.Fatalf("an ordinary variable was dropped: %v", kept)
+	}
+	// Only values, never names or whole entries: "MALFORMED_NO_EQUALS" must not
+	// appear, and neither must "PMR94_SECRET=carries-the-token".
+	for _, candidate := range offered {
+		if strings.Contains(candidate, "PMR94_") || candidate == "MALFORMED_NO_EQUALS" {
+			t.Fatalf("the matcher was offered a name or a whole entry: %q", candidate)
+		}
+	}
+}

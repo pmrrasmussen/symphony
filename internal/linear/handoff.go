@@ -131,9 +131,10 @@ type HandoffSession struct {
 	handoffMu                    sync.Mutex
 }
 
-// MatchesSecret lets the Codex launcher remove inherited values containing the
+// MatchesSecret lets a launcher remove inherited values containing the
 // configured credential without exposing the credential itself across the
-// adapter boundary. It is never sent to Codex, returned by a tool, or logged.
+// adapter boundary. Both backends reach it through capability.SecretMatcher. It
+// is never sent to an agent, returned by a tool, or logged.
 func (s *HandoffSession) MatchesSecret(candidate string) bool {
 	value, _ := s.settings.Tracker.Provider["api_key"].(string)
 	return value != "" && strings.Contains(candidate, value)
