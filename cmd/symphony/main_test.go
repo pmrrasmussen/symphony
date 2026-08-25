@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"log/slog"
 	"os"
@@ -11,7 +12,9 @@ import (
 
 	"github.com/pmrrasmussen/symphony/internal/config"
 	"github.com/pmrrasmussen/symphony/internal/observability"
+	"github.com/pmrrasmussen/symphony/internal/operator"
 	"github.com/pmrrasmussen/symphony/internal/preflight"
+	"github.com/pmrrasmussen/symphony/internal/tui"
 )
 
 func TestRunAcceptsPositionalWorkflowForDryRun(t *testing.T) {
@@ -100,6 +103,24 @@ func TestRunRejectsUndocumentedLogLevel(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "--log-level") {
 		t.Fatalf("stderr did not explain the rejected flag: %s", stderr.String())
+	}
+}
+
+func TestRunTUIIsReadOnlyAndExitsCleanly(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	calls := 0
+	discover := tui.Discover(func(_ context.Context, _ operator.Options) ([]operator.Instance, error) {
+		calls++
+		return []operator.Instance{{ID: "com.pmrrasmussen.symphony.test", Liveness: operator.LivenessStopped}}, nil
+	})
+	if code := runTUI(nil, strings.NewReader("q\n"), &stdout, &stderr, discover); code != 0 {
+		t.Fatalf("exit=%d stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if calls != 1 || !strings.Contains(stdout.String(), "Symphony operator view") {
+		t.Fatalf("calls=%d stdout=%s", calls, stdout.String())
+	}
+	if code := runTUI([]string{"--workflow", "x"}, strings.NewReader(""), &stdout, &stderr, discover); code != 2 {
+		t.Fatalf("flagged tui exit=%d", code)
 	}
 }
 

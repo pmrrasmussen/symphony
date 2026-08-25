@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -29,6 +30,7 @@ const (
 	LabelPrefix       = "com.pmrrasmussen.symphony"
 	defaultStatusAge  = 2 * time.Minute
 	defaultLogEntries = 20
+	maxRecentLogBytes = 64 * 1024
 )
 
 const labelPrefix = LabelPrefix
@@ -100,6 +102,8 @@ type EffectiveConfig struct {
 	WorkspaceRoot        string         `json:"workspace_root,omitempty"`
 	WorkspaceSource      string         `json:"workspace_source,omitempty"`
 	CodexCommand         string         `json:"codex_command,omitempty"`
+	CodexApprovalPolicy  string         `json:"codex_approval_policy,omitempty"`
+	CodexThreadSandbox   string         `json:"codex_thread_sandbox,omitempty"`
 	TurnTimeout          time.Duration  `json:"turn_timeout"`
 	ReadTimeout          time.Duration  `json:"read_timeout"`
 	StartTimeout         time.Duration  `json:"start_timeout"`
@@ -108,14 +112,66 @@ type EffectiveConfig struct {
 	GitHubRepository     string         `json:"github_repository,omitempty"`
 	GitHubBaseBranch     string         `json:"github_base_branch,omitempty"`
 	GitHubMergeMethod    string         `json:"github_merge_method,omitempty"`
+	GitHubRequiredChecks []string       `json:"github_required_checks,omitempty"`
 	Credentials          Credentials    `json:"credentials"`
 }
 
-// Snapshot is intentionally small so arbitrary state-file content is never
-// reflected into the UI.
+// Snapshot is the display-safe subset of status.Snapshot. It deliberately
+// mirrors only the status-file contract, rather than exposing coordinator
+// internals or arbitrary status-file fields to operator clients.
 type Snapshot struct {
-	State     string    `json:"state,omitempty"`
-	UpdatedAt time.Time `json:"updated_at,omitempty"`
+	SchemaVersion int             `json:"schema_version,omitempty"`
+	PID           int             `json:"pid,omitempty"`
+	StartedAt     time.Time       `json:"process_started_at,omitempty"`
+	GeneratedAt   time.Time       `json:"generated_at,omitempty"`
+	State         string          `json:"state,omitempty"`
+	Coordinator   RuntimeSnapshot `json:"coordinator"`
+
+	// UpdatedAt is retained for discovery's freshness calculation and older
+	// status snapshots. It is not a separate field in the current contract.
+	UpdatedAt time.Time `json:"-"`
+}
+
+// RuntimeSnapshot contains only fixed operational metadata made public by
+// the runtime status contract.
+type RuntimeSnapshot struct {
+	Claimed  int               `json:"claimed"`
+	Running  []RunningSnapshot `json:"running"`
+	Retrying []RetrySnapshot   `json:"retrying"`
+	Stopping bool              `json:"stopping"`
+}
+
+type RunningSnapshot struct {
+	IssueIdentifier      string                `json:"issue_identifier"`
+	IssueState           string                `json:"issue_state"`
+	Attempt              int                   `json:"attempt"`
+	TurnCount            int                   `json:"turn_count"`
+	StartedAt            time.Time             `json:"started_at"`
+	LastActivityAt       time.Time             `json:"last_activity_at"`
+	Usage                Usage                 `json:"usage"`
+	RateLimit            map[string]int64      `json:"rate_limit,omitempty"`
+	OutstandingOperation *OutstandingOperation `json:"outstanding_operation,omitempty"`
+}
+
+type Usage struct {
+	InputTokens  int64 `json:"input_tokens"`
+	OutputTokens int64 `json:"output_tokens"`
+	TotalTokens  int64 `json:"total_tokens"`
+}
+
+type OutstandingOperation struct {
+	Type      string    `json:"type"`
+	Name      string    `json:"name,omitempty"`
+	StartedAt time.Time `json:"started_at"`
+	AgeMS     int64     `json:"age_ms"`
+}
+
+type RetrySnapshot struct {
+	IssueIdentifier string    `json:"issue_identifier"`
+	Attempt         int       `json:"attempt"`
+	Kind            string    `json:"kind"`
+	Reason          string    `json:"reason"`
+	Due             time.Time `json:"due_at"`
 }
 
 // LogEvent exposes the fixed structured-log envelope, not arbitrary log
@@ -400,9 +456,11 @@ func inspectWorkflow(instance *Instance, environment map[string]string) []string
 		MaxConcurrentByState: copyLimits(settings.Agent.ByState), MaxTurns: settings.Agent.MaxTurns,
 		WorkspaceRoot: settings.Workspace.Root, WorkspaceSource: settings.Workspace.SourceRoot,
 		CodexCommand: settings.Codex.Command, TurnTimeout: settings.Codex.TurnTimeout, ReadTimeout: settings.Codex.ReadTimeout,
+		CodexApprovalPolicy: settings.Codex.ApprovalPolicy, CodexThreadSandbox: settings.Codex.ThreadSandbox,
 		StartTimeout: settings.Codex.StartTimeout, StallTimeout: settings.Codex.StallTimeout,
 		GitHubOwner: settings.GitHub.Owner, GitHubRepository: settings.GitHub.Repository, GitHubBaseBranch: settings.GitHub.BaseBranch,
-		GitHubMergeMethod: settings.GitHub.MergeMethod, Credentials: credentialPresence(workflow.Raw, instance.Paths.Workflow, environment),
+		GitHubMergeMethod: settings.GitHub.MergeMethod, GitHubRequiredChecks: append([]string(nil), settings.GitHub.RequiredChecks...),
+		Credentials: credentialPresence(workflow.Raw, instance.Paths.Workflow, environment),
 	}
 	for _, check := range preflight.RunWithEnvironment(context.Background(), instance.Paths.Workflow, instance.Paths.LogsRoot, environment).Checks {
 		if check.Status == preflight.StatusPassed {
@@ -539,15 +597,21 @@ func readSnapshot(path string) (*Snapshot, error) {
 		return nil, err
 	}
 	var raw struct {
-		State          string `json:"state"`
-		UpdatedAt      string `json:"updated_at"`
-		UpdatedAtCamel string `json:"updatedAt"`
-		Timestamp      string `json:"timestamp"`
-		UpdatedAtMS    int64  `json:"updated_at_ms"`
+		SchemaVersion  int             `json:"schema_version"`
+		PID            int             `json:"pid"`
+		StartedAt      time.Time       `json:"process_started_at"`
+		GeneratedAt    time.Time       `json:"generated_at"`
+		State          string          `json:"state"`
+		Coordinator    RuntimeSnapshot `json:"coordinator"`
+		UpdatedAt      string          `json:"updated_at"`
+		UpdatedAtCamel string          `json:"updatedAt"`
+		Timestamp      string          `json:"timestamp"`
+		UpdatedAtMS    int64           `json:"updated_at_ms"`
 	}
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return nil, fmt.Errorf("parse status snapshot: %w", err)
 	}
+	updated := raw.GeneratedAt
 	text := raw.UpdatedAt
 	if text == "" {
 		text = raw.UpdatedAtCamel
@@ -555,23 +619,37 @@ func readSnapshot(path string) (*Snapshot, error) {
 	if text == "" {
 		text = raw.Timestamp
 	}
-	var updated time.Time
-	if text != "" {
+	if updated.IsZero() && text != "" {
 		var err error
 		updated, err = time.Parse(time.RFC3339, text)
 		if err != nil {
 			return nil, fmt.Errorf("parse snapshot timestamp: %w", err)
 		}
-	} else if raw.UpdatedAtMS > 0 {
+	} else if updated.IsZero() && raw.UpdatedAtMS > 0 {
 		updated = time.UnixMilli(raw.UpdatedAtMS)
-	} else {
+	} else if updated.IsZero() {
 		return nil, errors.New("status snapshot has no timestamp")
 	}
-	return &Snapshot{State: raw.State, UpdatedAt: updated}, nil
+	return &Snapshot{SchemaVersion: raw.SchemaVersion, PID: raw.PID, StartedAt: raw.StartedAt, GeneratedAt: raw.GeneratedAt, State: raw.State, Coordinator: raw.Coordinator, UpdatedAt: updated}, nil
 }
 
 func recentLog(path string, limit int, secretValues []string) ([]LogEvent, error) {
-	data, err := os.ReadFile(path)
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	start := info.Size() - maxRecentLogBytes
+	if start > 0 {
+		if _, err := file.Seek(start, io.SeekStart); err != nil {
+			return nil, err
+		}
+	}
+	data, err := io.ReadAll(io.LimitReader(file, maxRecentLogBytes))
 	if err != nil {
 		return nil, err
 	}

@@ -20,9 +20,11 @@ import (
 	"github.com/pmrrasmussen/symphony/internal/domain"
 	"github.com/pmrrasmussen/symphony/internal/linear"
 	"github.com/pmrrasmussen/symphony/internal/observability"
+	"github.com/pmrrasmussen/symphony/internal/operator"
 	"github.com/pmrrasmussen/symphony/internal/preflight"
 	"github.com/pmrrasmussen/symphony/internal/service"
 	"github.com/pmrrasmussen/symphony/internal/status"
+	"github.com/pmrrasmussen/symphony/internal/tui"
 	"github.com/pmrrasmussen/symphony/internal/workspace"
 )
 
@@ -33,6 +35,9 @@ func main() {
 func run(args []string, stdout, stderr io.Writer) int {
 	if len(args) > 0 && args[0] == "service" {
 		return runService(args[1:], stdout, stderr)
+	}
+	if len(args) > 0 && args[0] == "tui" {
+		return runTUI(args[1:], os.Stdin, stdout, stderr, operator.Discover)
 	}
 	processStartedAt := time.Now()
 	var workflowPath, logs, logLevelFlag, statusFile string
@@ -251,6 +256,18 @@ func runService(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "usage: symphony service <install|status|restart|uninstall> [flags]")
 		return 2
 	}
+}
+
+func runTUI(args []string, input io.Reader, stdout, stderr io.Writer, discover tui.Discover) int {
+	if len(args) != 0 {
+		fmt.Fprintln(stderr, "symphony tui: this read-only view accepts no flags")
+		return 2
+	}
+	if err := tui.Run(context.Background(), input, stdout, discover); err != nil {
+		fmt.Fprintln(stderr, "symphony tui:", err)
+		return 1
+	}
+	return 0
 }
 
 // logStartupCredentialStatus records whether startup resolved the credentials

@@ -177,6 +177,13 @@ with a separate path for each process (the repository-local convention is
 versioned runtime snapshot, not a liveness authority; see
 [docs/runtime-status.md](docs/runtime-status.md).
 
+Use `symphony tui` for a read-only terminal view across convention-matching
+local Symphony LaunchAgents. It reads launchd observation, each instance's
+safe status snapshot, normalized effective configuration, validation findings,
+and a bounded redacted structured-log tail. `r` refreshes local observations;
+the command does not start, stop, pause, or connect to a Symphony daemon or
+remote Linear, GitHub, or Codex service.
+
 For ongoing repository development, configure `workspace.source_root: .`.
 Symphony then creates one detached Git worktree per issue beneath
 `workspace.root`; each new worktree starts from a freshly fetched
