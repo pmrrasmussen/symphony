@@ -102,10 +102,17 @@ type Backend struct {
 // running, and the capability registry every turn of this run serves.
 type session struct {
 	id string
-	// ctx is the run-lived context Start was given. Capability invocations and
-	// the turn-ended finalizer run on it, never on a turn's or an HTTP request's
-	// context: a killed child cancels those instantly, which is exactly the case
-	// where aborting a merge already in flight would do the damage.
+	// ctx is the run-lived context Start was given. Capability invocations run on
+	// it, never on a turn's or an HTTP request's context: a killed child cancels
+	// those instantly, which is exactly the case where aborting a merge already
+	// in flight would do the damage.
+	//
+	// The turn-ended finalizer is the one thing that does not run on it. The
+	// coordinator stops a run by cancelling this very context and only then
+	// cancelling the session, so it is routinely dead exactly when the deferred
+	// Merging -> In Review transition is owed (PMR-95). The endpoint derives that
+	// finalizer's context itself, dropping this one's cancellation and keeping its
+	// values -- see mcpbridge.finalizerBudget.
 	ctx context.Context
 
 	// registry is built once per run and holds the provider session pointers the
@@ -457,14 +464,13 @@ func reportRetirement(events *sink, expired error) {
 // expired, or a turn-ended finalizer that had not returned. Both are
 // operator-visible facts with no URL, token, argument, or result in them.
 //
-// The finalizer runs on the run-lived session context rather than on a caller's,
-// exactly as the Codex transport's does: a Cancel context is bounded at seconds
-// and a turn context is already cancelled. That is the better of the available
-// contexts, not a live one -- on a hard cancel the coordinator has usually
-// already cancelled the run context too, so the deferred transition runs on a
-// dead context on this backend exactly as it does on Codex. Fixing that means
-// giving a session a context that outlives its run, which is a change to both
-// backends and is tracked separately.
+// The context passed to the revocation is the run's, and it is deliberately not
+// the finalizer's: it carries values and nothing else. The endpoint derives the
+// finalizer's own budgeted context after its drain, because the drain ignores a
+// context by design and is bounded at two minutes, so anything minted here would
+// routinely be spent before the finalizer started (see mcpbridge.finalizerBudget).
+// That is also why nothing here has a cancel to defer: a defer that fired when
+// the revocation returned could cut a still-running transition short.
 //
 // only, when non-nil, retires that registration and nothing else. The turn's own
 // shutdown passes its own registration because by then the session may already

@@ -786,12 +786,27 @@ func (s *Session) fireDeferredRefusal(ctx context.Context) {
 }
 
 // FinalizeLanding fires the deferred Merging -> In Review transition (and its
-// comment) once when the Codex turn ends after a retryable landing gate was hit
+// comment) once when an agent turn ends after a retryable landing gate was hit
 // but landing neither succeeded nor was already refused. It is a safe no-op
 // when the feature is off, when no retryable gate was hit, when landing
 // succeeded, when the last landing outcome was a non-terminal wait (the issue
 // stays in Merging for the coordinator's delayed retry), or when the deferred
 // transition already fired.
+//
+// Two of those conditions are worth naming precisely, because a reader checking
+// which one carries the weight will otherwise get it wrong.
+//
+// The feature check is unreachable by construction and kept only as a statement
+// of intent: retryableGateHit is set exclusively by gate(), which returns through
+// refuse() before setting it whenever the feature is off, so no session can ever
+// reach here with the feature off and a gate on record.
+//
+// The landed check is genuinely redundant with fireDeferredRefusal's own, and
+// deliberately so: this is the guard a reader of this function needs to see, and
+// the case it covers -- a gate hit, then a fix turn's retry that merged -- is the
+// highest-consequence mistake available here, since firing would walk a merged,
+// Done issue back to review with a comment claiming fix attempts were exhausted.
+// Both transports assert that case end to end.
 func (s *Session) FinalizeLanding(ctx context.Context) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

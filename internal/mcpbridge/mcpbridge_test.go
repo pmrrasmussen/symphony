@@ -44,6 +44,14 @@ type stubRegistry struct {
 	mu          sync.Mutex
 	turnEnded   int
 	onTurnEnded func()
+	// finalizerCtx is the context the last turn-ended finalizer was handed, and
+	// finalizerBudgetLeft is how much of a deadline it still had when it got it.
+	// The context the finalizer runs on is not the one Revoke was called with,
+	// and the difference is only observable from inside the finalizer.
+	finalizerCtx         context.Context
+	finalizerErr         error
+	finalizerBudgetLeft  time.Duration
+	finalizerHadDeadline bool
 }
 
 func newRegistry() *stubRegistry {
@@ -57,14 +65,29 @@ func (s *stubRegistry) Lookup(name string) (capability.Capability, bool) {
 	return bound, ok
 }
 
-func (s *stubRegistry) TurnEnded(context.Context) {
+func (s *stubRegistry) TurnEnded(ctx context.Context) {
 	s.mu.Lock()
 	s.turnEnded++
+	s.finalizerCtx = ctx
+	s.finalizerErr = ctx.Err()
+	deadline, ok := ctx.Deadline()
+	s.finalizerHadDeadline = ok
+	if ok {
+		s.finalizerBudgetLeft = time.Until(deadline)
+	}
 	hook := s.onTurnEnded
 	s.mu.Unlock()
 	if hook != nil {
 		hook()
 	}
+}
+
+// finalizerContext reports what the finalizer was handed: whether its context was
+// already done, whether it was budgeted, and how much of that budget was left.
+func (s *stubRegistry) finalizerContext() (error, bool, time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.finalizerErr, s.finalizerHadDeadline, s.finalizerBudgetLeft
 }
 
 func (s *stubRegistry) turnEndedCount() int {
@@ -1263,5 +1286,62 @@ func waitFor(t *testing.T, settled func() bool, what string) {
 			t.Fatalf("timed out waiting for %s", what)
 		}
 		time.Sleep(time.Millisecond)
+	}
+}
+
+// TestTheFinalizersBudgetStartsAfterTheDrain is the regression test for the
+// mistake this endpoint's shape invites (PMR-95). The finalizer needs a context
+// that is live and bounded, and there is exactly one place that can be true: the
+// drain runs first, deliberately ignores every context, and is bounded at two
+// minutes. A budget derived anywhere earlier -- by Revoke, or by Revoke's caller
+// -- shares its clock with that wait and is routinely spent before the finalizer
+// starts, which returns the deferred Merging -> In Review transition to being
+// impossible in exactly the case it exists for.
+//
+// The drain here outlasts the finalizer's whole budget, which is what makes a
+// budget derived too early observable at all.
+func TestTheFinalizersBudgetStartsAfterTheDrain(t *testing.T) {
+	entered := make(chan struct{})
+	server := endpoint(t)
+	server.bounds.finalizer = 200 * time.Millisecond
+	// Long enough to spend a budget minted before it, and short enough that this
+	// test costs a fraction of a second.
+	held := 3 * server.bounds.finalizer
+
+	registry := newRegistry().with("slow", func(context.Context) (capability.Result, *capability.Failure) {
+		close(entered)
+		time.Sleep(held)
+		return capability.Result{Success: true, Payload: "done"}, nil
+	})
+	registration, _ := register(t, server, registry)
+
+	call := asyncCall(t, registration, "slow")
+	awaitSignal(t, entered, "the invocation to start")
+
+	// Revoke's own context is already cancelled, the way the coordinator leaves
+	// it: it stops a run by cancelling the context the session holds and only
+	// then cancels the session. The finalizer must not inherit that either.
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := registration.Revoke(cancelled); err != nil {
+		t.Fatalf("Revoke reported %v, want a clean drain and finalize", err)
+	}
+	await(t, call, "the drained call")
+
+	if count := registry.turnEndedCount(); count != 1 {
+		t.Fatalf("the turn-ended finalizer ran %d times, want exactly 1", count)
+	}
+	failure, budgeted, left := registry.finalizerContext()
+	if failure != nil {
+		t.Fatalf("the finalizer was handed an already-dead context: %v", failure)
+	}
+	if !budgeted {
+		t.Fatal("the finalizer was handed a context with no deadline at all; a hung tracker would hold the revocation for the daemon's lifetime")
+	}
+	// Half the budget is the assertion that matters: a budget minted before the
+	// drain would have had none of it left, and one minted before Revoke would
+	// have had less than nothing.
+	if left < server.bounds.finalizer/2 {
+		t.Fatalf("the finalizer had %s of its %s budget left, so its clock started before the drain", left, server.bounds.finalizer)
 	}
 }

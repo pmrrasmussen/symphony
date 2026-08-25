@@ -91,6 +91,40 @@ const (
 	// network-hung git process no matter what the drain does.
 	finalizeTimeout = 30 * time.Second
 
+	// finalizerBudget bounds the finalizer's own work, which is a different
+	// question from finalizeTimeout's "how long will Revoke wait for it".
+	//
+	// It exists because the context Revoke is given cannot be that bound. The
+	// coordinator stops a run by cancelling the very context the backend's
+	// session holds and only then cancelling the session, so by the time Revoke
+	// runs, its ctx is routinely already done -- and the finalizer's whole job,
+	// the deferred Merging -> In Review transition, is precisely the work a
+	// stopped run still owes its issue (PMR-95). Nor can the caller pre-derive a
+	// budget and pass it in: the drain above runs first, ignores ctx by design,
+	// and is bounded at two minutes, so a budget minted before Revoke shares its
+	// clock with a wait twelve times its length and is routinely spent before the
+	// finalizer starts. So the finalizer's context is derived where the finalizer
+	// is actually invoked -- see finalize.
+	//
+	// Five seconds, because the work is a handful of sequential tracker requests
+	// and because the Codex transport, which invokes the same finalizer directly
+	// inside its Cancel, is bounded by the coordinator's five-second wait for a
+	// cancellation to return. Both transports therefore give the finalizer the
+	// same budget. It stays far inside finalizeTimeout, so a finalizer that is
+	// slow at its own work is ended by this and reported as complete, and
+	// finalizeTimeout is left for the case it exists for: a finalizer blocked
+	// before it reads a context at all.
+	//
+	// The price of expiry is not "the transition is retried later". It is that
+	// the transition is lost for good: the GitHub session latches its
+	// deferred-fired flag before attempting anything, so no later turn end will
+	// attempt it again. The issue is still redispatched -- the configured Merging
+	// state is a workflow active state -- but only into the same landing attempt
+	// against the same failed gate, holding the one state-aware Merging slot,
+	// with no human told to look at it. Latching on success instead is a change
+	// to that provider's idempotency contract and is deliberately not made here.
+	finalizerBudget = 5 * time.Second
+
 	serverName    = "symphony"
 	serverVersion = "0.1.0"
 )
@@ -115,11 +149,12 @@ type Capabilities interface {
 // permanently.
 var _ Capabilities = (*capability.Registry)(nil)
 
-// bounds are the two waits Revoke performs. They are per-server fields rather
-// than referenced constants only so this package's own tests can drive an
-// expired bound without a multi-minute wait; nothing outside this package can
-// set or observe them, and Listen always installs the constants above.
-type bounds struct{ drain, finalize time.Duration }
+// bounds are the two waits Revoke performs plus the budget it runs the finalizer
+// under. They are per-server fields rather than referenced constants only so this
+// package's own tests can drive an expired bound without a multi-minute wait;
+// nothing outside this package can set or observe them, and Listen always
+// installs the constants above.
+type bounds struct{ drain, finalize, finalizer time.Duration }
 
 // Server is the single loopback MCP endpoint. One listener serves every
 // concurrent session: capacity is small and sessions are separated by their
@@ -154,7 +189,7 @@ func Listen() (*Server, error) {
 	}
 	s := &Server{
 		url:    "http://" + net.JoinHostPort(addr.IP.String(), strconv.Itoa(addr.Port)) + endpointPath,
-		bounds: bounds{drain: drainTimeout, finalize: finalizeTimeout},
+		bounds: bounds{drain: drainTimeout, finalize: finalizeTimeout, finalizer: finalizerBudget},
 	}
 	s.http = &http.Server{
 		Handler:           http.HandlerFunc(s.serve),
@@ -360,8 +395,13 @@ var (
 // Revoke is idempotent and always returns within its own bounds. It returns nil
 // when it drained and finalized in order, and otherwise ErrDrainExpired,
 // ErrFinalizerExpired, or both joined -- each of which means an invariant this
-// function exists to hold was knowingly given up on. ctx is the context the
-// finalizer runs on, so it must still be live.
+// function exists to hold was knowingly given up on.
+//
+// ctx is not the context the finalizer runs on and does not need to be live: the
+// drain above deliberately ignores it, and a caller cannot know how much of a
+// budget that drain will spend before the finalizer starts. Only ctx's values
+// reach the finalizer; its cancellation and deadline do not. See finalize and
+// finalizerBudget.
 func (g *Registration) Revoke(ctx context.Context) error {
 	g.revokeOnce.Do(func() {
 		g.mu.Lock()
@@ -414,14 +454,25 @@ func (g *Registration) drain() bool {
 // already-cancelled ctx would not help, because the block happens before ctx is
 // read.
 //
+// That goroutine is also where the finalizer's context is derived, and the timing
+// is the whole point. The drain has finished by now, so a budget minted here is
+// spent on the finalizer and nothing else -- unlike one minted by Revoke's caller,
+// which shares its clock with a two-minute, ctx-ignoring wait. The derivation
+// drops the caller's cancellation (see finalizerBudget: the run that is being
+// stopped is exactly the run whose transition is still owed) and keeps its values.
+// Cancelling it belongs to the same goroutine too: a defer in finalize would fire
+// when the wait below expires and cut a still-running transition short.
+//
 // An expired finalizer is not abandoned: it is idempotent, the deferred
-// Merging -> In Review transition it may still perform must happen, and the
-// session context it runs on will end it. Revoke stops waiting and says so
-// instead of waiting for it.
-func (g *Registration) finalize(ctx context.Context) bool {
+// Merging -> In Review transition it may still perform must happen, and its own
+// budget is what will end it. Revoke stops waiting and says so instead of waiting
+// for it.
+func (g *Registration) finalize(parent context.Context) bool {
 	finished := make(chan struct{})
 	go func() {
 		defer close(finished)
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), g.bounds.finalizer)
+		defer cancel()
 		g.capabilities.TurnEnded(ctx)
 	}()
 	bound := time.NewTimer(g.bounds.finalize)

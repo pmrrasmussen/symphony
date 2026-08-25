@@ -33,6 +33,36 @@ type Backend struct {
 	github      *githubhost.Manager
 }
 
+// finalizeBudget bounds the turn-ended finalizer's own work, which runs detached
+// from the run's cancellation (see finalizeLanding).
+//
+// The work is a handful of sequential Linear GraphQL round trips: the deferred
+// transition re-reads the issue, resolves the team's states, transitions,
+// re-reads to confirm, and comments. Seconds is the right order of magnitude,
+// and the ceiling that actually binds is the coordinator's: it waits exactly five
+// seconds for agent.Cancel to return, and a hard Cancel runs this finalizer
+// before returning. A longer budget does not lose the transition -- the
+// cancellation goroutine outlives the coordinator's wait -- but it does make the
+// coordinator log "agent cancellation timed out" for a session that is shutting
+// down exactly as designed, so five seconds is what keeps a correct cancel quiet.
+// The Claude transport gives the same finalizer the same budget, derived at its
+// own transport's only correct point: see mcpbridge.finalizerBudget.
+//
+// Two ceilings that look like they bind do not, and are recorded so they are not
+// mistaken for constraints later. The daemon's twenty-second graceful shutdown
+// deadline waits on the run goroutine, which is blocked on the child's exit
+// rather than on this call. And the endpoint's thirty-second finalizer bound is
+// on the other transport and starts after its drain, so it shares no clock with
+// this.
+//
+// The price of expiry is not "the transition is retried later". It is that the
+// transition is lost: the GitHub session latches its deferred-fired flag before
+// attempting anything, so an expired finalizer leaves the issue in Merging with
+// no later turn end that will attempt it again. Latching on success instead is a
+// change to that provider's idempotency contract and is deliberately not made
+// here.
+const finalizeBudget = 5 * time.Second
+
 func New(secretNames ...string) *Backend {
 	names := append(config.ReservedSecretEnvNames(), secretNames...)
 	return &Backend{sessions: map[string]*client{}, secretNames: uniquePaths(names)}
@@ -179,10 +209,16 @@ func (b *Backend) Cancel(ctx context.Context, s domain.AgentSession) error {
 	if c == nil {
 		return nil
 	}
+	// The kill comes first because it is immediate and is what a caller of Cancel
+	// needs promptly, while the finalizer below can spend its whole budget on an
+	// unresponsive tracker. Ordering them the other way left a child the
+	// coordinator had already decided to stop running for that entire budget --
+	// which cost nothing while the finalizer ran on a dead context and did no
+	// work, and costs seconds now that it does (PMR-95).
+	c.kill()
 	// A hard cancel may pre-empt turn/completed, so finalize the deferred
 	// landing refusal here too. It is idempotent and a no-op when unused.
 	c.finalizeLanding()
-	c.kill()
 	select {
 	case <-c.exited:
 		return nil
@@ -773,8 +809,25 @@ func (c *client) unsupportedTool(id any) {
 // turn ends, however it ended. It is idempotent, so the three paths that can end
 // a turn -- turn/completed, turn/failed or turn/cancelled, and a hard Cancel --
 // all call it.
+//
+// It deliberately does not run on the run-lived context Start was given, because
+// by the time this matters that context is already dead. The coordinator stops a
+// run by cancelling that very context and only then cancelling the session
+// (Coordinator.stopRun, and Shutdown), so a finalizer inheriting it could not
+// issue the deferred Merging -> In Review transition at all (PMR-95).
+//
+// What that costs is not a stalled issue: the configured Merging state is a
+// workflow active state, so the coordinator redispatches the issue. It is that
+// the redispatch is the same landing attempt against the same failed gate, on an
+// issue no human has been told to look at, holding the one state-aware Merging
+// slot while it loops. The transition is what breaks that loop.
+//
+// Dropping the run's cancellation is therefore the point, and finalizeBudget is
+// what keeps that from being unbounded.
 func (c *client) finalizeLanding() {
-	c.capabilities.TurnEnded(c.ctx)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(c.ctx), finalizeBudget)
+	defer cancel()
+	c.capabilities.TurnEnded(ctx)
 }
 
 // Tool failures are normal app-server responses: the model can inspect the
