@@ -206,7 +206,7 @@ type client struct {
 	startTimeout        time.Duration
 	turnTimeout         time.Duration
 	ctx                 context.Context
-	capabilities        *capability.Registry
+	capabilities        sessionCapabilities
 	mu                  sync.Mutex
 	writeMu             sync.Mutex
 	next                int
@@ -221,6 +221,16 @@ type client struct {
 	exited              chan struct{}
 	finishOnce          sync.Once
 	killOnce            sync.Once
+}
+
+// sessionCapabilities is the per-turn portion of the capability registry the
+// Codex transport needs. Keeping the seam here makes the terminal-turn wiring
+// directly testable while the concrete registry remains the production owner
+// of capability definitions, dispatch, and deferred landing finalization.
+type sessionCapabilities interface {
+	Definitions() []capability.Definition
+	Lookup(string) (capability.Capability, bool)
+	TurnEnded(context.Context)
 }
 
 type callResult struct {
@@ -238,7 +248,7 @@ type rpc struct {
 	} `json:"error"`
 }
 
-func start(ctx context.Context, r domain.AgentRequest, secrets []string, secretMatcher func(string) bool, capabilities *capability.Registry) (*client, error) {
+func start(ctx context.Context, r domain.AgentRequest, secrets []string, secretMatcher func(string) bool, capabilities sessionCapabilities) (*client, error) {
 	command := strings.TrimSpace(r.Command)
 	if command == "" {
 		command = "codex app-server"
@@ -659,7 +669,7 @@ func (c *client) emitItemEvent(method string, raw json.RawMessage) {
 
 // dynamicTools wraps agent-neutral capability definitions in the app-server's
 // own dynamic-tool envelope. Order follows the registry, which is stable.
-func dynamicTools(registry *capability.Registry) []map[string]any {
+func dynamicTools(registry sessionCapabilities) []map[string]any {
 	definitions := registry.Definitions()
 	tools := make([]map[string]any, 0, len(definitions))
 	for _, definition := range definitions {

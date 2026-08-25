@@ -510,6 +510,114 @@ func TestLandingDecisionsAreTerminalEventsForTheRun(t *testing.T) {
 	}
 }
 
+// deferredLandingRegistry models the registry-owned deferred landing
+// transition. The real registry delegates this to github.Session; lifecycle
+// tests in internal/github cover that implementation. This fixture keeps the
+// adapter test focused on the missing boundary: every way a Codex turn can end
+// must call Registry.TurnEnded exactly once.
+type deferredLandingRegistry struct {
+	fixEnabled, retryableGateHit, landed bool
+	turnEnded, transitions               int
+	deferredFired                        bool
+}
+
+func (*deferredLandingRegistry) Definitions() []capability.Definition { return nil }
+
+func (*deferredLandingRegistry) Lookup(string) (capability.Capability, bool) { return nil, false }
+
+func (r *deferredLandingRegistry) TurnEnded(context.Context) {
+	r.turnEnded++
+	if !r.fixEnabled || !r.retryableGateHit || r.landed || r.deferredFired {
+		return
+	}
+	r.deferredFired = true
+	r.transitions++
+}
+
+// TestTurnEndFinalizesDeferredLanding exercises the three places a Codex turn
+// can end. A retryable landing gate is non-terminal so the agent can fix it in
+// the same turn; if it does not, ending that turn must return the issue from
+// Merging to In Review exactly once. The concrete deferred transition lives in
+// github.Session and is tested there; this test pins the Codex-to-registry
+// lifecycle wiring that used to have no coverage.
+func TestTurnEndFinalizesDeferredLanding(t *testing.T) {
+	finalizations := []struct {
+		name            string
+		registry        deferredLandingRegistry
+		wantTransitions int
+	}{
+		{
+			name:            "retryable gate remains unresolved",
+			registry:        deferredLandingRegistry{fixEnabled: true, retryableGateHit: true},
+			wantTransitions: 1,
+		},
+		{
+			name:     "landing already resolved",
+			registry: deferredLandingRegistry{fixEnabled: true, retryableGateHit: true, landed: true},
+		},
+		{
+			name:     "bounded fix disabled",
+			registry: deferredLandingRegistry{retryableGateHit: true},
+		},
+	}
+	for _, tc := range []struct {
+		name string
+		end  func(*Backend, *client, domain.AgentSession)
+	}{
+		{
+			name: "turn completed",
+			end: func(_ *Backend, c *client, _ domain.AgentSession) {
+				c.handle(rpc{Method: "turn/completed"})
+			},
+		},
+		{
+			name: "turn failed",
+			end: func(_ *Backend, c *client, _ domain.AgentSession) {
+				c.handle(rpc{Method: "turn/failed"})
+			},
+		},
+		{
+			name: "turn cancelled",
+			end: func(_ *Backend, c *client, _ domain.AgentSession) {
+				c.handle(rpc{Method: "turn/cancelled"})
+			},
+		},
+		{
+			name: "hard cancel",
+			end: func(b *Backend, _ *client, session domain.AgentSession) {
+				if err := b.Cancel(context.Background(), session); err != nil {
+					t.Fatalf("cancel: %v", err)
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, finalization := range finalizations {
+				t.Run(finalization.name, func(t *testing.T) {
+					registry := finalization.registry
+					session := domain.AgentSession{ID: "thread-1-turn-1"}
+					c := &client{
+						capabilities: &registry,
+						ctx:          context.Background(),
+						in:           nopWriteCloser{Writer: io.Discard},
+						exited:       make(chan struct{}),
+						active:       make(chan domain.Event, 4),
+						activeReady:  true,
+					}
+					close(c.exited)
+					b := &Backend{sessions: map[string]*client{session.ID: c}}
+
+					tc.end(b, c, session)
+
+					if registry.turnEnded != 1 || registry.transitions != finalization.wantTransitions {
+						t.Fatalf("turn endings=%d transitions=%d, want %d deferred transitions", registry.turnEnded, registry.transitions, finalization.wantTransitions)
+					}
+				})
+			}
+		})
+	}
+}
+
 func TestRejectedLinearAndGitHubToolsDoNotBlockTheTurn(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer r.Body.Close()
