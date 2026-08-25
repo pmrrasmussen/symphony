@@ -8,7 +8,7 @@ tracker:
     api_key_file: $SYMPHONY_LINEAR_API_KEY_FILE
     # Host-owned tracker transition policy. Symphony applies every edge here
     # itself, with the host Linear credential; none is ever exposed to a Codex
-    # session, so the agent has no tracker-write capability at all. The two edge
+    # session, so the agent has no issue-state transition capability. The two edge
     # sets are kept structurally distinct on purpose and must not be flattened
     # into one map: Merging is both a dispatchable/active state and the
     # land-fallback source, so a flat source->target map consumed at dispatch
@@ -27,12 +27,14 @@ tracker:
       # Merging -> In Review fallback, keyed by github.merge_state below.
       refuse_landing:
         Merging: In Review
-    # Optional, opt-in Codex client tool. It creates a new issue only in this
-    # project/team and records the active issue as its Linear parent; it
-    # cannot select an arbitrary project, team, or issue. Intended for
-    # decomposing one task into several independently reviewable pull
-    # requests: normally one child issue per isolated worktree and PR.
-    # child_issue_creation: true
+    # Optional, opt-in Codex client tool for capturing meaningful out-of-scope
+    # work. It creates a parentless issue only in this project/team, always in
+    # Backlog, with worker-supplied title, description, and acceptance criteria.
+    # The worker may only relate it to the active issue or mark it blocked by
+    # the active issue; it cannot select arbitrary scope or an initial state.
+    # Backlog must remain excluded from active_states below so a human promotion
+    # to Todo is required before Symphony can dispatch the follow-up.
+    # followup_issue_creation: true
     # Enables the scoped github_publish_pr/github_pr_context handoff tools for
     # the bound issue and is where github_publish_pr hands the issue off for
     # review, host-side. In Review is the single, fixed human-controlled review
@@ -121,6 +123,17 @@ Follow the repository instructions in AGENTS.md, README.md, and WORKFLOW.md.
 WORKFLOW.md is the single executable source of delivery policy: the
 state-specific guidance below is generated from it for this issue's current
 state.
+{{if or (eq .issue.state "Todo") (eq .issue.state "In Progress") (eq .issue.state "Rework")}}
+## Scope management
+- When implementation reveals meaningful work outside this issue, use
+  `create_followup_issue` when available to capture it with a clear title,
+  description, and acceptance criteria. Use `related` for contextual work or
+  `blocked_by_current` only when the follow-up depends on this issue.
+- Continue the current issue after filing the follow-up; do not expand its
+  scope, wait for the follow-up, or treat it as child-agent orchestration. The
+  new issue remains parentless and non-dispatchable in Backlog until a human
+  promotes it to an eligible state such as Todo.
+{{end}}
 {{if or (eq .issue.state "Todo") (eq .issue.state "In Progress")}}
 ## Implementation and validation
 - Implement a focused, validated change for this issue. Run the narrowest

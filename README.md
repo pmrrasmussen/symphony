@@ -153,16 +153,20 @@ To let a Codex session hand an issue off safely, optionally configure
 not general Linear or GraphQL access; see the Linear tracker profile for its
 strict scope.
 
-To let a Codex session split a task into independently reviewable pull
-requests, optionally configure `tracker.provider.child_issue_creation: true`.
-This enables a session-bound `create_child_issue` tool, not general Linear
-issue creation: it can only create a new issue in the active issue's already
-configured Linear project and team, always records the active issue as the
-new issue's Linear parent, and accepts only a bounded set of fields (title,
-description, priority, labels drawn from the team's existing labels, and
-dependencies on issues the same session already created). The intended
-pattern is one child issue per isolated Symphony worktree and pull request;
-see the [Linear tracker profile](docs/linear-tracker.md) for its exact scope.
+To let a Codex session capture meaningful work that falls outside its current
+issue, optionally configure `tracker.provider.followup_issue_creation: true`.
+This enables a session-bound `create_followup_issue` tool, not general Linear
+or GraphQL access. It can only create a parentless issue in the active issue's
+already configured project and team, always in `Backlog`, and requires a title,
+description, and acceptance criteria. Its only optional relationship is
+bounded to the originating issue: `related`, or `blocked_by_current` when the
+follow-up depends on the current work. `Backlog` is rejected as an active state
+while this capability is enabled, so Symphony cannot dispatch the follow-up
+until a human promotes it to an eligible state such as `Todo`. The legacy
+`child_issue_creation` setting is accepted as a warning-emitting alias for
+migration, but it enables these follow-up semantics and the old
+`create_child_issue` tool is no longer advertised. See the
+[Linear tracker profile](docs/linear-tracker.md) for the exact scope.
 
 An optional host-side GitHub integration can publish a completed, clean
 worktree and create or reuse its pull request. It requires the Linear handoff

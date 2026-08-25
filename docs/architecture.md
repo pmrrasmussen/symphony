@@ -44,14 +44,16 @@ A queued retry timer never occupies this capacity -- only a live session or a
 launch already in flight does -- so one landing session and one unrelated
 implementation session can run concurrently when global capacity permits.
 
-The optional `create_child_issue` capability follows the same model: it is
-disabled unless `tracker.provider.child_issue_creation` is configured, and it
-derives its entire scope (project, team, and parent issue) from the same
-bound active-issue read used by the handoff and transition operations. It
-never accepts a project, team, issue, or credential from Codex, and a
-dependency between two child issues can only reference issues already created
-by that same session, never an arbitrary Linear issue. See the
-[Linear tracker profile](linear-tracker.md) for the exact bounded fields.
+The optional `create_followup_issue` capability follows the same model: it is
+disabled unless `tracker.provider.followup_issue_creation` is configured and
+derives its project, team, Backlog state, and originating issue from the same
+bound active-issue read used by the handoff and transition operations. It never
+accepts a project, team, initial state, parent, arbitrary issue, or credential
+from Codex. The only optional relationship is to the originating issue itself:
+`related`, or blocked by the current issue. Because Backlog must be excluded
+from dispatchable states, capturing follow-up scope cannot fan out another
+worker or make the current issue wait. See the [Linear tracker
+profile](linear-tracker.md) for the exact bounded fields.
 
 The optional GitHub adapter follows the same capability model. Configuration
 fixes one owner, repository, base branch, and host-only fine-grained token.

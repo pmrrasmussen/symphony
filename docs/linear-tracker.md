@@ -14,7 +14,8 @@
 | `handoff_state` | optional | The single human-controlled review state `github_publish_pr` hands a bound issue off to, host-side. The name must be a non-active workflow state in the active issue's Linear team. It binds a Linear session and enables the scoped GitHub handoff tools, but is not itself a model-invokable tool. |
 | `handoff_comment_template` | optional | A repository-owned Go template for the comment Symphony posts when it performs the host-side review handoff. It requires `handoff_state` and receives only `issue`. |
 | `transitions` | optional | The single host-owned tracker transition policy. A structured object with two independent edge sets, both applied host-side with the host credential and never exposed to a Codex session: `start` (dispatch-time edges keyed by the issue's current state — the canonical `Todo -> In Progress`; both endpoints must be active, non-terminal states) and `refuse_landing` (the `Merging -> In Review` fallback `github_land_pr` applies on a hard gate, keyed by `github.merge_state`). The two sets are kept structurally distinct — never flattened into one map — because `Merging` is both a dispatchable state and the land-fallback source. Terminal and same-state edges are rejected; `start` moves are idempotent and fail-safe. |
-| `child_issue_creation` | optional | Boolean. Enables the session-bound Codex `create_child_issue` tool, described below. Disabled by default. |
+| `followup_issue_creation` | optional | Boolean. Enables the session-bound Codex `create_followup_issue` tool, described below. Disabled by default. `Backlog` must not be active/dispatchable. |
+| `child_issue_creation` | deprecated | Legacy alias for `followup_issue_creation`. It emits a migration warning and enables the new follow-up semantics; setting both names is rejected. |
 
 Invalid provider values produce `invalid_tracker_config`; a missing or empty key
 produces `missing_tracker_secret`. `api_key_file` loading errors are reported by
@@ -105,12 +106,13 @@ active candidate. Symphony does not automatically re-assert the handoff; see
 [docs/observability.md](observability.md) for the log record and the deferred
 auto-reconcile follow-up.
 
-When neither `handoff_state` nor `child_issue_creation` is configured, Symphony
-binds no Linear session for the Codex child and advertises no session-bound
-Linear tool. When either is configured, the service validates the active issue's
-project and team and freezes the policy for the session before the child process
-starts. A workflow reload affects later sessions only; an invalid reload retains
-the last valid policy.
+When neither `handoff_state` nor `followup_issue_creation` is configured,
+Symphony binds no Linear session for the Codex child and advertises no
+session-bound Linear tool. When either is configured, the service validates the
+active issue's project and team and freezes the policy for the session before
+the child process starts. Follow-up creation additionally resolves the team's
+unique `Backlog` state before launching Codex. A workflow reload affects later
+sessions only; an invalid reload retains the last valid policy.
 
 Before every host handoff or transition mutation, Symphony re-reads the bound
 issue and rejects the action if its project, team, or state changed, or if it is
@@ -137,40 +139,46 @@ terminal, stale, cross-project, and cross-team states are rejected. Host
 transitions are serialized per session, so a race or ambiguous provider result
 is reconciled by the next scoped call.
 
-## Optional child issue creation capability
+## Optional follow-up issue creation capability
 
-`tracker.provider.child_issue_creation: true` enables the only session-bound
-Codex Linear tool, `create_child_issue`. Either `handoff_state` or
-`child_issue_creation` is enough to bind a Linear session for the Codex child
-process, but the tool is advertised only when its own setting is configured.
-Unlike the removed `linear_graphql` tool, it never transitions the active
-issue; it only creates a scoped sub-issue. `create_child_issue` requires
-no separate project or team configuration: it always creates the new issue in
-the active issue's already-configured Linear project and team, and always
-records the active issue as the new issue's Linear parent (a native Linear
-sub-issue relationship, visible in the Linear UI).
+`tracker.provider.followup_issue_creation: true` enables the only
+session-bound Codex Linear tool, `create_followup_issue`. Either
+`handoff_state` or `followup_issue_creation` is enough to bind a Linear session
+for the Codex child process, but the tool is advertised only when its own
+setting is configured. Unlike the removed `linear_graphql` tool, it never
+transitions the active issue and cannot perform arbitrary mutations.
 
-The tool's only accepted fields are `title` (required), `description`,
-`priority` (0-4), `labels` (resolved only against label names that already
-exist on the active issue's team; an unrecognized name fails the whole call
-rather than creating a new label or silently dropping it), and `depends_on`.
-There is no field for an issue ID, project, team, endpoint, or credential.
+The tool requires `title`, `description`, and `acceptance_criteria` and accepts
+one optional `relationship` enum: `related`, or `blocked_by_current` when the
+new work depends on completion of the originating issue. Acceptance criteria
+are appended to the Linear description under a dedicated heading. There is no
+field for an issue ID, project, team, initial state, parent, endpoint, or
+credential. Worker input therefore cannot broaden the session's authority or
+make an issue immediately dispatchable.
 
-`depends_on` is deliberately bounded to this session's own lineage: each entry
-must be the `id` or `identifier` returned by an earlier `create_child_issue`
-call in the same session, and is applied as a Linear `blocks` relation (the
-referenced child blocks the new one). A reference to any other issue,
-including the active issue itself or a child issue created by a different
-session, is rejected before any mutation is attempted; the tool cannot create
-a relation against an issue it did not itself create.
+Every call creates an ordinary, parentless issue in the active issue's bound
+project and team with the team's uniquely resolved `Backlog` state. Symphony
+rejects `followup_issue_creation` configuration when `Backlog` appears in
+`active_states`, so the new issue cannot be picked up until a human moves it to
+an eligible state such as `Todo`. The originating issue is not changed and no
+parent/child waiting, resumption, failure aggregation, or fan-out semantics are
+introduced.
 
-Before creating an issue, Symphony re-reads the active issue and rejects the
-call if its project, team, or state changed since session setup, using the
-same scope check as the `comment` operation above. A completed child issue
-creation is logged with only the parent and child issue IDs/identifiers
-(never title, description, or label content) as the audit record.
+When `relationship` is `related`, Symphony creates only a Linear `related`
+relation between the bound current issue and the newly returned follow-up ID.
+When it is `blocked_by_current`, the current issue is recorded as blocking the
+follow-up. No caller-supplied issue identifier reaches either fixed relation
+mutation. Omitting the field creates no relation.
 
-The intended pattern is to decompose one task into several independently
-reviewable pull requests: normally create one `create_child_issue` call per
-unit of work, and each resulting issue produces its own isolated Symphony
-worktree and its own pull request once it reaches an eligible state.
+Before creating an issue, Symphony re-reads the originating issue and rejects
+the call if its project, team, or state changed since session setup. The create
+mutation fixes project, team, and Backlog state and omits `parentId`; Symphony
+also verifies the returned issue is parentless and matches that complete scope.
+Audit logs contain only originating/follow-up IDs and identifiers plus the
+bounded relation enum, never worker-supplied content or credentials.
+
+The capability is for scope management: capture meaningful out-of-scope work,
+then continue the current issue. A human later decides whether and when the
+Backlog follow-up becomes dispatchable. Existing workflows using
+`child_issue_creation` receive a value-free deprecation warning and are
+normalized to these semantics; `create_child_issue` is no longer advertised.

@@ -1,9 +1,8 @@
 package linear
 
 // This file contains the intentionally small Linear capability exposed to a
-// running Codex session. It is not a GraphQL proxy despite the compatibility
-// tool name: every query and mutation is fixed here, and the issue/project/
-// team are bound before Codex is launched.
+// running Codex session. It is not a GraphQL proxy: every query and mutation
+// is fixed here, and the issue/project/team are bound before Codex is launched.
 
 import (
 	"context"
@@ -77,10 +76,10 @@ func (h *Handoff) PrepareWithSettings(ctx context.Context, s config.Settings, is
 	if strings.TrimSpace(s.Tracker.HandoffState) != "" && !stateAllowed(active.State.Name, s.Tracker.ActiveStates) {
 		return nil, trackerError("handoff_scope", "active issue is not in a workflow active state")
 	}
-	if s.Tracker.ChildIssueCreation && active.ProjectID() == "" {
-		return nil, trackerError("invalid_tracker_config", "linear active issue project could not be resolved for child issue creation")
+	if s.Tracker.FollowupIssueCreation && active.ProjectID() == "" {
+		return nil, trackerError("invalid_tracker_config", "linear active issue project could not be resolved for follow-up issue creation")
 	}
-	stateID, comment := "", ""
+	stateID, followupStateID, comment := "", "", ""
 	if strings.TrimSpace(s.Tracker.HandoffState) != "" {
 		stateID, err = h.resolveState(ctx, s, active.TeamID(), s.Tracker.HandoffState)
 		if err != nil {
@@ -97,18 +96,25 @@ func (h *Handoff) PrepareWithSettings(ctx context.Context, s config.Settings, is
 			}
 		}
 	}
+	if s.Tracker.FollowupIssueCreation {
+		followupStateID, err = h.resolveState(ctx, s, active.TeamID(), "Backlog")
+		if err != nil {
+			return nil, err
+		}
+	}
 	return &HandoffSession{
 		client: h.client, settings: s, issue: active, targetStateID: stateID,
 		handoffComment: comment, refuseLanding: copyTransitions(s.Tracker.HostTransitions.RefuseLanding),
-		childIssueCreationEnabled: s.Tracker.ChildIssueCreation, logger: h.logger,
+		followupIssueCreationEnabled: s.Tracker.FollowupIssueCreation, followupStateID: followupStateID, logger: h.logger,
 	}, nil
 }
 
-// HandoffSession is the fixed authority granted to one app-server session. It
-// has no method invocable by Codex that writes the tracker: every state change
-// here is driven host-side (github_publish_pr's LinkAndHandoff, the landing
-// host methods, and the poll-loop reconciliation), never by a model tool call.
-// It has no method that accepts an issue, project, endpoint, or credential.
+// HandoffSession is the fixed authority granted to one app-server session.
+// Every active-issue state change is driven host-side (github_publish_pr's
+// LinkAndHandoff, the landing host methods, and poll-loop reconciliation),
+// never by a model tool call. The optional model-invokable follow-up operation
+// creates only a parentless Backlog issue in this bound scope. No method accepts
+// an arbitrary issue, project, endpoint, or credential.
 type HandoffSession struct {
 	client         *http.Client
 	settings       config.Settings
@@ -117,11 +123,11 @@ type HandoffSession struct {
 	handoffComment string
 	// refuseLanding is the lowercased-source Merging -> In Review fallback map
 	// (tracker.provider.transitions.refuse_landing) used only by RefuseLanding.
-	refuseLanding             map[string]string
-	childIssueCreationEnabled bool
-	createdChildren           map[string]childIssueRef
-	logger                    *slog.Logger
-	handoffMu                 sync.Mutex
+	refuseLanding                map[string]string
+	followupIssueCreationEnabled bool
+	followupStateID              string
+	logger                       *slog.Logger
+	handoffMu                    sync.Mutex
 }
 
 // MatchesSecret lets the Codex launcher remove inherited values containing the
@@ -753,18 +759,18 @@ func (h *Handoff) resolveStateWithPolicy(ctx context.Context, s config.Settings,
 	for _, state := range payload.Data.Team.States.Nodes {
 		if strings.EqualFold(strings.TrimSpace(state.Name), strings.TrimSpace(target)) {
 			if found != "" || strings.TrimSpace(state.ID) == "" {
-				return "", trackerError("handoff_scope", "configured handoff state is ambiguous")
+				return "", trackerError("handoff_scope", "requested Linear state is ambiguous")
 			}
 			for _, terminal := range s.Tracker.TerminalStates {
 				if !allowTerminal && strings.EqualFold(strings.TrimSpace(state.Name), strings.TrimSpace(terminal)) {
-					return "", trackerError("handoff_scope", "configured handoff state is terminal")
+					return "", trackerError("handoff_scope", "requested Linear state is terminal")
 				}
 			}
 			found = strings.TrimSpace(state.ID)
 		}
 	}
 	if found == "" {
-		return "", trackerError("handoff_scope", "configured handoff state is not in the active issue team")
+		return "", trackerError("handoff_scope", "requested Linear state is not in the active issue team")
 	}
 	return found, nil
 }
