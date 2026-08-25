@@ -106,9 +106,13 @@ func (t theme) definitions(sections []definition) string {
 	return strings.Join(blocks, "\n")
 }
 
-// detailBody renders one detail page and fits it to the row budget, reporting
-// anything it could not draw rather than dropping it in silence.
-func (m Model) detailBody(instance operator.Instance, current page, now time.Time, style theme, budget int) string {
+// detailBody renders one detail page into the row budget and reports the
+// furthest offset its content allows.
+//
+// The body scrolls rather than being cut off with a count. The alternate screen
+// has no scrollback by definition, so rows past the window used to be
+// unreachable rather than merely out of sight.
+func (m Model) detailBody(instance operator.Instance, current page, now time.Time, style theme, budget int) (string, int) {
 	var body string
 	switch current {
 	case configPage:
@@ -116,20 +120,42 @@ func (m Model) detailBody(instance operator.Instance, current page, now time.Tim
 	case validationPage:
 		body = m.validationPanel(instance, style)
 	default:
-		body = m.statusPanel(instance, now, style, budget)
+		body = m.statusPanel(instance, now, style)
 	}
-	lines, hidden := clamp(strings.Split(strings.TrimRight(body, "\n"), "\n"), budget)
-	drawn := strings.Join(lines, "\n")
-	if note := style.more(hidden); note != "" {
-		drawn += "\n" + note
+	lines := strings.Split(strings.TrimRight(body, "\n"), "\n")
+	// An unknown height clips nothing, which is what the plain surface and every
+	// height-unaware caller rely on.
+	if budget <= 0 || len(lines) <= budget {
+		return strings.Join(lines, "\n"), 0
 	}
-	return drawn
+	// One row of the budget pays for the position indicator.
+	viewport := budget - 1
+	maxOffset := len(lines) - viewport
+	offset := min(max(m.offset, 0), maxOffset)
+	return strings.Join(lines[offset:offset+viewport], "\n") + "\n" +
+		style.position(offset, viewport, len(lines)), maxOffset
 }
 
-// statusPanel is the page that changes while an operator watches it, so the
-// fixed parts are drawn first and the log tail gives way to whatever room is
-// left.
-func (m Model) statusPanel(instance operator.Instance, now time.Time, style theme, budget int) string {
+// position says where the viewport sits in the content and which way there is
+// more of it. A bare count leaves the reader guessing whether they have reached
+// the end, and the keys are named here rather than in the hint bar because they
+// only apply while there is something to scroll.
+func (t theme) position(offset, viewport, total int) string {
+	marks := ""
+	if offset > 0 {
+		marks += "▴"
+	}
+	if offset+viewport < total {
+		marks += "▾"
+	}
+	return t.muted.Render(fmt.Sprintf("%s %d-%d of %d · ctrl+d/ctrl+u scroll · g/G ends",
+		marks, offset+1, offset+viewport, total))
+}
+
+// statusPanel is the page that changes while an operator watches it. It renders
+// in full; the viewport in detailBody decides what is on screen, so the log tail
+// is scrolled to rather than dropped.
+func (m Model) statusPanel(instance operator.Instance, now time.Time, style theme) string {
 	sections := []string{}
 	if instance.Snapshot == nil {
 		sections = append(sections, style.warn.Render("No readable runtime snapshot.")+
@@ -163,17 +189,8 @@ func (m Model) statusPanel(instance operator.Instance, now time.Time, style them
 	if len(instance.RecentLog) == 0 {
 		return fixed
 	}
-	room := 0
-	if budget > 0 {
-		// Two rows for the blank line and the caption above the tail.
-		room = budget - lipgloss.Height(fixed) - 2
-		if room < 1 {
-			return fixed
-		}
-	}
-	events, hidden := clamp(instance.RecentLog, room)
-	rows := make([][]string, 0, len(events))
-	for _, event := range events {
+	rows := make([][]string, 0, len(instance.RecentLog))
+	for _, event := range instance.RecentLog {
 		rows = append(rows, []string{
 			style.muted.Render(event.Time.Local().Format("15:04:05")),
 			style.muted.Render(event.Level),
@@ -181,9 +198,6 @@ func (m Model) statusPanel(instance operator.Instance, now time.Time, style them
 		})
 	}
 	tail := style.emphasis.Render("Recent redacted lifecycle activity") + "\n" + style.borderless(nil, rows)
-	if note := style.more(hidden); note != "" {
-		tail += "\n" + note
-	}
 	return fixed + "\n\n" + tail
 }
 
@@ -324,7 +338,7 @@ func (m Model) validationPanel(instance operator.Instance, style theme) string {
 // splitView shows the list and the selected instance side by side. A window
 // this wide can hold both, which removes the drill-in keypress between seeing
 // an instance and reading it.
-func (m Model) splitView(now time.Time, style theme) string {
+func (m Model) splitView(now time.Time, style theme) (string, int) {
 	instance := m.instances[m.selected]
 	current := m.detailPage()
 	header := lipgloss.JoinVertical(lipgloss.Left,
@@ -339,7 +353,7 @@ func (m Model) splitView(now time.Time, style theme) string {
 	budget := style.mainBudget(header)
 	list := m.instanceList(style.sized(min(44, style.width/3)-2), budget)
 	// Three columns go to the two gutters and the rule between them.
-	detail := m.detailBody(instance, current, now, style.sized(style.width-lipgloss.Width(list)-3), budget)
+	detail, maxOffset := m.detailBody(instance, current, now, style.sized(style.width-lipgloss.Width(list)-3), budget)
 	// The divider spans whichever half is taller, so it reads as one boundary
 	// down the screen rather than a rule that stops where the list happens to
 	// end.
@@ -348,5 +362,5 @@ func (m Model) splitView(now time.Time, style theme) string {
 		lipgloss.NewStyle().PaddingLeft(1).Render(detail),
 	)
 	return style.frame(header, main, m.statusLine(now, style),
-		style.muted.Render("j/k select · s/c/v page · Tab next · r refresh · q quit"))
+		style.muted.Render("j/k select · s/c/v page · Tab next · r refresh · q quit")), maxOffset
 }
