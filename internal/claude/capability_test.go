@@ -3,7 +3,9 @@ package claude
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,7 +15,10 @@ import (
 	"time"
 
 	"github.com/pmrrasmussen/symphony/internal/capability"
+	"github.com/pmrrasmussen/symphony/internal/config"
 	"github.com/pmrrasmussen/symphony/internal/domain"
+	githubhost "github.com/pmrrasmussen/symphony/internal/github"
+	"github.com/pmrrasmussen/symphony/internal/linear"
 	"github.com/pmrrasmussen/symphony/internal/mcpbridge"
 )
 
@@ -358,6 +363,15 @@ func TestEveryTurnEndPathRetiresTheRegistrationExactlyOnce(t *testing.T) {
 				// Cancelling once the session has announced itself proves the
 				// child is really running, so this is a hard cancel of a live
 				// turn rather than of a turn that had already ended.
+				//
+				// What this pins is that a returned Cancel has already retired
+				// the session's authority. It does not pin that Cancel's own
+				// revocation is what did it: the turn's shutdown reaches its
+				// retirement microseconds after the kill, so this still passes
+				// with Cancel's call deleted. That call is kept as the guard on
+				// the path where the wait below does not complete -- the
+				// coordinator bounds Cancel at five seconds -- and no test can
+				// distinguish it.
 				for event := range events {
 					if event.Kind == domain.EventSessionStarted {
 						break
@@ -651,12 +665,24 @@ func (r *scriptedRegistry) ended() int {
 type scriptedCapability struct {
 	definition capability.Definition
 	result     capability.Result
+	// entered and release let a test hold an invocation in flight, which is what
+	// a revocation's drain waits for.
+	entered chan<- struct{}
+	release <-chan struct{}
 }
 
 func (c scriptedCapability) Definition() capability.Definition { return c.definition }
 func (c scriptedCapability) Lifecycle() bool                   { return false }
 func (c scriptedCapability) Prepare(json.RawMessage) (capability.Invocation, *capability.Failure) {
-	return func(context.Context) (capability.Result, *capability.Failure) { return c.result, nil }, nil
+	return func(context.Context) (capability.Result, *capability.Failure) {
+		if c.entered != nil {
+			c.entered <- struct{}{}
+		}
+		if c.release != nil {
+			<-c.release
+		}
+		return c.result, nil
+	}, nil
 }
 
 func oneCapabilityRegistry() *scriptedRegistry {
@@ -795,4 +821,401 @@ func assertArgs(t *testing.T, got, want []string) {
 			t.Fatalf("argument %d = %q, want %q:\n got %q\nwant %q", i, got[i], want[i], got, want)
 		}
 	}
+}
+
+// TestStartBindsTheHostProvidersAndTheirSecrets covers the block every other
+// test in this file steps over. The capability tests build a session by hand so
+// they can substitute a registry, which leaves Start's own preparation -- the
+// handoff, the GitHub session, the secret matcher, and the Bindings the registry
+// is built from -- asserted by nothing at all.
+//
+// That is the one function the whole wiring rests on, and its failure is silent
+// by construction: drop the bindings and advertisedNames returns nil, so no
+// --mcp-config is rendered, so verifyInit expects zero MCP servers and finds
+// zero, so the session is approved and the turn ends completed with committed,
+// unpublished work. Every gate passes. Only this test does not.
+func TestStartBindsTheHostProvidersAndTheirSecrets(t *testing.T) {
+	tracker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		var query struct {
+			Query string `json:"query"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&query); err != nil {
+			t.Error(err)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.Contains(query.Query, "SymphonyLinearHandoffIssue"):
+			_, _ = w.Write([]byte(`{"data":{"issue":{"id":"issue-1","identifier":"PMR-52","title":"Parity","description":"safe",` +
+				`"url":"https://linear.app/issue/PMR-52","project":{"id":"project-uuid","slugId":"project-1"},` +
+				`"team":{"id":"team-1"},"state":{"id":"merging","name":"Merging"}}}}`))
+		case strings.Contains(query.Query, "SymphonyLinearHandoffStates"):
+			_, _ = w.Write([]byte(`{"data":{"team":{"id":"team-1","states":{"nodes":[{"id":"review","name":"In Review"},{"id":"backlog","name":"Backlog"}]}}}}`))
+		default:
+			t.Errorf("unexpected query: %s", query.Query)
+		}
+	}))
+	defer tracker.Close()
+	settings := config.Settings{
+		Tracker: config.Tracker{
+			Provider:              map[string]any{"api_key": "linear-api-secret", "project_slug_id": "project-1", "endpoint": tracker.URL},
+			ActiveStates:          []string{"Merging"},
+			HandoffState:          "In Review",
+			FollowupIssueCreation: true,
+		},
+		GitHub: config.GitHub{Enabled: true, Owner: "owner", Repository: "repo", BaseBranch: "main",
+			Token: "github-token-secret", Endpoint: tracker.URL, MergeState: "Merging", MergeMethod: "merge"},
+	}
+	snapshot := func() config.Settings { return settings }
+
+	dir := t.TempDir()
+	// The init echo has to name all four capabilities, which is itself part of
+	// the assertion: a contract built from a registry missing its bindings would
+	// refuse this turn.
+	tools := allCodingTools
+	for _, name := range allCapabilityNames {
+		tools += `,"` + mcpToolName(name) + `"`
+	}
+	script := writeFakeClaude(t, dir, "cat <<'EOF'\n"+
+		`{"type":"system","subtype":"init","cwd":"`+workspaceOf(dir)+`","permissionMode":"dontAsk","tools":[`+tools+
+		`],"mcp_servers":[{"name":"symphony","status":"connected"}]}`+"\n"+resultLine(false, "")+"\nEOF\n")
+	t.Setenv("PMR52_INHERITS_THE_FORGE_TOKEN", "prefix-github-token-secret-suffix")
+
+	mcpEndpoint, err := mcpbridge.Listen()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = mcpEndpoint.Close(context.Background()) })
+	backend := NewWithProviders(snapshot, linear.NewHandoff(snapshot), githubhost.New(snapshot, nil), mcpEndpoint)
+
+	r := request(t, dir, script)
+	r.Issue = domain.Issue{ID: "issue-1", Identifier: "PMR-52", State: "Merging"}
+	agentSession, events, err := backend.Start(context.Background(), r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	collected := drain(t, events)
+
+	backend.mu.Lock()
+	s := backend.sessions[agentSession.ID]
+	backend.mu.Unlock()
+	if s == nil {
+		t.Fatal("the session was forgotten")
+	}
+	// The advertised set is the registry's own, so this is also what --tools was
+	// pinned to and what tools/list serves.
+	if strings.Join(s.advertised, ",") != strings.Join(allCapabilityNames, ",") {
+		t.Fatalf("advertised=%v, want %v", s.advertised, allCapabilityNames)
+	}
+	if s.secretMatcher == nil {
+		t.Fatal("Start bound providers without a secret matcher, so their resolved credentials reach the child")
+	}
+	// Both providers' credentials must be recognized: only the matcher can see
+	// them, because neither has a configured name or a configured value.
+	for _, secret := range []string{"prefix-github-token-secret-suffix", "carries linear-api-secret inside"} {
+		if !s.secretMatcher(secret) {
+			t.Fatalf("the session secret matcher does not recognize %q", secret)
+		}
+	}
+	if s.secretMatcher("ordinary-value") {
+		t.Fatal("the session secret matcher matches unrelated values")
+	}
+	if environment := readFile(t, filepath.Join(dir, "env.txt")); strings.Contains(environment, "github-token-secret") {
+		t.Fatal("a provider-resolved credential reached the child environment")
+	}
+	if lastKind(t, collected).Kind != domain.EventCompleted {
+		t.Fatalf("a fully bound session did not complete: %v", kinds(collected))
+	}
+}
+
+// TestTheAdvertisedSetIsTheRegistrysOwn is the parity assertion PMR-52 asked
+// for, in the only form this package can make it: the same bindings that give
+// internal/codex its four dynamic tools give this backend the same four names,
+// in the same order, with the mcp__symphony__ prefix applied to each and nothing
+// added, dropped, or reordered. internal/codex asserts the app-server half of
+// the same statement over the same bindings, so neither transport can quietly
+// grow a capability set of its own.
+func TestTheAdvertisedSetIsTheRegistrysOwn(t *testing.T) {
+	settings := config.Settings{}
+	settings.Tracker.FollowupIssueCreation = true
+	settings.GitHub.MergeState = "Merging"
+	registry := capability.Build(capability.Bindings{
+		Settings: settings,
+		Issue:    domain.Issue{Identifier: "PMR-52", State: "Merging"},
+		Handoff:  &linear.HandoffSession{},
+		GitHub:   &githubhost.Session{},
+	})
+	definitions := registry.Definitions()
+	names := advertisedNames(registry)
+	if len(names) != len(definitions) {
+		t.Fatalf("advertised %d names for %d definitions", len(names), len(definitions))
+	}
+	for i, definition := range definitions {
+		if names[i] != definition.Name {
+			t.Fatalf("name %d = %q, want the registry's %q", i, names[i], definition.Name)
+		}
+	}
+	if strings.Join(names, ",") != strings.Join(allCapabilityNames, ",") {
+		t.Fatalf("advertised=%v, want %v", names, allCapabilityNames)
+	}
+	contract, err := launchArgs(request(t, t.TempDir(), "unused"), "session-1", false,
+		&capabilityEndpoint{url: "http://127.0.0.1:1/mcp", token: "t", names: names})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := append(append([]string(nil), codingTools...), prefixed(definitions2names(definitions))...)
+	if strings.Join(contract.tools, ",") != strings.Join(want, ",") {
+		t.Fatalf("tool surface=%v, want %v", contract.tools, want)
+	}
+}
+
+func definitions2names(definitions []capability.Definition) []string {
+	names := make([]string, 0, len(definitions))
+	for _, definition := range definitions {
+		names = append(names, definition.Name)
+	}
+	return names
+}
+
+// TestTheNextTurnCannotStartUntilThePreviousRegistrationIsFullyRetired is the
+// falsifiable form of the ordering every document in this repository asserts.
+//
+// The stale-token test above catches the next-turn revocation being deleted
+// outright, but not the mutation that actually threatens the invariant: moving
+// it to just after spawn. The parent wins that race against a starting child
+// every time, so a probe from the child cannot see the difference.
+//
+// This transcript removes the race. Turn one reports its result -- so a
+// continuation is requested -- and then makes a capability call that blocks
+// inside the invocation, holding the drain open. With the revocation before
+// spawn, turn two's child provably cannot exist until this test releases that
+// call: the launch is parked in the drain. With the revocation after spawn, turn
+// two's child starts immediately, concurrently with a capability call from the
+// previous turn against the same provider session -- which is the hazard, and
+// which the marker file below makes visible.
+func TestTheNextTurnCannotStartUntilThePreviousRegistrationIsFullyRetired(t *testing.T) {
+	if _, err := exec.LookPath("curl"); err != nil {
+		t.Skip("curl is needed for the child to hold a capability call open")
+	}
+	dir := t.TempDir()
+	entered, release := make(chan struct{}, 1), make(chan struct{})
+	registry := &scriptedRegistry{served: []capability.Capability{scriptedCapability{
+		definition: capability.Definition{Name: capability.NameGitHubPRContext, Description: "read review context",
+			InputSchema: map[string]any{"type": "object", "additionalProperties": false}},
+		result:  capability.Result{Success: true, Payload: map[string]any{"state": "open"}},
+		entered: entered, release: release,
+	}}}
+	init, marker, first := capabilityInitLine(dir), filepath.Join(dir, "second-turn-started"), filepath.Join(dir, "first-turn-ran")
+	script := writeFakeClaude(t, dir, ""+
+		"if [ ! -f "+first+" ]; then\n"+
+		"  : > "+first+"\n"+
+		"  cat <<'EOF'\n"+init+"\n"+resultLine(false, "")+"\nEOF\n"+
+		"  url=$(grep -o 'http://[0-9.]*:[0-9]*/mcp' "+filepath.Join(dir, "args.txt")+" | head -1)\n"+
+		"  printf '%s' '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\""+
+		capability.NameGitHubPRContext+"\",\"arguments\":{}}}' > "+filepath.Join(dir, "held.body")+"\n"+
+		"  curl -sS -X POST -H \"Authorization: Bearer $"+endpointTokenEnvName+"\" -H 'Content-Type: application/json'"+
+		" --data-binary @"+filepath.Join(dir, "held.body")+" -o /dev/null \"$url\" &\n"+
+		// The shell stays alive so turn one's own stream goroutine is still in
+		// its read loop: nothing but the next turn's launch can retire it.
+		"  sleep 30\n"+
+		"else\n"+
+		"  : > "+marker+"\n"+
+		"  cat <<'EOF'\n"+init+"\n"+resultLine(false, "")+"\nEOF\n"+
+		"fi\n")
+
+	backend, _ := backendWithEndpoint(t)
+	session, events, err := startWithRegistry(t, backend, context.Background(), request(t, dir, script), registry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for event := range events {
+		if terminal(event.Kind) {
+			break
+		}
+	}
+	select {
+	case <-entered:
+	case <-time.After(20 * time.Second):
+		t.Fatal("turn one never reached the capability invocation")
+	}
+
+	continued := make(chan error, 1)
+	var second <-chan domain.Event
+	go func() {
+		var err error
+		second, err = backend.Continue(context.Background(), session, "second turn")
+		continued <- err
+	}()
+	// The invocation is in flight, so the launch must be parked in the drain.
+	// Anything that got past it started a turn concurrently with a live
+	// capability call from the previous one.
+	select {
+	case err := <-continued:
+		t.Fatalf("the next turn launched while a capability call from the previous turn was still in flight (err=%v)", err)
+	case <-time.After(750 * time.Millisecond):
+	}
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("turn two's child ran before turn one's registration was retired")
+	}
+
+	close(release)
+	if err := <-continued; err != nil {
+		t.Fatal(err)
+	}
+	drain(t, second)
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("turn two never ran: %v", err)
+	}
+}
+
+// TestAnExpiredRevocationIsReportedOnceHoweverManyPathsRetireIt covers the latch
+// and the reporting rule around it. An expired drain or finalizer is the code
+// knowingly abandoning an ordering invariant; nothing in mcpbridge logs, so an
+// unreported expiry is invisible, and a doubly reported one reads as two.
+func TestAnExpiredRevocationIsReportedOnceHoweverManyPathsRetireIt(t *testing.T) {
+	bridge := &failingRegistration{err: mcpbridge.ErrDrainExpired}
+	held := &registration{bridge: bridge}
+	s := &session{id: "s", ctx: context.Background(), endpoint: held}
+
+	if err := s.retireEndpoint(nil); !errors.Is(err, mcpbridge.ErrDrainExpired) {
+		t.Fatalf("the retiring path reported %v, want the drain expiry", err)
+	}
+	s.mu.Lock()
+	cleared := s.endpoint == nil
+	s.mu.Unlock()
+	if !cleared {
+		t.Fatal("a retired registration is still the session's live one")
+	}
+	// The turn's own shutdown arrives second and must neither revoke again nor
+	// report the same expiry a second time.
+	if err := s.retireEndpoint(held); err != nil {
+		t.Fatalf("the losing path reported %v, want nothing", err)
+	}
+	if calls := bridge.revocations(); calls != 1 {
+		t.Fatalf("the registration was revoked %d times, want exactly 1", calls)
+	}
+}
+
+// TestAnExpiredRevocationReachesTheNextTurnsStream covers the emission site the
+// previous turn's stream cannot serve: by the time this expiry is known, that
+// stream is closed.
+func TestAnExpiredRevocationReachesTheNextTurnsStream(t *testing.T) {
+	dir := t.TempDir()
+	registry := oneCapabilityRegistry()
+	script := writeFakeClaude(t, dir, "cat <<'EOF'\n"+capabilityInitLine(dir)+"\n"+resultLine(false, "")+"\nEOF\n")
+	backend, _ := backendWithEndpoint(t)
+	id, err := newSessionID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &session{id: id, ctx: context.Background(), registry: registry, advertised: advertisedNames(registry),
+		endpoint: &registration{bridge: &failingRegistration{err: errors.Join(mcpbridge.ErrDrainExpired, mcpbridge.ErrFinalizerExpired)}}}
+	backend.mu.Lock()
+	backend.sessions[id] = s
+	backend.mu.Unlock()
+	events, err := backend.run(context.Background(), s, request(t, dir, script), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	collected := drain(t, events)
+	var reported int
+	for _, event := range collected {
+		if event.Kind != domain.EventDiagnostic || !strings.Contains(event.Message, "capability endpoint revocation") {
+			continue
+		}
+		reported++
+		for _, reason := range []string{"in flight", "finalizer"} {
+			if !strings.Contains(event.Message, reason) {
+				t.Fatalf("the diagnostic lost a reason: %q", event.Message)
+			}
+		}
+	}
+	if reported != 1 {
+		t.Fatalf("an expired revocation produced %d diagnostics, want exactly 1: %v", reported, kinds(collected))
+	}
+	if lastKind(t, collected).Kind != domain.EventCompleted {
+		t.Fatal("an expired revocation of the previous turn failed this one")
+	}
+}
+
+// TestReportRetirementIsSilentOnASuccessfulRevocation pins the shared emission
+// helper both retirement sites use, including the one inside stream's defers,
+// which cannot be reached with a substituted registration.
+func TestReportRetirementIsSilentOnASuccessfulRevocation(t *testing.T) {
+	events := &sink{events: make(chan domain.Event, eventBuffer)}
+	reportRetirement(events, nil)
+	if len(events.events) != 0 {
+		t.Fatalf("a clean revocation reported %d events", len(events.events))
+	}
+	reportRetirement(events, mcpbridge.ErrFinalizerExpired)
+	events.close()
+	collected := drain(t, events.events)
+	if len(collected) != 1 || collected[0].Kind != domain.EventDiagnostic {
+		t.Fatalf("collected=%v", kinds(collected))
+	}
+	if !strings.Contains(collected[0].Message, "finalizer") {
+		t.Fatalf("diagnostic=%q", collected[0].Message)
+	}
+}
+
+// TestTheEndpointNeverReachesADiagnostic covers the one path where raw child
+// output becomes an event message. observability.Text redacts credential-shaped
+// text, and a loopback URL is not credential-shaped, so a CLI that prints its
+// MCP configuration or a connect failure to stderr would put the endpoint in a
+// diagnostic and from there into the log.
+func TestTheEndpointNeverReachesADiagnostic(t *testing.T) {
+	dir := t.TempDir()
+	registry := oneCapabilityRegistry()
+	script := writeFakeClaude(t, dir, "cat <<'EOF'\n"+capabilityInitLine(dir)+"\nEOF\n"+
+		"url=$(grep -o 'http://[0-9.]*:[0-9]*/mcp' "+filepath.Join(dir, "args.txt")+" | head -1)\n"+
+		"echo \"mcp connect failed: $url token $"+endpointTokenEnvName+"\" >&2\n"+
+		"exit 3\n")
+	backend, _ := backendWithEndpoint(t)
+	_, events, err := startWithRegistry(t, backend, context.Background(), request(t, dir, script), registry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	collected := drain(t, events)
+	url, token := endpointFromChild(t, dir)
+	var diagnostics int
+	for _, event := range collected {
+		if strings.Contains(event.Message, url) || strings.Contains(event.Message, token) {
+			t.Fatalf("an event carried the endpoint: %q", event.Message)
+		}
+		if event.Kind == domain.EventDiagnostic && strings.Contains(event.Message, "mcp connect failed") {
+			diagnostics++
+		}
+	}
+	// The diagnostic itself must survive: redaction, not suppression.
+	if diagnostics != 1 {
+		t.Fatalf("the child's stderr produced %d diagnostics, want exactly 1: %v", diagnostics, kinds(collected))
+	}
+}
+
+// failingRegistration is a registration whose revocation reports an abandoned
+// invariant. It exists because a real one cannot: mcpbridge's drain and
+// finalizer bounds are private and are only ever the production constants, so
+// reaching ErrDrainExpired for real costs two minutes of a wedged provider call.
+type failingRegistration struct {
+	err error
+
+	mu    sync.Mutex
+	calls int
+}
+
+func (f *failingRegistration) URL() string   { return "http://127.0.0.1:1/mcp" }
+func (f *failingRegistration) Token() string { return "substituted" }
+
+func (f *failingRegistration) Revoke(context.Context) error {
+	f.mu.Lock()
+	f.calls++
+	f.mu.Unlock()
+	return f.err
+}
+
+func (f *failingRegistration) revocations() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
 }
