@@ -27,13 +27,13 @@ import (
 
 const maxResponse = 1 << 20
 
-// Structured-handoff input bounds. These mirror the maxLength values in the
-// github_publish_pr Codex tool schema (internal/codex/backend.go); both sides
-// must be kept in sync.
+// Structured-handoff input bounds. These are the single source for both the
+// parser below and the advertised github_publish_pr schema, which reads them
+// from internal/capability; an invariant test asserts the two agree.
 const (
-	maxPublishWhyBytes         = 4 << 10
-	maxPublishWhatChangedBytes = 8 << 10
-	maxPublishOnCallBytes      = 2 << 10
+	MaxPublishWhyBytes         = 4 << 10
+	MaxPublishWhatChangedBytes = 8 << 10
+	MaxPublishOnCallBytes      = 2 << 10
 )
 
 // Bounds applied to github_pr_context output so a large upstream history
@@ -283,13 +283,13 @@ func ParsePublishInput(arguments json.RawMessage) (PublishInput, error) {
 	why := strings.TrimSpace(*input.Why)
 	whatChanged := strings.TrimSpace(*input.WhatChanged)
 	onCall := strings.TrimSpace(*input.OnCall)
-	if why == "" || len([]byte(why)) > maxPublishWhyBytes {
+	if why == "" || len([]byte(why)) > MaxPublishWhyBytes {
 		return PublishInput{}, errors.New("github publish why is empty or too large")
 	}
-	if whatChanged == "" || len([]byte(whatChanged)) > maxPublishWhatChangedBytes {
+	if whatChanged == "" || len([]byte(whatChanged)) > MaxPublishWhatChangedBytes {
 		return PublishInput{}, errors.New("github publish what_changed is empty or too large")
 	}
-	if len([]byte(onCall)) > maxPublishOnCallBytes {
+	if len([]byte(onCall)) > MaxPublishOnCallBytes {
 		return PublishInput{}, errors.New("github publish on_call is too large")
 	}
 	return PublishInput{Why: why, WhatChanged: whatChanged, OnCall: onCall}, nil

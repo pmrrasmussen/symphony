@@ -138,9 +138,14 @@ diagnose a run that looks idle:
   `commandExecution`, `mcpToolCall`, `fileChange`, `dynamicToolCall`),
   `item_id`, `outcome` (`started`, `completed`, `failed`, `declined`), and
   `duration_ms` once known. `item_name` appears only when the protocol
-  supplies a fixed tool name directly (an MCP tool's name, or Symphony's own
-  bound `github_publish_pr`/`github_land_pr` capability); it is never derived
-  from command bodies or tool arguments.
+  supplies a fixed tool name directly (an MCP tool's name), or when the name is
+  a registry-owned constant for one of Symphony's own bound capabilities
+  (`github_publish_pr`, `github_pr_context`, and `github_land_pr`); it is never
+  derived from command bodies, tool arguments, or the tool name an agent sent.
+  `create_followup_issue` deliberately emits no `dynamicToolCall` records: it is
+  a single bounded tracker round trip, so there is no slow outstanding operation
+  to make visible, and its argument validation belongs to the provider rather
+  than to a reported call.
 * **Heartbeat and stall records** — every reconciliation pass for a still-active
   run logs `"msg":"agent heartbeat"` with `last_activity_age_ms` and, when one
   tool/item is outstanding, `outstanding_item_type`, `outstanding_item_id`, and

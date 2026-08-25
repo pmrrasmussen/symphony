@@ -712,8 +712,8 @@ func TestParsePublishInputRejectsInvalidArguments(t *testing.T) {
 		"non-string why":     `{"why":1,"what_changed":"b","on_call":"c"}`,
 		"empty why":          `{"why":"  ","what_changed":"b","on_call":"c"}`,
 		"empty what_changed": `{"why":"a","what_changed":"","on_call":"c"}`,
-		"oversized why":      `{"why":"` + strings.Repeat("x", maxPublishWhyBytes+1) + `","what_changed":"b","on_call":"c"}`,
-		"oversized on_call":  `{"why":"a","what_changed":"b","on_call":"` + strings.Repeat("x", maxPublishOnCallBytes+1) + `"}`,
+		"oversized why":      `{"why":"` + strings.Repeat("x", MaxPublishWhyBytes+1) + `","what_changed":"b","on_call":"c"}`,
+		"oversized on_call":  `{"why":"a","what_changed":"b","on_call":"` + strings.Repeat("x", MaxPublishOnCallBytes+1) + `"}`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := ParsePublishInput(json.RawMessage(arguments)); err == nil {

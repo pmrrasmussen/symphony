@@ -118,7 +118,11 @@ func TestAFailedStartBindsNothing(t *testing.T) {
 	if _, _, err := router.Start(context.Background(), domain.AgentRequest{}); err == nil {
 		t.Fatal("expected the start error to surface")
 	}
-	if _, err := router.Continue(context.Background(), domain.AgentSession{ID: "codex-session"}, "go"); err == nil {
+	// The probe must carry the backend the binding would have been keyed under,
+	// or it cannot collide with a wrongly created binding and the assertion is
+	// vacuous.
+	probe := domain.AgentSession{ID: "codex-session", Backend: "codex"}
+	if _, err := router.Continue(context.Background(), probe, "go"); err == nil {
 		t.Fatal("a session that never started must not be continuable")
 	}
 }

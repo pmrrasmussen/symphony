@@ -451,8 +451,12 @@ type landingBackend struct {
 	lastErr             error
 }
 
-// callLandTool applies the host-side dispatch guard and, when the capability is
-// still open, invokes it exactly as the Codex tool handler does.
+// callLandTool mirrors the landing capability's own pre-dispatch guard, which
+// lives in internal/capability. This package cannot import that one -- the
+// dependency runs the other way -- and the fake Linear and GitHub servers this
+// test drives are package-internal, so the guard is restated here on purpose.
+// internal/capability owns the behavior and asserts it directly; keep the two in
+// agreement.
 func (b *landingBackend) callLandTool(ctx context.Context, session *Session) (LandResult, bool, error) {
 	if session.LandingResolved() {
 		b.mu.Lock()
