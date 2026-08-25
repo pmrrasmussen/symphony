@@ -192,7 +192,9 @@ func (w *lifecycleWorkspace) BeforeRun(context.Context, domain.Workspace, domain
 func (w *lifecycleWorkspace) AfterRun(context.Context, domain.Workspace, domain.Issue) {
 	w.afterRun <- struct{}{}
 }
-func (w *lifecycleWorkspace) Cleanup(context.Context, domain.Issue) error { return nil }
+func (w *lifecycleWorkspace) Cleanup(context.Context, domain.Issue) (domain.CleanupOutcome, error) {
+	return domain.CleanupClean, nil
+}
 func (w *lifecycleWorkspace) Execute(context.Context, domain.Workspace, string, []string) ([]byte, error) {
 	return nil, errors.New("unexpected execute")
 }

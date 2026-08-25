@@ -221,11 +221,22 @@ func (f *apiFixture) settings() config.GitHub {
 func (f *apiFixture) pullJSON() map[string]any {
 	return map[string]any{
 		"number": f.prNumber, "html_url": "https://github.com/owner/repo/pull/7",
-		"state": f.prState, "merged": f.prMerged, "body": f.prBody,
+		"state": f.prState, "merged": f.prMerged, "merged_at": f.mergedAt(), "body": f.prBody,
 		"mergeable": f.mergeable, "mergeable_state": f.mergeableState,
 		"head": map[string]any{"ref": f.prHeadRef, "sha": f.prSHA},
 		"base": map[string]any{"ref": f.prBaseRef},
 	}
+}
+
+// mergedAt mirrors GitHub's pull-request-simple schema, which the list
+// endpoint returns: it carries merged_at but no merged field. Landing
+// verification treats either as merged, and merged_at is the one that is
+// actually present in production, so the fixture must emit it.
+func (f *apiFixture) mergedAt() any {
+	if !f.prMerged {
+		return nil
+	}
+	return "2026-08-25T09:00:00Z"
 }
 
 func boolPtr(b bool) *bool { return &b }
@@ -1678,5 +1689,121 @@ func TestLandReconcilesWhenGitHubSucceedsButLinearCompletionFails(t *testing.T) 
 	}
 	if linear.landCompleted != 1 {
 		t.Fatalf("recovery completion=%d", linear.landCompleted)
+	}
+}
+
+// verifyLandedManager builds a read-only Manager for the terminal workspace
+// cleanup verification path, with no session, worktree, or Linear handoff: the
+// verifier is host-owned and must never need any of them.
+func verifyLandedManager(t *testing.T, api *apiFixture, mutate func(*config.GitHub)) *Manager {
+	t.Helper()
+	settings := api.settings()
+	if mutate != nil {
+		mutate(&settings)
+	}
+	return New(func() config.Settings { return config.Settings{GitHub: settings} }, slog.Default())
+}
+
+func TestVerifyLandedConfirmsOnlyTheMergedPullRequestHead(t *testing.T) {
+	const workspaceHead = "landed-head"
+	tests := []struct {
+		name      string
+		configure func(*apiFixture)
+		mutate    func(*config.GitHub)
+		commit    string
+		want      bool
+		wantErr   bool
+		wantCalls bool
+	}{
+		{
+			name:      "merged head commit",
+			configure: func(api *apiFixture) { api.prExists, api.prMerged, api.prSHA = true, true, workspaceHead },
+			commit:    workspaceHead,
+			want:      true,
+			wantCalls: true,
+		},
+		{
+			name:      "merged pull request with a rewritten head",
+			configure: func(api *apiFixture) { api.prExists, api.prMerged, api.prSHA = true, true, "rewritten-head" },
+			commit:    workspaceHead,
+			wantCalls: true,
+		},
+		{
+			name:      "open pull request",
+			configure: func(api *apiFixture) { api.prExists, api.prSHA = true, workspaceHead },
+			commit:    workspaceHead,
+			wantCalls: true,
+		},
+		{
+			name:      "closed unmerged pull request",
+			configure: func(api *apiFixture) { api.prExists, api.prState, api.prSHA = true, "closed", workspaceHead },
+			commit:    workspaceHead,
+			wantCalls: true,
+		},
+		{
+			name:      "no pull request",
+			configure: func(api *apiFixture) {},
+			commit:    workspaceHead,
+			wantCalls: true,
+		},
+		{
+			name:      "ambiguous pull requests",
+			configure: func(api *apiFixture) { api.prExists, api.multiplePulls, api.prMerged = true, true, true },
+			commit:    workspaceHead,
+			wantErr:   true,
+			wantCalls: true,
+		},
+		{
+			name:      "github integration disabled",
+			configure: func(api *apiFixture) { api.prExists, api.prMerged, api.prSHA = true, true, workspaceHead },
+			mutate:    func(s *config.GitHub) { s.Enabled = false },
+			commit:    workspaceHead,
+		},
+		{
+			name:      "no recorded commit",
+			configure: func(api *apiFixture) { api.prExists, api.prMerged, api.prSHA = true, true, workspaceHead },
+			commit:    "   ",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			api := newAPI(t)
+			test.configure(api)
+			m := verifyLandedManager(t, api, test.mutate)
+			issue := domain.Issue{ID: "issue-27", Identifier: "PMR-27"}
+
+			landed, err := m.VerifyLanded(context.Background(), issue, test.commit)
+			if test.wantErr != (err != nil) {
+				t.Fatalf("VerifyLanded error=%v, wantErr=%t", err, test.wantErr)
+			}
+			if landed != test.want {
+				t.Fatalf("VerifyLanded=%t, want %t", landed, test.want)
+			}
+			api.mu.Lock()
+			defer api.mu.Unlock()
+			if (len(api.auth) > 0) != test.wantCalls {
+				t.Fatalf("GitHub requests=%d, want any=%t", len(api.auth), test.wantCalls)
+			}
+			if api.created != 0 || api.merges != 0 || len(api.patches) != 0 || api.updateBranchCalls != 0 {
+				t.Fatalf("verification mutated GitHub: created=%d merges=%d patches=%v update_branch=%d", api.created, api.merges, api.patches, api.updateBranchCalls)
+			}
+		})
+	}
+}
+
+// A branch name Symphony would never have produced must not be verified
+// against some other repository branch.
+func TestVerifyLandedRejectsAnIssueWithoutADerivableBranch(t *testing.T) {
+	api := newAPI(t)
+	api.prExists, api.prMerged = true, true
+	m := verifyLandedManager(t, api, nil)
+	landed, err := m.VerifyLanded(context.Background(), domain.Issue{ID: "issue-27", Identifier: "-.-"}, api.prSHA)
+	if landed || err != nil {
+		t.Fatalf("VerifyLanded=%t err=%v, want false and no error", landed, err)
+	}
+	api.mu.Lock()
+	defer api.mu.Unlock()
+	if len(api.auth) != 0 {
+		t.Fatalf("undecidable branch issued %d GitHub requests", len(api.auth))
 	}
 }

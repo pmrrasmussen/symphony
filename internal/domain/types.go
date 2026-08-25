@@ -158,10 +158,37 @@ type Workspace struct {
 	GitIntegrityBaseline string
 	CreatedNow           bool
 }
+
+// CleanupOutcome is the fixed, secret-free vocabulary a successful terminal
+// workspace cleanup reports. It exists so the operator log distinguishes an
+// ordinary removal from one that discarded local commits, which is only ever
+// allowed after Symphony itself verified those commits landed.
+type CleanupOutcome string
+
+const (
+	// CleanupClean is a workspace that was already absent, or was removed with
+	// no local commits past its recorded base commit.
+	CleanupClean CleanupOutcome = "clean"
+	// CleanupLanded is a clean, owned Git worktree whose HEAD was a local
+	// commit past the recorded base commit, removed only because a
+	// LandingVerifier confirmed that exact commit as the merged pull request
+	// head for the bound issue and repository.
+	CleanupLanded CleanupOutcome = "landed"
+)
+
+// LandingVerifier answers the one bounded question terminal cleanup must ask
+// before it may discard committed work: was this exact local commit published
+// and merged for this issue in the configured repository? Implementations are
+// read-only and never widen the running agent's capability surface. A false
+// answer, an unconfigured integration, or any error keeps cleanup fail-closed.
+type LandingVerifier interface {
+	VerifyLanded(ctx context.Context, issue Issue, commit string) (bool, error)
+}
+
 type WorkspaceExecutor interface {
 	Prepare(context.Context, Issue) (Workspace, error)
 	BeforeRun(context.Context, Workspace, Issue) error
 	AfterRun(context.Context, Workspace, Issue)
-	Cleanup(context.Context, Issue) error
+	Cleanup(context.Context, Issue) (CleanupOutcome, error)
 	Execute(context.Context, Workspace, string, []string) ([]byte, error)
 }

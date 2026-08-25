@@ -14,6 +14,7 @@ import (
 
 	"github.com/pmrrasmussen/symphony/internal/config"
 	"github.com/pmrrasmussen/symphony/internal/domain"
+	"github.com/pmrrasmussen/symphony/internal/observability"
 )
 
 const maxHandoffCommentBytes = 8 << 10
@@ -212,7 +213,7 @@ func (s *HandoffSession) handoffLocked(ctx context.Context) error {
 		}
 	}
 	if s.isTargetState(current) && commented {
-		s.logSkip("handoff", current.State.Name)
+		s.logSkip(observability.OperationHandoff, current.State.Name)
 		return nil
 	}
 	if !commented {
@@ -230,7 +231,7 @@ func (s *HandoffSession) handoffLocked(ctx context.Context) error {
 		}
 	}
 	if s.isTargetState(current) {
-		s.logSkip("handoff", current.State.Name)
+		s.logSkip(observability.OperationHandoff, current.State.Name)
 		return nil
 	}
 	if err := s.ensureMutable(ctx); err != nil {
@@ -240,7 +241,7 @@ func (s *HandoffSession) handoffLocked(ctx context.Context) error {
 	if err := s.transition(ctx); err != nil {
 		return err
 	}
-	s.logEdge("handoff", fromState, s.settings.Tracker.HandoffState)
+	s.logEdge(observability.OperationHandoff, fromState, s.settings.Tracker.HandoffState)
 	return nil
 }
 
@@ -319,7 +320,7 @@ func (s *HandoffSession) RefuseLanding(ctx context.Context, mergeState string) (
 		return false, trackerError("handoff_response", "Linear did not apply the configured Merging fallback transition")
 	}
 	s.issue = updated
-	s.logEdge("landing_refused", mergeState, target)
+	s.logEdge(observability.OperationLandingRefused, mergeState, target)
 	return true, nil
 }
 
@@ -358,7 +359,7 @@ func (s *HandoffSession) CompleteLanding(ctx context.Context, mergeState string)
 	if err := s.transitionTo(ctx, doneID); err != nil {
 		return false, err
 	}
-	s.logEdge("landing_completed", current.State.Name, doneName)
+	s.logEdge(observability.OperationLandingCompleted, current.State.Name, doneName)
 	return true, nil
 }
 
@@ -406,7 +407,7 @@ func (s *HandoffSession) ReconcileMerged(ctx context.Context, mergeState string)
 	if err := s.transitionTo(ctx, doneID); err != nil {
 		return false, err
 	}
-	s.logEdge("merge_reconciled", current.State.Name, doneName)
+	s.logEdge(observability.OperationMergeReconciled, current.State.Name, doneName)
 	return true, nil
 }
 
@@ -492,7 +493,7 @@ func (s *HandoffSession) Complete(ctx context.Context) (bool, error) {
 	if err := s.transitionTo(ctx, doneID); err != nil {
 		return false, err
 	}
-	s.logEdge("review_completed", current.State.Name, doneName)
+	s.logEdge(observability.OperationReviewCompleted, current.State.Name, doneName)
 	return true, nil
 }
 
@@ -507,7 +508,7 @@ func (s *HandoffSession) log(outcome string) {
 // reconstructable from Symphony's logs alone: the operation, the from/to state
 // NAMES, and the bound issue. It is deliberately redaction-safe — state names
 // and issue identifiers only, never a rendered comment, prompt, or issue text.
-func (s *HandoffSession) logEdge(operation, fromState, toState string) {
+func (s *HandoffSession) logEdge(operation observability.Operation, fromState, toState string) {
 	if s.logger == nil {
 		return
 	}
@@ -524,7 +525,7 @@ func (s *HandoffSession) logEdge(operation, fromState, toState string) {
 // because the issue was already in the requested state. Actual state changes
 // use logEdge at info level; a skip changes nothing and stays out of the info
 // log. State names only, like logEdge.
-func (s *HandoffSession) logSkip(operation, state string) {
+func (s *HandoffSession) logSkip(operation observability.Operation, state string) {
 	if s.logger == nil {
 		return
 	}
