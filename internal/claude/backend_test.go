@@ -529,12 +529,15 @@ func TestHostSecretsNeverReachTheChild(t *testing.T) {
 		t.Setenv(name, value)
 	}
 	t.Setenv("HOST_CONFIGURED_NAME", "configured-name-secret")
+	t.Setenv("HOST_PADDED_NAME", "padded-name-secret")
 	t.Setenv("INNOCENT_LOOKING", "prefix-configured-value-secret-suffix")
 	t.Setenv("KEPT", "ordinary-value")
 
 	settings := func() config.Settings {
 		return config.Settings{
-			HostSecretEnvNames: []string{"HOST_CONFIGURED_NAME"},
+			// The padded name is the parity case with internal/codex, which
+			// applies the same trimming to the same settings-derived names.
+			HostSecretEnvNames: []string{"HOST_CONFIGURED_NAME", "  HOST_PADDED_NAME  ", "   "},
 			HostSecretValues:   []string{"configured-value-secret"},
 		}
 	}
@@ -550,12 +553,18 @@ func TestHostSecretsNeverReachTheChild(t *testing.T) {
 	environment := readFile(t, filepath.Join(dir, "env.txt"))
 	// The names are compared exactly, so an absence assertion on one name cannot
 	// be satisfied by another that merely ends with it -- GITHUB_TOKEN inside
-	// SYMPHONY_GITHUB_TOKEN, for example.
+	// SYMPHONY_GITHUB_TOKEN, for example. Only a line whose prefix is shaped
+	// like a variable name counts: a multi-line value on a developer or CI
+	// machine would otherwise read as a name and fail confusingly.
 	var names []string
 	for _, line := range strings.Split(environment, "\n") {
-		if name, _, found := strings.Cut(line, "="); found {
-			names = append(names, name)
+		name, _, found := strings.Cut(line, "=")
+		if !found || strings.TrimFunc(name, func(r rune) bool {
+			return r == '_' || r >= 'A' && r <= 'Z' || r >= 'a' && r <= 'z' || r >= '0' && r <= '9'
+		}) != "" {
+			continue
 		}
+		names = append(names, name)
 	}
 	for name, value := range reserved {
 		if slices.Contains(names, name) {
@@ -566,7 +575,7 @@ func TestHostSecretsNeverReachTheChild(t *testing.T) {
 		}
 	}
 	for _, forbidden := range []string{
-		"configured-name-secret", "configured-value-secret", "extra-secret",
+		"configured-name-secret", "padded-name-secret", "configured-value-secret", "extra-secret",
 	} {
 		if strings.Contains(environment, forbidden) {
 			t.Fatalf("child environment retained %q", forbidden)
@@ -1061,5 +1070,37 @@ func TestTwoRefusedInitLinesReportOneFailure(t *testing.T) {
 	}
 	if terminals[0].Kind != domain.EventFailed || !strings.Contains(terminals[0].Message, "permission mode") {
 		t.Fatalf("terminal event=%+v", terminals[0])
+	}
+}
+
+// TestAMalformedEntryIsDroppedAndOnlyValuesReachTheMatcher is the counterpart to
+// internal/codex's test of the same name: neither case is reachable through
+// os.Environ(), which is why both loops take an explicit entry list. The name
+// half matters beyond tidiness -- a matcher fed a whole entry would strip any
+// variable whose *name* happened to contain a credential-shaped string.
+func TestAMalformedEntryIsDroppedAndOnlyValuesReachTheMatcher(t *testing.T) {
+	var offered []string
+	kept := filterEntries(
+		[]string{"MALFORMED_NO_EQUALS", "PMR94_KEEP=ordinary", "PMR94_SECRET=carries-the-token"},
+		map[string]bool{},
+		nil,
+		func(candidate string) bool {
+			offered = append(offered, candidate)
+			return strings.Contains(candidate, "the-token")
+		},
+	)
+	if slices.Contains(kept, "MALFORMED_NO_EQUALS") {
+		t.Fatalf("an entry carrying no \"=\" was forwarded to the child: %v", kept)
+	}
+	if slices.Contains(kept, "PMR94_SECRET=carries-the-token") {
+		t.Fatalf("a matched value survived: %v", kept)
+	}
+	if !slices.Contains(kept, "PMR94_KEEP=ordinary") {
+		t.Fatalf("an ordinary variable was dropped: %v", kept)
+	}
+	for _, candidate := range offered {
+		if strings.Contains(candidate, "PMR94_") || candidate == "MALFORMED_NO_EQUALS" {
+			t.Fatalf("the matcher was offered a name or a whole entry: %q", candidate)
+		}
 	}
 }

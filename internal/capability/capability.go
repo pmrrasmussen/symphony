@@ -129,6 +129,42 @@ type Bindings struct {
 	GitHub   *githubhost.Session
 }
 
+// SecretMatcher reports the credentials the providers bound to one session
+// actually hold, so a launcher can remove any inherited variable whose value
+// carries one -- filter 4 of config.ReservedSecretEnvNames. It returns nil when
+// nothing is bound, which every launcher reads as "no provider filter".
+//
+// It lives here, beside Build, and takes the same Bindings, because the set of
+// bound providers and the set of their credentials must not be able to diverge:
+// a provider added to Bindings gains both its capabilities and its credential
+// filter, or neither. Both backends call it, so the two cannot differ on which
+// provider credential is stripped -- they did before, in the same way twice.
+//
+// manager is the fallback for the case that made this a function rather than a
+// closure at each call site: githubhost.Manager.PrepareWithSettings returns nil
+// when no Linear handoff was prepared, so a run with github.enabled but no
+// handoff_state has a bound manager, no session, and -- until this existed -- a
+// live matcher that answered false for every candidate, including the forge
+// token itself. The manager reads its own settings callback rather than this
+// snapshot; that is the credential it would use for such a run, since no
+// session froze one.
+func SecretMatcher(b Bindings, manager *githubhost.Manager) func(string) bool {
+	if b.Handoff == nil && b.GitHub == nil && manager == nil {
+		return nil
+	}
+	return func(candidate string) bool {
+		switch {
+		case b.Handoff != nil && b.Handoff.MatchesSecret(candidate):
+			return true
+		case b.GitHub != nil:
+			return b.GitHub.MatchesSecret(candidate)
+		case manager != nil:
+			return manager.MatchesSecret(candidate)
+		}
+		return false
+	}
+}
+
 // Build assembles the capabilities for one session. Order is stable and is part
 // of the advertised contract.
 func Build(b Bindings) *Registry {

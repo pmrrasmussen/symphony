@@ -122,8 +122,10 @@ func New(settings func() config.Settings, logger *slog.Logger) *Manager {
 
 func (m *Manager) Enabled() bool { return m.settings().GitHub.Enabled }
 
-// MatchesSecret allows the Codex launcher to strip the GitHub token and any
-// inherited value containing it from the child environment.
+// MatchesSecret allows a launcher to strip the GitHub token and any inherited
+// value containing it from the child environment. It is the fallback
+// capability.SecretMatcher uses for a run that bound this manager but prepared
+// no Session, which is every run with github.enabled and no Linear handoff.
 func (m *Manager) MatchesSecret(candidate string) bool {
 	token := m.settings().GitHub.Token
 	return token != "" && strings.Contains(candidate, token)

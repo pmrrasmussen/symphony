@@ -1452,6 +1452,7 @@ func TestNoHostCredentialReachesTheChildEnvironment(t *testing.T) {
 	// list mentions. Filter 4: the bound provider session's own credential,
 	// under a name no list mentions and with no configured value at all.
 	t.Setenv("PMR94_CONFIGURED_NAME", "configured-name-value")
+	t.Setenv("PMR94_PADDED_NAME", "padded-name-value")
 	t.Setenv("PMR94_INHERITED_CONFIGURED", "Bearer configured-secret-value")
 	t.Setenv("PMR94_INHERITED_FORGE", "prefix-provider-forge-token-suffix")
 	t.Setenv("PMR94_INHERITED_TRACKER", "wraps provider-tracker-key inside")
@@ -1464,7 +1465,10 @@ func TestNoHostCredentialReachesTheChildEnvironment(t *testing.T) {
 		},
 		GitHub: config.GitHub{Enabled: true, Owner: "owner", Repository: "repo", BaseBranch: "main",
 			Token: "provider-forge-token", Endpoint: tracker.URL, MergeState: "Merging", MergeMethod: "merge"},
-		HostSecretEnvNames: []string{"PMR94_CONFIGURED_NAME"},
+		// The padded name is the parity case: internal/claude's filteredEnv trims
+		// and skips empties, and this backend must not be looser about the same
+		// hand-assembled Settings that filter 4 exists for.
+		HostSecretEnvNames: []string{"PMR94_CONFIGURED_NAME", "  PMR94_PADDED_NAME  ", "   "},
 		HostSecretValues:   []string{"configured-secret-value"},
 	}
 	dir := t.TempDir()
@@ -1499,7 +1503,8 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{}}'
 			t.Fatalf("child environment retained the value of reserved variable %s", name)
 		}
 	}
-	for _, leaked := range []string{"configured-name-value", "configured-secret-value", "provider-forge-token", "provider-tracker-key"} {
+	for _, leaked := range []string{"configured-name-value", "padded-name-value",
+		"configured-secret-value", "provider-forge-token", "provider-tracker-key"} {
 		if strings.Contains(child, leaked) {
 			t.Fatalf("child environment retained %q", leaked)
 		}
@@ -1512,14 +1517,31 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{}}'
 // childEnvironmentNames reads the variable names out of `env` output, so an
 // absence assertion on one name cannot be satisfied by another name that merely
 // ends with it -- GITHUB_TOKEN inside SYMPHONY_GITHUB_TOKEN, for example.
+//
+// Only a line whose prefix is shaped like a variable name counts, because a
+// developer or CI machine can hold a multi-line value whose continuation lines
+// would otherwise read as names and produce a confusing failure.
 func childEnvironmentNames(child string) []string {
 	var names []string
 	for _, line := range strings.Split(child, "\n") {
-		if name, _, found := strings.Cut(line, "="); found {
+		if name, _, found := strings.Cut(line, "="); found && environmentName(name) {
 			names = append(names, name)
 		}
 	}
 	return names
+}
+
+func environmentName(candidate string) bool {
+	if candidate == "" {
+		return false
+	}
+	for i, r := range candidate {
+		digit := r >= '0' && r <= '9'
+		if !(r == '_' || r >= 'A' && r <= 'Z' || r >= 'a' && r <= 'z' || digit && i > 0) {
+			return false
+		}
+	}
+	return true
 }
 
 func readChildEnvironment(t *testing.T, path string) string {
@@ -1529,4 +1551,93 @@ func readChildEnvironment(t *testing.T, path string) string {
 		t.Fatal(err)
 	}
 	return string(data)
+}
+
+// TestABoundGitHubManagerWithoutAHandoffStillStripsItsToken closes a hole the
+// provider matcher had from the day it was written, in both backends
+// identically. githubhost.Manager.PrepareWithSettings returns nil when no Linear
+// handoff was prepared, so a workflow with github.enabled but no handoff_state
+// and no followup_issue_creation leaves a bound manager, no session -- and, until
+// capability.SecretMatcher took the manager as its fallback, a matcher that was
+// live and answered false for every candidate, the forge token included.
+//
+// It was never a leak through a loaded workflow, because HostSecretValues covers
+// the same token there. It is a leak for any Settings not produced by Load,
+// which is the case filter 4 exists for, so leaving it would have made the
+// documented reason false.
+func TestABoundGitHubManagerWithoutAHandoffStillStripsItsToken(t *testing.T) {
+	settings := config.Settings{
+		// No handoff_state and no followup_issue_creation: nothing prepares a
+		// Linear handoff, so nothing prepares a GitHub session either.
+		Tracker: config.Tracker{Provider: map[string]any{"api_key": "provider-tracker-key"}, ActiveStates: []string{"Todo"}},
+		GitHub: config.GitHub{Enabled: true, Owner: "owner", Repository: "repo", BaseBranch: "main",
+			Token: "provider-forge-token", Endpoint: "https://api.github.com", MergeState: "Merging", MergeMethod: "merge"},
+	}
+	t.Setenv("PMR94_INHERITED_FORGE", "prefix-provider-forge-token-suffix")
+	t.Setenv("PMR94_KEPT", "ordinary-value")
+	dir := t.TempDir()
+	environment := filepath.Join(dir, "environment")
+	script := writeAppServer(t, dir, `
+env > `+environment+`
+IFS= read -r line
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'
+IFS= read -r line
+IFS= read -r line
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thread-1"}}}'
+IFS= read -r line
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn-1"}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{}}'
+`)
+	b := integratedBackend(func() config.Settings { return settings })
+	r := request(dir, script)
+	r.Issue = domain.Issue{ID: "issue-1", Identifier: "PMR-94", State: "Todo"}
+	if _, events, err := b.Start(context.Background(), r); err != nil {
+		t.Fatal(err)
+	} else {
+		for range events {
+		}
+	}
+	child := readChildEnvironment(t, environment)
+	if strings.Contains(child, "provider-forge-token") {
+		t.Fatal("a bound GitHub manager's token reached the child because no session was prepared to match it")
+	}
+	if !strings.Contains(child, "ordinary-value") {
+		t.Fatal("the manager fallback removed unrelated variables")
+	}
+}
+
+// TestAMalformedEntryIsDroppedAndOnlyValuesReachTheMatcher pins the two smaller
+// halves of backend parity with internal/claude, which has the same test over
+// its own filterEntries. Neither case is reachable through os.Environ(), which
+// is why the loop takes an explicit entry list.
+//
+// The name half matters beyond tidiness: a matcher fed a whole entry would strip
+// any variable whose *name* happened to contain a credential-shaped string,
+// silently removing something the child needs.
+func TestAMalformedEntryIsDroppedAndOnlyValuesReachTheMatcher(t *testing.T) {
+	var offered []string
+	kept := filterEntries(
+		[]string{"MALFORMED_NO_EQUALS", "PMR94_KEEP=ordinary", "PMR94_SECRET=carries-the-token"},
+		nil,
+		func(candidate string) bool {
+			offered = append(offered, candidate)
+			return strings.Contains(candidate, "the-token")
+		},
+	)
+	if slices.Contains(kept, "MALFORMED_NO_EQUALS") {
+		t.Fatalf("an entry carrying no \"=\" was forwarded to the child: %v", kept)
+	}
+	if slices.Contains(kept, "PMR94_SECRET=carries-the-token") {
+		t.Fatalf("a matched value survived: %v", kept)
+	}
+	if !slices.Contains(kept, "PMR94_KEEP=ordinary") {
+		t.Fatalf("an ordinary variable was dropped: %v", kept)
+	}
+	// Only values, never names or whole entries: "MALFORMED_NO_EQUALS" must not
+	// appear, and neither must "PMR94_SECRET=carries-the-token".
+	for _, candidate := range offered {
+		if strings.Contains(candidate, "PMR94_") || candidate == "MALFORMED_NO_EQUALS" {
+			t.Fatalf("the matcher was offered a name or a whole entry: %q", candidate)
+		}
+	}
 }

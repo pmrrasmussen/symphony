@@ -217,22 +217,22 @@ func (b *Backend) Start(ctx context.Context, r domain.AgentRequest) (domain.Agen
 	if b.github != nil {
 		githubSession = b.github.PrepareWithSettings(settings.GitHub, r.Issue, r.Workspace, handoff)
 	}
-	var secretMatcher func(string) bool
-	if handoff != nil || b.github != nil {
-		secretMatcher = func(candidate string) bool {
-			return handoff != nil && handoff.MatchesSecret(candidate) || githubSession != nil && githubSession.MatchesSecret(candidate)
-		}
-	}
 	id, err := newSessionID()
 	if err != nil {
 		return domain.AgentSession{}, nil, err
 	}
-	registry := capability.Build(capability.Bindings{Settings: settings, Issue: r.Issue, Handoff: handoff, GitHub: githubSession})
+	// One set of bindings drives both the registry and the secret matcher, so
+	// the providers this session can reach and the credentials it strips cannot
+	// disagree -- and neither can this backend and internal/codex, which derives
+	// both from the same call.
+	bindings := capability.Bindings{Settings: settings, Issue: r.Issue, Handoff: handoff, GitHub: githubSession}
+	registry := capability.Build(bindings)
 	advertised := advertisedNames(registry)
 	if err := verifyPromises(settings, r.Prompt, advertised); err != nil {
 		return domain.AgentSession{}, nil, err
 	}
-	s := &session{id: id, ctx: ctx, registry: registry, advertised: advertised, secretMatcher: secretMatcher}
+	s := &session{id: id, ctx: ctx, registry: registry, advertised: advertised,
+		secretMatcher: capability.SecretMatcher(bindings, b.github)}
 	b.mu.Lock()
 	b.sessions[id] = s
 	b.mu.Unlock()

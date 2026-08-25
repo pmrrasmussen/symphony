@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -1772,5 +1773,32 @@ func TestEverySelectableBackendHasAValidatedLaunchContract(t *testing.T) {
 		if !known || strings.TrimSpace(launch.Command) == "" || launch.TurnTimeout <= 0 || launch.StallTimeout <= 0 {
 			t.Fatalf("backend %q launch=%+v known=%v", backend, launch, known)
 		}
+	}
+}
+
+// TestReservedSecretEnvNamesReturnsAnIndependentCopy pins the contract every
+// caller relies on: both launchers append their own configured names to the
+// result, so a returned slice that aliased the package's own would let one
+// backend's constructor overwrite the shared policy for the whole process. The
+// aliasing is invisible while len == cap, which it is for five names -- append
+// reallocates -- so this is exactly the invariant that breaks silently when a
+// sixth name is added.
+func TestReservedSecretEnvNamesReturnsAnIndependentCopy(t *testing.T) {
+	// The expected values are copied here, not aliased: a first attempt at this
+	// test held ReservedSecretEnvNames()'s own result and compared it against
+	// itself, so an aliasing regression corrupted both sides equally and the
+	// test passed. That is exactly the mutation it is supposed to catch.
+	want := append([]string(nil), ReservedSecretEnvNames()...)
+	if len(want) == 0 {
+		t.Fatal("no reserved names")
+	}
+	appended := append(ReservedSecretEnvNames(), "SOMEONE_ELSES_NAME")
+	ReservedSecretEnvNames()[0] = "OVERWRITTEN"
+
+	if got := ReservedSecretEnvNames(); !slices.Equal(got, want) {
+		t.Fatalf("the reserved list is now %v, want %v: a caller's write or append reached the package's own slice", got, want)
+	}
+	if appended[len(appended)-1] != "SOMEONE_ELSES_NAME" {
+		t.Fatal("append did not land on the returned slice")
 	}
 }

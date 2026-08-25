@@ -20,6 +20,15 @@ import (
 	"github.com/pmrrasmussen/symphony/internal/preflight"
 )
 
+// linearKeyEnvironment and githubKeyEnvironment are the plist variables this
+// LaunchAgent hands *to* the daemon, which is the opposite direction from
+// config.ReservedSecretEnvNames -- the names no agent child may inherit. They
+// are deliberately separate constants rather than indexes into that list, since
+// each is one specific variable this installer writes and neither is a policy
+// over a set. The two lists must still agree: a name the plist sets that the
+// reserved list does not carry would be exported into the daemon and then
+// inherited by every agent child. TestReservedNamesCoverTheServiceCredentialVariables
+// is what holds them together.
 const (
 	linearKeyEnvironment = "SYMPHONY_LINEAR_API_KEY_FILE"
 	githubKeyEnvironment = "SYMPHONY_GITHUB_TOKEN_FILE"

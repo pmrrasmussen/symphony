@@ -220,10 +220,11 @@ Host-owned Linear and GitHub secrets are absent from the Codex child
 configured name, by configured value, and by the credential the run's bound
 providers hold, so no host credential is handed to the worker as a variable, and
 all publishing authority stays with the host. The same filter applies to both
-backends; [docs/architecture.md](docs/architecture.md) describes it in full. That guarantee covers the
-environment, not reachability and not files on disk. With both local reads and
-outbound network available to the worker, what protects host credentials from
-exfiltration is that no untrusted input reaches the worker -- the issue text
+backends; [docs/architecture.md](docs/architecture.md) describes it in full.
+That guarantee covers the environment, not reachability and not files on disk.
+With both local reads and outbound network available to the worker, what
+protects host credentials from exfiltration is that no untrusted input reaches
+the worker -- the issue text
 and repository content it acts on are operator-owned -- rather than the sandbox
 itself.
 

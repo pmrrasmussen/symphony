@@ -96,22 +96,24 @@ func (b *Backend) Start(ctx context.Context, r domain.AgentRequest) (domain.Agen
 			return domain.AgentSession{}, nil, fmt.Errorf("prepare Linear handoff: %w", err)
 		}
 	}
-	var secretMatcher func(string) bool
 	var githubSession *githubhost.Session
 	if b.github != nil {
 		githubSession = b.github.PrepareWithSettings(settings.GitHub, r.Issue, r.Workspace, handoff)
 	}
-	if handoff != nil || b.github != nil {
-		secretMatcher = func(candidate string) bool {
-			return handoff != nil && handoff.MatchesSecret(candidate) || githubSession != nil && githubSession.MatchesSecret(candidate)
-		}
-	}
 	r.TurnSandboxPolicy = localCommitSandbox(r)
-	secretNames := append(append([]string(nil), b.secretNames...), settings.HostSecretEnvNames...)
-	secretMatcher = withSecretValues(secretMatcher, settings.HostSecretValues)
+	// uniquePaths is applied to the combined slice, not just the constructor's
+	// half: it trims and drops empties, which is what internal/claude's
+	// filteredEnv does to the same settings-derived names. Without it a
+	// hand-assembled Settings could carry " NAME " here and have it blocked on
+	// one backend and inherited on the other.
+	secretNames := uniquePaths(append(append([]string(nil), b.secretNames...), settings.HostSecretEnvNames...))
 	// The registry is per session and holds these same provider session
-	// pointers, because every per-run idempotency latch lives in them.
-	capabilities := capability.Build(capability.Bindings{Settings: settings, Issue: r.Issue, Handoff: handoff, GitHub: githubSession})
+	// pointers, because every per-run idempotency latch lives in them. The
+	// secret matcher is derived from the same bindings, so the providers this
+	// session can reach and the credentials it strips cannot disagree.
+	bindings := capability.Bindings{Settings: settings, Issue: r.Issue, Handoff: handoff, GitHub: githubSession}
+	secretMatcher := withSecretValues(capability.SecretMatcher(bindings, b.github), settings.HostSecretValues)
+	capabilities := capability.Build(bindings)
 	c, err := start(ctx, r, secretNames, secretMatcher, capabilities)
 	if err != nil {
 		return domain.AgentSession{}, nil, err
@@ -361,17 +363,32 @@ func uniquePaths(paths []string) []string {
 // documents all four filters and why each is needed; internal/claude applies
 // the same four and adds nothing but the capability endpoint token.
 func filteredEnv(names []string, secretMatcher func(string) bool) []string {
+	return filterEntries(os.Environ(), names, secretMatcher)
+}
+
+// filterEntries is filteredEnv over an explicit entry list, which is the only
+// way a test can present an entry os.Environ() cannot be made to hold.
+//
+// An entry carrying no "=" is dropped rather than forwarded, and only the value
+// is ever offered to the matcher. Both are what internal/claude does with the
+// same entry: a malformed entry conveys nothing to a child, and running a whole
+// entry through the matcher would let a variable's own *name* trip a credential
+// match and silently strip an unrelated variable.
+func filterEntries(entries, names []string, secretMatcher func(string) bool) []string {
 	blocked := map[string]bool{}
 	for _, n := range names {
 		blocked[n] = true
 	}
 	out := []string{}
-	for _, v := range os.Environ() {
-		k := strings.SplitN(v, "=", 2)[0]
-		value := strings.TrimPrefix(v, k+"=")
-		if !blocked[k] && (secretMatcher == nil || !secretMatcher(value)) {
-			out = append(out, v)
+	for _, entry := range entries {
+		name, value, found := strings.Cut(entry, "=")
+		if !found || blocked[name] {
+			continue
 		}
+		if secretMatcher != nil && secretMatcher(value) {
+			continue
+		}
+		out = append(out, entry)
 	}
 	return out
 }

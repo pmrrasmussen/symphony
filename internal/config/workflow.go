@@ -679,26 +679,38 @@ var reservedSecretEnvNames = []string{
 // A launcher filters the inherited environment through four filters, and each
 // one exists because the others cannot cover it:
 //
-//  1. ReservedSecretEnvNames removes the documented variables Symphony's own
-//     credentials are read from, whatever the workflow configures. It is the
-//     only filter that applies to a workflow with no credential reference at
-//     all -- for example one whose tracker key is passed in some other way --
-//     and the only one that covers a credential *file path*, which is not a
-//     secret value and so is invisible to filter 3.
+//  1. ReservedSecretEnvNames removes these five documented names, whatever the
+//     workflow configures. It is the only filter that applies to a workflow
+//     with no credential reference at all -- one whose tracker key is passed in
+//     some other way, so filters 2 and 3 are both empty -- and it covers the two
+//     documented *_FILE names even when nothing references them.
 //  2. Settings.HostSecretEnvNames removes the variables this workflow actually
-//     references. Filter 1 cannot: the names are repository-chosen and unknown
-//     here. It is also the only control over the `api_key_file` form, where the
-//     variable holds a path rather than the credential (PMR-80).
+//     references. Filter 1 cannot: those names are repository-chosen. It is
+//     also the only filter of any kind that covers a repository-chosen
+//     credential *file path*: for the api_key_file and token_file forms the
+//     variable holds a path, not the credential, so filter 3 never matches it
+//     and filter 1 does not know its name (PMR-80).
 //  3. Settings.HostSecretValues removes any variable whose value *contains* a
 //     configured credential, under any name. Neither name filter can: an
 //     inherited variable Symphony has never heard of can still carry the
-//     credential, plain or wrapped in something like "Bearer <token>".
-//  4. The session's provider secret matcher removes the credential the bound
-//     provider sessions actually hold. Filter 3 is derived by the loader from
-//     the workflow at load time; the provider session is the authority on the
-//     credential it will use, and the two can differ -- a settings reload
-//     between turns rotates 3 while a run's frozen providers keep 4, and a
-//     Settings assembled by anything other than Load carries no values at all.
+//     credential, plain or wrapped in something like "Bearer <token>". For a
+//     Settings produced by Load this is the broadest filter of the four --
+//     resolveProvider writes resolved api_key_file contents back into
+//     provider["api_key"], and decodeGitHub disables the integration outright
+//     for a literal inline token, so hostSecretValues sees both credentials in
+//     resolved form.
+//  4. capability.SecretMatcher removes the credential the providers bound to
+//     this run actually hold. Because of what filter 3 just resolved, no
+//     *loadable* configuration makes this the only filter that catches a
+//     credential today: for now it is defence-in-depth against a divergence
+//     between the two, and against a Settings assembled by anything other than
+//     Load, which carries no HostSecretValues at all. It stops being merely
+//     that as soon as a backend relaunches per turn with providers bound: a
+//     launcher reads the *live* settings callback for filters 2 and 3 on every
+//     turn while the matcher stays frozen at session build, so a reload that
+//     rotates a credential mid-run leaves the value the frozen providers still
+//     use covered by nothing else. internal/claude spawns one process per turn,
+//     which is exactly that shape.
 //
 // A credential the launcher deliberately hands over -- the Claude backend's
 // capability endpoint token -- is appended after filtering, so no filter can
@@ -710,7 +722,10 @@ var reservedSecretEnvNames = []string{
 // Each numbered filter is proven per backend, because a hole would be silent:
 // see TestNoHostCredentialReachesTheChildEnvironment in internal/codex and
 // TestHostSecretsNeverReachTheChild plus
-// TestStartBindsTheHostProvidersAndTheirSecrets in internal/claude.
+// TestStartBindsTheHostProvidersAndTheirSecrets in internal/claude. Filter 1's
+// names are also the names internal/service writes into the LaunchAgent plist;
+// TestReservedNamesCoverTheServiceCredentialVariables holds those two lists
+// together.
 func ReservedSecretEnvNames() []string { return append([]string(nil), reservedSecretEnvNames...) }
 
 // hostSecretEnvNames extracts only environment variable names from credential

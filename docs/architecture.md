@@ -239,25 +239,39 @@ never includes tool arguments, command bodies, outputs, or raw payloads. See
 
 No host credential reaches an agent child as an environment variable, under
 either backend. One filter, described once, is applied by both launchers, and it
-has four parts because no three of them cover the fourth. First, a fixed set of
-reserved variable names -- the documented names Symphony's own tracker and forge
-credentials are read from -- is removed whatever the workflow configures; it is
-also the only part that removes a credential *file path*, which is not a secret
-value. Second, the variable names this workflow actually references are removed;
-those are repository-chosen and so cannot be in the fixed set. Third, any
-variable whose value contains a configured credential is removed under any name,
-because an inherited variable Symphony has never heard of can still carry the
-credential, plain or wrapped as `Bearer <token>`. Fourth, the credential the
-run's bound provider sessions actually hold is removed: the third part is
-derived by the loader from the workflow, while a provider session is the
-authority on the credential it will use, and the two can diverge across a
-settings reload. The Claude backend adds exactly one variable after filtering --
-this turn's capability endpoint token, which is the credential it deliberately
-hands over -- and blocks that name on the way in so it can have no other source.
-Everything else is inherited on purpose: both CLIs authenticate through the
-operator's own stored login, which lives in the home directory they read.
-`internal/config`'s `ReservedSecretEnvNames` owns both the reserved names and
-this description, and each part is proven separately per backend.
+has four parts. First, a fixed set of reserved variable names -- the documented
+names Symphony's own tracker and forge credentials are read from -- is removed
+whatever the workflow configures, so it still applies to a workflow that
+references no credential at all. Second, the variable names this workflow
+actually references are removed; those are repository-chosen, so the fixed set
+cannot know them. This second part is also the only one that covers a
+credential *file path*: with `api_key_file` or `token_file` the variable holds a
+path rather than the credential, so the value filter below never matches it
+(PMR-80), and a worker that learned the path could read the file, which no
+sandbox mode prevents. Third, any variable whose value contains a configured
+credential is removed under any name, because an inherited variable Symphony has
+never heard of can still carry the credential, plain or wrapped as
+`Bearer <token>`; for a loaded workflow this is the broadest of the four, since
+the loader resolves both credentials to their values before deriving it. Fourth,
+the credential the run's bound providers actually hold is removed. That fourth
+part is defence-in-depth today rather than the sole cover for anything -- no
+loadable configuration separates it from the third -- and it becomes
+load-bearing as soon as a backend relaunches per turn with providers bound,
+because the first three parts are re-read from live settings on every turn while
+the matcher stays frozen at session build. The Claude backend, which spawns one
+process per turn, is exactly that shape; it also adds exactly one variable after
+filtering -- this turn's capability endpoint token, the credential it
+deliberately hands over -- and blocks that name on the way in so it can have no
+other source. Everything else is inherited on purpose: both CLIs authenticate
+through the operator's own stored login, which lives in the home directory they
+read.
+
+`internal/config`'s `ReservedSecretEnvNames` owns the reserved names and this
+description; the other three parts are derived and applied by the launchers, and
+`internal/capability`'s `SecretMatcher` builds the fourth from the same bindings
+that decide which capabilities a session gets, so the providers a session can
+reach and the credentials it strips cannot diverge. Each part is proven
+separately per backend.
 
 When `workspace.source_root` is configured, `LocalWorkspaceExecutor` creates a
 detached Git worktree for each issue. Before creating a new workspace, it

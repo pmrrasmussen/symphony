@@ -12,8 +12,9 @@ import (
 //
 // The filter itself is not this backend's own: config.ReservedSecretEnvNames
 // documents all four filters -- the reserved names, the configured names, the
-// configured values, and the session's provider secret matcher -- and why no
-// three of them cover the fourth. internal/codex applies exactly the same four.
+// configured values, and the bound providers' secret matcher -- and what each
+// one covers that the others do not. internal/codex applies exactly the same
+// four, and its filterEntries matches this one entry for entry.
 //
 // What is specific to this launcher is the endpoint. It is the only variable
 // added. The token is appended after filtering rather than merged before it, so
@@ -49,9 +50,24 @@ func filteredEnv(extraNames []string, settings func() config.Settings, secretMat
 		}
 	}
 
-	environment := os.Environ()
-	filtered := make([]string, 0, len(environment)+1)
-	for _, entry := range environment {
+	filtered := filterEntries(os.Environ(), blocked, values, secretMatcher)
+	if endpoint != nil && endpoint.token != "" {
+		filtered = append(filtered, endpointTokenEnvName+"="+endpoint.token)
+	}
+	return filtered
+}
+
+// filterEntries is the environment loop over an explicit entry list, which is
+// the only way a test can present an entry os.Environ() cannot be made to hold.
+//
+// An entry carrying no "=" is dropped rather than forwarded, and only the value
+// is ever offered to the value filters: a malformed entry conveys nothing to a
+// child, and running a whole entry through them would let a variable's own
+// *name* trip a credential match and silently strip an unrelated variable.
+// internal/codex's filterEntries does the same with the same entry.
+func filterEntries(entries []string, blocked map[string]bool, values []string, secretMatcher func(string) bool) []string {
+	filtered := make([]string, 0, len(entries)+1)
+	for _, entry := range entries {
 		name, value, found := strings.Cut(entry, "=")
 		if !found || blocked[name] {
 			continue
@@ -60,9 +76,6 @@ func filteredEnv(extraNames []string, settings func() config.Settings, secretMat
 			continue
 		}
 		filtered = append(filtered, entry)
-	}
-	if endpoint != nil && endpoint.token != "" {
-		filtered = append(filtered, endpointTokenEnvName+"="+endpoint.token)
 	}
 	return filtered
 }
