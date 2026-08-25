@@ -100,6 +100,9 @@ func TestAnUnavailableBackendFailsTheLaunchWithoutFallingBack(t *testing.T) {
 	if err == nil {
 		t.Fatal("an unavailable backend must fail the launch")
 	}
+	if _, _, err := router.Start(context.Background(), domain.AgentRequest{Backend: "claude"}); err == nil {
+		t.Fatal("an unavailable requested backend must fail the launch")
+	}
 	if !strings.Contains(err.Error(), `"claude"`) || !strings.Contains(err.Error(), "codex") {
 		t.Fatalf("error does not name the selection and what is available: %v", err)
 	}
@@ -162,29 +165,71 @@ func TestReloadDoesNotMoveAnInFlightSessionToAnotherBackend(t *testing.T) {
 	if starts, continues, cancels := other.observed(); starts != 0 || len(continues) != 0 || len(cancels) != 0 {
 		t.Fatalf("newly configured backend touched an in-flight session: starts=%d continues=%v cancels=%v", starts, continues, cancels)
 	}
-	// The reported backend for the run stays the one that started it, so the
-	// scheduler resolves its policy under the right runtime.
-	if got := router.Backend(session); got != "" && got != "other" {
-		t.Fatalf("Backend() = %q for a released session", got)
-	}
 }
 
-func TestBackendReportsTheRuntimeThatOwnsASession(t *testing.T) {
+// TestStartHonorsTheRequestedBackendOverTheCurrentSelection is the fix for the
+// two-reads race: the scheduler resolves the command, sandbox, and timeouts for
+// one backend, so the router must run that backend rather than resolving the
+// selection a second time against a configuration that may have reloaded.
+func TestStartHonorsTheRequestedBackendOverTheCurrentSelection(t *testing.T) {
 	codex, other := &fakeBackend{name: "codex"}, &fakeBackend{name: "other"}
-	selection := "codex"
-	router := NewRouter(func() config.Settings { return settingsFor(selection) },
+	router := NewRouter(func() config.Settings { return settingsFor("other") },
 		map[string]domain.AgentBackend{"codex": codex, "other": other})
-	session, _, err := router.Start(context.Background(), domain.AgentRequest{})
+	session, _, err := router.Start(context.Background(), domain.AgentRequest{Backend: "codex"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	selection = "other"
-	if got := router.Backend(session); got != "codex" {
-		t.Fatalf("Backend() = %q after the selection changed, want the runtime that started the run", got)
+	if starts, _, _ := codex.observed(); starts != 1 {
+		t.Fatal("the requested backend did not start the session")
 	}
-	// An unknown session falls back to the current selection rather than "".
-	if got := router.Backend(domain.AgentSession{ID: "unknown"}); got != "other" {
-		t.Fatalf("Backend() = %q for an unknown session, want the current selection", got)
+	if starts, _, _ := other.observed(); starts != 0 {
+		t.Fatal("the configured backend overrode the resolved request")
+	}
+	// The session is stamped, so no later lookup has to re-derive the runtime.
+	if session.Backend != "codex" {
+		t.Fatalf("session.Backend=%q, want codex", session.Backend)
+	}
+	if _, err := router.Continue(context.Background(), session, "turn 2"); err != nil {
+		t.Fatal(err)
+	}
+	if _, continues, _ := codex.observed(); len(continues) != 1 {
+		t.Fatal("the stamped session did not resume on its own backend")
+	}
+}
+
+// TestSessionsAreBoundPerBackendNotByIDAlone matters because session IDs are
+// minted by the backends: two runtimes may hand back the same one, and one must
+// not be able to steal or release the other's binding.
+func TestSessionsAreBoundPerBackendNotByIDAlone(t *testing.T) {
+	// Both backends mint the same session ID.
+	first, second := &fakeBackend{name: "same"}, &fakeBackend{name: "same"}
+	router := NewRouter(func() config.Settings { return config.Settings{} },
+		map[string]domain.AgentBackend{"first": first, "second": second})
+
+	firstSession, _, err := router.Start(context.Background(), domain.AgentRequest{Backend: "first"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondSession, _, err := router.Start(context.Background(), domain.AgentRequest{Backend: "second"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstSession.ID != secondSession.ID {
+		t.Fatalf("fixture no longer exercises the collision: %q vs %q", firstSession.ID, secondSession.ID)
+	}
+
+	if err := router.Cancel(context.Background(), firstSession); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, cancels := first.observed(); len(cancels) != 1 {
+		t.Fatal("cancelling the first session did not reach its own backend")
+	}
+	if _, _, cancels := second.observed(); len(cancels) != 0 {
+		t.Fatal("cancelling one session cancelled another backend's identically named session")
+	}
+	// The other binding survived, so its run can still be continued.
+	if _, err := router.Continue(context.Background(), secondSession, "still alive"); err != nil {
+		t.Fatalf("cancelling one backend's session released another's binding: %v", err)
 	}
 }
 

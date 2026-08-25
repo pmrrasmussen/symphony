@@ -147,7 +147,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	// Coordination talks to the router, not to a runtime: the router resolves
 	// agent.backend for each new session and pins continuation and cancellation
 	// to whichever backend started it.
-	var a domain.AgentBackend = agent.NewRouter(settings, map[string]domain.AgentBackend{"codex": backend})
+	var a domain.AgentBackend = agent.NewRouter(settings, map[string]domain.AgentBackend{config.DefaultAgentBackend: backend})
 	var w domain.WorkspaceExecutor = ws
 	c := coordinator.New(t, a, w, settings, slog.New(log.Handler()))
 	var statusPublisher *status.Publisher

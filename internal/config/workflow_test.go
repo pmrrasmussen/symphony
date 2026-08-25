@@ -1311,7 +1311,7 @@ func TestAgentBackendDefaultsToCodexAndFailsClosed(t *testing.T) {
 	write := func(t *testing.T, agentBlock string) string {
 		t.Helper()
 		path := filepath.Join(d, strings.ReplaceAll(t.Name(), "/", "_")+".md")
-		body := "---\ntracker: {kind: linear, provider: {api_key: k}, active_states: [Todo], terminal_states: [Done]}\npolling: {interval_ms: 100}\nworkspace: {root: work}\nhooks: {timeout_ms: 100}\nagent: {" + agentBlock + "}\ncodex: {command: codex app-server}\n---\nbody"
+		body := "---\ntracker: {kind: linear, provider: {api_key: secret-key}, active_states: [Todo], terminal_states: [Done]}\npolling: {interval_ms: 100}\nworkspace: {root: work}\nhooks: {timeout_ms: 100}\nagent: {" + agentBlock + "}\ncodex: {command: codex app-server}\n---\nbody"
 		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 			t.Fatal(err)
 		}
@@ -1347,9 +1347,12 @@ func TestAgentBackendDefaultsToCodexAndFailsClosed(t *testing.T) {
 			if !strings.Contains(err.Error(), "invalid configuration: agent.backend must be one of codex") {
 				t.Fatalf("error=%v", err)
 			}
-			// The rejection must not echo anything but the offending value.
-			if strings.Contains(err.Error(), "api_key") || strings.Contains(err.Error(), "k") && !strings.Contains(err.Error(), "backend") {
-				t.Fatalf("error leaked configuration: %v", err)
+			// The rejection must name the offending value and nothing else from
+			// the configuration.
+			for _, leaked := range []string{"api_key", "secret-key", "Todo", "Done", "codex app-server", "/tmp/work"} {
+				if strings.Contains(err.Error(), leaked) {
+					t.Fatalf("error leaked configured value %q: %v", leaked, err)
+				}
 			}
 		})
 	}
@@ -1401,7 +1404,14 @@ func TestAgentLaunchResolvesTheSelectedBackendsContract(t *testing.T) {
 	// An unknown name yields no launch parameters rather than another backend's,
 	// which is what makes a stale or wrong lookup fail loudly instead of running
 	// something unintended.
-	if unknown := s.AgentLaunchFor("claude"); unknown.Command != "" || unknown.TurnTimeout != 0 || unknown.Backend != "claude" {
+	unknown, known := s.AgentLaunchFor("claude")
+	if known {
+		t.Fatal("an unknown backend reported a known launch contract")
+	}
+	if unknown.Command != "" || unknown.TurnTimeout != 0 || unknown.StallTimeout != 0 || unknown.Backend != "claude" {
 		t.Fatalf("unknown backend launch=%+v", unknown)
+	}
+	if _, known := s.AgentLaunchFor(""); !known {
+		t.Fatal("an unset backend must resolve to the default contract")
 	}
 }

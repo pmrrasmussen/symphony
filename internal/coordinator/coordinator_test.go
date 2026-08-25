@@ -1722,8 +1722,20 @@ func TestStallBudgetIsResolvedUnderTheRunsBackendNotTheConfiguredOne(t *testing.
 
 	clock.set(time.Date(2026, 7, 18, 12, 0, 2, 0, time.UTC))
 	c.Tick(context.Background())
-	<-ws.after
-	<-timer.signal
+	// Bounded waits on purpose: resolving the budget under the configured
+	// backend instead of the run's leaves this run unsupervised, which shows up
+	// as nothing ever happening. Fail with that diagnosis instead of hanging the
+	// package until the test binary's own timeout.
+	select {
+	case <-ws.after:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the stalled run was never reconciled: the stall budget was not resolved under the run's backend")
+	}
+	select {
+	case <-timer.signal:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no retry was scheduled for the stalled run")
+	}
 
 	starts, _, cancels := agent.counts()
 	if starts != 1 || cancels != 1 {

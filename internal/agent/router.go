@@ -34,12 +34,21 @@ func NewRouter(settings func() config.Settings, backends map[string]domain.Agent
 	return &Router{settings: settings, backends: backends, bound: map[string]domain.AgentBackend{}}
 }
 
-// Start resolves the configured backend and binds the session it returns to it.
-// An unknown or unavailable selection fails the launch rather than falling back
-// to another runtime: a silent fallback would run the issue under a backend the
-// operator did not choose.
+// Start runs the request on the backend it names, falling back to the configured
+// selection only when the caller did not resolve one. Honoring the request is
+// what keeps the launch parameters and the runtime consistent: the scheduler
+// resolves the command, sandbox, and timeouts for a specific backend, so
+// resolving the selection again here could pair one backend's parameters with
+// another's runtime if a reload landed in between.
+//
+// An unavailable selection fails the launch rather than falling back to another
+// runtime: a silent fallback would run the issue under a backend the operator
+// did not choose.
 func (r *Router) Start(ctx context.Context, request domain.AgentRequest) (domain.AgentSession, <-chan domain.Event, error) {
-	name := r.selected()
+	name := strings.TrimSpace(request.Backend)
+	if name == "" {
+		name = r.selected()
+	}
 	backend := r.backends[name]
 	if backend == nil {
 		return domain.AgentSession{}, nil, fmt.Errorf("agent backend %q is not available (have %s)", name, strings.Join(r.available(), ", "))
@@ -48,10 +57,19 @@ func (r *Router) Start(ctx context.Context, request domain.AgentRequest) (domain
 	if err != nil {
 		return session, events, err
 	}
+	// Stamp the runtime that created the session so every later lookup about
+	// this run reads the answer instead of re-deriving it.
+	session.Backend = name
 	r.mu.Lock()
-	r.bound[session.ID] = backend
+	r.bound[binding(session)] = backend
 	r.mu.Unlock()
 	return session, events, nil
+}
+
+// binding keys a session by its runtime as well as its ID: session IDs are
+// minted by the backends, so two runtimes could mint the same one.
+func binding(session domain.AgentSession) string {
+	return session.Backend + "\x00" + session.ID
 }
 
 // Continue resumes a session on the backend that created it.
@@ -69,8 +87,8 @@ func (r *Router) Continue(ctx context.Context, session domain.AgentSession, prom
 // already treat cancelling an unknown session as a no-op.
 func (r *Router) Cancel(ctx context.Context, session domain.AgentSession) error {
 	r.mu.Lock()
-	backend := r.bound[session.ID]
-	delete(r.bound, session.ID)
+	backend := r.bound[binding(session)]
+	delete(r.bound, binding(session))
 	r.mu.Unlock()
 	if backend == nil {
 		return nil
@@ -78,24 +96,9 @@ func (r *Router) Cancel(ctx context.Context, session domain.AgentSession) error 
 	return backend.Cancel(ctx, session)
 }
 
-// Backend reports which runtime owns a session, for the scheduler's own
-// per-backend policy lookups. It reports the configured selection for a session
-// the router does not know, so a caller always gets a usable name.
-func (r *Router) Backend(session domain.AgentSession) string {
-	r.mu.Lock()
-	backend := r.bound[session.ID]
-	r.mu.Unlock()
-	for name, candidate := range r.backends {
-		if candidate == backend {
-			return name
-		}
-	}
-	return r.selected()
-}
-
 func (r *Router) pinned(session domain.AgentSession) (domain.AgentBackend, error) {
 	r.mu.Lock()
-	backend := r.bound[session.ID]
+	backend := r.bound[binding(session)]
 	r.mu.Unlock()
 	if backend == nil {
 		return nil, fmt.Errorf("no agent backend holds session %q", session.ID)

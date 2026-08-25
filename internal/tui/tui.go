@@ -560,7 +560,8 @@ func backendLabel(backend string) string {
 	if backend == "" {
 		return "Agent"
 	}
-	return strings.ToUpper(backend[:1]) + backend[1:]
+	runes := []rune(backend)
+	return strings.ToUpper(string(runes[0])) + string(runes[1:])
 }
 
 func empty(value string) string {

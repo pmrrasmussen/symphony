@@ -122,6 +122,13 @@ type Tracker interface {
 }
 type AgentRequest struct {
 	Issue Issue
+	// Backend names the agent runtime this request must run on. The scheduler
+	// resolves the selection once, together with the command, sandbox, and
+	// timeout values below, and the router honors it rather than resolving the
+	// selection again -- two independent reads of a hot-reloadable configuration
+	// could otherwise start a session on one runtime with another's launch
+	// parameters. An empty value lets the router choose the configured backend.
+	Backend string
 	// GitMetadataRoots are the only paths outside the workspace directory a
 	// workspace-write turn may write: the source repository's shared object
 	// store and this linked worktree's own per-worktree metadata directory. It
@@ -141,7 +148,14 @@ type AgentRequest struct {
 	// does not loosen steady-state mid-turn hang detection.
 	StartTimeout time.Duration
 }
-type AgentSession struct{ ID, ThreadID, TurnID string }
+type AgentSession struct {
+	ID, ThreadID, TurnID string
+	// Backend is the runtime that created this session, stamped by the router.
+	// It is the authority for every later per-backend lookup about this run, so
+	// no caller has to re-derive it from configuration that may since have
+	// changed.
+	Backend string
+}
 type AgentBackend interface {
 	Start(context.Context, AgentRequest) (AgentSession, <-chan Event, error)
 	Continue(context.Context, AgentSession, string) (<-chan Event, error)

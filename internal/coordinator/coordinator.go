@@ -691,8 +691,14 @@ func (c *Coordinator) reconcile(ctx context.Context) error {
 		c.mu.Lock()
 		last := r.last
 		c.mu.Unlock()
-		stallTimeout := s.AgentLaunchFor(r.backend).StallTimeout
-		if reason == "" && stallTimeout > 0 && now.Sub(last) > stallTimeout {
+		launch, known := s.AgentLaunchFor(r.backend)
+		if !known {
+			// A run whose backend this configuration cannot describe has no
+			// policy to apply. Say so: silently treating the zero budget as
+			// "no stall timeout" would leave the run unsupervised.
+			c.log.Warn("agent backend policy unavailable", "issue_identifier", r.issue.Identifier, "agent_backend", r.backend)
+		}
+		if reason == "" && known && launch.StallTimeout > 0 && now.Sub(last) > launch.StallTimeout {
 			reason = stopStalled
 		}
 		if reason == "" {
@@ -816,7 +822,7 @@ func (c *Coordinator) launch(parent context.Context, i domain.Issue, attempt int
 		}
 		launch := s.AgentLaunch()
 		c.log.Debug("agent launch requested", "issue_id", i.ID, "issue_identifier", i.Identifier, "attempt", attempt, "agent_backend", launch.Backend)
-		session, events, err := c.agent.Start(ctx, domain.AgentRequest{Issue: i, Workspace: ws.Path, GitMetadataRoots: ws.GitMetadataRoots, Prompt: prompt, Command: launch.Command, ApprovalPolicy: launch.ApprovalPolicy, ThreadSandbox: launch.ThreadSandbox, TurnSandboxPolicy: launch.TurnSandboxPolicy, TurnTimeout: launch.TurnTimeout, ReadTimeout: launch.ReadTimeout, StartTimeout: launch.StartTimeout})
+		session, events, err := c.agent.Start(ctx, domain.AgentRequest{Issue: i, Backend: launch.Backend, Workspace: ws.Path, GitMetadataRoots: ws.GitMetadataRoots, Prompt: prompt, Command: launch.Command, ApprovalPolicy: launch.ApprovalPolicy, ThreadSandbox: launch.ThreadSandbox, TurnSandboxPolicy: launch.TurnSandboxPolicy, TurnTimeout: launch.TurnTimeout, ReadTimeout: launch.ReadTimeout, StartTimeout: launch.StartTimeout})
 		if err != nil {
 			c.workspaces.AfterRun(context.Background(), ws, i)
 			c.unreserve(i.ID)
@@ -831,7 +837,7 @@ func (c *Coordinator) launch(parent context.Context, i domain.Issue, attempt int
 		}
 		now := c.clock.Now()
 		r := &running{
-			issue: i, backend: launch.Backend, session: session, last: now, cancel: cancel, workspace: ws,
+			issue: i, backend: runBackend(session, launch), session: session, last: now, cancel: cancel, workspace: ws,
 			run: domain.Run{IssueID: i.ID, IssueIdentifier: i.Identifier, WorkspacePath: ws.Path, SessionID: session.ID, Attempt: attempt, TurnCount: 1, StartedAt: now},
 		}
 		c.mu.Lock()
@@ -1006,6 +1012,17 @@ func (c *Coordinator) waitForContinuation(ctx context.Context) error {
 	case <-fired:
 		return nil
 	}
+}
+
+// runBackend records the runtime that actually created the session. The router
+// stamps it, so a reload between resolving the launch and starting the session
+// cannot leave the run tagged with a backend it never ran on. The resolved
+// launch is only a fallback, for a backend that does not stamp sessions.
+func runBackend(session domain.AgentSession, launch config.AgentLaunch) string {
+	if backend := strings.TrimSpace(session.Backend); backend != "" {
+		return backend
+	}
+	return launch.Backend
 }
 
 func continuationGuidance(turn, maxTurns int) string {

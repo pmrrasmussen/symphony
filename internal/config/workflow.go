@@ -160,7 +160,9 @@ type Agent struct {
 // one run: what to execute, where, under which sandbox, and the four timeout
 // budgets. Coordination reads this instead of any single backend's settings
 // block, so adding a backend does not spread its vocabulary through the
-// scheduler. Every field is captured per launch; see Settings.AgentLaunch.
+// scheduler. The workspace directory and writable paths are not here: they are
+// per-run values the workspace layer owns and travel on domain.AgentRequest.
+// Every field is captured per launch; see Settings.AgentLaunch.
 //
 // TurnSandboxPolicy is interface-typed and may hold a map, so this struct is not
 // safely comparable: compare fields, never two launches with ==.
@@ -393,7 +395,7 @@ func decode(raw map[string]any, base, path, logRoot string, sources *sourceSnaps
 	if err != nil {
 		return Settings{}, err
 	}
-	backend, err := stringDefault(agent, "backend", defaultAgentBackend)
+	backend, err := stringDefault(agent, "backend", DefaultAgentBackend)
 	if err != nil {
 		return Settings{}, err
 	}
@@ -1198,27 +1200,37 @@ func cloneValue(value any) any {
 // sandboxModes are the thread_sandbox values Codex accepts (app-server
 // SandboxMode). An unlisted value is rejected here rather than surfacing as an
 // opaque thread/start failure on every dispatch.
-// defaultAgentBackend keeps every workflow written before agent.backend existed
-// behaving exactly as it did.
-const defaultAgentBackend = "codex"
+// DefaultAgentBackend keeps every workflow written before agent.backend existed
+// behaving exactly as it did. It is exported so the process that registers the
+// backends cannot drift from the value this package accepts.
+const DefaultAgentBackend = "codex"
 
 // agentBackends is the closed set of selectable agent runtimes.
-var agentBackends = []string{defaultAgentBackend}
+var agentBackends = []string{DefaultAgentBackend}
 
-// AgentLaunch resolves the launch contract for the configured backend.
-func (s Settings) AgentLaunch() AgentLaunch { return s.AgentLaunchFor(s.Agent.Backend) }
+// AgentLaunch resolves the launch contract for the configured backend. The
+// configured value is always one this package knows, so the lookup cannot fail.
+func (s Settings) AgentLaunch() AgentLaunch {
+	launch, _ := s.AgentLaunchFor(s.Agent.Backend)
+	return launch
+}
 
 // AgentLaunchFor resolves the launch contract for a named backend, which is how
 // the scheduler applies current policy to a run that a previous configuration
 // started: reload keeps publishing live values, but they are read under the
 // backend that owns the run rather than whichever one is configured now.
-func (s Settings) AgentLaunchFor(backend string) AgentLaunch {
+//
+// The boolean reports whether the name is known. It exists so a caller cannot
+// mistake an unknown backend's zero-valued launch for a real policy: a zero
+// stall budget, for instance, reads as "stall detection disabled" and would
+// leave a run unsupervised in silence.
+func (s Settings) AgentLaunchFor(backend string) (AgentLaunch, bool) {
 	launch := AgentLaunch{Backend: backend}
 	if launch.Backend == "" {
-		launch.Backend = defaultAgentBackend
+		launch.Backend = DefaultAgentBackend
 	}
 	switch launch.Backend {
-	case defaultAgentBackend:
+	case DefaultAgentBackend:
 		launch.Command = s.Codex.Command
 		launch.ApprovalPolicy = s.Codex.ApprovalPolicy
 		launch.ThreadSandbox = s.Codex.ThreadSandbox
@@ -1227,8 +1239,10 @@ func (s Settings) AgentLaunchFor(backend string) AgentLaunch {
 		launch.ReadTimeout = s.Codex.ReadTimeout
 		launch.StartTimeout = s.Codex.StartTimeout
 		launch.StallTimeout = s.Codex.StallTimeout
+	default:
+		return launch, false
 	}
-	return launch
+	return launch, true
 }
 
 var sandboxModes = []string{"read-only", "workspace-write", "danger-full-access"}
