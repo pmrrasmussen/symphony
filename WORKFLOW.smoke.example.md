@@ -15,6 +15,8 @@ workspace:
 hooks:
   timeout_ms: 60000
 agent:
+  # codex is the only accepted agent runtime today; the key may be omitted.
+  backend: codex
   max_concurrent_agents: 1
   max_turns: 1
 codex:
