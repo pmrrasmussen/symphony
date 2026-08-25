@@ -12,6 +12,17 @@ configured approval and sandbox policy; this service does not provide Docker,
 VM, SSH, distributed execution, or a database.  Linear credentials stay in
 the host process and are removed from Codex's environment.
 
+On macOS, one repository may have one independently configured LaunchAgent.
+The LaunchAgent is machine-local instance configuration, not repository policy:
+it selects the shared executable, repository `WorkingDirectory`, and separate
+workflow, workspace, log, service-log, and status paths. `WORKFLOW.md` remains
+the repository-owned policy source. The per-repository `status.json` is a safe
+current observation that can be stale after a crash, and `symphony.jsonl` is
+redacted event history; neither establishes process liveness or replaces
+Linear/workspace durable state. The TUI only presents local discovery and has
+no mutation capability. See [macOS repository services](macos-services.md)
+for the complete operator convention.
+
 The canonical lifecycle (PMR-38) is `Todo -> In Progress -> In Review <->
 Rework -> Merging -> Done`. `Todo`, `In Progress`, `Rework`, and `Merging` are
 configured as `tracker.active_states`, so the coordinator dispatches a session
