@@ -192,7 +192,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 
 func runService(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
-		fmt.Fprintln(stderr, "usage: symphony service <install|status|restart|uninstall> [flags]")
+		fmt.Fprintln(stderr, "usage: symphony service <install|migrate|status|restart|uninstall> [flags]")
 		return 2
 	}
 	command := args[0]
@@ -225,6 +225,19 @@ func runService(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintln(stdout, "already installed", instance.Label)
 		}
 		return 0
+	case "migrate":
+		migration, err := service.Migrate(ctx, options)
+		if err != nil {
+			fmt.Fprintln(stderr, "symphony service migrate:", err)
+			return 1
+		}
+		if !migration.Changed {
+			fmt.Fprintln(stdout, "already managed", migration.Label)
+			return 0
+		}
+		fmt.Fprintln(stdout, "migrated", migration.Legacy, "to", migration.Label)
+		fmt.Fprintln(stdout, "replaced LaunchAgent backed up at", migration.Backup)
+		return 0
 	case "status":
 		instance, err := service.Status(ctx, options)
 		if err != nil {
@@ -253,7 +266,7 @@ func runService(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stdout, "uninstalled", instance.Label)
 		return 0
 	default:
-		fmt.Fprintln(stderr, "usage: symphony service <install|status|restart|uninstall> [flags]")
+		fmt.Fprintln(stderr, "usage: symphony service <install|migrate|status|restart|uninstall> [flags]")
 		return 2
 	}
 }

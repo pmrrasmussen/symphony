@@ -80,7 +80,7 @@ func Install(ctx context.Context, options Options) (Instance, bool, error) {
 	if err := validatePlist(ctx, runner, d.Content); err != nil {
 		return Instance{}, false, err
 	}
-	if err := rejectConflicts(ctx, options, d); err != nil {
+	if err := rejectConflicts(ctx, options, d, ""); err != nil {
 		return Instance{}, false, err
 	}
 	if err := ensureDirectories(d); err != nil {
@@ -551,12 +551,18 @@ func validatePlist(ctx context.Context, runner Runner, content []byte) error {
 	return nil
 }
 
-func rejectConflicts(ctx context.Context, options Options, d desired) error {
+// rejectConflicts refuses any registration that would collide with another
+// service. ignorePlist is the one validated pre-installer LaunchAgent an
+// explicit migration is replacing; it is empty for every other operation.
+func rejectConflicts(ctx context.Context, options Options, d desired, ignorePlist string) error {
 	instances, err := operator.Discover(ctx, operator.Options{LaunchAgentsDir: filepath.Dir(d.PlistPath)})
 	if err != nil {
 		return fmt.Errorf("discover existing Symphony services: %w", err)
 	}
 	for _, existing := range instances {
+		if ignorePlist != "" && filepath.Clean(existing.Paths.Plist) == filepath.Clean(ignorePlist) {
+			continue
+		}
 		if existing.ID == d.Label {
 			if existing.Paths.Plist != d.PlistPath || !existing.Managed {
 				return fmt.Errorf("refusing to overwrite unmanaged LaunchAgent %s", d.PlistPath)
@@ -597,11 +603,11 @@ func findManaged(ctx context.Context, options Options, d desired) (operator.Inst
 		return operator.Instance{}, fmt.Errorf("no Symphony service is installed for %s", d.Workflow)
 	}
 	if len(matches) > 1 {
-		return operator.Instance{}, fmt.Errorf("ambiguous Symphony services for %s", d.Workflow)
+		return operator.Instance{}, fmt.Errorf("ambiguous Symphony services for %s; leave exactly one LaunchAgent for this repository in place, then run symphony service migrate to adopt it", d.Workflow)
 	}
 	instance := matches[0]
 	if !instance.Managed || filepath.Clean(instance.Paths.Workflow) != filepath.Clean(d.Workflow) {
-		return operator.Instance{}, fmt.Errorf("refusing to manage unrelated LaunchAgent %s", instance.Paths.Plist)
+		return operator.Instance{}, fmt.Errorf("refusing to manage unrelated LaunchAgent %s; run symphony service migrate to adopt a compatible hand-authored Symphony LaunchAgent for this repository", instance.Paths.Plist)
 	}
 	if options.Name != "" && instance.ID != d.Label {
 		return operator.Instance{}, fmt.Errorf("configured service name %s does not match %s", d.Label, instance.ID)

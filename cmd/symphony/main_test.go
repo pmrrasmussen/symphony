@@ -124,6 +124,18 @@ func TestRunTUIIsReadOnlyAndExitsCleanly(t *testing.T) {
 	}
 }
 
+func TestRunServiceUsageDocumentsMigrate(t *testing.T) {
+	for _, args := range [][]string{nil, {"bogus"}} {
+		var stdout, stderr bytes.Buffer
+		if code := runService(args, &stdout, &stderr); code != 2 {
+			t.Fatalf("args=%v exit=%d stderr=%s", args, code, stderr.String())
+		}
+		if !strings.Contains(stderr.String(), "install|migrate|status|restart|uninstall") {
+			t.Fatalf("args=%v usage did not document migrate: %s", args, stderr.String())
+		}
+	}
+}
+
 func TestLogStartupCredentialStatusReportsConfigurationWithoutSecrets(t *testing.T) {
 	var output bytes.Buffer
 	log := observability.New(slog.NewJSONHandler(&output, nil), nil)

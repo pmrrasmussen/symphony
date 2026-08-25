@@ -42,6 +42,15 @@ never overwrites an unmarked LaunchAgent. Use `--workflow`, `--name`,
 configuration. `service status`, `service restart`, and `service uninstall`
 select only the current repository’s managed instance.
 
+If a repository already has a hand-authored Symphony LaunchAgent, run
+`symphony service migrate` there once. That command is the only explicit way to
+replace an unmarked plist: it adopts a legacy agent only when its label,
+repository, workflow, executable, and runtime paths match this repository
+exactly, backs the old plist up under `.symphony/service`, never leaves two
+schedulers loaded, and restores the prior service if validation, installation,
+or bootstrap fails. Unrelated or ambiguous agents are left untouched with
+concrete diagnostics.
+
 Services pass credential file paths only, never credential values. The normal
 Linear reference is `$SYMPHONY_LINEAR_API_KEY_FILE` in `WORKFLOW.md`, resolved
 by default to `~/.config/symphony/linear-api-key`. For a GitHub-enabled
