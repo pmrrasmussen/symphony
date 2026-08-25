@@ -349,13 +349,40 @@ func New(instances []operator.Instance, now time.Time) Model {
 	return Model{instances: copy, updatedAt: now}
 }
 
+// splitLayout reports whether the window is wide enough to show the list and
+// the selected instance at once. It is derived from the width rather than
+// stored, so it cannot fall out of step with the last resize. An unknown width
+// stays on the drill-down layout, which is what every width-unaware caller and
+// the plain surface get.
+func (m Model) splitLayout() bool {
+	return m.layout && m.width >= splitWidth && len(m.instances) > 0
+}
+
+// detailPage is the page the detail body shows. The split layout has no
+// separate overview to be on, so the selected instance's Status is its resting
+// state.
+func (m Model) detailPage() page {
+	if m.page == overviewPage {
+		return statusPage
+	}
+	return m.page
+}
+
+// inspecting reports whether the detail keys apply: either the user drilled
+// into a page, or the split layout is already showing one beside the list.
+func (m Model) inspecting() bool {
+	return m.page != overviewPage || m.splitLayout()
+}
+
 // Update applies one small keyboard action. It returns true when the caller
 // should leave the UI. Refresh is handled by Run so it can reread the host.
 func (m Model) Update(key string) (Model, bool) {
 	key = normalizeKey(key)
 	switch key {
 	case "q":
-		if m.page == overviewPage {
+		// There is nothing to back out to when the detail is already beside the
+		// list, so the split layout quits on the first press.
+		if m.page == overviewPage || m.splitLayout() {
 			return m, true
 		}
 		m.page = overviewPage
@@ -364,26 +391,27 @@ func (m Model) Update(key string) (Model, bool) {
 	case "down", "j":
 		m.move(1)
 	case "enter":
-		if m.page == overviewPage && len(m.instances) > 0 {
+		// Inert in the split layout: the page it would open is already open.
+		if m.page == overviewPage && !m.splitLayout() && len(m.instances) > 0 {
 			m.page = statusPage
 		}
 	case "tab":
-		if m.page != overviewPage {
-			m.page++
+		if m.inspecting() {
+			m.page = m.detailPage() + 1
 			if m.page > validationPage {
 				m.page = statusPage
 			}
 		}
 	case "s":
-		if m.page != overviewPage {
+		if m.inspecting() {
 			m.page = statusPage
 		}
 	case "c":
-		if m.page != overviewPage {
+		if m.inspecting() {
 			m.page = configPage
 		}
 	case "v":
-		if m.page != overviewPage {
+		if m.inspecting() {
 			m.page = validationPage
 		}
 	}
@@ -451,6 +479,9 @@ func (m Model) View(now time.Time) string {
 	if style.tooSmall() {
 		return style.tooSmallFrame()
 	}
+	if m.splitLayout() {
+		return m.splitView(now, style)
+	}
 	if m.page == overviewPage {
 		return m.overview(now, style)
 	}
@@ -458,6 +489,24 @@ func (m Model) View(now time.Time) string {
 		return "Symphony operator view\n\nNo configured Symphony instances.\n\nq: quit\n"
 	}
 	instance := m.instances[m.selected]
+	if !style.layout {
+		return m.plainDetail(instance, now, style)
+	}
+	header := lipgloss.JoinVertical(lipgloss.Left,
+		style.primary.Render("Symphony operator view")+"  "+style.emphasis.Render(instance.ID),
+		style.liveness(instance.Liveness)+style.muted.Render(" · launchd "+launchdText(instance.Launchd)),
+		style.tabs(m.page),
+	)
+	return style.frame(header,
+		m.detailBody(instance, m.page, now, style, style.mainBudget(header)),
+		m.statusLine(now, style),
+		style.muted.Render("s/c/v page · Tab next · r refresh · q back"))
+}
+
+// plainDetail is the redirected detail page. Its wording is deliberately fixed:
+// this is the surface pipes and scripts read, so the dashboard's tables are
+// free to lay the same fields out differently without moving it.
+func (m Model) plainDetail(instance operator.Instance, now time.Time, style theme) string {
 	var b strings.Builder
 	switch m.page {
 	case statusPage:
@@ -467,32 +516,11 @@ func (m Model) View(now time.Time) string {
 	case validationPage:
 		m.writeValidation(&b, instance)
 	}
-	if !style.layout {
-		var plain strings.Builder
-		fmt.Fprintf(&plain, "Symphony operator view  %s\n", instance.ID)
-		fmt.Fprintf(&plain, "state: %s  launchd: %s  refreshed: %s\n\n", livenessLabel(instance.Liveness), launchdText(instance.Launchd), formatAge(now, m.updatedAt))
-		fmt.Fprintf(&plain, "%s\n\n", style.tabs(m.page))
-		return plain.String() + b.String()
-	}
-	header := lipgloss.JoinVertical(lipgloss.Left,
-		style.primary.Render("Symphony operator view")+"  "+style.emphasis.Render(instance.ID),
-		style.liveness(instance.Liveness)+style.muted.Render(" · launchd "+launchdText(instance.Launchd)),
-		style.tabs(m.page),
-	)
-	body := strings.TrimRight(b.String(), "\n")
-	if style.width > 0 {
-		// These pages are prose, so they wrap rather than truncate -- and they
-		// wrap before the budget is counted, because a line that becomes two
-		// after the count would push the hint bar off the screen.
-		body = lipgloss.NewStyle().Width(style.width).Render(body)
-	}
-	lines, hidden := clamp(strings.Split(body, "\n"), style.mainBudget(header))
-	main := strings.Join(lines, "\n")
-	if note := style.more(hidden); note != "" {
-		main += "\n" + note
-	}
-	return style.frame(header, main, m.statusLine(now, style),
-		style.muted.Render("s/c/v page · Tab next · r refresh · q back"))
+	var plain strings.Builder
+	fmt.Fprintf(&plain, "Symphony operator view  %s\n", instance.ID)
+	fmt.Fprintf(&plain, "state: %s  launchd: %s  refreshed: %s\n\n", livenessLabel(instance.Liveness), launchdText(instance.Launchd), formatAge(now, m.updatedAt))
+	fmt.Fprintf(&plain, "%s\n\n", style.tabs(m.page))
+	return plain.String() + b.String()
 }
 
 // statusLine is the frame's one line of ephemeral feedback: what the last
@@ -559,28 +587,23 @@ func (m Model) overview(now time.Time, style theme) string {
 		style.muted.Render("j/k select · ⏎ inspect · r refresh · q quit"))
 }
 
-// instanceTable draws the overview as a real table, so the column widths are
-// computed from the content rather than hand-counted. The old header was a
-// literal string and had drifted one column out of step with its rows.
+// instanceRows builds the overview's columns and rows. Which columns appear
+// depends on the width band: the two numeric columns go first, because they are
+// one keypress away on the Status page and below eighty columns they cost the
+// identifier the room it needs to stay legible.
 //
-// Which columns appear depends on the width band. The two numeric columns go
-// first: they are one keypress away on the Status page, and below eighty
-// columns they cost the identifier the room it needs to stay legible.
-func (m Model) instanceTable(style theme, budget int) string {
+// rowBudget is how many instance rows may be drawn; each renderer subtracts its
+// own chrome from the frame's budget before calling.
+func (m Model) instanceRows(style theme, rowBudget int) (headers []string, rows [][]string, hidden int) {
 	numeric := bandFor(style.width) != bandNarrow
-	headers := []string{"INSTANCE", "STATE"}
+	headers = []string{"INSTANCE", "STATE"}
 	if numeric {
 		headers = append(headers, "AGENTS", "RETRIES")
 	}
 	headers = append(headers, "CHECKS")
 
-	// The table spends three rows on its own border and header, so only what is
-	// left of the budget can go to instances.
-	shown, hidden := window(m.instances, m.selected, budget-3)
-	selected := m.selected
-	if hidden > 0 {
-		selected = m.selected - (len(m.instances) - hidden - len(shown))
-	}
+	shown, hidden := window(m.instances, m.selected, rowBudget)
+	selected := m.selected - (len(m.instances) - hidden - len(shown))
 
 	nameWidth := 0
 	if style.width > 0 {
@@ -593,7 +616,7 @@ func (m Model) instanceTable(style theme, budget int) string {
 		nameWidth = max(floor, style.width/3)
 	}
 
-	rows := make([][]string, 0, len(shown))
+	rows = make([][]string, 0, len(shown))
 	for index, instance := range shown {
 		marker, name := "  ", instance.ID
 		if nameWidth > 0 {
@@ -613,7 +636,29 @@ func (m Model) instanceTable(style theme, budget int) string {
 		}
 		rows = append(rows, append(row, style.checks(instance.Findings)))
 	}
+	return headers, rows, hidden
+}
 
+// numericColumns are the row indexes to right-align, so magnitudes line up down
+// the column. They exist only in the wider bands.
+func numericColumns(style theme) []int {
+	if bandFor(style.width) == bandNarrow {
+		return nil
+	}
+	return []int{2, 3}
+}
+
+// instanceTable draws the overview as a real table, so the column widths are
+// computed from the content rather than hand-counted. The old header was a
+// literal string and had drifted one column out of step with its rows.
+func (m Model) instanceTable(style theme, budget int) string {
+	// The table spends three rows on its own border and header.
+	headers, rows, hidden := m.instanceRows(style, budget-3)
+	right := numericColumns(style)
+	rightward := make(map[int]bool, len(right))
+	for _, column := range right {
+		rightward[column] = true
+	}
 	rendered := table.New().
 		Border(lipgloss.RoundedBorder()).
 		BorderStyle(style.rule).
@@ -625,8 +670,7 @@ func (m Model) instanceTable(style theme, budget int) string {
 			if row == table.HeaderRow {
 				cell = style.emphasis.Padding(0, 1)
 			}
-			// Numerics right-align so magnitudes line up down the column.
-			if numeric && (column == 2 || column == 3) {
+			if rightward[column] {
 				cell = cell.Align(lipgloss.Right)
 			}
 			return cell
@@ -638,6 +682,19 @@ func (m Model) instanceTable(style theme, budget int) string {
 		// across the window and strands each number far from its header.
 		drawn = rendered.Width(style.width).Wrap(false).String()
 	}
+	if note := style.more(hidden); note != "" {
+		return drawn + "\n" + note
+	}
+	return drawn
+}
+
+// instanceList draws the same rows without a box, for the split layout. The rule
+// between the panes already separates them, and a bordered table inside a
+// divided column is the second border the clutter audit counts.
+func (m Model) instanceList(style theme, budget int) string {
+	// Without a border the list spends one row, on its header.
+	headers, rows, hidden := m.instanceRows(style, budget-1)
+	drawn := style.borderless(headers, rows, numericColumns(style)...)
 	if note := style.more(hidden); note != "" {
 		return drawn + "\n" + note
 	}
@@ -943,6 +1000,16 @@ func formatDuration(value time.Duration) string {
 		return fmt.Sprintf("%dm", int(value.Minutes()))
 	}
 	return fmt.Sprintf("%dh%dm", int(value.Hours()), int(value.Minutes())%60)
+}
+
+// formatSince is how long ago a timestamp was, or unknown when the snapshot did
+// not carry one. now.Sub(zero) is two and a half million hours, which is worse
+// than admitting the field is missing.
+func formatSince(now, then time.Time) string {
+	if then.IsZero() {
+		return "unknown"
+	}
+	return formatDuration(now.Sub(then))
 }
 
 func formatAge(now, then time.Time) string {

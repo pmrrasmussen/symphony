@@ -280,17 +280,29 @@ func TestWindowSizeIsRecordedForTheRenderer(t *testing.T) {
 	}
 }
 
-// styledFixture builds a styled model wide enough that no panel wraps, so
-// these tests exercise styling rather than line breaking.
+// styledFixture builds a styled model wide enough that no panel wraps, so these
+// tests exercise styling rather than line breaking. It stays below splitWidth so
+// that they exercise the drill-down layout; splitFixture covers the other side.
 func styledFixture(instances []operator.Instance, now time.Time) Model {
 	model := New(instances, now)
 	model.layout = true
 	model.color = true
-	model.width = 120
+	model.width = 100
 	return model
 }
 
-func TestStyledFramesKeepAssertedPhrasesContiguous(t *testing.T) {
+// splitFixture builds a styled model wide enough for the side-by-side layout.
+func splitFixture(instances []operator.Instance, now time.Time) Model {
+	model := styledFixture(instances, now)
+	model.width = 130
+	return model
+}
+
+// The dashboard lays the same fields out as tables, so a cell boundary now
+// separates values the prose ran together. The plain renderer keeps the old
+// wording and its own tests still guard it; what must not change here is which
+// fields appear and which never do.
+func TestStyledDetailPagesTabulateTheSameFields(t *testing.T) {
 	now := time.Date(2026, 8, 25, 12, 0, 0, 0, time.UTC)
 	instance := operator.Instance{
 		ID:       "com.pmrrasmussen.symphony",
@@ -306,22 +318,153 @@ func TestStyledFramesKeepAssertedPhrasesContiguous(t *testing.T) {
 	model := styledFixture([]operator.Instance{instance}, now)
 	model.page = statusPage
 	status := model.View(now)
-	for _, want := range []string{"PMR-75 (In Progress)", "turns 4/20", "tokens: input 12, output 3, total 15"} {
+	for _, want := range []string{"ISSUE", "STATE", "TURNS", "TOKENS", "PMR-75", "In Progress", "4/20", "15"} {
 		if !strings.Contains(status, want) {
-			t.Fatalf("styled status page broke %q:\n%s", want, status)
+			t.Fatalf("styled status page lost %q:\n%s", want, status)
 		}
 	}
+
 	model.page = configPage
 	config := model.View(now)
-	if !strings.Contains(config, "Credentials: Linear configured; GitHub not configured") {
-		t.Fatalf("styled config page broke the credential line:\n%s", config)
+	for _, want := range []string{"Credentials", "Linear", "GitHub", "configured", "not configured"} {
+		if !strings.Contains(config, want) {
+			t.Fatalf("styled config page lost %q:\n%s", want, config)
+		}
 	}
-	// The styling must not become a new way to leak a credential reference.
+	// Tabulating the credentials must not become a new way to leak the
+	// reference behind them.
 	if strings.Contains(config, "SECRET_ENV") {
 		t.Fatalf("styled config page exposed a credential reference:\n%s", config)
 	}
 	if !strings.Contains(config, "\x1b") {
 		t.Fatal("styled frame carries no styling at all")
+	}
+}
+
+func TestSplitLayoutAppearsOnlyFromItsThreshold(t *testing.T) {
+	now := time.Date(2026, 8, 25, 12, 0, 0, 0, time.UTC)
+	instances := []operator.Instance{{ID: "one", Liveness: operator.LivenessRunning}}
+	for _, testCase := range []struct {
+		width int
+		split bool
+	}{
+		{width: 0, split: false},
+		{width: 100, split: false},
+		{width: splitWidth - 1, split: false},
+		{width: splitWidth, split: true},
+		{width: 200, split: true},
+	} {
+		model := styledFixture(instances, now)
+		model.width = testCase.width
+		if model.splitLayout() != testCase.split {
+			t.Fatalf("width %d: split=%v, want %v", testCase.width, model.splitLayout(), testCase.split)
+		}
+		// The hint bar is the honest signal: the split layout quits outright,
+		// the drill-down backs out first.
+		view := model.View(now)
+		wantHint := "q quit"
+		if !testCase.split && model.page != overviewPage {
+			wantHint = "q back"
+		}
+		if !strings.Contains(view, wantHint) {
+			t.Fatalf("width %d: hint bar missing %q:\n%s", testCase.width, wantHint, view)
+		}
+	}
+}
+
+func TestSplitLayoutQuitsWithoutBackingOutFirst(t *testing.T) {
+	now := time.Date(2026, 8, 25, 12, 0, 0, 0, time.UTC)
+	model := splitFixture([]operator.Instance{{ID: "one", Liveness: operator.LivenessRunning}}, now)
+
+	// Enter has nothing to open: the page it would drill into is already beside
+	// the list.
+	moved, quit := model.Update("enter")
+	if quit || moved.page != overviewPage {
+		t.Fatalf("enter changed the split layout: page=%v quit=%v", moved.page, quit)
+	}
+
+	// The detail keys still work without drilling in first.
+	moved, _ = model.Update("c")
+	if moved.page != configPage {
+		t.Fatalf("c did not reach Config in the split layout: page=%v", moved.page)
+	}
+	moved, _ = moved.Update("tab")
+	if moved.page != validationPage {
+		t.Fatalf("Tab did not advance in the split layout: page=%v", moved.page)
+	}
+	// One q, not two: there is no overview to return to.
+	if _, quit = moved.Update("q"); !quit {
+		t.Fatal("q on a split detail page did not quit")
+	}
+	if _, quit = model.Update("q"); !quit {
+		t.Fatal("q on the split layout did not quit")
+	}
+}
+
+func TestSplitLayoutShowsTheListBesideTheSelectedInstance(t *testing.T) {
+	now := time.Date(2026, 8, 25, 12, 0, 0, 0, time.UTC)
+	model := splitFixture([]operator.Instance{
+		{ID: "com.pmrrasmussen.symphony", Liveness: operator.LivenessRunning},
+		{ID: "com.pmrrasmussen.symphony.testing-grounds", Liveness: operator.LivenessStopped},
+	}, now)
+	model.selected = 1
+	view := model.View(now)
+	// Both halves, on the same rows: the list on the left and the selected
+	// instance's Status on the right.
+	for _, want := range []string{"INSTANCE", "▸", "│", "com.pmrrasmussen.symphony.testing-grounds"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("split frame missing %q:\n%s", want, view)
+		}
+	}
+	// The frame must still fit the window it was given.
+	for _, line := range strings.Split(strings.TrimRight(view, "\n"), "\n") {
+		if lipgloss.Width(line) > model.width {
+			t.Fatalf("split frame line is %d columns wide in a %d-column window:\n%s",
+				lipgloss.Width(line), model.width, view)
+		}
+	}
+}
+
+func TestValidationPageWordsSeverityAsWellAsColoringIt(t *testing.T) {
+	now := time.Date(2026, 8, 25, 12, 0, 0, 0, time.UTC)
+	model := styledFixture([]operator.Instance{{
+		ID:       "one",
+		Liveness: operator.LivenessInvalid,
+		Findings: []operator.Finding{
+			{Severity: operator.SeverityError, Code: "workflow", Message: "unreadable"},
+			{Severity: operator.SeverityWarning, Code: "logs", Message: "no log directory yet"},
+		},
+	}}, now)
+	model.page = validationPage
+	view := model.View(now)
+	// Color alone would be invisible to a red-green colorblind reader, so the
+	// severity is spelled out in its own column.
+	for _, want := range []string{"SEVERITY", "CODE", "MESSAGE", "ERROR", "WARNING", "workflow", "unreadable", "INVALID"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("validation page lost %q:\n%s", want, view)
+		}
+	}
+}
+
+func TestZeroTimestampsSayUnknownRatherThanMillionsOfHours(t *testing.T) {
+	now := time.Date(2026, 8, 25, 12, 0, 0, 0, time.UTC)
+	if got := formatSince(now, time.Time{}); got != "unknown" {
+		t.Fatalf("formatSince on a zero time returned %q", got)
+	}
+	if got := formatSince(now, now.Add(-90*time.Second)); got != "1m" {
+		t.Fatalf("formatSince returned %q, want 1m", got)
+	}
+	// A snapshot that carried no start time used to render 2562047h47m.
+	model := styledFixture([]operator.Instance{{
+		ID:       "one",
+		Liveness: operator.LivenessRunning,
+		Snapshot: &operator.Snapshot{Coordinator: operator.RuntimeSnapshot{Running: []operator.RunningSnapshot{{
+			IssueIdentifier: "PMR-75", IssueState: "In Progress", TurnCount: 1,
+		}}}},
+	}}, now)
+	model.page = statusPage
+	if view := model.View(now); strings.Contains(view, "2562047h") {
+		t.Fatalf("status page rendered a zero timestamp as a duration:\n%s", view)
 	}
 }
 
@@ -428,7 +571,7 @@ func TestWidthBandsDropTheNumericColumnsFirst(t *testing.T) {
 		width   int
 		numeric bool
 	}{
-		{width: 130, numeric: true},
+		{width: 119, numeric: true},
 		{width: 100, numeric: true},
 		{width: 80, numeric: true},
 		{width: 70, numeric: false},
