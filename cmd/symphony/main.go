@@ -20,6 +20,7 @@ import (
 	"github.com/pmrrasmussen/symphony/internal/config"
 	"github.com/pmrrasmussen/symphony/internal/coordinator"
 	"github.com/pmrrasmussen/symphony/internal/domain"
+	githubhost "github.com/pmrrasmussen/symphony/internal/github"
 	"github.com/pmrrasmussen/symphony/internal/linear"
 	"github.com/pmrrasmussen/symphony/internal/observability"
 	"github.com/pmrrasmussen/symphony/internal/operator"
@@ -135,9 +136,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	ws := workspace.New(settings)
-	// Optional host capabilities stay disabled until WORKFLOW.md supplies their
-	// fixed scope; resolved credentials are filtered from the Codex child.
-	backend, githubLifecycle := codex.NewWithIntegrations(settings, slog.New(log.Handler()))
+	backends, githubLifecycle := wire(settings, slog.New(log.Handler()))
 	// Terminal cleanup may only discard a worktree's local commits once Symphony
 	// itself verified them merged. The verifier is read-only and host-owned; when
 	// GitHub is not configured it always answers no and cleanup stays as strict
@@ -148,12 +147,6 @@ func run(args []string, stdout, stderr io.Writer) int {
 	// Coordination talks to the router, not to a runtime: the router resolves
 	// agent.backend for each new session and pins continuation and cancellation
 	// to whichever backend started it.
-	// Claude sessions get no Symphony capabilities yet -- configuration refuses
-	// that combination -- so this backend is launch and lifecycle only.
-	backends := map[string]domain.AgentBackend{
-		config.DefaultAgentBackend: backend,
-		config.ClaudeAgentBackend:  claude.New(settings),
-	}
 	if err := agent.Validate(backends); err != nil {
 		log.Error("agent backend registry is incomplete", "error", err)
 		return 2
@@ -307,6 +300,32 @@ func runTUI(args []string, input io.Reader, stdout, stderr io.Writer, discover t
 		return 1
 	}
 	return 0
+}
+
+// wire builds the agent backend registry together with the host providers those
+// backends share, and hands back the one GitHub manager this process may hold.
+// It exists as a seam rather than inline wiring so the sharing is asserted by a
+// test: the manager comes back out of the backend that was given it, so the poll
+// loop and the landing verifier cannot end up on a second manager that merely
+// shares a configuration callback. That second manager is the whole hazard --
+// it would own its own linked-pull-request table and its own exactly-once
+// completion guard, so a merged pull request would leave its Linear issue
+// unreconciled while the guard on the polled manager never fired.
+//
+// Optional host capabilities stay disabled until WORKFLOW.md supplies their
+// fixed scope; resolved credentials are filtered from the agent child. Claude
+// sessions get no Symphony capabilities yet -- configuration refuses that
+// combination -- so that backend is launch and lifecycle only, and it is
+// deliberately given no provider of its own.
+func wire(settings func() config.Settings, logger *slog.Logger) (map[string]domain.AgentBackend, *githubhost.Manager) {
+	handoff := linear.NewHandoff(settings)
+	handoff.SetLogger(logger)
+	sessions := codex.NewWithProviders(settings, handoff, githubhost.New(settings, logger))
+	backends := map[string]domain.AgentBackend{
+		config.DefaultAgentBackend: sessions,
+		config.ClaudeAgentBackend:  claude.New(settings),
+	}
+	return backends, sessions.GitHubManager()
 }
 
 // logStartupCredentialStatus records whether startup resolved the credentials

@@ -161,7 +161,22 @@ symphony tui
 The TUI is an ephemeral, read-only process. In a terminal it takes over the
 window as a full-screen dashboard and restores the previous screen on exit; a
 selected instance opens Status, Config, and Validation pages, and the strip
-marks which one is open. It scans convention-matching
+marks which one is open. From a hundred and twenty columns the list and the
+selected instance sit side by side, so there is nothing to drill into and `q`
+closes the view on the first press; below that the list is full width and
+`Enter` opens a page that `q` backs out of. Every page shares one frame: persistent context at the
+top, the data, then a line of feedback and a hint bar, both of which stay put.
+The layout follows the window -- the two numeric overview columns drop below
+eighty columns, and below sixty by fourteen the view asks for a larger window
+rather than drawing a wrapped one. A detail page taller than the window scrolls:
+`ctrl+d` and `ctrl+u` move half a screen, `pgdown` and `pgup` do the same, `g`
+and `G` jump to either end, and a position line reports where the viewport sits
+and which way there is more. `j` and `k` keep their one meaning throughout --
+they change which instance you are looking at, on the overview and on a detail
+page alike. An instance list longer than the window keeps the selected row
+visible and reports the rest as `+N more`. Setting `NO_COLOR` to a non-empty
+value keeps the dashboard and gives up only hue: each state carries its own
+shape and word as well as its color. It scans convention-matching
 LaunchAgents in `~/Library/LaunchAgents`, reads launchd state, each configured
 status snapshot, effective configuration, validation findings, and a bounded
 redacted log tail. In a terminal it repeats that scan every five seconds, and

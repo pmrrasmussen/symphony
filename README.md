@@ -257,7 +257,17 @@ safe status snapshot, normalized effective configuration, validation findings,
 and a bounded redacted structured-log tail. In a terminal it reads single
 keypresses, re-reads local observations every five seconds, and refreshes on
 demand with `r`; redirected output instead prints plain frames driven by
-line-buffered input and never polls. The command does not start, stop, pause,
+line-buffered input and never polls. The dashboard fits itself to the window:
+it shows the instance list beside the selected instance from a hundred and
+twenty columns, drops the two numeric columns below eighty columns, and asks
+for a larger window below sixty by fourteen. A detail page taller than the
+window scrolls with `ctrl+d`/`ctrl+u` and `g`/`G`, showing its position as
+`13-24 of 24`; the alternate screen has no scrollback, so without that the rows
+past the window would be unreachable rather than merely off screen. An instance
+list longer than the window keeps the selected row visible and reports the rest
+as `+N more`. `NO_COLOR` gives up hue while keeping
+the dashboard, since each state is drawn as a shape and a word as well as a
+color. The command does not start, stop, pause,
 or connect to a Symphony daemon or
 remote Linear, GitHub, or Codex service. It requires no central registry; see
 [the macOS repository-services guide](docs/macos-services.md) for the
