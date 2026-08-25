@@ -39,7 +39,14 @@ const (
 
 var unsafe = regexp.MustCompile(`[^A-Za-z0-9._-]`)
 
-type Local struct{ settings func() config.Settings }
+type Local struct {
+	settings func() config.Settings
+	// landing is the optional, host-owned merge verification terminal cleanup
+	// consults before it may discard a clean worktree's local commits. It stays
+	// nil until an integration is wired, and a nil verifier keeps the original
+	// fail-closed refusal.
+	landing domain.LandingVerifier
+}
 
 // workspaceState is deliberately stored below workspace.root rather than in a
 // process-local directory. It is the durable handoff record used after a
@@ -63,6 +70,12 @@ type workspaceState struct {
 }
 
 func New(settings func() config.Settings) *Local { return &Local{settings: settings} }
+
+// SetLandingVerifier installs the host-side merge verification terminal
+// cleanup uses to tell a published, merged commit apart from unpublished local
+// work. It must only ever be given a Symphony-owned, read-only verifier; it is
+// never reachable from an agent session.
+func (l *Local) SetLandingVerifier(v domain.LandingVerifier) { l.landing = v }
 func Key(identifier string) string {
 	clean := unsafe.ReplaceAllString(identifier, "_")
 	if clean == identifier && clean != "" && clean != "." && clean != ".." && clean != stateDirectory {
@@ -309,25 +322,25 @@ func sourceIntegrityDigest(ctx context.Context, sourceRoot, commonDir string) (s
 	return fmt.Sprintf("%x", digest.Sum(nil)), nil
 }
 
-func (l *Local) Cleanup(ctx context.Context, issue domain.Issue) error {
+func (l *Local) Cleanup(ctx context.Context, issue domain.Issue) (domain.CleanupOutcome, error) {
 	path, err := l.workspacePath(issue)
 	if err != nil {
-		return err
+		return domain.CleanupClean, err
 	}
 	if _, err := os.Stat(path); os.IsNotExist(err) {
-		return l.removeState(issue)
+		return domain.CleanupClean, l.removeState(issue)
 	} else if err != nil {
-		return err
+		return domain.CleanupClean, err
 	}
 	state, found, err := l.loadState(issue)
 	if err != nil {
-		return err
+		return domain.CleanupClean, err
 	}
 	if !found {
-		return errors.New("refusing to remove workspace without durable ownership state; preserve it outside the managed root for manual recovery")
+		return domain.CleanupClean, errors.New("refusing to remove workspace without durable ownership state; preserve it outside the managed root for manual recovery")
 	}
 	if err := validateStateOwner(state, issue); err != nil {
-		return err
+		return domain.CleanupClean, err
 	}
 	ws := domain.Workspace{Path: path, Key: Key(issue.Identifier)}
 	if err := l.hook(ctx, ws, issue, "before_remove", l.settings().Hooks.BeforeRemove); err != nil {
@@ -335,46 +348,80 @@ func (l *Local) Cleanup(ctx context.Context, issue domain.Issue) error {
 	}
 	git, err := isGitWorkspace(path)
 	if err != nil {
-		return err
+		return domain.CleanupClean, err
 	}
+	outcome := domain.CleanupClean
 	if git {
 		if state.BaseCommit == "" {
-			return errors.New("refusing to remove Git workspace without a recorded base commit")
+			return outcome, errors.New("refusing to remove Git workspace without a recorded base commit")
 		}
 		if state.SourceRoot != "" {
 			if err := validateWorktreeIdentity(path, state); err != nil {
-				return err
+				return outcome, err
 			}
 			available, availableErr := gitRepositoryAvailable(ctx, state)
 			if availableErr != nil {
-				return availableErr
+				return outcome, availableErr
 			}
 			if available {
-				if err := ensureGitWorkspaceUnchanged(ctx, path, state.BaseCommit); err != nil {
-					return err
+				unchanged := ensureGitWorkspaceUnchanged(ctx, path, state.BaseCommit)
+				landed, err := l.permitCommittedRemoval(ctx, issue, unchanged)
+				if err != nil {
+					return outcome, err
+				}
+				if landed {
+					outcome = domain.CleanupLanded
 				}
 				if err := removeRecordedWorktree(ctx, state, path, false); err != nil {
-					return err
+					return outcome, err
 				}
 				if err := pruneRecordedWorktrees(ctx, state); err != nil {
-					return err
+					return outcome, err
 				}
 			} else {
-				return errors.New("recorded source and Git common directory are unavailable; refusing to remove a worktree whose local changes cannot be verified; preserve it outside the managed root for manual recovery")
+				return outcome, errors.New("recorded source and Git common directory are unavailable; refusing to remove a worktree whose local changes cannot be verified; preserve it outside the managed root for manual recovery")
 			}
 		} else {
-			return errors.New("refusing to remove legacy Git workspace without recorded source-worktree identity; preserve it outside the managed root for manual recovery")
+			return outcome, errors.New("refusing to remove legacy Git workspace without recorded source-worktree identity; preserve it outside the managed root for manual recovery")
 		}
 	} else {
 		if state.SourceRoot != "" || state.GitCommonDir != "" || state.GitWorktreeDir != "" || state.BaseCommit != "" {
-			return errors.New("recorded Git workspace no longer has its worktree identity; refusing cleanup because local changes cannot be verified; manual recovery is required")
+			return outcome, errors.New("recorded Git workspace no longer has its worktree identity; refusing cleanup because local changes cannot be verified; manual recovery is required")
 		}
 		if err := os.RemoveAll(path); err != nil {
-			return err
+			return outcome, err
 		}
 	}
 	// Do not discard the completion record until the workspace was removed.
-	return l.removeState(issue)
+	return outcome, l.removeState(issue)
+}
+
+// permitCommittedRemoval decides whether a worktree safety refusal may be
+// overridden. Only one refusal ever can be: an otherwise clean, owned worktree
+// whose HEAD is a local commit past the recorded base commit, and only when the
+// configured verifier confirms that exact commit as the merged pull request
+// head for this issue. It reports whether such a verified landing was the
+// reason removal proceeds. Every other refusal, a missing verifier, an
+// unverified commit, and any verification error stay fail-closed, so
+// uncommitted or untracked changes and unpublished commits are still preserved.
+func (l *Local) permitCommittedRemoval(ctx context.Context, issue domain.Issue, refusal error) (bool, error) {
+	if refusal == nil {
+		return false, nil
+	}
+	var ahead committedAheadError
+	if !errors.As(refusal, &ahead) || l.landing == nil {
+		return false, refusal
+	}
+	landed, err := l.landing.VerifyLanded(ctx, issue, ahead.head)
+	if err != nil {
+		// The refusal text is preserved so an unverifiable commit is reported and
+		// classified exactly like an unpublished one; the verifier logs why.
+		return false, fmt.Errorf("%w; merged landing could not be verified", refusal)
+	}
+	if !landed {
+		return false, refusal
+	}
+	return true, nil
 }
 func (l *Local) Execute(ctx context.Context, ws domain.Workspace, command string, args []string) ([]byte, error) {
 	path, err := l.managedWorkspacePath(ws.Path)
@@ -590,9 +637,20 @@ func ensureGitWorkspaceUnchanged(ctx context.Context, path, baseCommit string) e
 		return err
 	}
 	if head != baseCommit {
-		return fmt.Errorf("refusing to remove Git workspace whose HEAD %s differs from recorded base commit %s", head, baseCommit)
+		return committedAheadError{head: head, baseCommit: baseCommit}
 	}
 	return nil
+}
+
+// committedAheadError is the single cleanup refusal a verified host landing may
+// override: an otherwise clean, owned worktree whose HEAD is a local commit
+// past the recorded base commit. Its message is unchanged from the untyped
+// error it replaces so the coordinator's fixed status vocabulary and the
+// operator documentation keep describing the same refusal.
+type committedAheadError struct{ head, baseCommit string }
+
+func (e committedAheadError) Error() string {
+	return fmt.Sprintf("refusing to remove Git workspace whose HEAD %s differs from recorded base commit %s", e.head, e.baseCommit)
 }
 
 func (l *Local) hook(ctx context.Context, ws domain.Workspace, issue domain.Issue, name, script string) error {

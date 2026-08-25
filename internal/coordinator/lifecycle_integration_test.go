@@ -2,9 +2,12 @@ package coordinator
 
 import (
 	"context"
+	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -135,7 +138,7 @@ func (w *observingLocalWorkspace) AfterRun(ctx context.Context, workspace domain
 	w.afterRun <- struct{}{}
 }
 
-func (w *observingLocalWorkspace) Cleanup(ctx context.Context, issue domain.Issue) error {
+func (w *observingLocalWorkspace) Cleanup(ctx context.Context, issue domain.Issue) (domain.CleanupOutcome, error) {
 	return w.local.Cleanup(ctx, issue)
 }
 
@@ -307,4 +310,128 @@ func lifecycleSettings(root, afterRun string) config.Settings {
 
 func lifecycleIssue(updated time.Time) domain.Issue {
 	return domain.Issue{ID: "issue-1", Identifier: "PMR-9", Title: "Lifecycle", State: "Todo", Dispatchable: true, UpdatedAt: &updated}
+}
+
+// stubLandingVerifier stands in for the host GitHub merge verification the
+// production wiring installs on the local workspace executor. It records the
+// commit terminal cleanup asked about so the test can prove cleanup verified
+// the worktree's own HEAD.
+type stubLandingVerifier struct {
+	mu     sync.Mutex
+	landed bool
+	calls  []string
+}
+
+func (s *stubLandingVerifier) VerifyLanded(_ context.Context, _ domain.Issue, commit string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.calls = append(s.calls, commit)
+	return s.landed, nil
+}
+
+func (s *stubLandingVerifier) verified() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.calls...)
+}
+
+// TestTerminalReconciliationRemovesOnlyVerifiedLandedWorktrees drives the
+// reconciliation path an issue takes once the host has landed its pull request
+// and the tracker reports Done: the run stops as terminal and cleanup runs
+// against a real Git worktree that carries one local commit.
+func TestTerminalReconciliationRemovesOnlyVerifiedLandedWorktrees(t *testing.T) {
+	tests := []struct {
+		name        string
+		landed      bool
+		wantStatus  string
+		wantRemoved bool
+	}{
+		{name: "verified landing", landed: true, wantStatus: `"status":"landed"`, wantRemoved: true},
+		{name: "unpublished commits", wantStatus: `"status":"committed"`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			source := newLifecycleGitRepository(t)
+			settings := lifecycleSettings(root, "")
+			settings.Workspace.SourceRoot = source
+			issue := lifecycleIssue(time.Date(2026, time.August, 25, 12, 0, 0, 0, time.UTC))
+			tracker := &lifecycleTracker{issue: issue}
+			agent := &lifecycleAgent{block: true, requests: make(chan domain.AgentRequest, 1)}
+			local := localworkspace.New(func() config.Settings { return settings })
+			verifier := &stubLandingVerifier{landed: test.landed}
+			local.SetLandingVerifier(verifier)
+			workspaces := &observingLocalWorkspace{local: local, afterRun: make(chan struct{}, 1)}
+			logs := &syncBuffer{}
+			c := New(tracker, agent, workspaces, func() config.Settings { return settings }, slog.New(slog.NewJSONHandler(logs, nil)))
+
+			c.Tick(context.Background())
+			request := <-agent.requests
+			waitForRunning(t, c, issue.Identifier)
+			runLifecycleGit(t, request.Workspace, "commit", "--allow-empty", "-m", "landed work")
+			head := lifecycleGitHead(t, request.Workspace)
+
+			landed := issue
+			landed.State = "Done"
+			tracker.setIssue(landed)
+			c.Tick(context.Background())
+			<-workspaces.afterRun
+
+			record := waitForSubstring(t, logs, `"msg":"workspace cleanup"`, 2*time.Second)
+			if !strings.Contains(record, test.wantStatus) {
+				t.Fatalf("cleanup record missing %s: %s", test.wantStatus, record)
+			}
+			if verified := verifier.verified(); len(verified) != 1 || verified[0] != head {
+				t.Fatalf("verified commits=%v, want the worktree HEAD %s once", verified, head)
+			}
+			_, statErr := os.Stat(request.Workspace)
+			if removed := os.IsNotExist(statErr); removed != test.wantRemoved {
+				t.Fatalf("workspace removed=%t, want %t (stat=%v)", removed, test.wantRemoved, statErr)
+			}
+			if err := c.Shutdown(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if !test.wantRemoved {
+				runLifecycleGit(t, source, "worktree", "remove", "--force", request.Workspace)
+			}
+		})
+	}
+}
+
+// newLifecycleGitRepository builds the minimal source repository shape
+// LocalWorkspaceExecutor requires: a checkout with an "origin" remote whose
+// main branch it can refresh before adding a detached worktree.
+func newLifecycleGitRepository(t *testing.T) string {
+	t.Helper()
+	remote := filepath.Join(t.TempDir(), "remote.git")
+	runLifecycleGit(t, filepath.Dir(remote), "init", "--bare", remote)
+	source := filepath.Join(t.TempDir(), "source")
+	if err := os.Mkdir(source, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runLifecycleGit(t, source, "init")
+	runLifecycleGit(t, source, "config", "user.email", "test@example.invalid")
+	runLifecycleGit(t, source, "config", "user.name", "Test")
+	runLifecycleGit(t, source, "commit", "--allow-empty", "-m", "initial")
+	runLifecycleGit(t, source, "branch", "-M", "main")
+	runLifecycleGit(t, source, "remote", "add", "origin", remote)
+	runLifecycleGit(t, source, "push", "-u", "origin", "main")
+	return source
+}
+
+func runLifecycleGit(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	out, err := exec.Command("git", append([]string{"-C", dir}, args...)...).CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v: %v: %s", args, err, out)
+	}
+}
+
+func lifecycleGitHead(t *testing.T, dir string) string {
+	t.Helper()
+	out, err := exec.Command("git", "-C", dir, "rev-parse", "HEAD").CombinedOutput()
+	if err != nil {
+		t.Fatalf("git rev-parse HEAD: %v: %s", err, out)
+	}
+	return strings.TrimSpace(string(out))
 }

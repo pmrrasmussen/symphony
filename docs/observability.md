@@ -184,11 +184,26 @@ tail -F .symphony/logs/symphony.jsonl \
   | jq 'select(.msg | test("human review state change|external tracker state change")) | {operation, from_state, to_state, issue_identifier, since_handoff_ms}'
 ```
 
-Workspace lifecycle final status (clean removal vs. kept for review):
+Workspace lifecycle final status (removal vs. kept for review):
 
 ```sh
 tail -F .symphony/logs/symphony.jsonl | jq 'select(.msg == "workspace cleanup")'
 ```
+
+Each record carries one fixed `status`: `clean` (removed, no local commits
+past the recorded base commit), `landed` (removed, and it did hold local
+commits, which Symphony verified as the merged pull request head for that
+issue), `dirty` (kept: uncommitted or untracked changes), `committed` (kept:
+local commits that are not verifiably merged, including a landing that could
+not be verified), or `blocked` (kept: any other fail-closed refusal, such as
+unowned or unverifiable state). Only `clean` and `landed` removed anything; the
+warn-level records carry the workspace package's own refusal text as `error`.
+The read-only landing check that separates `landed` from `committed` logs its
+own info-level `"msg":"GitHub landing verified for workspace cleanup"` or
+`"msg":"GitHub landing unverified; workspace commits are preserved"` record
+with the `repository`, the shortened `workspace_commit`, and, when verified,
+the `pr_number`. See [workspace ownership and
+recovery](completion-markers.md) for the full cleanup safety table.
 
 ## What never appears in the log
 

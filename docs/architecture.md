@@ -188,8 +188,9 @@ otherwise active issue. Invalid ownership state, or missing state beside an
 existing workspace, fails closed during preparation. The schema, restart
 behavior, and deliberate operator remediation procedure are documented in
 [workspace ownership and recovery](completion-markers.md). Cleanup refuses to
-remove a worktree with local changes or a commit that differs from its recorded
-base revision.
+remove a worktree with local changes, and refuses to remove a worktree whose
+commit differs from its recorded base revision unless the host GitHub adapter
+verifies that exact commit as the merged head of the issue's pull request.
 
 Workspace containment is checked against canonical filesystem paths, including
 existing symlink ancestors. Service-owned workspace directories, the durable

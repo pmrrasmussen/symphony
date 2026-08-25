@@ -281,8 +281,8 @@ func (f *fakeBoundaries) AfterRun(context.Context, domain.Workspace, domain.Issu
 		close(f.afterRun)
 	}
 }
-func (*fakeBoundaries) Cleanup(context.Context, domain.Issue) error {
-	return errorsf("unexpected cleanup")
+func (*fakeBoundaries) Cleanup(context.Context, domain.Issue) (domain.CleanupOutcome, error) {
+	return domain.CleanupClean, errorsf("unexpected cleanup")
 }
 func (*fakeBoundaries) Execute(context.Context, domain.Workspace, string, []string) ([]byte, error) {
 	return nil, errorsf("unexpected command execution")
