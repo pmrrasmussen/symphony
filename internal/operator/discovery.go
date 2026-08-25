@@ -87,7 +87,9 @@ type Credentials struct {
 	GitHub  CredentialPresence `json:"github"`
 }
 
-// EffectiveConfig is a display-safe projection of config.Settings.
+// EffectiveConfig is a display-safe projection of config.Settings. AgentBackend
+// reports the resolved agent runtime selection, so a workflow that omits
+// agent.backend still projects the default rather than an empty value.
 type EffectiveConfig struct {
 	TrackerKind          string         `json:"tracker_kind,omitempty"`
 	ProjectSelector      string         `json:"project_selector,omitempty"`
@@ -101,6 +103,7 @@ type EffectiveConfig struct {
 	MaxTurns             int            `json:"max_turns"`
 	WorkspaceRoot        string         `json:"workspace_root,omitempty"`
 	WorkspaceSource      string         `json:"workspace_source,omitempty"`
+	AgentBackend         string         `json:"agent_backend,omitempty"`
 	CodexCommand         string         `json:"codex_command,omitempty"`
 	CodexApprovalPolicy  string         `json:"codex_approval_policy,omitempty"`
 	CodexThreadSandbox   string         `json:"codex_thread_sandbox,omitempty"`
@@ -455,6 +458,7 @@ func inspectWorkflow(instance *Instance, environment map[string]string) []string
 		PollInterval: settings.Polling.Interval, MaxConcurrentAgents: settings.Agent.MaxConcurrent,
 		MaxConcurrentByState: copyLimits(settings.Agent.ByState), MaxTurns: settings.Agent.MaxTurns,
 		WorkspaceRoot: settings.Workspace.Root, WorkspaceSource: settings.Workspace.SourceRoot,
+		AgentBackend: settings.AgentLaunch().Backend,
 		CodexCommand: settings.Codex.Command, TurnTimeout: settings.Codex.TurnTimeout, ReadTimeout: settings.Codex.ReadTimeout,
 		CodexApprovalPolicy: settings.Codex.ApprovalPolicy, CodexThreadSandbox: settings.Codex.ThreadSandbox,
 		StartTimeout: settings.Codex.StartTimeout, StallTimeout: settings.Codex.StallTimeout,

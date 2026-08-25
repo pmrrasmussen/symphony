@@ -129,8 +129,9 @@ diagnose a run that looks idle:
   `issue_identifier` and `reason`.
 * **Claim and preparation records** — `"msg":"issue claimed"`,
   `"msg":"workspace preparation started"`, `"msg":"workspace prepared"`, and
-  `"msg":"codex launch requested"` trace an issue from admission through the
-  point Codex is asked to start a turn.
+  `"msg":"agent launch requested"` trace an issue from admission through the
+  point the selected agent backend is asked to start a turn. The launch record
+  carries `agent_backend`, naming the runtime that session starts on.
 * **Tool/item lifecycle records** (`"msg":"agent item event"`) — one per
   app-server tool or item transition: `item_type` (for example
   `commandExecution`, `mcpToolCall`, `fileChange`, `dynamicToolCall`),

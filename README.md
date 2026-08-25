@@ -162,11 +162,18 @@ whitespace-trimmed before use and are never included in reload logs.
 
 Each successful reload publishes one complete settings snapshot. Settings
 reads that start afterward use the new polling, state, concurrency, hook,
-workspace, and Codex policy. An already-started Codex process keeps the command,
-sandbox, and timeout values captured for its launch; new concurrency limits
-govern later admissions, while current state and stall policies continue to be
-applied by reconciliation. `--logs-root` selects the process log destination at
-startup and is not a reloadable `WORKFLOW.md` field.
+workspace, and Codex policy. An already-started agent session keeps the
+backend, command, sandbox, and timeout values captured for its launch, so a
+changed `agent.backend` applies only to sessions started later; new concurrency
+limits govern later admissions, while current state and stall policies continue
+to be applied by reconciliation. `--logs-root` selects the process log
+destination at startup and is not a reloadable `WORKFLOW.md` field.
+
+`agent.backend` selects the agent runtime new sessions start on. It defaults
+to `codex`, the only accepted value today, and validation is fail-closed: any
+other value rejects the whole configuration candidate rather than falling back
+to the default. The `codex:` block supplies the launch contract -- command,
+sandbox, and timeout budgets -- for the selected backend.
 
 `codex.thread_sandbox` sets the session's sandbox mode and the optional
 `codex.turn_sandbox_policy` object is validated against the Codex
@@ -240,8 +247,11 @@ a liveness authority; see [docs/runtime-status.md](docs/runtime-status.md).
 Use `symphony tui` for a read-only terminal view across convention-matching
 local Symphony LaunchAgents. It reads launchd observation, each instance's
 safe status snapshot, normalized effective configuration, validation findings,
-and a bounded redacted structured-log tail. `r` refreshes local observations;
-the command does not start, stop, pause, or connect to a Symphony daemon or
+and a bounded redacted structured-log tail. In a terminal it reads single
+keypresses, re-reads local observations every five seconds, and refreshes on
+demand with `r`; redirected output instead prints plain frames driven by
+line-buffered input and never polls. The command does not start, stop, pause,
+or connect to a Symphony daemon or
 remote Linear, GitHub, or Codex service. It requires no central registry; see
 [the macOS repository-services guide](docs/macos-services.md) for the
 multi-repository operator workflow.

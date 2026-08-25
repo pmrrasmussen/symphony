@@ -19,7 +19,7 @@ func TestRunExercisesLifecycleWithoutCreatingConfiguredState(t *testing.T) {
 	if !result.OK() {
 		t.Fatalf("result=%+v", result)
 	}
-	for _, check := range []string{"workflow", "github_handoff", "tracker", "workspace_root", "workspace_source", "log_root", "codex_command", "hooks", "scheduler_lifecycle"} {
+	for _, check := range []string{"workflow", "github_handoff", "tracker", "workspace_root", "workspace_source", "log_root", "agent_command", "hooks", "scheduler_lifecycle"} {
 		if !hasCheck(result, check) {
 			t.Fatalf("missing %s check: %+v", check, result)
 		}
@@ -40,7 +40,7 @@ func TestRunReportsIndependentBoundaryFailures(t *testing.T) {
 	if result.OK() || result.Status != StatusFailed {
 		t.Fatalf("result=%+v", result)
 	}
-	for _, check := range []string{"codex_command", "hooks"} {
+	for _, check := range []string{"agent_command", "hooks"} {
 		found := false
 		for _, item := range result.Checks {
 			if item.Name == check && item.Status == StatusFailed {
@@ -100,4 +100,25 @@ func hasCheck(result Result, name string) bool {
 		}
 	}
 	return false
+}
+
+// TestAgentCommandCheckNamesTheSelectedBackendsField keeps the operator-visible
+// text pointing at the field an operator must actually edit. The check is named
+// for the role so selecting another backend does not rename a machine-readable
+// result, but every message names that backend's own command field.
+func TestAgentCommandCheckNamesTheSelectedBackendsField(t *testing.T) {
+	if err := executable("this-program-does-not-exist-symphony-test", "codex.command"); err == nil {
+		t.Fatal("expected an unavailable executable to fail")
+	} else if !strings.Contains(err.Error(), "codex.command executable") {
+		t.Fatalf("failure does not name the backend's command field: %v", err)
+	}
+	if err := executable("", "codex.command"); err == nil || !strings.Contains(err.Error(), "codex.command is empty") {
+		t.Fatalf("empty command failure=%v", err)
+	}
+	if err := executable("codex app-server '", "codex.command"); err == nil || !strings.Contains(err.Error(), "codex.command has invalid shell syntax") {
+		t.Fatalf("invalid syntax failure=%v", err)
+	}
+	if err := executable("$(echo codex)", "codex.command"); err == nil || !strings.Contains(err.Error(), "codex.command executable must be a literal program name") {
+		t.Fatalf("non-literal program failure=%v", err)
+	}
 }

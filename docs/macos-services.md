@@ -161,7 +161,10 @@ symphony tui
 The TUI is an ephemeral, read-only process. It scans convention-matching
 LaunchAgents in `~/Library/LaunchAgents`, reads launchd state, each configured
 status snapshot, effective configuration, validation findings, and a bounded
-redacted log tail. Close it whenever you like: it does not start, stop,
+redacted log tail. In a terminal it repeats that scan every five seconds, and
+`r` repeats it on demand; each pass is an ordinary read of local files and
+launchd state. Redirected output prints plain frames and never polls. Close it
+whenever you like, with `q` or an interrupt: it does not start, stop,
 restart, pause, or otherwise affect repository services, and it has no
 connection to a central Symphony daemon.
 

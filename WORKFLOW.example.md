@@ -68,6 +68,12 @@ workspace:
 hooks:
   timeout_ms: 60000
 agent:
+  # Selects the agent runtime new sessions start on. codex is the only accepted
+  # value today; any other value fails the whole configuration candidate, and a
+  # workflow that omits the key runs on codex. A change takes effect for
+  # sessions started after the reload; an in-flight session keeps the backend
+  # it started on.
+  backend: codex
   # Four-agent operation: implementation/rework work can scale across the
   # available global capacity while max_concurrent_agents_by_state keeps
   # landing serialized at exactly one Merging agent.

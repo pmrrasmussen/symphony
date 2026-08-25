@@ -93,10 +93,15 @@ func run(ctx context.Context, workflowPath, logRoot string, environment map[stri
 	}
 	result.addPath("log_root", settings.LogRoot)
 
-	if err := executable(settings.Codex.Command); err != nil {
-		result.add("codex_command", StatusFailed, err.Error())
+	// The check is named for the role, not the runtime, so selecting another
+	// backend does not rename a machine-readable result. The message and every
+	// failure name the backend's own command field, which is where an operator
+	// has to go to fix it.
+	launch := settings.AgentLaunch()
+	if err := executable(launch.Command, launch.Backend+".command"); err != nil {
+		result.add("agent_command", StatusFailed, err.Error())
 	} else {
-		result.add("codex_command", StatusPassed, "command syntax and executable availability are valid; Codex was not started")
+		result.add("agent_command", StatusPassed, fmt.Sprintf("command syntax and executable availability are valid; the %s agent was not started", launch.Backend))
 	}
 
 	if err := hooks(settings.Hooks); err != nil {
@@ -159,23 +164,23 @@ func inspectPath(path string) (Status, string) {
 	}
 }
 
-func executable(command string) error {
+func executable(command, field string) error {
 	if _, err := exec.LookPath("sh"); err != nil {
 		return errorsf("shell executable is unavailable: %v", err)
 	}
 	if err := exec.Command("sh", "-n", "-c", "exec "+command).Run(); err != nil {
-		return errorsf("codex.command has invalid shell syntax: %v", err)
+		return errorsf("%s has invalid shell syntax: %v", field, err)
 	}
 	fields := strings.Fields(command)
 	if len(fields) == 0 {
-		return errorsf("codex.command is empty")
+		return errorsf("%s is empty", field)
 	}
 	program := strings.Trim(fields[0], "'\"")
 	if program == "" || strings.ContainsAny(program, "$`\\|&;()<>") {
-		return errorsf("codex.command executable must be a literal program name")
+		return errorsf("%s executable must be a literal program name", field)
 	}
 	if _, err := exec.LookPath(program); err != nil {
-		return errorsf("codex.command executable %q is unavailable", program)
+		return errorsf("%s executable %q is unavailable", field, program)
 	}
 	return nil
 }
