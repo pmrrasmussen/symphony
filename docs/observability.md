@@ -146,6 +146,16 @@ diagnose a run that looks idle:
   a single bounded tracker round trip, so there is no slow outstanding operation
   to make visible, and its argument validation belongs to the provider rather
   than to a reported call.
+
+  All of this describes `agent.backend: codex`. Under `agent.backend: claude` a
+  bounded capability is invoked over the private MCP endpoint rather than as an
+  app-server item, and the Claude `--print` stream reports no item lifecycle for
+  it, so **none** of the four capabilities emits these records -- including the
+  three whose `Lifecycle()` is the documented reason they do under Codex. The
+  `outstanding_item_type`/`outstanding_item_id` fields in the heartbeat records
+  below therefore never name a Claude capability call, and a capability call that
+  runs long is not what makes a Claude turn look stalled. Closing that gap is not
+  part of the capability wiring.
 * **Heartbeat and stall records** — every reconciliation pass for a still-active
   run logs `"msg":"agent heartbeat"` with `last_activity_age_ms` and, when one
   tool/item is outstanding, `outstanding_item_type`, `outstanding_item_id`, and

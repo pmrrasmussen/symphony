@@ -9,6 +9,31 @@
 //
 // The launch policy is fixed by launch.go, not configurable, and the only
 // confirmation that it applied is the CLI's own init event -- see verifyInit.
+//
+// One ordering problem is not solved here, and verifyPromises is the whole of
+// what stands in for a solution, so it is worth naming. The prompt that tells the
+// model which bounded tools exist is rendered by the coordinator before Start is
+// called, from the coordinator's own settings snapshot; the registry that decides
+// which of them this session can actually reach is built inside Start, from a
+// snapshot this backend reads later, plus the bound issue and the provider
+// sessions prepared for it. The component that promises a capability cannot see
+// the component that grants it, and the two do not even read the same
+// configuration.
+//
+// That last part is what makes the problem ordinary rather than exotic. A
+// WORKFLOW.md reload that disables the github integration between the render and
+// the launch leaves a prompt promising host-side publish and a session with no
+// publish capability, on a perfectly normal issue. (An issue identifier
+// containing no branch-safe character reaches the same state by a stranger
+// route.) Start compares the prompt against what the session serves and refuses,
+// because the failure is otherwise silent in the worst way available: every gate
+// passes and the turn ends completed with committed, unpublished work.
+//
+// The shape that removes the problem instead of detecting it is to hoist
+// capability.Build into the host and pass the *Registry on domain.AgentRequest,
+// so the prompt is rendered from the same registry the session serves and the
+// two cannot disagree. That touches internal/domain, both backends, and the
+// router, and is deliberately not done here.
 package claude
 
 import (
@@ -19,6 +44,7 @@ import (
 	"fmt"
 	"io"
 	"os/exec"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -202,7 +228,11 @@ func (b *Backend) Start(ctx context.Context, r domain.AgentRequest) (domain.Agen
 		return domain.AgentSession{}, nil, err
 	}
 	registry := capability.Build(capability.Bindings{Settings: settings, Issue: r.Issue, Handoff: handoff, GitHub: githubSession})
-	s := &session{id: id, ctx: ctx, registry: registry, advertised: advertisedNames(registry), secretMatcher: secretMatcher}
+	advertised := advertisedNames(registry)
+	if err := verifyPromises(settings, r.Prompt, advertised); err != nil {
+		return domain.AgentSession{}, nil, err
+	}
+	s := &session{id: id, ctx: ctx, registry: registry, advertised: advertised, secretMatcher: secretMatcher}
 	b.mu.Lock()
 	b.sessions[id] = s
 	b.mu.Unlock()
@@ -228,6 +258,73 @@ func advertisedNames(registry mcpbridge.Capabilities) []string {
 		names = append(names, definition.Name)
 	}
 	return names
+}
+
+// verifyPromises is the launch-time consistency guard: it refuses a turn whose
+// rendered prompt and whose reachable capability set do not describe the same
+// session. See the package comment for why a cross-check is what stands in for a
+// fix here.
+//
+// It reads r.Prompt and not only settings, and that is the point. The prompt was
+// rendered by the coordinator from its own settings snapshot; this function runs
+// against a snapshot the backend read later. A WORKFLOW.md reload that disables
+// the github integration between the two -- an ordinary reload, on an ordinary
+// issue -- produces a prompt that promises host-side publish and a session that
+// cannot serve it, and no comparison made purely within either snapshot sees it.
+// (The degenerate case where an issue identifier contains no branch-safe
+// character reaches the same state, but the reload is the plausible one.)
+//
+// Three refusals, and they are three different failures:
+//
+// A promise with nothing to serve it. Either snapshot promising publish while the
+// registry advertises none is the failure this guard was first written for. The
+// settings term is config.HostSidePublishPromised, called rather than restated so
+// it cannot drift from the branch it mirrors; the prompt term catches the reload
+// direction, where the settings term is false.
+//
+// Publish advertised with no handoff state. The reverse direction, and the more
+// damaging one. github_publish_pr's LinkAndHandoff comments the pull request onto
+// the issue and then transitions it to the configured handoff state; with no such
+// state configured the transition targets no state at all and fails, after the
+// pull request already exists. Configuration refuses this combination for this
+// backend, so reaching it means a settings snapshot that could not have been
+// loaded -- which is exactly when a launch should stop.
+//
+// An unmapped capability name in the prompt. This is the failure the naming work
+// in config.DeliveryInstructions exists to prevent, and until now nothing
+// verified it at runtime: the whole of its correctness was one backend-name
+// string comparison in another package. A prompt rendered for the wrong backend
+// names github_publish_pr while the CLI is pinned to
+// mcp__symphony__github_publish_pr; the launch contract is still
+// self-consistent, so verifyInit approves it, and the turn ends completed with
+// unpublished work.
+//
+// What is checked is not "no bare name appears". A bare name is legitimate and
+// routine: WORKFLOW.md's prompt body is repository-owned and names Symphony's
+// tools bare in several places -- this repository's own body does it seven times
+// -- and carrying that wording unchanged under both backends is the entire
+// purpose of the naming rule. A guard that refused any bare mention would refuse
+// every real dispatch. The invariant is the conditional one: a prompt that names
+// an advertised capability must also carry the rule that maps it. A prompt
+// rendered for the wrong backend fails that, because the rule and the prefixes
+// are emitted together or not at all.
+func verifyPromises(settings config.Settings, prompt string, advertised []string) error {
+	servesPublish := slices.Contains(advertised, capability.NameGitHubPublishPR)
+	promisesPublish := settings.HostSidePublishPromised() || strings.Contains(prompt, config.HostSidePublishPromiseMarker)
+	if promisesPublish && !servesPublish {
+		return fmt.Errorf("claude launch refused: host-side publish is promised for this run but this session advertises no %s capability", capability.NameGitHubPublishPR)
+	}
+	if servesPublish && strings.TrimSpace(settings.Tracker.HandoffState) == "" {
+		return fmt.Errorf("claude launch refused: this session advertises %s with no tracker.provider.handoff_state, so a publish would leave the pull request created and the issue untransitioned", capability.NameGitHubPublishPR)
+	}
+	if !strings.Contains(prompt, config.MCPNamingRuleMarker) {
+		for _, name := range advertised {
+			if strings.Contains(prompt, name) {
+				return fmt.Errorf("claude launch refused: the rendered prompt names the %s capability with no %s naming rule to map it, so it names a tool this session does not serve", name, config.MCPToolPrefix)
+			}
+		}
+	}
+	return nil
 }
 
 // Continue resumes the session in a new process. The launch policy is rebuilt

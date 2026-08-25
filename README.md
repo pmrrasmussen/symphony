@@ -571,18 +571,46 @@ file-editing tools sitting outside the sandbox entirely, per limit 1. What
 protects host credentials from exfiltration is that no untrusted input reaches
 the worker, not the sandbox.
 
-A Claude workflow that also enables a Symphony session capability --
+A Claude workflow may enable Symphony's session capabilities --
 `tracker.provider.handoff_state`, `tracker.provider.followup_issue_creation`,
-or a **configured and enabled** GitHub integration -- is **rejected at load**.
-A `github:` block that does not resolve (an unreadable `token_file`, say) leaves
-the integration disabled, exactly as it does under `codex`, and so does not
-reach that refusal; nothing is granted either way, because a disabled
-integration has no capability to expose. The bridge that would expose
-those bounded capabilities to a Claude session does not exist yet, and refusing
-the configuration is preferred over running an agent that silently cannot hand
-off, publish a pull request, or file a follow-up. A Claude backend is therefore
-an implementation runtime whose work a human reviews and lands from the
-worktree; the canonical `In Review`/`Merging` lifecycle above requires `codex`.
+and a **configured and enabled** GitHub integration -- so the canonical
+`In Review`/`Merging` lifecycle above runs on either backend. They reach the
+session over the private loopback MCP endpoint, so the CLI serves each one as
+`mcp__symphony__<tool>` rather than `<tool>`. Symphony's host-generated delivery
+instructions render those names and state the mapping rule, which is what keeps
+one repository-owned `WORKFLOW.md` -- whose prompt body names the bare tools --
+correct under both backends with no per-backend prompt. As a fail-closed
+cross-check, a launch whose prompt promises host-side publish while the session's
+own registry advertises no `github_publish_pr` is refused rather than run.
+
+Two narrow combinations are still **rejected at load**, for `claude` only.
+
+An **enabled GitHub integration without `handoff_state`**. With follow-up issues
+off, no Linear handoff session is prepared, so no GitHub session is either and
+the enabled integration grants nothing. With follow-up issues on the outcome is
+worse rather than better: `followup_issue_creation` alone satisfies
+`LinearSessionCapabilityEnabled`, so a handoff session *is* prepared, a GitHub
+session is built on top of it, and `github_publish_pr` and `github_pr_context`
+are advertised -- while the delivery guidance branches on the handoff state and
+tells the run that publishing is unavailable. A worker that trusts its tool list
+over the prompt reaches `LinkAndHandoff` with no target state, which comments the
+pull request onto the issue and then attempts a transition to no state at all.
+The refusal arrives after the pull request already exists, which is why this is
+refused at load rather than left to the launch guard.
+
+A **`handoff_state` with neither an enabled GitHub integration nor
+`followup_issue_creation`**: the handoff object is prepared and nothing
+model-facing uses it.
+
+Both stay accepted under `codex`, where they behave identically -- the
+advertisement is the same registry's -- because they always have been and
+narrowing them would reject workflows already in the field. The
+prompt/advertisement mismatch described above is pre-existing under `codex` and
+is not addressed here. Under `claude` they are refused so that a session
+launched with no MCP server at all always means "this workflow configures no
+capability". A `github:` block that does not resolve (an unreadable
+`token_file`, say) leaves the integration disabled, exactly as it does under
+`codex`, so it configures nothing and reaches neither rule.
 
 `--dry-run` adds one check for this backend, `agent_authentication`: it runs
 `claude auth status` and reads only the `loggedIn` boolean. That command also

@@ -70,7 +70,10 @@ func run(ctx context.Context, workflowPath, logRoot string, environment map[stri
 	for _, warning := range settings.Warnings {
 		result.add("workflow_migration", StatusWarning, warning)
 	}
-	if settings.GitHub.Enabled && settings.Tracker.HandoffState != "" {
+	// The same predicate the rendered guidance branches on and the Claude backend
+	// cross-checks its registry against, rather than a third copy of it: what
+	// preflight reports available is then what a worker is told is available.
+	if settings.HostSidePublishPromised() {
 		result.add("github_handoff", StatusPassed, "host-side pull request publishing is enabled for the configured handoff state")
 	} else if settings.GitHub.Enabled {
 		result.add("github_handoff", StatusWarning, "host-side pull request publishing is unavailable: configure tracker.provider.handoff_state")

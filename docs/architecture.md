@@ -9,26 +9,56 @@ respectively.  Which `AgentBackend` a session starts on is configuration-driven
 and an unrecognized one is rejected at load rather than defaulted.  Only the
 selected backend's launch contract has to be complete, so an absent `codex:` or
 `claude:` block fails a candidate only when that backend is the one selected.
-A `claude` workflow that also enables a Symphony session capability --
-`tracker.provider.handoff_state`, `tracker.provider.followup_issue_creation`,
-or a configured and enabled GitHub integration -- is rejected at load.  The
-transport that would expose those bounded capabilities to a Claude session
-exists and is wired: the backend prepares the same provider sessions Codex
-does, builds the same registry, and serves it over the private loopback MCP
-endpoint (`internal/mcpbridge`) described below.  What is not in place yet is
-the prompt side.  The delivery instructions `WORKFLOW.md` renders name bare
-tool names, which is what a Codex dynamic tool is called and not what an MCP
-tool is called, and nothing yet cross-checks at launch that a capability the
-prompt promises is one the built registry actually advertises.  Lifting the
-refusal before both exist would produce the worst available failure: every gate
-in the repository passes -- configuration valid, preflight green, init echo
-exactly as expected -- while the host tells the model to call a tool it cannot
-reach, and the turn ends `EventCompleted` with committed, unpublished work.  So
-the wiring lands inert and the refusal stays until the guidance and the
-consistency guard land with it.  A `github:`
-block that does not resolve stays disabled, as it does under `codex`, so it
-never reaches that refusal -- which grants nothing, because a disabled
-integration has no capability to bridge.
+A `claude` workflow may enable Symphony's session capabilities.  The backend
+prepares the same provider sessions Codex does, builds the same registry, and
+serves it over the private loopback MCP endpoint (`internal/mcpbridge`)
+described below; the host-generated delivery instructions name each capability
+by the name its transport serves it under, which for that endpoint is
+`mcp__symphony__<tool>`; and `claude.Backend.Start` cross-checks the
+rendered prompt against what the session it is about to start can serve: it
+refuses a prompt that promises host-side publish where the registry advertises no
+`github_publish_pr`, a session advertising publish with no handoff state to
+publish into, and a prompt that names any advertised capability without its
+`mcp__symphony__` prefix.  That last one is what verifies the naming at runtime;
+without it the whole of the naming guarantee is a single backend-name comparison
+in `internal/config`.  The cross-check exists because the promise and the grant
+are made by different components, in a fixed order, from *different settings
+snapshots*: the coordinator renders the prompt from its own snapshot before the
+backend builds the registry from a later one plus the bound issue and its
+prepared provider sessions.  A reload that disables the GitHub integration
+between the two is enough to produce a promise no session can keep, on an
+ordinary issue.  The
+shape that removes the problem rather than detecting it is to hoist
+`capability.Build` into the host and pass the registry on `domain.AgentRequest`;
+that touches `internal/domain`, both backends, and the router, and has not been
+done.  Detecting it is not optional, because the undetected failure is the worst
+available: every gate passes -- configuration valid, preflight green, init echo
+exactly as expected -- while the turn ends `EventCompleted` with committed,
+unpublished work.
+
+Two residual configuration rules remain, both applying only to `claude`.  An
+enabled GitHub integration requires `handoff_state`.  Without one and with
+follow-up issues off, no Linear handoff session is prepared, so no GitHub session
+is either and the integration grants nothing; without one and with follow-up
+issues *on*, `followup_issue_creation` alone satisfies
+`LinearSessionCapabilityEnabled`, so a handoff session is prepared, a GitHub
+session is built on it, and `github_publish_pr` is advertised while the delivery
+guidance tells the run that publishing is unavailable.  It is not true that such
+a configuration advertises nothing, and the case where it advertises is the
+dangerous one: a worker acting on the advertised tool reaches `LinkAndHandoff`
+with no target state, which comments the pull request onto the issue and then
+transitions it to no state at all, so the refusal lands after an irreversible
+GitHub mutation.  The second rule is the narrower one it leaves behind: a
+`handoff_state` with neither an enabled GitHub integration nor
+`followup_issue_creation` prepares a handoff object nothing model-facing uses.
+Both stay accepted under `codex`, where they behave identically because the
+advertisement is the same registry's; they always have been, and the
+prompt/advertisement mismatch above is pre-existing there and is not addressed
+here.  Under `claude` they are refused so that "no MCP server at all" in the init
+echo keeps a single meaning -- this workflow configures no capability -- rather
+than also standing for a capability that was configured and could not be
+reached.  A `github:` block that does not resolve stays disabled, as it does
+under `codex`, so it configures nothing and reaches neither rule.
 
 The initial implementation is intentionally for a trusted local machine.
 `WORKFLOW.md` is repository-owned, versioned policy and its hooks are trusted

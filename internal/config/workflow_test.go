@@ -488,14 +488,184 @@ func TestEmptyPromptUsesFallback(t *testing.T) {
 	}
 }
 
+// hostPublishGuidance is the exact host-side publish guidance every dispatch
+// received before DeliveryInstructions took a backend. It is a byte-level golden
+// rather than a set of Contains checks because it is the parity statement this
+// change rests on: for the backend that was there first, the new parameter must
+// change nothing whatsoever, and a Contains check would pass through an inserted
+// preamble, a renamed tool, or a dropped bullet.
+const hostPublishGuidance = `Delivery mode: host-side publish is available for this run.
+
+- Make and validate the change in this workspace, then create a local commit.
+- Do not run gh, git push, or otherwise try to publish directly to GitHub.
+- When the worktree is clean and committed, call github_publish_pr with why, what_changed, and on_call. It is bound to this issue, repository, and branch and will create or update the PR body from those fields and hand the issue to review.
+- Call github_pr_context (no arguments) to read bounded check status, review state, and unresolved feedback for that same pull request.`
+
+// mcpNamingPreamble is the golden naming rule the Claude branch prepends. It is
+// written out here rather than assembled from MCPToolPrefix so that the
+// assertion is against the text a model actually reads: a preamble built from the
+// same expression as the code under test would agree with any prefix at all,
+// including none.
+const mcpNamingPreamble = "Tool naming: Symphony's bounded tools reach you through a single MCP server, " +
+	"so each one is named mcp__symphony__<tool> and not <tool>. Wherever these instructions or the task " +
+	"above name a Symphony tool without that prefix, call mcp__symphony__ followed by that name. Your own " +
+	"tool list decides availability: a Symphony tool that is not in it is unavailable for this run, " +
+	"whatever the instructions say.\n\n"
+
+// symphonyToolNames are the capability names a workflow prompt may use. They are
+// duplicated from internal/capability because importing it here is a cycle; the
+// list only has to stay a subset for these assertions to hold, and
+// internal/capability owns the names themselves.
+var symphonyToolNames = []string{"create_followup_issue", "github_publish_pr", "github_pr_context", "github_land_pr"}
+
+func hostPublishSettings() Settings {
+	return Settings{GitHub: GitHub{Enabled: true}, Tracker: Tracker{HandoffState: "In Review"}}
+}
+
 func TestDeliveryInstructionsReportExactAvailableMode(t *testing.T) {
-	manual := (Settings{}).DeliveryInstructions()
+	manual := (Settings{}).DeliveryInstructions(DefaultAgentBackend)
 	if !strings.Contains(manual, "Delivery mode: manual") || !strings.Contains(manual, "github.owner") {
 		t.Fatalf("manual instructions=%q", manual)
 	}
-	host := (Settings{GitHub: GitHub{Enabled: true}, Tracker: Tracker{HandoffState: "In Review"}}).DeliveryInstructions()
-	if !strings.Contains(host, "host-side publish") || !strings.Contains(host, "github_publish_pr") || strings.Contains(host, "manual") {
-		t.Fatalf("host instructions=%q", host)
+	if host := hostPublishSettings().DeliveryInstructions(DefaultAgentBackend); host != hostPublishGuidance {
+		t.Fatalf("host instructions=%q, want the unchanged Codex golden %q", host, hostPublishGuidance)
+	}
+	// An unrecognized backend is not given MCP names. Bare names are what the
+	// only two implemented transports need -- Codex serves them verbatim -- so a
+	// backend this function has never heard of must not be told its tools are
+	// renamed.
+	if unknown := hostPublishSettings().DeliveryInstructions("docker"); unknown != hostPublishGuidance {
+		t.Fatalf("unknown-backend instructions=%q, want the bare-name golden", unknown)
+	}
+}
+
+// TestClaudeGuidanceRenamesEveryToolItNames is the load-bearing assertion for the
+// backend branch. WORKFLOW.md is repository-owned and names Symphony's tools
+// bare, so the only thing that keeps one prompt correct on the MCP transport is
+// that this function renders the prefixed names and says how the mapping works.
+//
+// It is asserted as "the Claude text is the Codex text, plus the preamble, with
+// each named tool prefixed and nothing else different", which is exactly the
+// contract and is falsifiable in both directions: drop the branch and the
+// preamble is missing, keep the preamble but leave a name bare and the
+// substitution no longer matches.
+func TestClaudeGuidanceRenamesEveryToolItNames(t *testing.T) {
+	claude := hostPublishSettings().DeliveryInstructions(ClaudeAgentBackend)
+	if !strings.HasPrefix(claude, mcpNamingPreamble) {
+		t.Fatalf("claude instructions did not open with the naming rule: %q", claude)
+	}
+	want := hostPublishGuidance
+	for _, name := range symphonyToolNames {
+		want = strings.ReplaceAll(want, name, MCPToolPrefix+name)
+	}
+	if body := strings.TrimPrefix(claude, mcpNamingPreamble); body != want {
+		t.Fatalf("claude delivery guidance=%q, want the Codex guidance with prefixed tool names %q", body, want)
+	}
+	// No tool name may survive unprefixed anywhere in the rendered text: a bare
+	// name is a name the CLI does not serve, and the model has no way to tell.
+	for _, name := range symphonyToolNames {
+		if strings.Count(claude, name) != strings.Count(claude, MCPToolPrefix+name) {
+			t.Fatalf("tool %q appears unprefixed in the claude guidance: %q", name, claude)
+		}
+	}
+}
+
+// TestAClaudeRunThatCanAdvertiseNothingReadsExactlyLikeACodexRun keeps the
+// preamble from becoming noise. A run with no reachable capability is told about
+// no tool at all, so a naming rule for tools that do not exist would be an
+// invitation to look for them.
+func TestAClaudeRunThatCanAdvertiseNothingReadsExactlyLikeACodexRun(t *testing.T) {
+	for name, s := range map[string]Settings{
+		"nothing configured":                   {},
+		"github enabled with no handoff state": {GitHub: GitHub{Enabled: true}},
+		"handoff state with no github":         {Tracker: Tracker{HandoffState: "In Review"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			codex := s.DeliveryInstructions(DefaultAgentBackend)
+			claude := s.DeliveryInstructions(ClaudeAgentBackend)
+			if claude != codex {
+				t.Fatalf("claude=%q, want byte-identical to codex %q", claude, codex)
+			}
+			if strings.Contains(claude, MCPToolPrefix) {
+				t.Fatalf("a run with nothing to advertise was given the MCP naming rule: %q", claude)
+			}
+		})
+	}
+}
+
+// TestTheNamingRuleCoversACapabilityTheDeliveryModeNeverNames is why the
+// preamble is a rule over the prefix rather than a list of the tools these
+// bullets happen to mention. create_followup_issue is named only by WORKFLOW.md's
+// own body, in a manual-delivery run that mentions no tool at all, and it is
+// still renamed by the transport.
+func TestTheNamingRuleCoversACapabilityTheDeliveryModeNeverNames(t *testing.T) {
+	s := Settings{Tracker: Tracker{FollowupIssueCreation: true}}
+	claude := s.DeliveryInstructions(ClaudeAgentBackend)
+	if !strings.HasPrefix(claude, mcpNamingPreamble) {
+		t.Fatalf("a follow-up-only claude run was given no naming rule: %q", claude)
+	}
+	if body := strings.TrimPrefix(claude, mcpNamingPreamble); body != s.DeliveryInstructions(DefaultAgentBackend) {
+		t.Fatalf("delivery mode changed with the backend: %q", body)
+	}
+	if !strings.Contains(claude, "Delivery mode: manual") {
+		t.Fatalf("a run with no publish capability was not told delivery is manual: %q", claude)
+	}
+}
+
+// TestHostSidePublishPromisedIsTheConditionTheGuidanceBranchesOn pins the
+// predicate internal/claude cross-checks its registry against to the branch it
+// claims to mirror. The two live in different packages and are compared only at
+// launch, so a predicate that drifted from the branch would leave the guard
+// checking a condition nothing renders.
+func TestHostSidePublishPromisedIsTheConditionTheGuidanceBranchesOn(t *testing.T) {
+	for _, s := range []Settings{
+		{},
+		{GitHub: GitHub{Enabled: true}},
+		{Tracker: Tracker{HandoffState: "In Review"}},
+		{Tracker: Tracker{HandoffState: "In Review", FollowupIssueCreation: true}},
+		hostPublishSettings(),
+		{GitHub: GitHub{Enabled: true}, Tracker: Tracker{HandoffState: "   "}},
+	} {
+		for _, backend := range AgentBackends() {
+			promised := strings.Contains(s.DeliveryInstructions(backend), "Delivery mode: host-side publish")
+			if promised != s.HostSidePublishPromised() {
+				t.Fatalf("settings %+v backend %q: guidance promises publish=%v, HostSidePublishPromised=%v", s, backend, promised, s.HostSidePublishPromised())
+			}
+		}
+	}
+}
+
+// TestAnAllWhitespaceHandoffStateIsNoHandoffStateAtAll asserts the trim against
+// fixed expectations rather than against another predicate. The agreement test
+// above cannot cover it: DeliveryInstructions branches on
+// HostSidePublishPromised, so comparing the two agrees for any definition of the
+// predicate, trimmed or not.
+//
+// The value is unreachable through Load, but this predicate is now consumed by
+// internal/claude and internal/preflight, and every sibling that reads the same
+// field trims it. Untrimmed, the promise is true while the handoff session and
+// the GitHub session built from that field are both nil -- so the guidance
+// promises a publish, no session serves it, and every claude launch refuses at
+// session_start with retry and backoff.
+func TestAnAllWhitespaceHandoffStateIsNoHandoffStateAtAll(t *testing.T) {
+	s := Settings{GitHub: GitHub{Enabled: true}, Tracker: Tracker{HandoffState: "   "}}
+	if s.HostSidePublishPromised() {
+		t.Fatal("an all-whitespace handoff state promised host-side publish")
+	}
+	if s.LinearSessionCapabilityEnabled() {
+		t.Fatal("an all-whitespace handoff state asked for a bound Linear session")
+	}
+	if s.SessionCapabilityAdvertisable() {
+		t.Fatal("an all-whitespace handoff state reported a capability as advertisable")
+	}
+	for _, backend := range AgentBackends() {
+		guidance := s.DeliveryInstructions(backend)
+		if strings.Contains(guidance, HostSidePublishPromiseMarker) {
+			t.Fatalf("backend %q was promised host-side publish: %q", backend, guidance)
+		}
+		if !strings.Contains(guidance, "Delivery mode: manual") {
+			t.Fatalf("backend %q was not told delivery is manual: %q", backend, guidance)
+		}
 	}
 }
 
@@ -1418,8 +1588,9 @@ func TestAgentLaunchResolvesTheSelectedBackendsContract(t *testing.T) {
 
 // TestClaudeBackendConfiguration covers the claude block: its defaults, that a
 // typo is refused rather than silently defaulted, that only the selected
-// backend's launch contract has to be complete, and that a Claude workflow may
-// not yet enable Symphony session capabilities.
+// backend's launch contract has to be complete, and the residual capability
+// rule -- a Claude workflow may enable a Symphony session capability, but not one
+// no session could ever advertise.
 func TestClaudeBackendConfiguration(t *testing.T) {
 	d := t.TempDir()
 	write := func(t *testing.T, body string) string {
@@ -1479,16 +1650,83 @@ func TestClaudeBackendConfiguration(t *testing.T) {
 		}
 	})
 
-	t.Run("session capabilities are refused until the bridge lands", func(t *testing.T) {
-		for _, capability := range []string{
-			"tracker: {kind: linear, provider: {api_key: k, handoff_state: In Review}, active_states: [Todo], terminal_states: [Done]}",
-			"tracker: {kind: linear, provider: {api_key: k, followup_issue_creation: true}, active_states: [Todo], terminal_states: [Done]}",
+	// The refusal these two subtests replace was blanket: any session capability
+	// with agent.backend claude. What is left is the residual rule, so the
+	// accepted and refused halves are asserted separately and by the same route.
+	t.Run("a capability a session can advertise is accepted", func(t *testing.T) {
+		t.Setenv("PMR52_GITHUB_TOKEN", "github-secret")
+		for name, front := range map[string]string{
+			"follow-up issues": "tracker: {kind: linear, provider: {api_key: k, followup_issue_creation: true}, active_states: [Todo], terminal_states: [Done]}\n",
+			"host-side publish": "tracker: {kind: linear, provider: {api_key: k, handoff_state: In Review}, active_states: [Todo], terminal_states: [Done]}\n" +
+				"github: {owner: pmrrasmussen, repository: symphony, token: $PMR52_GITHUB_TOKEN}\n",
 		} {
-			body := "---\n" + capability + "\npolling: {interval_ms: 100}\nworkspace: {root: work}\nhooks: {timeout_ms: 100}\nagent: {backend: claude}\n---\nbody"
-			_, err := Load(write(t, body), "logs")
-			if err == nil || !strings.Contains(err.Error(), "cannot yet be combined with Symphony session capabilities") {
-				t.Fatalf("capability %q gave err=%v", capability, err)
-			}
+			t.Run(name, func(t *testing.T) {
+				body := "---\n" + front + "polling: {interval_ms: 100}\nworkspace: {root: work}\nhooks: {timeout_ms: 100}\nagent: {backend: claude}\n---\nbody"
+				w, err := Load(write(t, body), "logs")
+				if err != nil {
+					t.Fatalf("a Claude workflow with a reachable capability was rejected: %v", err)
+				}
+				if !w.Config.SessionCapabilityAdvertisable() {
+					t.Fatalf("accepted a capability no session could advertise: %+v", w.Config.Tracker)
+				}
+			})
+		}
+	})
+
+	t.Run("a capability no session could advertise is refused", func(t *testing.T) {
+		// After the handoff_state rule below, the only way left to write one: the
+		// handoff object is prepared and nothing model-facing uses it.
+		body := "---\ntracker: {kind: linear, provider: {api_key: k, handoff_state: In Review}, active_states: [Todo], terminal_states: [Done]}\n" +
+			"polling: {interval_ms: 100}\nworkspace: {root: work}\nhooks: {timeout_ms: 100}\nagent: {backend: claude}\n---\nbody"
+		_, err := Load(write(t, body), "logs")
+		if err == nil || !strings.Contains(err.Error(), "configures a Symphony session capability that no session could advertise") {
+			t.Fatalf("err=%v", err)
+		}
+	})
+
+	// TestClaudeBackendConfiguration's other subtests describe configurations that
+	// grant the model nothing. This one describes the opposite, and is the reason
+	// the rule is unconditional rather than a special case of "advertises
+	// nothing": with follow-up issues on, followup_issue_creation alone satisfies
+	// LinearSessionCapabilityEnabled, so a Linear handoff session exists, so a
+	// GitHub session is built on top of it, so github_publish_pr IS advertised --
+	// while DeliveryInstructions branches on HostSidePublishPromised and tells the
+	// run that publishing is unavailable. A worker that believes its tool list
+	// over the prompt reaches LinkAndHandoff with no target state, which comments
+	// the pull request onto the issue and then transitions it to nothing. The
+	// refusal would arrive after the pull request exists.
+	t.Run("an enabled github integration requires a handoff state", func(t *testing.T) {
+		t.Setenv("PMR52_GITHUB_TOKEN", "github-secret")
+		for name, provider := range map[string]string{
+			"no other capability":      "{api_key: k}",
+			"with follow-up issues on": "{api_key: k, followup_issue_creation: true}",
+		} {
+			t.Run(name, func(t *testing.T) {
+				body := "---\ntracker: {kind: linear, provider: " + provider + ", active_states: [Todo], terminal_states: [Done]}\n" +
+					"github: {owner: pmrrasmussen, repository: symphony, token: $PMR52_GITHUB_TOKEN}\n" +
+					"polling: {interval_ms: 100}\nworkspace: {root: work}\nhooks: {timeout_ms: 100}\nagent: {backend: claude}\n---\nbody"
+				_, err := Load(write(t, body), "logs")
+				if err == nil || !strings.Contains(err.Error(), "requires tracker.provider.handoff_state for an enabled github integration") {
+					t.Fatalf("err=%v", err)
+				}
+			})
+		}
+	})
+
+	// The same configuration stays valid for codex. The prompt/advertisement
+	// mismatch above is pre-existing there and is deliberately not fixed by this
+	// rule: narrowing codex would reject workflows already in the field.
+	t.Run("codex still accepts github without a handoff state", func(t *testing.T) {
+		t.Setenv("PMR52_GITHUB_TOKEN", "github-secret")
+		body := "---\ntracker: {kind: linear, provider: {api_key: k, followup_issue_creation: true}, active_states: [Todo], terminal_states: [Done]}\n" +
+			"github: {owner: pmrrasmussen, repository: symphony, token: $PMR52_GITHUB_TOKEN}\n" +
+			"polling: {interval_ms: 100}\nworkspace: {root: work}\nhooks: {timeout_ms: 100}\nagent: {backend: codex}\n---\nbody"
+		w, err := Load(write(t, body), "logs")
+		if err != nil {
+			t.Fatalf("codex workflow was rejected: %v", err)
+		}
+		if !w.Config.GitHub.Enabled || w.Config.Tracker.HandoffState != "" {
+			t.Fatalf("fixture does not exercise the combination: %+v", w.Config.GitHub.Enabled)
 		}
 	})
 
@@ -1496,17 +1734,6 @@ func TestClaudeBackendConfiguration(t *testing.T) {
 		body := "---\ntracker: {kind: linear, provider: {api_key: k, handoff_state: In Review}, active_states: [Todo], terminal_states: [Done]}\npolling: {interval_ms: 100}\nworkspace: {root: work}\nhooks: {timeout_ms: 100}\nagent: {backend: codex}\n---\nbody"
 		if _, err := Load(write(t, body), "logs"); err != nil {
 			t.Fatalf("codex workflow with capabilities was rejected: %v", err)
-		}
-	})
-
-	t.Run("an enabled github integration is refused", func(t *testing.T) {
-		// The github term of the refusal, isolated: no handoff_state and no
-		// followup_issue_creation, so only GitHub.Enabled can reject this.
-		t.Setenv("PMR50_GITHUB_TOKEN", "github-secret")
-		body := head + "github: {owner: pmrrasmussen, repository: symphony, token: $PMR50_GITHUB_TOKEN}\nagent: {backend: claude}\n---\nbody"
-		_, err := Load(write(t, body), "logs")
-		if err == nil || !strings.Contains(err.Error(), "cannot yet be combined with Symphony session capabilities") {
-			t.Fatalf("err=%v", err)
 		}
 	})
 
