@@ -58,6 +58,34 @@ type Model struct {
 	// known and the frame should size itself to its content and clamp nothing.
 	width  int
 	height int
+	// offset is the first detail-body row drawn. The alternate screen has no
+	// scrollback, so without this the rows past the window are unreachable
+	// rather than merely off screen.
+	offset int
+}
+
+// scrollToEnd is an offset past any possible content. The renderer knows the
+// body's real length and the driver clamps to it on the next frame, so jumping
+// to the bottom does not need the length here.
+const scrollToEnd = 1 << 30
+
+// viewportRows is how many rows a detail body may draw, or zero when the height
+// is unknown and nothing is clipped.
+func (m Model) viewportRows() int {
+	if !m.layout || m.height <= 0 {
+		return 0
+	}
+	// Three header rows, two rules, the status line, and the hint bar.
+	return m.height - 7
+}
+
+// scrollStep is half a screen, which is the vim convention the scroll keys
+// borrow. It falls back to a few lines when the height is unknown.
+func (m Model) scrollStep() int {
+	if rows := m.viewportRows(); rows > 0 {
+		return max(1, rows/2)
+	}
+	return 5
 }
 
 // Layout bands. The dashboard has to read in a sixty-column tmux split as well
@@ -308,13 +336,6 @@ func window[T any](items []T, index, limit int) ([]T, int) {
 	return items[start : start+size], len(items) - size
 }
 
-// clamp keeps the first items that fit and reports how many it dropped, so a
-// long log or a busy coordinator cannot push the hint bar off the screen. A
-// limit of zero or less means the height is unknown and clamps nothing.
-func clamp[T any](items []T, limit int) ([]T, int) {
-	return window(items, 0, limit)
-}
-
 // more reports what clamp dropped. Silent truncation would read as a complete
 // screen, which is the one thing an operator view must never do.
 func (t theme) more(hidden int) string {
@@ -378,6 +399,7 @@ func (m Model) inspecting() bool {
 // should leave the UI. Refresh is handled by Run so it can reread the host.
 func (m Model) Update(key string) (Model, bool) {
 	key = normalizeKey(key)
+	page, selected := m.page, m.selected
 	switch key {
 	case "q":
 		// There is nothing to back out to when the detail is already beside the
@@ -414,6 +436,27 @@ func (m Model) Update(key string) (Model, bool) {
 		if m.inspecting() {
 			m.page = validationPage
 		}
+	case "ctrl+d", "pgdown":
+		if m.inspecting() {
+			m.offset += m.scrollStep()
+		}
+	case "ctrl+u", "pgup":
+		if m.inspecting() {
+			m.offset = max(0, m.offset-m.scrollStep())
+		}
+	case "g":
+		if m.inspecting() {
+			m.offset = 0
+		}
+	case "G":
+		if m.inspecting() {
+			m.offset = scrollToEnd
+		}
+	}
+	if m.page != page || m.selected != selected {
+		// Different content behind the viewport, so start it at the top rather
+		// than part way down someone else's page.
+		m.offset = 0
 	}
 	return m, false
 }
@@ -442,6 +485,9 @@ func normalizeKey(key string) string {
 		return "down"
 	case "\t":
 		return "tab"
+	case "G", "shift+g":
+		// Lowercasing below would make this indistinguishable from g.
+		return "G"
 	default:
 		return strings.ToLower(strings.TrimSpace(key))
 	}
@@ -475,32 +521,39 @@ func (m *Model) Refresh(instances []operator.Instance, err error, now time.Time)
 // never prints config credentials, arbitrary environment variables, prompts,
 // protocol payloads, or log attributes.
 func (m Model) View(now time.Time) string {
+	frame, _ := m.render(now)
+	return frame
+}
+
+// render draws the frame and reports the furthest detail offset its content
+// allows. The driver uses that to correct a scroll that ran past the end, which
+// is what lets the bottom key not need the body's length up front.
+func (m Model) render(now time.Time) (string, int) {
 	style := newTheme(m.layout, m.color, m.width, m.height)
 	if style.tooSmall() {
-		return style.tooSmallFrame()
+		return style.tooSmallFrame(), 0
 	}
 	if m.splitLayout() {
 		return m.splitView(now, style)
 	}
 	if m.page == overviewPage {
-		return m.overview(now, style)
+		return m.overview(now, style), 0
 	}
 	if len(m.instances) == 0 {
-		return "Symphony operator view\n\nNo configured Symphony instances.\n\nq: quit\n"
+		return "Symphony operator view\n\nNo configured Symphony instances.\n\nq: quit\n", 0
 	}
 	instance := m.instances[m.selected]
 	if !style.layout {
-		return m.plainDetail(instance, now, style)
+		return m.plainDetail(instance, now, style), 0
 	}
 	header := lipgloss.JoinVertical(lipgloss.Left,
 		style.primary.Render("Symphony operator view")+"  "+style.emphasis.Render(instance.ID),
 		style.liveness(instance.Liveness)+style.muted.Render(" · launchd "+launchdText(instance.Launchd)),
 		style.tabs(m.page),
 	)
-	return style.frame(header,
-		m.detailBody(instance, m.page, now, style, style.mainBudget(header)),
-		m.statusLine(now, style),
-		style.muted.Render("s/c/v page · Tab next · r refresh · q back"))
+	body, maxOffset := m.detailBody(instance, m.page, now, style, style.mainBudget(header))
+	return style.frame(header, body, m.statusLine(now, style),
+		style.muted.Render("j/k instance · s/c/v page · Tab next · r refresh · q back")), maxOffset
 }
 
 // plainDetail is the redirected detail page. Its wording is deliberately fixed:
@@ -955,7 +1008,11 @@ func (a *app) press(pressed string) (tea.Model, tea.Cmd) {
 }
 
 func (a *app) View() tea.View {
-	view := tea.NewView(a.model.View(time.Now()))
+	frame, maxOffset := a.model.render(time.Now())
+	// Correct a scroll that ran past the end, so scrolling back responds on the
+	// first keypress rather than after as many as ran over.
+	a.model.offset = min(a.model.offset, maxOffset)
+	view := tea.NewView(frame)
 	view.AltScreen = true
 	return view
 }
