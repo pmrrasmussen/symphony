@@ -36,12 +36,12 @@ tracker:
     # to an active state (PMR-63). Symphony logs any such external revert
     # (operation: external_reversion); see README.md and docs/linear-tracker.md.
     handoff_state: In Review
-    # Optional, opt-in Codex client tool. It creates a new issue only in this
-    # project/team and records the active issue as its parent; it cannot
-    # select an arbitrary project, team, or issue. Intended for decomposing
-    # one task into several independently reviewable pull requests: normally
-    # one child issue per isolated worktree and PR.
-    # child_issue_creation: true
+    # Optional, opt-in Codex client tool for capturing meaningful out-of-scope
+    # work. It creates a parentless issue only in this project/team, always in
+    # Backlog, and may only relate it to the active issue or mark it blocked by
+    # the active issue. Backlog must stay outside active_states so a human must
+    # promote the follow-up to Todo before Symphony can dispatch it.
+    # followup_issue_creation: true
   # The canonical lifecycle: Todo -> In Progress -> In Review <-> Rework ->
   # Merging -> Done. Rework and Merging are active/dispatchable so a human can
   # resume implementation, or dispatch a landing agent, from the same

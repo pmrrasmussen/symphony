@@ -107,8 +107,8 @@ func (b *Backend) Start(ctx context.Context, r domain.AgentRequest) (domain.Agen
 	}
 	threadParams := map[string]any{"cwd": r.Workspace, "approvalPolicy": r.ApprovalPolicy, "sandbox": r.ThreadSandbox}
 	tools := []map[string]any{}
-	if handoff != nil && settings.Tracker.ChildIssueCreation {
-		tools = append(tools, createChildIssueToolDefinition())
+	if handoff != nil && settings.Tracker.FollowupIssueCreation {
+		tools = append(tools, createFollowupIssueToolDefinition())
 	}
 	if githubSession != nil {
 		tools = append(tools, githubToolDefinition(), githubContextToolDefinition())
@@ -643,20 +643,19 @@ func (c *client) emitItemEvent(method string, raw json.RawMessage) {
 	})
 }
 
-func createChildIssueToolDefinition() map[string]any {
+func createFollowupIssueToolDefinition() map[string]any {
 	return map[string]any{
-		"type": "function", "name": "create_child_issue",
-		"description": "Create a new Linear issue in the active issue's configured project and team, recorded as a Linear sub-issue of the active issue. Use this to split this task into independently reviewable pull requests: normally create one child issue per isolated worktree and PR. depends_on may only reference identifiers returned by earlier create_child_issue calls in this same session.",
+		"type": "function", "name": "create_followup_issue",
+		"description": "Capture meaningful out-of-scope work as a new Backlog Linear issue in the active issue's configured project and team, then continue the current issue. The follow-up is not a child and is not dispatchable until a human promotes it. relationship may only relate it to the current issue or mark it blocked by the current issue.",
 		"inputSchema": map[string]any{
 			"type": "object", "additionalProperties": false,
 			"properties": map[string]any{
-				"title":       map[string]any{"type": "string", "minLength": 1, "maxLength": 255},
-				"description": map[string]any{"type": "string", "maxLength": 20000},
-				"priority":    map[string]any{"type": "integer", "minimum": 0, "maximum": 4},
-				"labels":      map[string]any{"type": "array", "maxItems": 20, "items": map[string]any{"type": "string", "maxLength": 128}},
-				"depends_on":  map[string]any{"type": "array", "maxItems": 20, "items": map[string]any{"type": "string", "maxLength": 64}},
+				"title":               map[string]any{"type": "string", "minLength": 1, "maxLength": 255},
+				"description":         map[string]any{"type": "string", "minLength": 1, "maxLength": 16000},
+				"acceptance_criteria": map[string]any{"type": "string", "minLength": 1, "maxLength": 4000},
+				"relationship":        map[string]any{"type": "string", "enum": []string{"related", "blocked_by_current"}},
 			},
-			"required": []string{"title"},
+			"required": []string{"title", "description", "acceptance_criteria"},
 		},
 	}
 }
@@ -780,13 +779,13 @@ func (c *client) handleToolCall(x rpc) {
 		c.sendServerResponse(x.ID, map[string]any{"success": true, "contentItems": []any{map[string]any{"type": "inputText", "text": string(content)}}})
 		return
 	}
-	if request.Tool == "create_child_issue" && c.handoff != nil {
-		result, err := c.handoff.CreateChildIssue(c.ctx, request.Arguments)
+	if request.Tool == "create_followup_issue" && c.handoff != nil {
+		result, err := c.handoff.CreateFollowupIssue(c.ctx, request.Arguments)
 		if err != nil {
 			// Do not return provider errors, issue data, or any credential-derived
 			// value to the child. The generic response is enough for the model to
 			// choose another path, while the normalized event informs the scheduler.
-			c.toolFailure(x.ID, "Linear child issue creation was rejected.")
+			c.toolFailure(x.ID, "Linear follow-up issue creation was rejected.")
 			return
 		}
 		text, err := json.Marshal(result.Data)
@@ -797,7 +796,7 @@ func (c *client) handleToolCall(x rpc) {
 		c.sendServerResponse(x.ID, map[string]any{"success": result.Success, "contentItems": []any{map[string]any{"type": "inputText", "text": string(text)}}})
 		return
 	}
-	// No other client-side tool is bound: the agent has no Linear-mutating tool.
+	// No other client-side tool is bound: the agent has no Linear state-transition tool.
 	c.unsupportedTool(x.ID)
 }
 

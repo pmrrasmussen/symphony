@@ -92,7 +92,10 @@ type GitHub struct {
 	AllowConflictResolution bool
 }
 
-const legacyProjectSlugWarning = "tracker.provider.project_slug is deprecated; migrate to project_slug_id"
+const (
+	legacyProjectSlugWarning        = "tracker.provider.project_slug is deprecated; migrate to project_slug_id"
+	legacyChildIssueCreationWarning = "tracker.provider.child_issue_creation is deprecated; migrate to followup_issue_creation"
+)
 
 type Tracker struct {
 	Kind                                         string
@@ -102,12 +105,12 @@ type Tracker struct {
 	// HostTransitions is the single host-owned tracker transition policy
 	// (tracker.provider.transitions). Symphony applies every edge in it itself,
 	// with the host Linear credential; none is ever exposed to a Codex session.
-	// The agent has no tracker-write capability.
+	// The agent has no issue-state transition capability.
 	HostTransitions HostTransitions
-	// ChildIssueCreation enables the session-bound Codex create_child_issue
-	// tool. It is opt-in and disabled by default; see child_issue_creation in
-	// tracker.provider.
-	ChildIssueCreation bool
+	// FollowupIssueCreation enables the session-bound Codex
+	// create_followup_issue tool. It is opt-in and disabled by default; see
+	// followup_issue_creation in tracker.provider.
+	FollowupIssueCreation bool
 }
 
 // HostTransitions holds the two host-applied tracker transition edge sets.
@@ -289,7 +292,7 @@ func decode(raw map[string]any, base, path, logRoot string, sources *sourceSnaps
 	if err != nil {
 		return Settings{}, err
 	}
-	childIssueCreation, err := childIssueCreationPolicy(resolvedProvider)
+	followupIssueCreation, err := followupIssueCreationPolicy(resolvedProvider, activeStates)
 	if err != nil {
 		return Settings{}, err
 	}
@@ -405,7 +408,7 @@ func decode(raw map[string]any, base, path, logRoot string, sources *sourceSnaps
 			HandoffState:           handoffState,
 			HandoffCommentTemplate: handoffCommentTemplate,
 			HostTransitions:        hostTransitions,
-			ChildIssueCreation:     childIssueCreation,
+			FollowupIssueCreation:  followupIssueCreation,
 		},
 		Polling:   Polling{Interval: pollInterval},
 		Workspace: Workspace{Root: workspaceRoot, SourceRoot: sourceRoot},
@@ -621,7 +624,7 @@ func handoffPolicy(provider map[string]any, activeStates, terminalStates []strin
 // hostTransitionPolicy parses the single repository-owned, host-applied
 // transition policy under tracker.provider.transitions. Symphony applies every
 // edge itself with the host credential; none is exposed to a Codex session, so
-// the agent has no tracker-write capability at all. The two edge sets are
+// the agent has no issue-state transition capability. The two edge sets are
 // parsed and validated separately and never flattened into one map: the
 // canonical Merging state is both a dispatchable active state and the
 // land-fallback source, so a flat source->target map consumed at dispatch
@@ -731,18 +734,25 @@ func transitionEdges(value any, field string) (map[string]string, error) {
 	return result, nil
 }
 
-// childIssueCreationPolicy is deliberately a single boolean: unlike
-// handoff_state, the scope of the create_child_issue tool (project, team, and
-// parent issue) is entirely derived from the active issue at session start, so
-// there is no separate destination value to validate here.
-func childIssueCreationPolicy(provider map[string]any) (bool, error) {
-	value, exists := provider["child_issue_creation"]
+// followupIssueCreationPolicy is deliberately a single boolean. The tool's
+// project and team are derived from the active issue, and its initial state is
+// fixed to Backlog. Enabling it while Backlog is dispatchable would defeat the
+// human promotion gate, so that configuration fails closed.
+func followupIssueCreationPolicy(provider map[string]any, activeStates []string) (bool, error) {
+	value, exists := provider["followup_issue_creation"]
 	if !exists {
 		return false, nil
 	}
 	enabled, ok := value.(bool)
 	if !ok {
-		return false, errors.New("invalid configuration: tracker.provider.child_issue_creation must be a boolean")
+		return false, errors.New("invalid configuration: tracker.provider.followup_issue_creation must be a boolean")
+	}
+	if enabled {
+		for _, state := range activeStates {
+			if strings.EqualFold(strings.TrimSpace(state), "Backlog") {
+				return false, errors.New("invalid configuration: tracker.provider.followup_issue_creation requires Backlog to be non-dispatchable")
+			}
+		}
 	}
 	return enabled, nil
 }
@@ -923,14 +933,15 @@ func (s Settings) Render(issue any, attempt int) (string, error) {
 }
 
 // LinearSessionCapabilityEnabled reports whether a bound Linear session must be
-// prepared for a Codex run. The agent has NO tracker-write tool: the only
+// prepared for a Codex run. The agent has no issue-state transition tool: the only
 // things that still require a bound session are the host-owned review handoff
 // object (handoff_state; used by github_publish_pr's LinkAndHandoff and by the
-// landing/reconciliation host methods) and the opt-in create_child_issue tool.
+// landing/reconciliation host methods) and the opt-in create_followup_issue
+// tool.
 // Every board-affecting transition is applied host-side, so no model-invokable
-// path can write the tracker.
+// path can change an issue's workflow state.
 func (s Settings) LinearSessionCapabilityEnabled() bool {
-	return strings.TrimSpace(s.Tracker.HandoffState) != "" || s.Tracker.ChildIssueCreation
+	return strings.TrimSpace(s.Tracker.HandoffState) != "" || s.Tracker.FollowupIssueCreation
 }
 
 // DeliveryInstructions describe the only PR delivery capability available to
@@ -1264,6 +1275,11 @@ func resolveProvider(m map[string]any, base string, sources *sourceSnapshot) (ma
 	if err != nil {
 		return nil, nil, err
 	}
+	followupWarnings, err := normalizeFollowupIssueCreation(out)
+	if err != nil {
+		return nil, nil, err
+	}
+	warnings = append(warnings, followupWarnings...)
 	apiKey, hasAPIKey := out["api_key"]
 	if hasAPIKey {
 		if _, ok := apiKey.(string); !ok {
@@ -1323,6 +1339,20 @@ func normalizeProjectSlug(provider map[string]any) ([]string, error) {
 	provider["project_slug_id"] = legacy
 	delete(provider, "project_slug")
 	return []string{legacyProjectSlugWarning}, nil
+}
+
+func normalizeFollowupIssueCreation(provider map[string]any) ([]string, error) {
+	legacy, hasLegacy := provider["child_issue_creation"]
+	_, hasCanonical := provider["followup_issue_creation"]
+	if hasLegacy && hasCanonical {
+		return nil, errors.New("invalid configuration: tracker.provider.followup_issue_creation and deprecated child_issue_creation must not both be set")
+	}
+	if !hasLegacy {
+		return nil, nil
+	}
+	provider["followup_issue_creation"] = legacy
+	delete(provider, "child_issue_creation")
+	return []string{legacyChildIssueCreationWarning}, nil
 }
 
 func pathValue(m map[string]any, key, fallback, base string, sources *sourceSnapshot) (string, error) {

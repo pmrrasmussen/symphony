@@ -588,7 +588,7 @@ func TestHostTransitionPolicyIsExactAndReloadSafe(t *testing.T) {
 	}
 }
 
-func TestChildIssueCreationPolicyIsOptInBooleanAndReloadSafe(t *testing.T) {
+func TestFollowupIssueCreationPolicyIsOptInBooleanBacklogGatedAndReloadSafe(t *testing.T) {
 	d := t.TempDir()
 	p := filepath.Join(d, "WORKFLOW.md")
 	base := "tracker: {kind: linear, provider: {%s}, active_states: [Todo, In Progress], terminal_states: [Done]}"
@@ -603,38 +603,80 @@ func TestChildIssueCreationPolicyIsOptInBooleanAndReloadSafe(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if s.Current().Config.Tracker.ChildIssueCreation {
-		t.Fatal("child issue creation must default to disabled")
+	if s.Current().Config.Tracker.FollowupIssueCreation {
+		t.Fatal("follow-up issue creation must default to disabled")
 	}
 	if s.Current().Config.LinearSessionCapabilityEnabled() {
 		t.Fatal("no Linear session capability should be enabled by default")
 	}
 
-	write("child_issue_creation: true")
+	write("followup_issue_creation: true")
 	if err := s.Reload(); err != nil {
 		t.Fatal(err)
 	}
-	if !s.Current().Config.Tracker.ChildIssueCreation {
-		t.Fatal("child issue creation was not enabled")
+	if !s.Current().Config.Tracker.FollowupIssueCreation {
+		t.Fatal("follow-up issue creation was not enabled")
 	}
 	if !s.Current().Config.LinearSessionCapabilityEnabled() {
-		t.Fatal("child issue creation alone should enable the Linear session capability")
+		t.Fatal("follow-up issue creation alone should enable the Linear session capability")
 	}
 
-	write("child_issue_creation: \"true\"")
+	write("followup_issue_creation: \"true\"")
 	if err := s.Reload(); err == nil {
-		t.Fatal("non-boolean child_issue_creation reloaded")
+		t.Fatal("non-boolean followup_issue_creation reloaded")
 	}
-	if !s.Current().Config.Tracker.ChildIssueCreation {
-		t.Fatal("invalid reload replaced child issue creation policy")
+	if !s.Current().Config.Tracker.FollowupIssueCreation {
+		t.Fatal("invalid reload replaced follow-up issue creation policy")
 	}
 
-	write("child_issue_creation: false")
+	write("followup_issue_creation: false")
 	if err := s.Reload(); err != nil {
 		t.Fatal(err)
 	}
-	if s.Current().Config.Tracker.ChildIssueCreation {
-		t.Fatal("explicit false did not disable child issue creation")
+	if s.Current().Config.Tracker.FollowupIssueCreation {
+		t.Fatal("explicit false did not disable follow-up issue creation")
+	}
+
+	dispatchableBacklog := "---\ntracker: {kind: linear, provider: {followup_issue_creation: true}, active_states: [Todo, Backlog], terminal_states: [Done]}\n---\nprompt"
+	if err := os.WriteFile(p, []byte(dispatchableBacklog), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Reload(); err == nil {
+		t.Fatal("follow-up issue creation accepted dispatchable Backlog")
+	}
+}
+
+func TestLegacyChildIssueCreationMigratesToFollowupCapability(t *testing.T) {
+	d := t.TempDir()
+	p := filepath.Join(d, "WORKFLOW.md")
+	write := func(provider string) {
+		t.Helper()
+		content := "---\ntracker: {kind: linear, provider: {" + provider + "}, active_states: [Todo], terminal_states: [Done]}\n---\nprompt"
+		if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("child_issue_creation: true")
+	w, err := Load(p, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !w.Config.Tracker.FollowupIssueCreation {
+		t.Fatal("legacy child setting did not enable the follow-up capability")
+	}
+	if len(w.Config.Warnings) != 1 || w.Config.Warnings[0] != legacyChildIssueCreationWarning {
+		t.Fatalf("migration warnings=%q", w.Config.Warnings)
+	}
+	if _, exists := w.Config.Tracker.Provider["child_issue_creation"]; exists {
+		t.Fatalf("legacy setting was not normalized: %#v", w.Config.Tracker.Provider)
+	}
+	if value := w.Config.Tracker.Provider["followup_issue_creation"]; value != true {
+		t.Fatalf("normalized follow-up setting=%#v", value)
+	}
+
+	write("child_issue_creation: true, followup_issue_creation: true")
+	if _, err := Load(p, ""); err == nil {
+		t.Fatal("legacy and canonical follow-up settings were both accepted")
 	}
 }
 
