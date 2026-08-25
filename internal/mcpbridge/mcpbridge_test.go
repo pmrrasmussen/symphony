@@ -3,6 +3,7 @@ package mcpbridge
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -389,7 +390,9 @@ func TestUnauthorizedTokensAreRefused(t *testing.T) {
 	server := endpoint(t)
 	registration, _ := register(t, server, newRegistry().with("tool", succeeds("ok")))
 	revoked, _ := register(t, server, newRegistry().with("tool", succeeds("ok")))
-	revoked.Revoke(context.Background())
+	if err := revoked.Revoke(context.Background()); err != nil {
+		t.Fatalf("Revoke reported %v", err)
+	}
 
 	body := `{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}`
 	for _, tc := range []struct{ name, header string }{
@@ -630,8 +633,9 @@ func TestRevokeDrainsInFlightWorkBeforeTurnEnded(t *testing.T) {
 	awaitSignal(t, entered, "the invocation to start")
 
 	revoked := make(chan struct{})
+	outcome := make(chan error, 1)
 	go func() {
-		registration.Revoke(context.Background())
+		outcome <- registration.Revoke(context.Background())
 		close(revoked)
 	}()
 
@@ -649,6 +653,9 @@ func TestRevokeDrainsInFlightWorkBeforeTurnEnded(t *testing.T) {
 	releaseOnce()
 	awaitSignal(t, revoked, "Revoke to return")
 	await(t, call, "the drained call")
+	if err := <-outcome; err != nil {
+		t.Fatalf("Revoke reported %v, want a clean drain and finalize", err)
+	}
 	mu.Lock()
 	ordered := finalizedAfterReturn
 	mu.Unlock()
@@ -659,7 +666,9 @@ func TestRevokeDrainsInFlightWorkBeforeTurnEnded(t *testing.T) {
 		t.Fatalf("the turn-ended finalizer ran %d times, want 1", count)
 	}
 	// Revoke is idempotent.
-	registration.Revoke(context.Background())
+	if again := registration.Revoke(context.Background()); again != nil {
+		t.Fatalf("a second Revoke reported %v", again)
+	}
 	if count := registry.turnEndedCount(); count != 1 {
 		t.Fatalf("a second Revoke ran the finalizer again (%d times)", count)
 	}
@@ -686,29 +695,49 @@ func TestTerminalResultReachesTheOwningSink(t *testing.T) {
 	}
 }
 
-// TestRevokedRegistrationCannotEmit covers the late terminal outcome: the turn
-// is over, the consumer has already seen its terminal event, and a second one
-// must not reach it.
-func TestRevokedRegistrationCannotEmit(t *testing.T) {
+// TestTerminalEventSurvivesAConcurrentRevoke is the drain's actual purpose. A
+// turn cancelled while github_land_pr is in flight is the case this transport is
+// built for: the landing finishes, reports waiting or merged, and that event is
+// what schedules the delayed retry or ends the run. Releasing the invocation
+// slot before emitting it lets the revocation retire the registration first and
+// destroy the event, leaving the issue in Merging with nothing to retry it.
+func TestTerminalEventSurvivesAConcurrentRevoke(t *testing.T) {
 	entered := make(chan struct{})
 	release := make(chan struct{})
 	releaseOnce := sync.OnceFunc(func() { close(release) })
 	t.Cleanup(releaseOnce)
+
+	var mu sync.Mutex
+	var delivered []domain.Event
+	finalizedAfterDelivery := false
+
 	registry := newRegistry().with("lands", func(context.Context) (capability.Result, *capability.Failure) {
 		close(entered)
 		<-release
-		return capability.Result{Success: true, Payload: "merged", Terminal: domain.EventLandingResolved}, nil
+		return capability.Result{Success: true, Payload: map[string]any{"status": "waiting"},
+			Terminal: domain.EventLandingWaiting, Reason: "required checks are pending"}, nil
 	})
-	registration, events := register(t, endpoint(t), registry)
+	registry.onTurnEnded = func() {
+		mu.Lock()
+		finalizedAfterDelivery = len(delivered) == 1
+		mu.Unlock()
+	}
+	server := endpoint(t)
+	registration, err := server.Register(context.Background(), registry, func(event domain.Event) {
+		mu.Lock()
+		delivered = append(delivered, event)
+		mu.Unlock()
+	})
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
 
 	call := asyncCall(t, registration, "lands")
-	awaitSignal(t, entered, "the invocation to start")
+	awaitSignal(t, entered, "the landing to start")
 
-	revoked := make(chan struct{})
-	go func() {
-		registration.Revoke(context.Background())
-		close(revoked)
-	}()
+	revoked := make(chan error, 1)
+	go func() { revoked <- registration.Revoke(context.Background()) }()
+	// The registration is inactive and Revoke is parked in the drain.
 	waitFor(t, func() bool {
 		response, _ := send(t, http.MethodPost, registration.URL(), registration.Token(),
 			`{"jsonrpc":"2.0","id":1,"method":"ping"}`)
@@ -716,14 +745,212 @@ func TestRevokedRegistrationCannotEmit(t *testing.T) {
 	}, "the revoked token to stop authenticating")
 
 	releaseOnce()
-	awaitSignal(t, revoked, "Revoke to return")
-	await(t, call, "the drained call")
-	if emitted := events.all(); len(emitted) != 0 {
-		t.Fatalf("a revoked registration emitted %v", emitted)
+	if _, isError := toolOutcome(t, await(t, call, "the landing")); isError {
+		t.Fatal("the landing was reported as an error")
 	}
-	registration.emit(domain.Event{Kind: domain.EventCompleted})
+	select {
+	case err := <-revoked:
+		if err != nil {
+			t.Fatalf("Revoke reported %v, want a clean drain", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for Revoke to return")
+	}
+
+	mu.Lock()
+	events, ordered := append([]domain.Event(nil), delivered...), finalizedAfterDelivery
+	mu.Unlock()
+	if len(events) != 1 {
+		t.Fatalf("a landing drained by Revoke delivered %v, want its terminal event", events)
+	}
+	if events[0].Kind != domain.EventLandingWaiting || events[0].Message != "required checks are pending" {
+		t.Fatalf("delivered %+v", events[0])
+	}
+	if !ordered {
+		t.Fatal("the turn-ended finalizer ran before the terminal event was delivered")
+	}
+}
+
+// TestTerminalEventIsDeliveredBeforeTheSlotIsReleased pins the ordering inside
+// callTool, which the retirement gate alone does not: emitting after the
+// invocation slot is released is a race the emit usually wins, so a test that
+// only counts delivered events cannot tell the two orderings apart. This one
+// blocks inside the sink and asserts Revoke cannot get past the drain while the
+// event is still being delivered -- which is only true if the slot is still
+// held, and is what makes delivery a guarantee instead of a likely outcome.
+func TestTerminalEventIsDeliveredBeforeTheSlotIsReleased(t *testing.T) {
+	emitting := make(chan struct{})
+	held := make(chan struct{})
+	releaseSink := sync.OnceFunc(func() { close(held) })
+	t.Cleanup(releaseSink)
+
+	registry := newRegistry().with("lands", func(context.Context) (capability.Result, *capability.Failure) {
+		return capability.Result{Success: true, Payload: "merged", Terminal: domain.EventLandingResolved}, nil
+	})
+	server := endpoint(t)
+	registration, err := server.Register(context.Background(), registry, func(domain.Event) {
+		close(emitting)
+		<-held
+	})
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	call := asyncCall(t, registration, "lands")
+	awaitSignal(t, emitting, "the terminal event to reach the sink")
+
+	revoked := make(chan error, 1)
+	go func() { revoked <- registration.Revoke(context.Background()) }()
+	select {
+	case err := <-revoked:
+		t.Fatalf("Revoke returned (%v) while the terminal event was still being delivered: the invocation slot was released before the event, so a revocation can retire the registration first and drop it", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	releaseSink()
+	select {
+	case err := <-revoked:
+		if err != nil {
+			t.Fatalf("Revoke reported %v, want a clean drain", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for Revoke to return")
+	}
+	if _, isError := toolOutcome(t, await(t, call, "the landing")); isError {
+		t.Fatal("the landing was reported as an error")
+	}
+}
+
+// TestRetiredRegistrationCannotEmit covers the other side of that gate: once
+// Revoke has drained and retired the registration, the turn really is over and a
+// later event must not reach a consumer that has stopped reading.
+func TestRetiredRegistrationCannotEmit(t *testing.T) {
+	registration, events := register(t, endpoint(t), newRegistry())
+	if err := registration.Revoke(context.Background()); err != nil {
+		t.Fatalf("Revoke reported %v", err)
+	}
+	registration.emit(domain.Event{Kind: domain.EventLandingResolved})
 	if emitted := events.all(); len(emitted) != 0 {
-		t.Fatalf("a revoked registration emitted %v", emitted)
+		t.Fatalf("a retired registration emitted %v", emitted)
+	}
+}
+
+// TestRevokeReportsAnExpiredDrain covers the case where Revoke gives up: it must
+// return inside its own bound and say that it did, because the caller cannot
+// otherwise tell that the ordering invariant was abandoned -- the finalizer ran
+// beside a live invocation, that invocation's outcome is lost, and its goroutine
+// still holds the slot.
+func TestRevokeReportsAnExpiredDrain(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	releaseOnce := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(releaseOnce)
+
+	server := endpoint(t)
+	server.bounds.drain = 25 * time.Millisecond
+	registry := newRegistry().with("slow", func(context.Context) (capability.Result, *capability.Failure) {
+		close(entered)
+		<-release
+		return capability.Result{Success: true, Payload: "done", Terminal: domain.EventLandingResolved}, nil
+	})
+	registration, events := register(t, server, registry)
+
+	call := asyncCall(t, registration, "slow")
+	awaitSignal(t, entered, "the invocation to start")
+
+	// A Revoke that stops honouring its bound must fail this test in seconds,
+	// not park it until the package timeout, so the blocked invocation is
+	// released either way well before that.
+	go func() {
+		time.Sleep(2 * time.Second)
+		releaseOnce()
+	}()
+	started := time.Now()
+	err := registration.Revoke(context.Background())
+	if !errors.Is(err, ErrDrainExpired) {
+		t.Fatalf("Revoke reported %v, want ErrDrainExpired", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("Revoke took %s; its bound did not bound it", elapsed)
+	}
+	if errors.Is(err, ErrFinalizerExpired) {
+		t.Fatalf("Revoke reported %v, want the drain alone", err)
+	}
+	// Idempotent, and the same outcome.
+	if again := registration.Revoke(context.Background()); !errors.Is(again, ErrDrainExpired) {
+		t.Fatalf("a second Revoke reported %v", again)
+	}
+
+	// The consequence the error exists to report: the invocation that outlived
+	// the drain is retired, so the terminal event it produces is dropped.
+	releaseOnce()
+	await(t, call, "the abandoned call")
+	if emitted := events.all(); len(emitted) != 0 {
+		t.Fatalf("an invocation that outlived the drain emitted %v", emitted)
+	}
+}
+
+// TestRevokeReportsAnUnfinishedFinalizer bounds the finalizer too. It can block
+// before it consults any context -- the GitHub session's finalizer takes that
+// session's mutex first, and a landing holds the same mutex across Git children
+// bounded only by the session context -- so Revoke would otherwise inherit the
+// lifetime of a network-hung git process.
+func TestRevokeReportsAnUnfinishedFinalizer(t *testing.T) {
+	release := make(chan struct{})
+	releaseOnce := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(releaseOnce)
+
+	server := endpoint(t)
+	server.bounds.finalize = 25 * time.Millisecond
+	registry := newRegistry()
+	registry.onTurnEnded = func() { <-release }
+	registration, _ := register(t, server, registry)
+
+	// As above: a finalizer called inline instead of under a bound must fail
+	// this test in seconds rather than deadlock it.
+	go func() {
+		time.Sleep(2 * time.Second)
+		releaseOnce()
+	}()
+	started := time.Now()
+	err := registration.Revoke(context.Background())
+	if !errors.Is(err, ErrFinalizerExpired) {
+		t.Fatalf("Revoke reported %v, want ErrFinalizerExpired", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("Revoke took %s; a blocked finalizer was not bounded", elapsed)
+	}
+	if errors.Is(err, ErrDrainExpired) {
+		t.Fatalf("Revoke reported %v, want the finalizer alone", err)
+	}
+	// The finalizer is not abandoned: it is idempotent and its deferred
+	// transition must still happen, so it is still running.
+	releaseOnce()
+	waitFor(t, func() bool { return registry.turnEndedCount() == 1 }, "the finalizer to finish on its own")
+}
+
+// TestCloseReportsUnrevokedRegistrations makes a missed Revoke visible. Closing
+// with a live registration silently leaks that session's deferred transition,
+// which is the same class of wiring mistake Register refuses a nil sink for.
+func TestCloseReportsUnrevokedRegistrations(t *testing.T) {
+	server := endpoint(t)
+	registration, _ := register(t, server, newRegistry())
+	err := server.Close(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "unrevoked") {
+		t.Fatalf("Close reported %v, want an unrevoked registration", err)
+	}
+	// Nothing can start an invocation on it afterwards either.
+	if gate := registration.beginCall(); !errors.Is(gate, errRevoked) {
+		t.Fatalf("a closed endpoint's registration admitted an invocation (%v)", gate)
+	}
+
+	clean := endpoint(t)
+	revoked, _ := register(t, clean, newRegistry())
+	if err := revoked.Revoke(context.Background()); err != nil {
+		t.Fatalf("Revoke reported %v", err)
+	}
+	if err := clean.Close(context.Background()); err != nil {
+		t.Fatalf("Close reported %v after every registration was revoked", err)
 	}
 }
 
@@ -777,14 +1004,21 @@ func TestIndependentRegistrationsServeConcurrently(t *testing.T) {
 	}
 
 	var revoking sync.WaitGroup
+	outcomes := make(chan error, sessions)
 	for _, registration := range registrations {
 		revoking.Add(1)
 		go func(registration *Registration) {
 			defer revoking.Done()
-			registration.Revoke(context.Background())
+			outcomes <- registration.Revoke(context.Background())
 		}(registration)
 	}
 	revoking.Wait()
+	close(outcomes)
+	for err := range outcomes {
+		if err != nil {
+			t.Fatalf("Revoke reported %v", err)
+		}
+	}
 	for i, registry := range registries {
 		if count := registry.turnEndedCount(); count != 1 {
 			t.Fatalf("session %d ran its finalizer %d times, want 1", i, count)

@@ -105,14 +105,12 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	case "tools/list":
 		writeResult(w, call.ID, map[string]any{"tools": toolList(registration)})
 	case "tools/call":
-		result, terminal := registration.callTool(call.Params)
-		writeResult(w, call.ID, result)
-		if terminal != nil {
-			// Emitted only after the response is written, mirroring
-			// internal/codex: a terminal event ends the logical run, and the
-			// model should still receive the result of the call that ended it.
-			registration.emit(*terminal)
-		}
+		// The response is written from inside callTool, while the invocation
+		// slot is still held: see callTool for why the write and the terminal
+		// event cannot happen after the slot is released.
+		registration.callTool(call.Params, func(result map[string]any) {
+			writeResult(w, call.ID, result)
+		})
 	default:
 		// The client calls an undocumented server/discover before initialize.
 		// The protocol's own unknown-method error is the correct answer and the
@@ -163,8 +161,22 @@ func toolList(g *Registration) []map[string]any {
 	return tools
 }
 
-// callTool runs one tools/call against this registration's registry and returns
-// the MCP result, plus the terminal event to emit once the response is written.
+// callTool runs one tools/call against this registration's registry, writing the
+// MCP result through respond and emitting any terminal outcome the capability
+// produced.
+//
+// Both happen before the deferred endCall releases the invocation slot, and that
+// ordering is load-bearing. A Revoke waiting in drain() wakes the moment the
+// slot is released and retires the registration; anything emitted after that is
+// dropped. A turn cancelled while a landing is in flight is exactly the case
+// this transport is built for -- the child is killed, the landing completes,
+// reports waiting or merged, and that event is what schedules the delayed retry
+// or ends the run. Releasing the slot first would destroy it, and the provider's
+// own finalizer would then also do nothing, because it sees the waiting outcome
+// the lost event was reporting.
+//
+// respond runs first so the model still receives the result of the call that
+// ended its turn, as it does on the Codex transport.
 //
 // Every decision about what a capability is, whether it accepts these
 // arguments, and what it refuses belongs to the registry. This function owns
@@ -182,47 +194,52 @@ func toolList(g *Registration) []map[string]any {
 // no consumer here. Any log or event ever added to this function must take the
 // name from the resolved capability's own definition, never from the decoded
 // request.
-func (g *Registration) callTool(params json.RawMessage) (map[string]any, *domain.Event) {
+func (g *Registration) callTool(params json.RawMessage, respond func(map[string]any)) {
 	var call struct {
 		Name      string          `json:"name"`
 		Arguments json.RawMessage `json:"arguments"`
 	}
 	if err := json.Unmarshal(params, &call); err != nil {
-		return unsupportedTool(), nil
+		respond(unsupportedTool())
+		return
 	}
 	bound, ok := g.capabilities.Lookup(call.Name)
 	if !ok {
 		// Refused as a tool result, not a JSON-RPC error: an unknown name is
 		// something the model chose and can correct, and the refusal reveals
 		// nothing about what is configured.
-		return unsupportedTool(), nil
+		respond(unsupportedTool())
+		return
 	}
 	invoke, failure := bound.Prepare(arguments(call.Arguments))
 	if failure != nil {
 		// A rejected argument list precedes the call, so it is not reported as
 		// one, and it does not claim the invocation slot.
-		return toolFailure(failure.Message), nil
+		respond(toolFailure(failure.Message))
+		return
 	}
 	if err := g.beginCall(); err != nil {
-		return toolFailure(gateRefusal(err)), nil
+		respond(toolFailure(gateRefusal(err)))
+		return
 	}
 	defer g.endCall()
 	// The session context, never the request's: see Register.
 	result, failure := invoke(g.sessionCtx)
 	if failure != nil {
-		return toolFailure(failure.Message), nil
+		respond(toolFailure(failure.Message))
+		return
 	}
 	payload, err := json.Marshal(result.Payload)
 	if err != nil {
-		return unsupportedTool(), nil
+		respond(unsupportedTool())
+		return
 	}
-	var terminal *domain.Event
+	respond(map[string]any{"content": text(string(payload)), "isError": !result.Success})
 	if result.Terminal != "" {
 		// A capability may settle the whole run. Reason is a fixed, bounded
 		// string owned by the provider.
-		terminal = &domain.Event{Kind: result.Terminal, At: time.Now(), Message: result.Reason}
+		g.emit(domain.Event{Kind: result.Terminal, At: time.Now(), Message: result.Reason})
 	}
-	return map[string]any{"content": text(string(payload)), "isError": !result.Success}, terminal
 }
 
 // arguments normalizes an absent argument object. MCP declares "arguments"

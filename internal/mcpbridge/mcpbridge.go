@@ -78,6 +78,14 @@ const (
 	// forever.
 	drainTimeout = 2 * time.Minute
 
+	// finalizeTimeout bounds the turn-ended finalizer, which needs a bound of
+	// its own because it can block before it looks at any context: the GitHub
+	// session's finalizer takes that session's mutex as its first statement, and
+	// a landing holds the same mutex across Git children that are bounded only
+	// by the session context. Without this, Revoke inherits the lifetime of a
+	// network-hung git process no matter what the drain does.
+	finalizeTimeout = 30 * time.Second
+
 	serverName    = "symphony"
 	serverVersion = "0.1.0"
 )
@@ -94,13 +102,28 @@ type Capabilities interface {
 	TurnEnded(ctx context.Context)
 }
 
+// No Go file imports this package yet, so nothing else would notice if the
+// registry stopped satisfying the seam: signature drift in internal/capability
+// would compile clean here and surface only when a backend is wired to it. This
+// assertion is what makes the seam's claim -- that the production registry is
+// the interface, and the tests substitute for it rather than the reverse -- hold
+// permanently.
+var _ Capabilities = (*capability.Registry)(nil)
+
+// bounds are the two waits Revoke performs. They are per-server fields rather
+// than referenced constants only so this package's own tests can drive an
+// expired bound without a multi-minute wait; nothing outside this package can
+// set or observe them, and Listen always installs the constants above.
+type bounds struct{ drain, finalize time.Duration }
+
 // Server is the single loopback MCP endpoint. One listener serves every
 // concurrent session: capacity is small and sessions are separated by their
 // bearer tokens, not by their ports, so the daemon opens exactly one listening
 // socket for its lifetime.
 type Server struct {
-	http *http.Server
-	url  string
+	http   *http.Server
+	url    string
+	bounds bounds
 
 	mu            sync.Mutex
 	closed        bool
@@ -124,7 +147,10 @@ func Listen() (*Server, error) {
 		_ = listener.Close()
 		return nil, errors.New("mcp capability endpoint bound a non-TCP address")
 	}
-	s := &Server{url: "http://" + net.JoinHostPort(addr.IP.String(), strconv.Itoa(addr.Port)) + endpointPath}
+	s := &Server{
+		url:    "http://" + net.JoinHostPort(addr.IP.String(), strconv.Itoa(addr.Port)) + endpointPath,
+		bounds: bounds{drain: drainTimeout, finalize: finalizeTimeout},
+	}
 	s.http = &http.Server{
 		Handler:           http.HandlerFunc(s.serve),
 		ReadHeaderTimeout: readHeaderTimeout,
@@ -137,17 +163,33 @@ func Listen() (*Server, error) {
 	return s, nil
 }
 
-// Close stops serving and drops every registration. It does not revoke them:
-// draining in-flight work and firing each registry's turn-ended finalizer is
-// the owning session's decision, so the caller revokes its registrations before
-// shutting the endpoint down. Shutdown's own wait for active requests is
-// bounded by ctx.
+// Close stops serving and unlinks every registration, marking each one inactive
+// so nothing can start a further invocation on it.
+//
+// It deliberately does not revoke them: draining in-flight work and firing a
+// registry's turn-ended finalizer belong to the owning session, and doing it
+// here would run every session's finalizer on a shutting-down context. A
+// registration still live at this point is therefore a missed Revoke, which
+// silently leaks that session's deferred Merging -> In Review transition, so
+// Close reports the count rather than swallowing it -- the same reasoning that
+// makes Register refuse a nil sink at wiring time. Shutdown's own wait for
+// active requests is bounded by ctx.
 func (s *Server) Close(ctx context.Context) error {
 	s.mu.Lock()
 	s.closed = true
+	unrevoked := s.registrations
 	s.registrations = nil
 	s.mu.Unlock()
-	return s.http.Shutdown(ctx)
+	for _, registration := range unrevoked {
+		registration.mu.Lock()
+		registration.active = false
+		registration.mu.Unlock()
+	}
+	err := s.http.Shutdown(ctx)
+	if len(unrevoked) > 0 {
+		return errors.Join(err, fmt.Errorf("mcp capability endpoint closed with %d unrevoked registration(s)", len(unrevoked)))
+	}
+	return err
 }
 
 // Register binds one session's capability registry to a fresh bearer token.
@@ -181,6 +223,7 @@ func (s *Server) Register(sessionCtx context.Context, capabilities Capabilities,
 		sessionCtx:   sessionCtx,
 		url:          s.url,
 		token:        token,
+		bounds:       s.bounds,
 		active:       true,
 		idle:         make(chan struct{}, 1),
 	}
@@ -244,17 +287,27 @@ type Registration struct {
 	sessionCtx   context.Context
 	url          string
 	token        string
+	bounds       bounds
 
 	mu sync.Mutex
 	// active is cleared by Revoke before anything is drained, so no further
-	// invocation can start and no further event can be emitted.
+	// invocation can start once the turn is ending. It deliberately does not
+	// gate emitting: see retired.
 	active bool
+	// retired is set only once Revoke has drained, so a call that was already
+	// running when the turn ended can still deliver the outcome it produced.
+	// Clearing active would gate that outcome out, which is exactly the event
+	// the drain was waiting for.
+	retired bool
 	// inFlight is the single-invocation gate. See beginCall.
 	inFlight bool
 	// idle wakes a draining Revoke when an invocation finishes. It is buffered
 	// so a finishing call never blocks on a Revoke that is not waiting.
 	idle       chan struct{}
 	revokeOnce sync.Once
+	// revokeErr is written inside revokeOnce and read after it, so every caller
+	// of an idempotent Revoke sees the same outcome.
+	revokeErr error
 }
 
 // URL is the endpoint address to hand the agent. It is the same for every
@@ -265,51 +318,114 @@ func (g *Registration) URL() string { return g.url }
 // the child's environment, and in no log line, event, or command argument.
 func (g *Registration) Token() string { return g.token }
 
+// ErrDrainExpired and ErrFinalizerExpired report that Revoke gave up waiting.
+// Both mean the registration was retired while work it was supposed to settle
+// first was still running, which is a state the caller cannot otherwise see:
+// nothing in this package logs, so an unreported expiry would be invisible.
+// Neither carries any part of a URL, token, argument, or result.
+var (
+	// ErrDrainExpired means an invocation was still in flight when the drain
+	// bound expired. Its consequences are concrete: the turn-ended finalizer ran
+	// concurrently with that invocation, the terminal outcome the invocation is
+	// about to produce will be dropped, and its goroutine survives holding the
+	// invocation slot until the session context ends.
+	ErrDrainExpired = errors.New("mcp registration revoked with an invocation still in flight")
+	// ErrFinalizerExpired means the registry's turn-ended finalizer had not
+	// returned when its bound expired. It is still running -- see finalize.
+	ErrFinalizerExpired = errors.New("mcp registration turn-ended finalizer did not complete")
+)
+
 // Revoke retires this registration at the end of an agent turn, in a fixed
 // order that the capability state depends on.
 //
 // First the registration is marked inactive and unlinked, so no new invocation
 // can start and a revoked token authenticates against nothing. Then any
-// invocation already running is drained. Only then does the registry's
-// turn-ended finalizer run, because that finalizer performs the deferred
-// Merging -> In Review transition: running it while a landing call is still in
-// flight would let the transition interleave with the merge it is the fallback
-// for.
+// invocation already running is drained -- including the terminal event it
+// produces, which is emitted before the invocation releases the slot, so a
+// landing's own outcome cannot be lost to the revocation that waited for it.
+// Only then does the registry's turn-ended finalizer run, because that finalizer
+// performs the deferred Merging -> In Review transition: running it while a
+// landing call is still in flight would let the transition interleave with the
+// merge it is the fallback for.
 //
 // The drain honours only its own bound, never ctx: a cancelled context is
 // exactly the case where the child was killed mid-call, which is when skipping
-// the drain would do the damage. Once the bound expires the finalizer runs
-// anyway, because never finalizing would leak the deferred transition
-// permanently. ctx is the context the finalizer itself runs on, so it must
-// still be live.
+// the drain would do the damage.
 //
-// Revoke is idempotent.
-func (g *Registration) Revoke(ctx context.Context) {
+// Revoke is idempotent and always returns within its own bounds. It returns nil
+// when it drained and finalized in order, and otherwise ErrDrainExpired,
+// ErrFinalizerExpired, or both joined -- each of which means an invariant this
+// function exists to hold was knowingly given up on. ctx is the context the
+// finalizer runs on, so it must still be live.
+func (g *Registration) Revoke(ctx context.Context) error {
 	g.revokeOnce.Do(func() {
 		g.mu.Lock()
 		g.active = false
 		g.mu.Unlock()
 		g.server.remove(g)
-		g.drain()
-		g.capabilities.TurnEnded(ctx)
+		drained := g.drain()
+		g.mu.Lock()
+		g.retired = true
+		g.mu.Unlock()
+		var problems []error
+		if !drained {
+			problems = append(problems, ErrDrainExpired)
+		}
+		if !g.finalize(ctx) {
+			problems = append(problems, ErrFinalizerExpired)
+		}
+		g.revokeErr = errors.Join(problems...)
 	})
+	return g.revokeErr
 }
 
-func (g *Registration) drain() {
-	bound := time.NewTimer(drainTimeout)
+// drain waits for an in-flight invocation to finish, and reports whether it did.
+func (g *Registration) drain() bool {
+	bound := time.NewTimer(g.bounds.drain)
 	defer bound.Stop()
 	for {
 		g.mu.Lock()
 		busy := g.inFlight
 		g.mu.Unlock()
 		if !busy {
-			return
+			return true
 		}
 		select {
 		case <-g.idle:
 		case <-bound.C:
-			return
+			return false
 		}
+	}
+}
+
+// finalize runs the registry's turn-ended finalizer under its own bound and
+// reports whether it returned inside it.
+//
+// The finalizer runs on its own goroutine because it can block before it
+// consults any context: the GitHub session's finalizer takes that session's
+// mutex as its first statement, and a landing holds the same mutex across Git
+// children bounded only by the session context. Calling it inline would give
+// Revoke the lifetime of a network-hung git process, and passing a bounded or
+// already-cancelled ctx would not help, because the block happens before ctx is
+// read.
+//
+// An expired finalizer is not abandoned: it is idempotent, the deferred
+// Merging -> In Review transition it may still perform must happen, and the
+// session context it runs on will end it. Revoke stops waiting and says so
+// instead of waiting for it.
+func (g *Registration) finalize(ctx context.Context) bool {
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		g.capabilities.TurnEnded(ctx)
+	}()
+	bound := time.NewTimer(g.bounds.finalize)
+	defer bound.Stop()
+	select {
+	case <-finished:
+		return true
+	case <-bound.C:
+		return false
 	}
 }
 
@@ -320,22 +436,31 @@ var (
 	errBusy    = errors.New("invocation already in flight")
 )
 
-// beginCall claims the registration's single invocation slot.
+// beginCall claims the registration's single invocation slot: exactly one
+// invocation runs at a time per registration, and a parallel second call is
+// refused rather than queued.
 //
-// Exactly one invocation runs at a time per registration, and a second
-// concurrent call is refused rather than queued. HTTP hands every request its
-// own goroutine and the CLI does issue parallel tool calls, but every provider
-// idempotency latch behind this registry -- landing attempts, the stale-base
-// update, the retryable-gate flag, the merged and deferred-fired flags, the
-// resolved-landing latch -- was only ever validated under the serialized entry
-// that the Codex app-server transport gives it, where tool calls are dispatched
-// inline on a single read loop. Serializing here makes this transport
-// behaviourally identical to the one those latches were built against, instead
-// of asking each of them to become concurrency-safe.
+// This is not what makes concurrent entry safe. Every provider entry point
+// behind the registry already holds its own session mutex for the whole call
+// (Publish, Context, Land, FinalizeLanding, LandingResolved), so parallel HTTP
+// requests would serialize there regardless, and a second parallel landing would
+// be declined by the resolved-landing latch it reads on entry.
 //
-// Refusing beats queueing: a queued duplicate would run against state the first
-// call has already changed, which is the same double-landing the latches exist
-// to prevent, only later.
+// What the gate buys is the difference between refusing in milliseconds and
+// waiting minutes. Without it, a parallel call parks an HTTP goroutine on that
+// session mutex behind a Land that can run for several bounded provider requests
+// plus a Git push, and then runs against state the first call has already
+// changed -- while the model waits, learning nothing. Refusing hands the model
+// something it can act on immediately. It also keeps at most one provider
+// operation per session outstanding, which is what makes Revoke's drain a single
+// bounded wait rather than a race with however many goroutines the child chose
+// to open.
+//
+// Note what this does not cover: Prepare runs before the gate is taken, so
+// argument validation is genuinely concurrent here where the Codex transport's
+// inline dispatch serialized it. That is harmless only because every Prepare is
+// pure parsing. A Prepare that ever touches provider session state must move
+// inside the gate.
 func (g *Registration) beginCall() error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -359,16 +484,26 @@ func (g *Registration) endCall() {
 	}
 }
 
-// emit forwards a terminal capability outcome to the owning session's sink, and
-// drops it once the registration is revoked: the turn is over by then, so the
-// consumer has already seen its terminal event and a late one would either be
-// attributed to the wrong turn or block on a channel nobody reads. The sink is
-// called without the lock held, because it is the session's code and may block.
+// emit forwards a terminal capability outcome to the owning session's sink.
+//
+// It is gated on retirement, not on activity, and the difference is the whole
+// point. A revocation clears active and then waits for the invocation already
+// running -- whose terminal outcome is precisely what the consumer is waiting
+// for, since a landing that reports waiting or resolved is what ends the logical
+// run. Gating on active would drop that event and strand the issue: no delayed
+// landing retry, and no deferred transition either, because the provider's own
+// finalizer sees the waiting outcome and returns. Retirement is set only after
+// the drain, so an in-flight call's outcome always gets through and only a truly
+// late event -- one from an invocation that outlived an expired drain, which
+// Revoke reports as ErrDrainExpired -- is dropped.
+//
+// The sink is called without the lock held, because it is the session's code and
+// may block.
 func (g *Registration) emit(event domain.Event) {
 	g.mu.Lock()
-	active := g.active
+	retired := g.retired
 	g.mu.Unlock()
-	if !active {
+	if retired {
 		return
 	}
 	g.sink(event)
