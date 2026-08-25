@@ -649,6 +649,70 @@ func decodeGitHub(raw map[string]any, objectValid bool, base string, sources *so
 	return GitHub{Enabled: true, Owner: owner, Repository: repository, BaseBranch: baseBranch, Token: token, Endpoint: strings.TrimRight(endpoint, "/"), PollInterval: time.Duration(pollMS) * time.Millisecond}
 }
 
+// reservedSecretEnvNames is the fixed half of the host credential filter: names
+// that never reach an agent child whatever a workflow says. They are the
+// documented variables Symphony's own tracker and forge credentials are read
+// from, and an agent reaches those providers through bounded capabilities,
+// never directly.
+//
+// It lives beside HostSecretEnvNames and HostSecretValues, and beside the
+// loader that derives both, because all of them are one policy -- see
+// ReservedSecretEnvNames -- and that policy is a property of the trust boundary,
+// not of either backend. Both launchers read it from here, so a name added or
+// removed cannot apply to one backend and not the other.
+var reservedSecretEnvNames = []string{
+	"LINEAR_API_KEY",
+	"SYMPHONY_LINEAR_API_KEY_FILE",
+	"GITHUB_TOKEN",
+	"SYMPHONY_GITHUB_TOKEN",
+	"SYMPHONY_GITHUB_TOKEN_FILE",
+}
+
+// ReservedSecretEnvNames returns the names no agent child may inherit under any
+// configuration. A copy is returned because a launcher appends its own
+// configured names to the result.
+//
+// This comment is also the one description of how host credentials are kept out
+// of an agent child. Both backends implement exactly this, and neither documents
+// it separately.
+//
+// A launcher filters the inherited environment through four filters, and each
+// one exists because the others cannot cover it:
+//
+//  1. ReservedSecretEnvNames removes the documented variables Symphony's own
+//     credentials are read from, whatever the workflow configures. It is the
+//     only filter that applies to a workflow with no credential reference at
+//     all -- for example one whose tracker key is passed in some other way --
+//     and the only one that covers a credential *file path*, which is not a
+//     secret value and so is invisible to filter 3.
+//  2. Settings.HostSecretEnvNames removes the variables this workflow actually
+//     references. Filter 1 cannot: the names are repository-chosen and unknown
+//     here. It is also the only control over the `api_key_file` form, where the
+//     variable holds a path rather than the credential (PMR-80).
+//  3. Settings.HostSecretValues removes any variable whose value *contains* a
+//     configured credential, under any name. Neither name filter can: an
+//     inherited variable Symphony has never heard of can still carry the
+//     credential, plain or wrapped in something like "Bearer <token>".
+//  4. The session's provider secret matcher removes the credential the bound
+//     provider sessions actually hold. Filter 3 is derived by the loader from
+//     the workflow at load time; the provider session is the authority on the
+//     credential it will use, and the two can differ -- a settings reload
+//     between turns rotates 3 while a run's frozen providers keep 4, and a
+//     Settings assembled by anything other than Load carries no values at all.
+//
+// A credential the launcher deliberately hands over -- the Claude backend's
+// capability endpoint token -- is appended after filtering, so no filter can
+// strip it and no inherited value can pre-empt it.
+//
+// Everything else is inherited on purpose: both CLIs authenticate through the
+// operator's own login, which lives in the home directory they read.
+//
+// Each numbered filter is proven per backend, because a hole would be silent:
+// see TestNoHostCredentialReachesTheChildEnvironment in internal/codex and
+// TestHostSecretsNeverReachTheChild plus
+// TestStartBindsTheHostProvidersAndTheirSecrets in internal/claude.
+func ReservedSecretEnvNames() []string { return append([]string(nil), reservedSecretEnvNames...) }
+
 // hostSecretEnvNames extracts only environment variable names from credential
 // references. It deliberately inspects the repository-owned raw fields so an
 // optional GitHub integration that is currently disabled cannot accidentally

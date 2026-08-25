@@ -33,16 +33,8 @@ type Backend struct {
 	github      *githubhost.Manager
 }
 
-var reservedSecretEnvNames = []string{
-	"LINEAR_API_KEY",
-	"SYMPHONY_LINEAR_API_KEY_FILE",
-	"GITHUB_TOKEN",
-	"SYMPHONY_GITHUB_TOKEN",
-	"SYMPHONY_GITHUB_TOKEN_FILE",
-}
-
 func New(secretNames ...string) *Backend {
-	names := append(append([]string(nil), reservedSecretEnvNames...), secretNames...)
+	names := append(config.ReservedSecretEnvNames(), secretNames...)
 	return &Backend{sessions: map[string]*client{}, secretNames: uniquePaths(names)}
 }
 
@@ -362,6 +354,12 @@ func uniquePaths(paths []string) []string {
 	}
 	return out
 }
+
+// filteredEnv applies the host credential filter to this child's environment:
+// the reserved and configured names in names, and the configured and
+// provider-held values in secretMatcher. config.ReservedSecretEnvNames
+// documents all four filters and why each is needed; internal/claude applies
+// the same four and adds nothing but the capability endpoint token.
 func filteredEnv(names []string, secretMatcher func(string) bool) []string {
 	blocked := map[string]bool{}
 	for _, n := range names {

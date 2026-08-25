@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -498,15 +499,35 @@ func TestUsageAccumulatesAcrossTurns(t *testing.T) {
 	}
 }
 
-// TestHostSecretsNeverReachTheChild covers both filters: by variable name and by
-// value, because an inherited variable under any other name can still carry a
-// configured credential.
+// TestHostSecretsNeverReachTheChild covers the filters that need no bound
+// provider: every reserved name, the configured names, and the configured
+// values, because an inherited variable under any other name can still carry a
+// configured credential. The fourth filter, the session's provider secret
+// matcher, needs prepared providers and is proven by
+// TestStartBindsTheHostProvidersAndTheirSecrets.
+// internal/codex's TestNoHostCredentialReachesTheChildEnvironment is the
+// counterpart, so a filter cannot hold on one transport and not the other.
+//
+// The reserved names are written out here rather than read from
+// config.ReservedSecretEnvNames, deliberately: a test that iterates the list
+// asserts nothing about its contents, and dropping an entry would leave it
+// green. Before this test, only two of the five were covered by anything.
 func TestHostSecretsNeverReachTheChild(t *testing.T) {
 	dir := t.TempDir()
 	script := writeFakeClaude(t, dir, "cat <<'EOF'\n"+initLine(dir, allCodingTools)+"\n"+resultLine(false, "")+"\nEOF\n")
 
-	t.Setenv("LINEAR_API_KEY", "reserved-name-secret")
-	t.Setenv("SYMPHONY_GITHUB_TOKEN", "another-reserved-secret")
+	// Each reserved value is unique and is matched by no other filter, so only
+	// the name can remove it.
+	reserved := map[string]string{
+		"LINEAR_API_KEY":               "reserved-linear-key-value",
+		"SYMPHONY_LINEAR_API_KEY_FILE": "/private/reserved-linear-key-path",
+		"GITHUB_TOKEN":                 "reserved-forge-token-value",
+		"SYMPHONY_GITHUB_TOKEN":        "reserved-symphony-forge-token-value",
+		"SYMPHONY_GITHUB_TOKEN_FILE":   "/private/reserved-forge-token-path",
+	}
+	for name, value := range reserved {
+		t.Setenv(name, value)
+	}
 	t.Setenv("HOST_CONFIGURED_NAME", "configured-name-secret")
 	t.Setenv("INNOCENT_LOOKING", "prefix-configured-value-secret-suffix")
 	t.Setenv("KEPT", "ordinary-value")
@@ -527,9 +548,25 @@ func TestHostSecretsNeverReachTheChild(t *testing.T) {
 	drain(t, events)
 
 	environment := readFile(t, filepath.Join(dir, "env.txt"))
+	// The names are compared exactly, so an absence assertion on one name cannot
+	// be satisfied by another that merely ends with it -- GITHUB_TOKEN inside
+	// SYMPHONY_GITHUB_TOKEN, for example.
+	var names []string
+	for _, line := range strings.Split(environment, "\n") {
+		if name, _, found := strings.Cut(line, "="); found {
+			names = append(names, name)
+		}
+	}
+	for name, value := range reserved {
+		if slices.Contains(names, name) {
+			t.Fatalf("child environment retained reserved variable %s", name)
+		}
+		if strings.Contains(environment, value) {
+			t.Fatalf("child environment retained the value of reserved variable %s", name)
+		}
+	}
 	for _, forbidden := range []string{
-		"reserved-name-secret", "another-reserved-secret", "configured-name-secret",
-		"configured-value-secret", "extra-secret",
+		"configured-name-secret", "configured-value-secret", "extra-secret",
 	} {
 		if strings.Contains(environment, forbidden) {
 			t.Fatalf("child environment retained %q", forbidden)

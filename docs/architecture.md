@@ -237,6 +237,28 @@ operation, all built from a fixed, narrow decode of protocol fields that
 never includes tool arguments, command bodies, outputs, or raw payloads. See
 [observability.md](observability.md).
 
+No host credential reaches an agent child as an environment variable, under
+either backend. One filter, described once, is applied by both launchers, and it
+has four parts because no three of them cover the fourth. First, a fixed set of
+reserved variable names -- the documented names Symphony's own tracker and forge
+credentials are read from -- is removed whatever the workflow configures; it is
+also the only part that removes a credential *file path*, which is not a secret
+value. Second, the variable names this workflow actually references are removed;
+those are repository-chosen and so cannot be in the fixed set. Third, any
+variable whose value contains a configured credential is removed under any name,
+because an inherited variable Symphony has never heard of can still carry the
+credential, plain or wrapped as `Bearer <token>`. Fourth, the credential the
+run's bound provider sessions actually hold is removed: the third part is
+derived by the loader from the workflow, while a provider session is the
+authority on the credential it will use, and the two can diverge across a
+settings reload. The Claude backend adds exactly one variable after filtering --
+this turn's capability endpoint token, which is the credential it deliberately
+hands over -- and blocks that name on the way in so it can have no other source.
+Everything else is inherited on purpose: both CLIs authenticate through the
+operator's own stored login, which lives in the home directory they read.
+`internal/config`'s `ReservedSecretEnvNames` owns both the reserved names and
+this description, and each part is proven separately per backend.
+
 When `workspace.source_root` is configured, `LocalWorkspaceExecutor` creates a
 detached Git worktree for each issue. Before creating a new workspace, it
 refreshes and resolves `origin/main`, so the initial commit is independent of
@@ -250,9 +272,8 @@ write access to only the two paths a detached-HEAD commit needs -- the source
 repository's shared object store and this linked worktree's own per-worktree
 metadata directory -- and never the rest of the common directory, so the agent
 cannot write the source repository's branch refs (including the primary branch)
-or the primary working tree's index. Host-owned Linear and GitHub secrets are
-stripped from the Codex child environment by variable name and by value, so no
-host credential is passed to the worker as a variable.
+or the primary working tree's index. No host-owned Linear or GitHub credential
+is passed to the worker as a variable.
 
 That bound covers writes and the environment only. A Codex sandbox does not
 restrict reads: a worker can read any file the user running Symphony can,
@@ -384,10 +405,9 @@ session with no capability, and Symphony's own endpoint reporting itself
 `connected` rather than `pending` for a session with one -- requires the
 reported working directory to resolve to the issue's workspace, and fails the
 turn closed otherwise or when no init event arrives at all -- but the event does not report sandbox state, so
-the sandbox's own status is not observable in the stream. Host Linear and
-GitHub secrets are stripped from the Claude child environment by variable name
-and by value, exactly as for Codex; everything else is inherited on purpose,
-because the CLI authenticates through the service user's own stored login.
+the sandbox's own status is not observable in the stream. The child environment
+is filtered by exactly the same host credential filter as Codex's, with the one
+addition described there: this turn's capability endpoint token.
 
 One consequence of running the CLI is not a boundary Symphony controls at all:
 the CLI persists its own full transcript -- rendered prompts, issue
