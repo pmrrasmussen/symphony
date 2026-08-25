@@ -73,6 +73,42 @@ workflow, smoke worktree, and smoke issue. Never upload raw logs or full agent
 prompts: they can contain sensitive issue content even though Symphony redacts
 known credential values.
 
+## Opt-in local full-lifecycle landing exercise
+
+This is a separate, mutating smoke profile for validating PR landing. Do
+not extend the checked-in `WORKFLOW.smoke.example.md` or the `live-smoke` CI
+job with these capabilities; the existing CI profile must remain read-only.
+Create an ignored local workflow for each exercise, and opt in only after its
+`--dry-run` preflight succeeds.
+
+The local full-lifecycle profile must:
+
+- target both a dedicated disposable Linear project and a dedicated
+  disposable GitHub repository, never production artifacts;
+- configure the host-owned `tracker.provider.transitions.start` edge from
+  `Todo` to `In Progress`, the
+  `tracker.provider.transitions.refuse_landing` edge from `Merging` to
+  `In Review`, and `handoff_state: In Review`;
+- include `Merging` in `active_states` so landing work is dispatched, while
+  excluding `In Review` so human review remains non-dispatchable;
+- set `github.merge_state: Merging`, choose an explicit `github.merge_method`,
+  and list the exact check names reported by the disposable repository in
+  `github.required_checks`;
+- provide a state-specific `Merging` prompt branch that calls the zero-argument
+  `github_land_pr` tool. That branch must not rebuild the change or call
+  `github_publish_pr`; a pending-check result waits in `Merging`, while a hard
+  refusal uses the host-owned fallback to `In Review`.
+
+Create one disposable issue in `Todo` and observe the complete path: the host
+starts it in `In Progress`, implementation publishes its pull request to
+`In Review`, a human moves it to `Merging`, and the next dispatch lands that
+same pull request and reconciles the issue to `Done`. This final dispatch is
+what distinguishes a full-lifecycle landing smoke from another implementation
+handoff exercise. Before cleanup, verify that the disposable source checkout
+is still on its default branch and has a clean worktree, proving the exercise
+remained isolated. Stop the service and remove all disposable artifacts when
+the run finishes.
+
 ## GitHub Actions smoke
 
 The `live-smoke` job is not triggered by pushes or pull requests. It runs only
