@@ -36,6 +36,7 @@ type Settings struct {
 	Hooks              Hooks
 	Agent              Agent
 	Codex              Codex
+	Claude             Claude
 	GitHub             GitHub
 	HostSecretEnvNames []string
 	HostSecretValues   []string
@@ -168,7 +169,7 @@ type Agent struct {
 // safely comparable: compare fields, never two launches with ==.
 type AgentLaunch struct {
 	Backend                                              string
-	Command, ApprovalPolicy, ThreadSandbox               string
+	Command, ApprovalPolicy, ThreadSandbox, Model        string
 	TurnSandboxPolicy                                    any
 	TurnTimeout, ReadTimeout, StartTimeout, StallTimeout time.Duration
 }
@@ -182,6 +183,15 @@ type Codex struct {
 	// read timeout, so it gets a generous budget that does not loosen
 	// mid-turn hang detection.
 	StartTimeout time.Duration
+}
+
+// Claude configures the Claude Code agent backend. It is deliberately small:
+// the launch policy (tool set, permission mode, settings sources, and the
+// sandbox) is fixed by Symphony rather than configurable, so an operator cannot
+// widen the boundary the child runs under.
+type Claude struct {
+	Command, Model            string
+	TurnTimeout, StallTimeout time.Duration
 }
 
 // Load validates the known core fields while retaining unknown extension keys.
@@ -302,6 +312,10 @@ func decode(raw map[string]any, base, path, logRoot string, sources *sourceSnaps
 		return Settings{}, err
 	}
 	codex, err := object(raw, "codex")
+	if err != nil {
+		return Settings{}, err
+	}
+	claude, err := object(raw, "claude")
 	if err != nil {
 		return Settings{}, err
 	}
@@ -441,6 +455,10 @@ func decode(raw map[string]any, base, path, logRoot string, sources *sourceSnaps
 	if err != nil {
 		return Settings{}, err
 	}
+	claudeSettings, err := decodeClaude(claude)
+	if err != nil {
+		return Settings{}, err
+	}
 	githubSettings := decodeGitHub(github, githubObjectValid, base, sources)
 	if landing.mergeState != "" && !githubSettings.Enabled {
 		return Settings{}, errors.New("invalid configuration: github.merge_state requires a fully configured github integration")
@@ -473,6 +491,7 @@ func decode(raw map[string]any, base, path, logRoot string, sources *sourceSnaps
 		Polling:   Polling{Interval: pollInterval},
 		Workspace: Workspace{Root: workspaceRoot, SourceRoot: sourceRoot},
 		Hooks:     Hooks{AfterCreate: afterCreate, BeforeRun: beforeRun, AfterRun: afterRun, BeforeRemove: beforeRemove, Timeout: hookTimeout},
+		Claude:    claudeSettings,
 		Agent:     Agent{Backend: backend, MaxConcurrent: maxConcurrent, MaxTurns: maxTurns, MaxRetryBackoff: maxRetryBackoff, ByState: byState},
 		Codex:     Codex{Command: command, ApprovalPolicy: approvalPolicy, ThreadSandbox: threadSandbox, TurnSandboxPolicy: turnSandboxPolicy, TurnTimeout: turnTimeout, ReadTimeout: readTimeout, StartTimeout: startTimeout, StallTimeout: stallTimeout},
 		GitHub:    githubSettings,
@@ -489,12 +508,28 @@ func decode(raw map[string]any, base, path, logRoot string, sources *sourceSnaps
 	if len(s.Tracker.ActiveStates) == 0 || len(s.Tracker.TerminalStates) == 0 {
 		return s, errors.New("invalid configuration: tracker active_states and terminal_states are required")
 	}
-	// The codex.* requirements below are unconditional only because codex is the
-	// single legal agent.backend value. A second backend must make them
-	// conditional on the selection, or a workflow that never starts a Codex
-	// session would still be rejected for an absent codex block.
-	if s.Polling.Interval <= 0 || s.Hooks.Timeout <= 0 || s.Agent.MaxConcurrent <= 0 || s.Agent.MaxTurns <= 0 || s.Agent.MaxRetryBackoff <= 0 || strings.TrimSpace(s.Codex.Command) == "" || s.Codex.TurnTimeout <= 0 || s.Codex.ReadTimeout <= 0 || s.Codex.StartTimeout <= 0 {
+	if s.Polling.Interval <= 0 || s.Hooks.Timeout <= 0 || s.Agent.MaxConcurrent <= 0 || s.Agent.MaxTurns <= 0 || s.Agent.MaxRetryBackoff <= 0 {
 		return s, errors.New("invalid configuration: non-positive duration or agent limit")
+	}
+	// Only the selected backend's launch contract has to be complete: a workflow
+	// that never starts a Codex session should not be rejected for an absent
+	// codex block, and vice versa.
+	switch s.Agent.Backend {
+	case ClaudeAgentBackend:
+		if strings.TrimSpace(s.Claude.Command) == "" || s.Claude.TurnTimeout <= 0 || s.Claude.StallTimeout <= 0 {
+			return s, errors.New("invalid configuration: non-positive duration or agent limit")
+		}
+		// The private capability bridge does not exist yet, so a Claude session
+		// has no way to reach Symphony's bounded capabilities. Refuse the
+		// configuration rather than run an agent that silently cannot publish a
+		// pull request or file a follow-up.
+		if s.LinearSessionCapabilityEnabled() || s.GitHub.Enabled {
+			return s, errors.New("invalid configuration: agent.backend claude cannot yet be combined with Symphony session capabilities (tracker.provider.handoff_state, tracker.provider.followup_issue_creation, or the github block)")
+		}
+	default:
+		if strings.TrimSpace(s.Codex.Command) == "" || s.Codex.TurnTimeout <= 0 || s.Codex.ReadTimeout <= 0 || s.Codex.StartTimeout <= 0 {
+			return s, errors.New("invalid configuration: non-positive duration or agent limit")
+		}
 	}
 	if s.Workspace.SourceRoot != "" {
 		info, err := os.Stat(s.Workspace.SourceRoot)
@@ -1205,8 +1240,17 @@ func cloneValue(value any) any {
 // backends cannot drift from the value this package accepts.
 const DefaultAgentBackend = "codex"
 
+// ClaudeAgentBackend runs turns on the Claude Code CLI.
+const ClaudeAgentBackend = "claude"
+
 // agentBackends is the closed set of selectable agent runtimes.
-var agentBackends = []string{DefaultAgentBackend}
+var agentBackends = []string{DefaultAgentBackend, ClaudeAgentBackend}
+
+// AgentBackends returns every selectable agent runtime. The process that
+// registers backend implementations reads this so a name this package accepts
+// can never lack an implementation -- otherwise a valid configuration would pass
+// validation and preflight and fail only at the first dispatch.
+func AgentBackends() []string { return append([]string(nil), agentBackends...) }
 
 // AgentLaunch resolves the launch contract for the configured backend. The
 // configured value is always one this package knows, so the lookup cannot fail.
@@ -1239,10 +1283,46 @@ func (s Settings) AgentLaunchFor(backend string) (AgentLaunch, bool) {
 		launch.ReadTimeout = s.Codex.ReadTimeout
 		launch.StartTimeout = s.Codex.StartTimeout
 		launch.StallTimeout = s.Codex.StallTimeout
+	case ClaudeAgentBackend:
+		launch.Command = s.Claude.Command
+		launch.Model = s.Claude.Model
+		launch.TurnTimeout = s.Claude.TurnTimeout
+		launch.StallTimeout = s.Claude.StallTimeout
 	default:
 		return launch, false
 	}
 	return launch, true
+}
+
+// claudeKeys is the complete set of claude block keys. An unknown key is
+// refused rather than ignored: a typo in a launch field would otherwise leave
+// the default silently in place, the same failure class that made a misspelled
+// sandbox key silently deny nothing.
+var claudeKeys = []string{"command", "model", "turn_timeout_ms", "stall_timeout_ms"}
+
+func decodeClaude(block map[string]any) (Claude, error) {
+	for key := range block {
+		if !contains(claudeKeys, key) {
+			return Claude{}, fmt.Errorf("invalid configuration: unknown claude field %q", key)
+		}
+	}
+	command, err := stringDefault(block, "command", "claude")
+	if err != nil {
+		return Claude{}, err
+	}
+	model, err := stringDefault(block, "model", "")
+	if err != nil {
+		return Claude{}, err
+	}
+	turnTimeout, err := durationMS(block, "turn_timeout_ms", 3_600_000)
+	if err != nil {
+		return Claude{}, err
+	}
+	stallTimeout, err := durationMS(block, "stall_timeout_ms", 300_000)
+	if err != nil {
+		return Claude{}, err
+	}
+	return Claude{Command: command, Model: model, TurnTimeout: turnTimeout, StallTimeout: stallTimeout}, nil
 }
 
 var sandboxModes = []string{"read-only", "workspace-write", "danger-full-access"}

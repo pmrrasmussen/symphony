@@ -268,3 +268,38 @@ func TestCancelReleasesTheBinding(t *testing.T) {
 		t.Fatal("a cancelled session must not be continuable")
 	}
 }
+
+// TestValidateRefusesARegistryMissingASelectableBackend closes the gap between
+// the set of names configuration accepts and the set the process can actually
+// run. Without this, a valid configuration passes validation and preflight and
+// fails only at the first dispatch.
+func TestValidateRefusesARegistryMissingASelectableBackend(t *testing.T) {
+	full := map[string]domain.AgentBackend{}
+	for _, name := range config.AgentBackends() {
+		full[name] = &fakeBackend{name: name}
+	}
+	if err := Validate(full); err != nil {
+		t.Fatalf("a complete registry was refused: %v", err)
+	}
+	if len(full) < 2 {
+		t.Fatal("expected more than one selectable backend")
+	}
+	for _, name := range config.AgentBackends() {
+		partial := map[string]domain.AgentBackend{}
+		for other, backend := range full {
+			if other != name {
+				partial[other] = backend
+			}
+		}
+		err := Validate(partial)
+		if err == nil {
+			t.Fatalf("a registry missing %q was accepted", name)
+		}
+		if !strings.Contains(err.Error(), name) {
+			t.Fatalf("error does not name the missing backend %q: %v", name, err)
+		}
+	}
+	if err := Validate(nil); err == nil {
+		t.Fatal("an empty registry was accepted")
+	}
+}

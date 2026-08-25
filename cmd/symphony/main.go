@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/pmrrasmussen/symphony/internal/agent"
+	"github.com/pmrrasmussen/symphony/internal/claude"
 	"github.com/pmrrasmussen/symphony/internal/codex"
 	"github.com/pmrrasmussen/symphony/internal/config"
 	"github.com/pmrrasmussen/symphony/internal/coordinator"
@@ -147,7 +148,17 @@ func run(args []string, stdout, stderr io.Writer) int {
 	// Coordination talks to the router, not to a runtime: the router resolves
 	// agent.backend for each new session and pins continuation and cancellation
 	// to whichever backend started it.
-	var a domain.AgentBackend = agent.NewRouter(settings, map[string]domain.AgentBackend{config.DefaultAgentBackend: backend})
+	// Claude sessions get no Symphony capabilities yet -- configuration refuses
+	// that combination -- so this backend is launch and lifecycle only.
+	backends := map[string]domain.AgentBackend{
+		config.DefaultAgentBackend: backend,
+		config.ClaudeAgentBackend:  claude.New(settings),
+	}
+	if err := agent.Validate(backends); err != nil {
+		log.Error("agent backend registry is incomplete", "error", err)
+		return 2
+	}
+	var a domain.AgentBackend = agent.NewRouter(settings, backends)
 	var w domain.WorkspaceExecutor = ws
 	c := coordinator.New(t, a, w, settings, slog.New(log.Handler()))
 	var statusPublisher *status.Publisher
