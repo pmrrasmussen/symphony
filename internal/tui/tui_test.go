@@ -78,7 +78,7 @@ func TestStatusViewRendersOnlySafeRuntimeFields(t *testing.T) {
 func TestConfigViewShowsCredentialPresenceNotReferences(t *testing.T) {
 	now := time.Now()
 	instance := operator.Instance{ID: "safe", Config: &operator.EffectiveConfig{
-		ProjectSelector: "project", WorkspaceSource: "/repo", WorkspaceRoot: "/work", CodexCommand: "codex app-server", CodexApprovalPolicy: "never", CodexThreadSandbox: "workspace-write",
+		ProjectSelector: "project", WorkspaceSource: "/repo", WorkspaceRoot: "/work", AgentBackend: "codex", CodexCommand: "codex app-server", CodexApprovalPolicy: "never", CodexThreadSandbox: "workspace-write",
 		Credentials: operator.Credentials{Tracker: operator.CredentialPresence{Configured: true, EnvironmentNames: []string{"SECRET_ENV"}, FileReferences: []string{"/secret/path"}}, GitHub: operator.CredentialPresence{}},
 	}}
 	model := New([]operator.Instance{instance}, now)
@@ -91,6 +91,25 @@ func TestConfigViewShowsCredentialPresenceNotReferences(t *testing.T) {
 	for _, forbidden := range []string{"SECRET_ENV", "/secret/path"} {
 		if strings.Contains(view, forbidden) {
 			t.Fatalf("config displayed credential reference %q:\n%s", forbidden, view)
+		}
+	}
+}
+
+func TestConfigViewLabelsAgentLineWithSelectedBackend(t *testing.T) {
+	now := time.Now()
+	for _, testCase := range []struct{ backend, want string }{
+		{backend: "codex", want: "\nCodex: codex app-server\n"},
+		// A snapshot written before backend selection existed reports no
+		// backend, which must still render a label.
+		{backend: "", want: "\nAgent: codex app-server\n"},
+	} {
+		instance := operator.Instance{ID: "safe", Config: &operator.EffectiveConfig{AgentBackend: testCase.backend, CodexCommand: "codex app-server"}}
+		model := New([]operator.Instance{instance}, now)
+		model, _ = model.Update("enter")
+		model, _ = model.Update("c")
+		view := model.View(now)
+		if !strings.Contains(view, testCase.want) {
+			t.Fatalf("backend %q view missing %q:\n%s", testCase.backend, testCase.want, view)
 		}
 	}
 }

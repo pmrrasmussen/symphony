@@ -150,6 +150,27 @@ type Agent struct {
 	MaxConcurrent, MaxTurns int
 	MaxRetryBackoff         time.Duration
 	ByState                 map[string]int
+	// Backend names the agent runtime new sessions are started on. It is
+	// validated against agentBackends, so an unknown value fails the whole
+	// candidate rather than silently falling back to a default.
+	Backend string
+}
+
+// AgentLaunch is the backend-neutral launch contract the scheduler applies to
+// one run: what to execute, where, under which sandbox, and the four timeout
+// budgets. Coordination reads this instead of any single backend's settings
+// block, so adding a backend does not spread its vocabulary through the
+// scheduler. The workspace directory and writable paths are not here: they are
+// per-run values the workspace layer owns and travel on domain.AgentRequest.
+// Every field is captured per launch; see Settings.AgentLaunch.
+//
+// TurnSandboxPolicy is interface-typed and may hold a map, so this struct is not
+// safely comparable: compare fields, never two launches with ==.
+type AgentLaunch struct {
+	Backend                                              string
+	Command, ApprovalPolicy, ThreadSandbox               string
+	TurnSandboxPolicy                                    any
+	TurnTimeout, ReadTimeout, StartTimeout, StallTimeout time.Duration
 }
 type Codex struct {
 	Command, ApprovalPolicy, ThreadSandbox string
@@ -374,6 +395,13 @@ func decode(raw map[string]any, base, path, logRoot string, sources *sourceSnaps
 	if err != nil {
 		return Settings{}, err
 	}
+	backend, err := stringDefault(agent, "backend", DefaultAgentBackend)
+	if err != nil {
+		return Settings{}, err
+	}
+	if !contains(agentBackends, backend) {
+		return Settings{}, fmt.Errorf("invalid configuration: agent.backend must be one of %s, got %q", strings.Join(agentBackends, ", "), backend)
+	}
 	command, err := stringDefault(codex, "command", "codex app-server")
 	if err != nil {
 		return Settings{}, err
@@ -445,7 +473,7 @@ func decode(raw map[string]any, base, path, logRoot string, sources *sourceSnaps
 		Polling:   Polling{Interval: pollInterval},
 		Workspace: Workspace{Root: workspaceRoot, SourceRoot: sourceRoot},
 		Hooks:     Hooks{AfterCreate: afterCreate, BeforeRun: beforeRun, AfterRun: afterRun, BeforeRemove: beforeRemove, Timeout: hookTimeout},
-		Agent:     Agent{MaxConcurrent: maxConcurrent, MaxTurns: maxTurns, MaxRetryBackoff: maxRetryBackoff, ByState: byState},
+		Agent:     Agent{Backend: backend, MaxConcurrent: maxConcurrent, MaxTurns: maxTurns, MaxRetryBackoff: maxRetryBackoff, ByState: byState},
 		Codex:     Codex{Command: command, ApprovalPolicy: approvalPolicy, ThreadSandbox: threadSandbox, TurnSandboxPolicy: turnSandboxPolicy, TurnTimeout: turnTimeout, ReadTimeout: readTimeout, StartTimeout: startTimeout, StallTimeout: stallTimeout},
 		GitHub:    githubSettings,
 		// Keep only the names of environment variables that carry host
@@ -461,6 +489,10 @@ func decode(raw map[string]any, base, path, logRoot string, sources *sourceSnaps
 	if len(s.Tracker.ActiveStates) == 0 || len(s.Tracker.TerminalStates) == 0 {
 		return s, errors.New("invalid configuration: tracker active_states and terminal_states are required")
 	}
+	// The codex.* requirements below are unconditional only because codex is the
+	// single legal agent.backend value. A second backend must make them
+	// conditional on the selection, or a workflow that never starts a Codex
+	// session would still be rejected for an absent codex block.
 	if s.Polling.Interval <= 0 || s.Hooks.Timeout <= 0 || s.Agent.MaxConcurrent <= 0 || s.Agent.MaxTurns <= 0 || s.Agent.MaxRetryBackoff <= 0 || strings.TrimSpace(s.Codex.Command) == "" || s.Codex.TurnTimeout <= 0 || s.Codex.ReadTimeout <= 0 || s.Codex.StartTimeout <= 0 {
 		return s, errors.New("invalid configuration: non-positive duration or agent limit")
 	}
@@ -1163,6 +1195,51 @@ func cloneValue(value any) any {
 	default:
 		return value
 	}
+}
+
+// DefaultAgentBackend keeps every workflow written before agent.backend existed
+// behaving exactly as it did. It is exported so the process that registers the
+// backends cannot drift from the value this package accepts.
+const DefaultAgentBackend = "codex"
+
+// agentBackends is the closed set of selectable agent runtimes.
+var agentBackends = []string{DefaultAgentBackend}
+
+// AgentLaunch resolves the launch contract for the configured backend. The
+// configured value is always one this package knows, so the lookup cannot fail.
+func (s Settings) AgentLaunch() AgentLaunch {
+	launch, _ := s.AgentLaunchFor(s.Agent.Backend)
+	return launch
+}
+
+// AgentLaunchFor resolves the launch contract for a named backend, which is how
+// the scheduler applies current policy to a run that a previous configuration
+// started: reload keeps publishing live values, but they are read under the
+// backend that owns the run rather than whichever one is configured now.
+//
+// The boolean reports whether the name is known. It exists so a caller cannot
+// mistake an unknown backend's zero-valued launch for a real policy: a zero
+// stall budget, for instance, reads as "stall detection disabled" and would
+// leave a run unsupervised in silence.
+func (s Settings) AgentLaunchFor(backend string) (AgentLaunch, bool) {
+	launch := AgentLaunch{Backend: backend}
+	if launch.Backend == "" {
+		launch.Backend = DefaultAgentBackend
+	}
+	switch launch.Backend {
+	case DefaultAgentBackend:
+		launch.Command = s.Codex.Command
+		launch.ApprovalPolicy = s.Codex.ApprovalPolicy
+		launch.ThreadSandbox = s.Codex.ThreadSandbox
+		launch.TurnSandboxPolicy = s.Codex.TurnSandboxPolicy
+		launch.TurnTimeout = s.Codex.TurnTimeout
+		launch.ReadTimeout = s.Codex.ReadTimeout
+		launch.StartTimeout = s.Codex.StartTimeout
+		launch.StallTimeout = s.Codex.StallTimeout
+	default:
+		return launch, false
+	}
+	return launch, true
 }
 
 // sandboxModes are the thread_sandbox values Codex accepts (app-server

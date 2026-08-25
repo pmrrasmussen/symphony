@@ -1022,7 +1022,7 @@ func TestReloadPublishesEveryDynamicSettingAsOneSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	updated := "---\ntracker: {kind: linear, provider: {api_key: ' second-key '}, required_labels: [Ready], active_states: [Backlog, Started], terminal_states: [Closed]}\npolling: {interval_ms: 200}\nworkspace: {root: work-two, source_root: " + secondSource + "}\nhooks: {after_create: two-create, before_run: two-before, after_run: two-after, before_remove: two-remove, timeout_ms: 201}\nagent: {max_concurrent_agents: 3, max_turns: 4, max_retry_backoff_ms: 202, max_concurrent_agents_by_state: {Started: 2}}\ncodex: {command: codex-two, approval_policy: on-request, thread_sandbox: danger-full-access, turn_sandbox_policy: {type: dangerFullAccess}, turn_timeout_ms: 203, read_timeout_ms: 204, start_timeout_ms: 206, stall_timeout_ms: 205}\n---\nsecond"
+	updated := "---\ntracker: {kind: linear, provider: {api_key: ' second-key '}, required_labels: [Ready], active_states: [Backlog, Started], terminal_states: [Closed]}\npolling: {interval_ms: 200}\nworkspace: {root: work-two, source_root: " + secondSource + "}\nhooks: {after_create: two-create, before_run: two-before, after_run: two-after, before_remove: two-remove, timeout_ms: 201}\nagent: {backend: codex, max_concurrent_agents: 3, max_turns: 4, max_retry_backoff_ms: 202, max_concurrent_agents_by_state: {Started: 2}}\ncodex: {command: codex-two, approval_policy: on-request, thread_sandbox: danger-full-access, turn_sandbox_policy: {type: dangerFullAccess}, turn_timeout_ms: 203, read_timeout_ms: 204, start_timeout_ms: 206, stall_timeout_ms: 205}\n---\nsecond"
 	if err := os.WriteFile(workflow, []byte(updated), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -1041,7 +1041,7 @@ func TestReloadPublishesEveryDynamicSettingAsOneSnapshot(t *testing.T) {
 	if settings.Hooks != (Hooks{AfterCreate: "two-create", BeforeRun: "two-before", AfterRun: "two-after", BeforeRemove: "two-remove", Timeout: 201 * time.Millisecond}) {
 		t.Fatalf("hooks=%+v", settings.Hooks)
 	}
-	if settings.Agent.MaxConcurrent != 3 || settings.Agent.MaxTurns != 4 || settings.Agent.MaxRetryBackoff != 202*time.Millisecond || settings.Agent.ByState["started"] != 2 {
+	if settings.Agent.MaxConcurrent != 3 || settings.Agent.MaxTurns != 4 || settings.Agent.MaxRetryBackoff != 202*time.Millisecond || settings.Agent.ByState["started"] != 2 || settings.Agent.Backend != "codex" {
 		t.Fatalf("agent=%+v", settings.Agent)
 	}
 	policy, ok := settings.Codex.TurnSandboxPolicy.(map[string]any)
@@ -1299,5 +1299,119 @@ func TestOmittedTurnSandboxPolicyStaysNil(t *testing.T) {
 	}
 	if w.Config.Codex.TurnSandboxPolicy != nil {
 		t.Fatalf("turn sandbox policy=%#v want nil when the key is omitted", w.Config.Codex.TurnSandboxPolicy)
+	}
+}
+
+// TestAgentBackendDefaultsToCodexAndFailsClosed covers the selection field: an
+// absent value must behave exactly as every workflow written before it existed,
+// and an unknown or wrongly typed value must fail the whole candidate rather
+// than fall back to a default.
+func TestAgentBackendDefaultsToCodexAndFailsClosed(t *testing.T) {
+	d := t.TempDir()
+	write := func(t *testing.T, agentBlock string) string {
+		t.Helper()
+		path := filepath.Join(d, strings.ReplaceAll(t.Name(), "/", "_")+".md")
+		body := "---\ntracker: {kind: linear, provider: {api_key: secret-key}, active_states: [Todo], terminal_states: [Done]}\npolling: {interval_ms: 100}\nworkspace: {root: work}\nhooks: {timeout_ms: 100}\nagent: {" + agentBlock + "}\ncodex: {command: codex app-server}\n---\nbody"
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+
+	t.Run("absent defaults to codex", func(t *testing.T) {
+		w, err := Load(write(t, "max_turns: 2"), "logs")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if w.Config.Agent.Backend != "codex" {
+			t.Fatalf("backend=%q, want codex", w.Config.Agent.Backend)
+		}
+	})
+
+	t.Run("explicit codex is accepted", func(t *testing.T) {
+		w, err := Load(write(t, "backend: codex"), "logs")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if w.Config.Agent.Backend != "codex" {
+			t.Fatalf("backend=%q", w.Config.Agent.Backend)
+		}
+	})
+
+	for _, value := range []string{"claude", "Codex", "codex ", "", "docker"} {
+		t.Run("rejects "+value, func(t *testing.T) {
+			_, err := Load(write(t, "backend: '"+value+"'"), "logs")
+			if err == nil {
+				t.Fatalf("backend %q was accepted", value)
+			}
+			if !strings.Contains(err.Error(), "invalid configuration: agent.backend must be one of codex") {
+				t.Fatalf("error=%v", err)
+			}
+			// The rejection must name the offending value and nothing else from
+			// the configuration.
+			for _, leaked := range []string{"api_key", "secret-key", "Todo", "Done", "codex app-server", "/tmp/work"} {
+				if strings.Contains(err.Error(), leaked) {
+					t.Fatalf("error leaked configured value %q: %v", leaked, err)
+				}
+			}
+		})
+	}
+
+	t.Run("rejects a non-string", func(t *testing.T) {
+		if _, err := Load(write(t, "backend: 3"), "logs"); err == nil {
+			t.Fatal("a non-string backend was accepted")
+		}
+	})
+}
+
+// TestAgentLaunchResolvesTheSelectedBackendsContract pins the neutral accessor
+// coordination and preflight read instead of a backend's own settings block.
+func TestAgentLaunchResolvesTheSelectedBackendsContract(t *testing.T) {
+	s := Settings{Codex: Codex{
+		Command: "codex app-server", ApprovalPolicy: "never", ThreadSandbox: "workspace-write",
+		TurnSandboxPolicy: map[string]any{"type": "workspaceWrite"},
+		TurnTimeout:       time.Hour, ReadTimeout: 5 * time.Second,
+		StartTimeout: 2 * time.Minute, StallTimeout: 5 * time.Minute,
+	}}
+	s.Agent.Backend = "codex"
+	launch := s.AgentLaunch()
+	if launch.Backend != "codex" || launch.Command != "codex app-server" || launch.ApprovalPolicy != "never" || launch.ThreadSandbox != "workspace-write" {
+		t.Fatalf("launch=%+v", launch)
+	}
+	// All four timeout budgets must be routed, not three: start_timeout_ms is
+	// distinct from read_timeout_ms on purpose.
+	if launch.TurnTimeout != time.Hour || launch.ReadTimeout != 5*time.Second || launch.StartTimeout != 2*time.Minute || launch.StallTimeout != 5*time.Minute {
+		t.Fatalf("timeouts=%+v", launch)
+	}
+	if policy, ok := launch.TurnSandboxPolicy.(map[string]any); !ok || policy["type"] != "workspaceWrite" {
+		t.Fatalf("turn sandbox policy=%#v", launch.TurnSandboxPolicy)
+	}
+
+	// An unset selection resolves as codex, so a pre-existing workflow keeps its
+	// exact launch contract.
+	unset := s
+	unset.Agent.Backend = ""
+	// AgentLaunch carries an interface-typed sandbox policy, so compare the
+	// comparable fields rather than the struct: == on a launch holding a map
+	// panics at run time.
+	got, want := unset.AgentLaunch(), s.AgentLaunch()
+	if got.Backend != want.Backend || got.Command != want.Command || got.ApprovalPolicy != want.ApprovalPolicy ||
+		got.ThreadSandbox != want.ThreadSandbox || got.TurnTimeout != want.TurnTimeout ||
+		got.ReadTimeout != want.ReadTimeout || got.StartTimeout != want.StartTimeout || got.StallTimeout != want.StallTimeout {
+		t.Fatalf("unset backend resolved differently: %+v", got)
+	}
+
+	// An unknown name yields no launch parameters rather than another backend's,
+	// which is what makes a stale or wrong lookup fail loudly instead of running
+	// something unintended.
+	unknown, known := s.AgentLaunchFor("claude")
+	if known {
+		t.Fatal("an unknown backend reported a known launch contract")
+	}
+	if unknown.Command != "" || unknown.TurnTimeout != 0 || unknown.StallTimeout != 0 || unknown.Backend != "claude" {
+		t.Fatalf("unknown backend launch=%+v", unknown)
+	}
+	if _, known := s.AgentLaunchFor(""); !known {
+		t.Fatal("an unset backend must resolve to the default contract")
 	}
 }

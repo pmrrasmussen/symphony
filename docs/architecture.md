@@ -3,7 +3,10 @@
 This service follows the Symphony specification using a coordination core that
 only knows normalized issues, agent events, and workspace operations.  Linear
 GraphQL, Codex JSON-RPC, and local process execution are adapters behind
-`Tracker`, `AgentBackend`, and `WorkspaceExecutor` respectively.
+`Tracker`, `AgentBackend`, and `WorkspaceExecutor` respectively.  Which
+`AgentBackend` a session starts on is configuration-driven (`agent.backend`);
+`codex` is the only accepted value today, and an unrecognized one is rejected
+at load rather than defaulted.
 
 The initial implementation is intentionally for a trusted local machine.
 `WORKFLOW.md` is repository-owned, versioned policy and its hooks are trusted
@@ -161,9 +164,11 @@ errors include configured project, credential, or path values.
 
 Successful reloads affect settings reads which begin after publication. Future
 polls and run launches therefore use the new states, intervals, limits, hooks,
-paths, and Codex settings. A Codex process already launched keeps its captured
-command, sandbox, and timeout values; concurrency changes do not evict it, but
-subsequent reconciliation still applies the current state and stall policy.
+paths, and agent settings, including a changed `agent.backend`. An agent session
+already launched keeps the backend that started it and the command, sandbox, and
+timeout values captured for that launch; concurrency changes do not evict it, but
+subsequent reconciliation still applies the current state and stall policy, read
+under the backend that owns the run rather than whichever one is configured now.
 The process log destination is selected by `--logs-root` at startup rather than
 by reloadable workflow policy.
 
