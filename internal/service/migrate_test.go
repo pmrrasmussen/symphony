@@ -20,12 +20,16 @@ func TestMigrateAdoptsExactLegacyAgentAndThenManagesTheRepository(t *testing.T) 
 		logsRoot:   filepath.Join(dir, ".symphony", "logs"),
 		keyFile:    options.LinearKeyFile,
 	})
+	runner.loaded = map[string]bool{"com.pmrrasmussen.symphony": true}
 	migration, err := Migrate(context.Background(), options)
 	if err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
 	if !migration.Changed || migration.Legacy != "com.pmrrasmussen.symphony" || migration.Label != "com.pmrrasmussen.symphony.owner-repository" {
 		t.Fatalf("migration = %#v", migration)
+	}
+	if runner.loaded["com.pmrrasmussen.symphony"] || !runner.loaded[migration.Label] {
+		t.Fatalf("launchd state after migration = %v", runner.loaded)
 	}
 	if _, err := os.Stat(legacy); !os.IsNotExist(err) {
 		t.Fatalf("legacy plist survived migration: %v", err)
@@ -135,7 +139,35 @@ func TestMigrateLeavesUnrelatedLaunchAgentUntouched(t *testing.T) {
 	assertNoManagedPlist(t, options.LaunchAgentsDir)
 }
 
-func TestMigrateRestoresLegacyAgentWhenLoadFails(t *testing.T) {
+func TestMigrateRestoresAndReloadsLegacyAgentWhenTheManagedServiceFailsToStart(t *testing.T) {
+	dir, options, runner := serviceFixture(t)
+	legacy, content := writeLegacyAgent(t, options.LaunchAgentsDir, legacyAgent{
+		label:      "com.pmrrasmussen.symphony.legacy",
+		repository: dir,
+		executable: repositoryExecutable(t, dir),
+		workflow:   filepath.Join(dir, "WORKFLOW.md"),
+		logsRoot:   filepath.Join(dir, ".symphony", "logs"),
+		keyFile:    options.LinearKeyFile,
+	})
+	runner.loaded = map[string]bool{"com.pmrrasmussen.symphony.legacy": true}
+	runner.fail = "launchctl kickstart"
+	migration, err := Migrate(context.Background(), options)
+	if err == nil || migration.Changed || !strings.Contains(err.Error(), "restored the prior LaunchAgent "+legacy) {
+		t.Fatalf("migration=%#v err=%v", migration, err)
+	}
+	if data, readErr := os.ReadFile(legacy); readErr != nil || string(data) != content {
+		t.Fatalf("legacy plist not restored = %q err=%v", data, readErr)
+	}
+	if !runner.loaded["com.pmrrasmussen.symphony.legacy"] || runner.loaded["com.pmrrasmussen.symphony.owner-repository"] {
+		t.Fatalf("prior service was not the only one left loaded: %v", runner.loaded)
+	}
+	assertNoManagedPlist(t, options.LaunchAgentsDir)
+	if _, statErr := os.Stat(filepath.Join(dir, ".symphony", "service", filepath.Base(legacy)+backupSuffix)); statErr != nil {
+		t.Fatalf("failed migration left no recoverable backup: %v", statErr)
+	}
+}
+
+func TestMigrateRestoresUnloadedLegacyPlistWithoutBootstrappingIt(t *testing.T) {
 	dir, options, runner := serviceFixture(t)
 	legacy, content := writeLegacyAgent(t, options.LaunchAgentsDir, legacyAgent{
 		label:      "com.pmrrasmussen.symphony.legacy",
@@ -146,16 +178,76 @@ func TestMigrateRestoresLegacyAgentWhenLoadFails(t *testing.T) {
 		keyFile:    options.LinearKeyFile,
 	})
 	runner.fail = "launchctl bootstrap"
-	migration, err := Migrate(context.Background(), options)
-	if err == nil || migration.Changed || !strings.Contains(err.Error(), "restored the prior LaunchAgent "+legacy) {
-		t.Fatalf("migration=%#v err=%v", migration, err)
+	_, err := Migrate(context.Background(), options)
+	if err == nil || !strings.Contains(err.Error(), "restored the prior LaunchAgent "+legacy) {
+		t.Fatalf("err=%v", err)
 	}
 	if data, readErr := os.ReadFile(legacy); readErr != nil || string(data) != content {
 		t.Fatalf("legacy plist not restored = %q err=%v", data, readErr)
 	}
+	if len(runner.loaded) != 0 {
+		t.Fatalf("a service was loaded during rollback: %v", runner.loaded)
+	}
 	assertNoManagedPlist(t, options.LaunchAgentsDir)
-	if _, statErr := os.Stat(filepath.Join(dir, ".symphony", "service", filepath.Base(legacy)+backupSuffix)); statErr != nil {
-		t.Fatalf("failed migration left no recoverable backup: %v", statErr)
+}
+
+// A hand-authored plist that sits on disk unloaded is the common case, and
+// launchctl bootout reports a failure for it. That must still migrate.
+func TestMigrateAdoptsLegacyAgentThatWasNeverLoaded(t *testing.T) {
+	dir, options, runner := serviceFixture(t)
+	legacy, _ := writeLegacyAgent(t, options.LaunchAgentsDir, legacyAgent{
+		label:      "com.pmrrasmussen.symphony.legacy",
+		repository: dir,
+		executable: repositoryExecutable(t, dir),
+		workflow:   filepath.Join(dir, "WORKFLOW.md"),
+		logsRoot:   filepath.Join(dir, ".symphony", "logs"),
+		keyFile:    options.LinearKeyFile,
+	})
+	migration, err := Migrate(context.Background(), options)
+	if err != nil || !migration.Changed {
+		t.Fatalf("migration=%#v err=%v", migration, err)
+	}
+	if callIndex(runner, "launchctl bootout gui/") < 0 {
+		t.Fatalf("migration skipped the legacy bootout: %v", runner.calls)
+	}
+	if _, statErr := os.Stat(legacy); !os.IsNotExist(statErr) {
+		t.Fatalf("legacy plist survived migration: %v", statErr)
+	}
+	if !runner.loaded[migration.Label] {
+		t.Fatalf("managed service was not loaded: %v", runner.loaded)
+	}
+}
+
+func TestMigrateAbortsWhenTheLegacyServiceStaysLoaded(t *testing.T) {
+	dir, options, runner := serviceFixture(t)
+	legacy, content := writeLegacyAgent(t, options.LaunchAgentsDir, legacyAgent{
+		label:      "com.pmrrasmussen.symphony.legacy",
+		repository: dir,
+		executable: repositoryExecutable(t, dir),
+		workflow:   filepath.Join(dir, "WORKFLOW.md"),
+		logsRoot:   filepath.Join(dir, ".symphony", "logs"),
+		keyFile:    options.LinearKeyFile,
+	})
+	runner.loaded = map[string]bool{"com.pmrrasmussen.symphony.legacy": true}
+	runner.fail = "launchctl bootout"
+	migration, err := Migrate(context.Background(), options)
+	if err == nil || migration.Changed {
+		t.Fatalf("migration=%#v err=%v", migration, err)
+	}
+	for _, want := range []string{"com.pmrrasmussen.symphony.legacy", "still loaded after bootout", "launchctl bootout"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("diagnostic %q missing from %v", want, err)
+		}
+	}
+	if data, readErr := os.ReadFile(legacy); readErr != nil || string(data) != content {
+		t.Fatalf("legacy plist changed = %q err=%v", data, readErr)
+	}
+	if !runner.loaded["com.pmrrasmussen.symphony.legacy"] {
+		t.Fatalf("legacy service state = %v", runner.loaded)
+	}
+	assertNoManagedPlist(t, options.LaunchAgentsDir)
+	if index := callIndex(runner, "launchctl bootstrap"); index >= 0 {
+		t.Fatalf("aborted migration still bootstrapped a service: %v", runner.calls)
 	}
 }
 

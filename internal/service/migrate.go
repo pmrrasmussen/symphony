@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/pmrrasmussen/symphony/internal/operator"
 )
@@ -15,6 +16,13 @@ import (
 // deliberately does not end in .plist and is kept outside ~/Library/LaunchAgents
 // so launchd can never load the replaced registration again by accident.
 const backupSuffix = ".pre-migration.backup"
+
+// unloadAttempts and unloadDelay bound the verification that a legacy service
+// really stopped, tolerating launchd reporting an unload as in progress.
+const (
+	unloadAttempts = 3
+	unloadDelay    = 250 * time.Millisecond
+)
 
 // Migration reports one explicit migration outcome. Legacy and Backup are
 // empty when the repository was already managed and nothing needed adopting.
@@ -80,20 +88,25 @@ func Migrate(ctx context.Context, options Options) (Migration, error) {
 	separate := filepath.Clean(legacy.Paths.Plist) != filepath.Clean(d.PlistPath)
 	// Stop the legacy scheduler and drop its registration before the managed
 	// one loads, so the repository never has two schedulers loaded at once.
-	_ = launchctl(ctx, runner, "bootout", launchService(legacy.ID))
+	// This is verified, and aborts before any destructive step, because a
+	// discarded bootout failure would silently leave both running.
+	wasLoaded, err := unloadLegacy(ctx, runner, legacy.ID)
+	if err != nil {
+		return Migration{}, err
+	}
 	if separate {
 		if err := os.Remove(legacy.Paths.Plist); err != nil {
-			return Migration{}, restoreLegacy(ctx, runner, *legacy, legacyContent, fmt.Errorf("remove legacy LaunchAgent plist: %w", err))
+			return Migration{}, restoreLegacy(ctx, runner, *legacy, legacyContent, wasLoaded, fmt.Errorf("remove legacy LaunchAgent plist: %w", err))
 		}
 	}
 	if err := atomicWrite(d.PlistPath, d.Content, 0o600); err != nil {
-		return Migration{}, restoreLegacy(ctx, runner, *legacy, legacyContent, fmt.Errorf("install LaunchAgent plist: %w", err))
+		return Migration{}, restoreLegacy(ctx, runner, *legacy, legacyContent, wasLoaded, fmt.Errorf("install LaunchAgent plist: %w", err))
 	}
 	if err := reload(ctx, runner, d, old); err != nil {
 		// reload already restored or removed the managed plist; only a
 		// separate legacy registration still needs restoring.
 		if separate {
-			return Migration{}, restoreLegacy(ctx, runner, *legacy, legacyContent, err)
+			return Migration{}, restoreLegacy(ctx, runner, *legacy, legacyContent, wasLoaded, err)
 		}
 		return Migration{}, err
 	}
@@ -211,13 +224,52 @@ func withinRepository(path, repository string) bool {
 	return relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator))
 }
 
+// unloadLegacy stops a loaded pre-installer service and verifies it is gone.
+// It reports whether the service was loaded to begin with. bootout is expected
+// to fail for a plist that sits on disk but was never bootstrapped, which is
+// benign and must keep migrating; a service that was loaded and is still
+// loaded afterwards is a genuine failure and aborts the migration.
+func unloadLegacy(ctx context.Context, runner Runner, label string) (bool, error) {
+	loaded := serviceLoaded(ctx, runner, label)
+	bootout := launchctl(ctx, runner, "bootout", launchService(label))
+	if !loaded {
+		return false, nil
+	}
+	for attempt := 1; ; attempt++ {
+		if !serviceLoaded(ctx, runner, label) {
+			return true, nil
+		}
+		if attempt == unloadAttempts {
+			break
+		}
+		// launchd can report an unload as still in progress.
+		select {
+		case <-ctx.Done():
+			return true, ctx.Err()
+		case <-time.After(unloadDelay):
+		}
+	}
+	reason := "launchd still reports it"
+	if bootout != nil {
+		reason = bootout.Error()
+	}
+	return true, fmt.Errorf("legacy service %s is still loaded after bootout: %s; its LaunchAgent and process were left in place. Unload it manually with launchctl bootout %q, then rerun symphony service migrate", label, reason, launchService(label))
+}
+
+// serviceLoaded is the same read-only launchd observation discovery makes,
+// routed through the injected Runner so migration stays testable.
+func serviceLoaded(ctx context.Context, runner Runner, label string) bool {
+	_, err := runner.Run(ctx, "launchctl", "print", launchService(label))
+	return err == nil
+}
+
 // restoreLegacy puts a validated pre-installer registration back exactly as it
 // was found, so a failed migration still leaves a recoverable service.
-func restoreLegacy(ctx context.Context, runner Runner, legacy operator.Instance, content []byte, cause error) error {
+func restoreLegacy(ctx context.Context, runner Runner, legacy operator.Instance, content []byte, wasLoaded bool, cause error) error {
 	if err := atomicWrite(legacy.Paths.Plist, content, 0o600); err != nil {
 		return fmt.Errorf("migrate %s: %w (restore legacy plist %s: %v)", legacy.ID, cause, legacy.Paths.Plist, err)
 	}
-	if legacy.Launchd.Loaded {
+	if wasLoaded {
 		if err := launchctl(ctx, runner, "bootstrap", "gui/"+fmt.Sprint(os.Getuid()), legacy.Paths.Plist); err != nil {
 			return fmt.Errorf("migrate %s: %w (restore legacy service: %v)", legacy.ID, cause, err)
 		}

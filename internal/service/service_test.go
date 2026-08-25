@@ -11,27 +11,65 @@ import (
 	"github.com/pmrrasmussen/symphony/internal/operator"
 )
 
+// fakeRunner models the launchd state the service package observes: only a
+// bootstrapped label is printable, and bootout fails for anything else. loaded
+// seeds labels that are already registered before a test acts.
 type fakeRunner struct {
-	root  string
-	calls []string
-	fail  string
+	root   string
+	calls  []string
+	fail   string
+	loaded map[string]bool
 }
 
 func (r *fakeRunner) Run(_ context.Context, name string, args ...string) ([]byte, error) {
-	r.calls = append(r.calls, name+" "+strings.Join(args, " "))
-	if name == "git" && strings.Join(args, " ") == "-C "+r.root+" rev-parse --show-toplevel" {
+	joined := strings.Join(args, " ")
+	r.calls = append(r.calls, name+" "+joined)
+	if name == "git" && joined == "-C "+r.root+" rev-parse --show-toplevel" {
 		return []byte(r.root + "\n"), nil
 	}
-	if name == "git" && strings.Contains(strings.Join(args, " "), "remote get-url origin") {
+	if name == "git" && strings.Contains(joined, "remote get-url origin") {
 		return []byte("git@github.com:owner/repository.git\n"), nil
 	}
-	if name == "plutil" || name == "launchctl" {
-		if r.fail != "" && strings.Contains(name+" "+strings.Join(args, " "), r.fail) {
-			return []byte("forced failure"), errors.New("forced failure")
-		}
+	if r.fail != "" && (name == "plutil" || name == "launchctl") && strings.Contains(name+" "+joined, r.fail) {
+		return []byte("forced failure"), errors.New("forced failure")
+	}
+	if name == "plutil" {
 		return nil, nil
 	}
+	if name == "launchctl" {
+		return r.launchctl(args)
+	}
 	return nil, errors.New("unexpected command")
+}
+
+func (r *fakeRunner) launchctl(args []string) ([]byte, error) {
+	if r.loaded == nil {
+		r.loaded = map[string]bool{}
+	}
+	switch args[0] {
+	case "print":
+		if r.loaded[serviceLabel(args[1])] {
+			return nil, nil
+		}
+		return []byte("Could not find service"), errors.New("service not loaded")
+	case "bootout":
+		label := serviceLabel(args[1])
+		if !r.loaded[label] {
+			return []byte("No such process"), errors.New("service not loaded")
+		}
+		delete(r.loaded, label)
+		return nil, nil
+	case "bootstrap":
+		r.loaded[strings.TrimSuffix(filepath.Base(args[len(args)-1]), ".plist")] = true
+		return nil, nil
+	}
+	return nil, nil
+}
+
+// serviceLabel extracts a label from a gui/<uid>[/<label>] service target.
+func serviceLabel(target string) string {
+	_, label, _ := strings.Cut(strings.TrimPrefix(target, "gui/"), "/")
+	return label
 }
 
 func TestInstallIsIdempotentAndUsesRepositoryScopedPaths(t *testing.T) {

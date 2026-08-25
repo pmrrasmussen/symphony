@@ -46,9 +46,9 @@ If a repository already has a hand-authored Symphony LaunchAgent, run
 `symphony service migrate` there once. That command is the only explicit way to
 replace an unmarked plist: it adopts a legacy agent only when its label,
 repository, workflow, executable, and runtime paths match this repository
-exactly, backs the old plist up under `.symphony/service`, never leaves two
-schedulers loaded, and restores the prior service if validation, installation,
-or bootstrap fails. Unrelated or ambiguous agents are left untouched with
+exactly, backs the old plist up under `.symphony/service`, verifies the legacy
+service really unloaded before replacing it so two schedulers never run, and
+restores the prior service if validation, installation, or bootstrap fails. Unrelated or ambiguous agents are left untouched with
 concrete diagnostics.
 
 Services pass credential file paths only, never credential values. The normal

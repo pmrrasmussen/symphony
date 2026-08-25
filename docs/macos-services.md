@@ -248,14 +248,19 @@ Symphony LaunchAgents`; remove or correct all but one and rerun.
    `<repo>/.symphony/service/<label>.plist.pre-migration.backup`. That path is
    outside `~/Library/LaunchAgents`, so launchd can never load the replaced
    registration again, and the file remains a known-good copy to restore from.
-2. Boots out the legacy label, then removes its plist, so the repository never
-   has two schedulers loaded at once.
+2. Boots out the legacy label and *verifies* it is no longer loaded, then
+   removes its plist, so the repository never has two schedulers loaded at
+   once. A hand-authored plist that was sitting on disk unloaded migrates
+   normally; `launchctl bootout` reporting a failure for it is expected. But a
+   legacy service that was running and is still loaded after the bootout
+   aborts the migration before anything is removed or installed, naming the
+   label and the manual `launchctl bootout` command to run first.
 3. Writes the managed plist, bootstraps it, and kickstarts it.
 
-If any step fails, the legacy plist is written back to its original path and
-bootstrapped again when it was loaded, and the error names both the cause and
-the restored agent. A failed `migrate` therefore leaves the previously valid
-service running, with no managed plist left behind.
+If any later step fails, the legacy plist is written back to its original path
+and bootstrapped again when it was loaded, and the error names both the cause
+and the restored agent. A failed `migrate` therefore leaves the previously
+valid service running, with no managed plist left behind.
 
 Rerunning `migrate` after a successful migration is a no-op that reports
 `already managed <label>`. From then on `service status`, `service restart`,
