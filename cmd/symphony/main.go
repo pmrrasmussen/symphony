@@ -21,6 +21,7 @@ import (
 	"github.com/pmrrasmussen/symphony/internal/linear"
 	"github.com/pmrrasmussen/symphony/internal/observability"
 	"github.com/pmrrasmussen/symphony/internal/preflight"
+	"github.com/pmrrasmussen/symphony/internal/service"
 	"github.com/pmrrasmussen/symphony/internal/status"
 	"github.com/pmrrasmussen/symphony/internal/workspace"
 )
@@ -30,6 +31,9 @@ func main() {
 }
 
 func run(args []string, stdout, stderr io.Writer) int {
+	if len(args) > 0 && args[0] == "service" {
+		return runService(args[1:], stdout, stderr)
+	}
 	processStartedAt := time.Now()
 	var workflowPath, logs, logLevelFlag, statusFile string
 	var dry bool
@@ -179,6 +183,74 @@ func run(args []string, stdout, stderr io.Writer) int {
 		}
 	}
 	return 0
+}
+
+func runService(args []string, stdout, stderr io.Writer) int {
+	if len(args) == 0 {
+		fmt.Fprintln(stderr, "usage: symphony service <install|status|restart|uninstall> [flags]")
+		return 2
+	}
+	command := args[0]
+	flags := flag.NewFlagSet("symphony service "+command, flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	var options service.Options
+	flags.StringVar(&options.Workflow, "workflow", "", "path to WORKFLOW.md (defaults to repository WORKFLOW.md)")
+	flags.StringVar(&options.Name, "name", "", "stable local instance name")
+	flags.StringVar(&options.Binary, "binary", "", "shared Symphony executable (defaults to ~/.local/bin/symphony)")
+	flags.StringVar(&options.LinearKeyFile, "linear-api-key-file", "", "Linear credential file override")
+	flags.StringVar(&options.GitHubTokenFile, "github-token-file", "", "repository-scoped GitHub credential file override")
+	flags.StringVar(&options.LogLevel, "log-level", "info", "service log level: info or debug")
+	if err := flags.Parse(args[1:]); err != nil || flags.NArg() != 0 {
+		if err == nil {
+			fmt.Fprintln(stderr, "symphony service: unexpected positional arguments")
+		}
+		return 2
+	}
+	ctx := context.Background()
+	switch command {
+	case "install":
+		instance, changed, err := service.Install(ctx, options)
+		if err != nil {
+			fmt.Fprintln(stderr, "symphony service install:", err)
+			return 1
+		}
+		if changed {
+			fmt.Fprintln(stdout, "installed", instance.Label)
+		} else {
+			fmt.Fprintln(stdout, "already installed", instance.Label)
+		}
+		return 0
+	case "status":
+		instance, err := service.Status(ctx, options)
+		if err != nil {
+			fmt.Fprintln(stderr, "symphony service status:", err)
+			return 1
+		}
+		if err := json.NewEncoder(stdout).Encode(instance); err != nil {
+			fmt.Fprintln(stderr, "write service status:", err)
+			return 1
+		}
+		return 0
+	case "restart":
+		instance, err := service.Restart(ctx, options)
+		if err != nil {
+			fmt.Fprintln(stderr, "symphony service restart:", err)
+			return 1
+		}
+		fmt.Fprintln(stdout, "restarted", instance.Label)
+		return 0
+	case "uninstall":
+		instance, err := service.Uninstall(ctx, options)
+		if err != nil {
+			fmt.Fprintln(stderr, "symphony service uninstall:", err)
+			return 1
+		}
+		fmt.Fprintln(stdout, "uninstalled", instance.Label)
+		return 0
+	default:
+		fmt.Fprintln(stderr, "usage: symphony service <install|status|restart|uninstall> [flags]")
+		return 2
+	}
 }
 
 // logStartupCredentialStatus records whether startup resolved the credentials

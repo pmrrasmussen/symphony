@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -22,10 +23,15 @@ import (
 )
 
 const (
-	labelPrefix       = "com.pmrrasmussen.symphony"
+	// LabelPrefix is the stable LaunchAgent namespace shared by discovery and
+	// service installation. A label under this prefix alone does not make a
+	// plist managed; installers also require the explicit managed marker.
+	LabelPrefix       = "com.pmrrasmussen.symphony"
 	defaultStatusAge  = 2 * time.Minute
 	defaultLogEntries = 20
 )
+
+const labelPrefix = LabelPrefix
 
 // Liveness is a conservative, read-only assessment. A snapshot alone never
 // makes an instance running: launchd must report a live process as well.
@@ -130,6 +136,7 @@ type LaunchdStatus struct {
 // Instance is the normalized model consumed by an operator UI.
 type Instance struct {
 	ID        string           `json:"id"`
+	Managed   bool             `json:"managed"`
 	Paths     Paths            `json:"paths"`
 	Config    *EffectiveConfig `json:"config,omitempty"`
 	Launchd   LaunchdStatus    `json:"launchd"`
@@ -253,6 +260,7 @@ func inspectCandidate(ctx context.Context, plistPath string, options Options) In
 	}
 	label, _ := values["Label"].(string)
 	instance.ID = strings.TrimSpace(label)
+	instance.Managed, _ = values["SymphonyManaged"].(bool)
 	if instance.ID == "" {
 		instance.ID = strings.TrimSuffix(filepath.Base(plistPath), ".plist")
 		add(&instance, "plist_missing_label", SeverityError, "LaunchAgent Label is required")
@@ -651,7 +659,7 @@ func add(instance *Instance, code string, severity FindingSeverity, message stri
 // stdout, so discovery never rewrites a LaunchAgent and can inspect XML and
 // binary plists alike.
 func parsePlist(ctx context.Context, path string, fallback []byte) (map[string]any, error) {
-	if _, err := exec.LookPath("plutil"); err == nil {
+	if runtime.GOOS == "darwin" {
 		output, err := exec.CommandContext(ctx, "plutil", "-convert", "json", "-o", "-", path).CombinedOutput()
 		if err != nil {
 			return nil, fmt.Errorf("parse plist: %w: %s", err, strings.TrimSpace(string(output)))
@@ -742,6 +750,10 @@ func xmlPlistValue(node *xmlPlistNode) (any, error) {
 	switch node.name {
 	case "string":
 		return strings.TrimSpace(node.text.String()), nil
+	case "true":
+		return true, nil
+	case "false":
+		return false, nil
 	case "array":
 		values := make([]string, 0, len(node.children))
 		for _, child := range node.children {
