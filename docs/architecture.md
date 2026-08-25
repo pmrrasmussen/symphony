@@ -9,26 +9,38 @@ respectively.  Which `AgentBackend` a session starts on is configuration-driven
 and an unrecognized one is rejected at load rather than defaulted.  Only the
 selected backend's launch contract has to be complete, so an absent `codex:` or
 `claude:` block fails a candidate only when that backend is the one selected.
-A `claude` workflow that also enables a Symphony session capability --
-`tracker.provider.handoff_state`, `tracker.provider.followup_issue_creation`,
-or a configured and enabled GitHub integration -- is rejected at load.  The
-transport that would expose those bounded capabilities to a Claude session
-exists and is wired: the backend prepares the same provider sessions Codex
-does, builds the same registry, and serves it over the private loopback MCP
-endpoint (`internal/mcpbridge`) described below.  What is not in place yet is
-the prompt side.  The delivery instructions `WORKFLOW.md` renders name bare
-tool names, which is what a Codex dynamic tool is called and not what an MCP
-tool is called, and nothing yet cross-checks at launch that a capability the
-prompt promises is one the built registry actually advertises.  Lifting the
-refusal before both exist would produce the worst available failure: every gate
-in the repository passes -- configuration valid, preflight green, init echo
-exactly as expected -- while the host tells the model to call a tool it cannot
-reach, and the turn ends `EventCompleted` with committed, unpublished work.  So
-the wiring lands inert and the refusal stays until the guidance and the
-consistency guard land with it.  A `github:`
-block that does not resolve stays disabled, as it does under `codex`, so it
-never reaches that refusal -- which grants nothing, because a disabled
-integration has no capability to bridge.
+A `claude` workflow may enable Symphony's session capabilities.  The backend
+prepares the same provider sessions Codex does, builds the same registry, and
+serves it over the private loopback MCP endpoint (`internal/mcpbridge`)
+described below; the host-generated delivery instructions name each capability
+by the name its transport serves it under, which for that endpoint is
+`mcp__symphony__<tool>`; and `claude.Backend.Start` refuses a launch whose
+rendered prompt promises host-side publish while its own registry advertises no
+`github_publish_pr`.  That last cross-check exists because the promise and the
+grant are made by different components in a fixed order: the coordinator renders
+the prompt from configuration before the backend builds the registry from
+configuration plus the bound issue and its prepared provider sessions, so the
+component that promises a capability cannot see the one that grants it.  The
+shape that removes the problem rather than detecting it is to hoist
+`capability.Build` into the host and pass the registry on `domain.AgentRequest`;
+that touches `internal/domain`, both backends, and the router, and has not been
+done.  Detecting it is not optional, because the undetected failure is the worst
+available: every gate passes -- configuration valid, preflight green, init echo
+exactly as expected -- while the turn ends `EventCompleted` with committed,
+unpublished work.
+
+One residual configuration rule remains, and it applies only to `claude`: a
+workflow that configures a session capability *no* session could advertise is
+rejected at load.  The two ways to write one are a `handoff_state` with no
+enabled GitHub integration and an enabled GitHub integration with no
+`handoff_state`, since a GitHub session is only prepared on top of a prepared
+Linear handoff session.  Under `codex` the same configuration is equally inert
+and stays accepted, because it always has been; under `claude` it is refused so
+that "no MCP server at all" in the init echo keeps a single meaning -- this
+workflow configures no capability -- rather than also standing for a capability
+that was configured and could not be reached.  A `github:` block that does not
+resolve stays disabled, as it does under `codex`, so it configures nothing and
+never reaches that rule.
 
 The initial implementation is intentionally for a trusted local machine.
 `WORKFLOW.md` is repository-owned, versioned policy and its hooks are trusted

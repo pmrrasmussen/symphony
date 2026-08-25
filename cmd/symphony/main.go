@@ -345,11 +345,10 @@ func runTUI(args []string, input io.Reader, stdout, stderr io.Writer, discover t
 // nothing to close it with.
 //
 // Optional host capabilities stay disabled until WORKFLOW.md supplies their
-// fixed scope; resolved credentials are filtered from the agent child. No Claude
-// session can bind a capability yet -- configuration still refuses that
-// combination -- so the providers and the endpoint the Claude backend is given
-// here reach nothing, deliberately: the wiring lands before the prompt guidance
-// and the launch-time consistency guard that make it safe to enable.
+// fixed scope; resolved credentials are filtered from the agent child. Either
+// backend may now bind them: the rendered guidance names a capability by the name
+// its transport serves it under, and internal/claude refuses a launch whose
+// prompt promises a capability its own registry does not advertise.
 func wire(settings func() config.Settings, logger *slog.Logger) (map[string]domain.AgentBackend, *githubhost.Manager, *mcpbridge.Server, error) {
 	handoff := linear.NewHandoff(settings)
 	handoff.SetLogger(logger)

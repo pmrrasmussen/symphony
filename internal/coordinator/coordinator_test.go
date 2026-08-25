@@ -386,15 +386,126 @@ func waitForRunning(t *testing.T, c *Coordinator, identifier string) {
 func TestRenderExplainsHostAndManualDeliveryModes(t *testing.T) {
 	settings := config.Settings{Prompt: "Work on {{.issue.identifier}}"}
 	issue := domain.Issue{Identifier: "PMR-40"}
-	manual, err := render(settings, issue, 0)
+	manual, err := render(settings, issue, 0, config.DefaultAgentBackend)
 	if err != nil || !strings.Contains(manual, "Delivery mode: manual") || !strings.Contains(manual, "Do not run gh, git push") {
 		t.Fatalf("manual prompt=%q err=%v", manual, err)
 	}
 	settings.GitHub.Enabled = true
 	settings.Tracker.HandoffState = "In Review"
-	host, err := render(settings, issue, 0)
+	host, err := render(settings, issue, 0, config.DefaultAgentBackend)
 	if err != nil || !strings.Contains(host, "Delivery mode: host-side publish") || !strings.Contains(host, "github_publish_pr with why, what_changed, and on_call") || !strings.Contains(host, "github_pr_context") {
 		t.Fatalf("host prompt=%q err=%v", host, err)
+	}
+	// The same settings under the MCP-framed backend must name the tools the CLI
+	// will actually serve. render is the only caller of DeliveryInstructions, so
+	// this is where a dropped backend argument becomes observable: it would leave
+	// the prompt naming Codex tool names for a Claude session.
+	claude, err := render(settings, issue, 0, config.ClaudeAgentBackend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(claude, config.MCPToolPrefix+"github_publish_pr with why, what_changed, and on_call") {
+		t.Fatalf("claude prompt did not name the MCP publish tool: %q", claude)
+	}
+	if strings.Count(claude, "github_pr_context") != strings.Count(claude, config.MCPToolPrefix+"github_pr_context") {
+		t.Fatalf("claude prompt named a bare tool: %q", claude)
+	}
+	if !strings.HasPrefix(claude, "Work on PMR-40\n\n") {
+		t.Fatalf("host guidance displaced the repository prompt: %q", claude)
+	}
+}
+
+// TestTheDispatchedBackendIsTheOneTheGuidanceIsRenderedFor closes the seam
+// between the two. The prompt and the session are resolved from one launch, so a
+// call site that resolved the backend twice -- or rendered before resolving --
+// could not disagree with itself.
+func TestTheDispatchedBackendIsTheOneTheGuidanceIsRenderedFor(t *testing.T) {
+	settings := config.Settings{Prompt: "task"}
+	settings.GitHub.Enabled = true
+	settings.Tracker.HandoffState = "In Review"
+	settings.Agent.Backend = config.ClaudeAgentBackend
+	settings.Claude = config.Claude{Command: "claude", TurnTimeout: time.Minute, StallTimeout: time.Minute}
+	launch := settings.AgentLaunch()
+	prompt, err := render(settings, domain.Issue{Identifier: "PMR-40"}, 0, launch.Backend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if launch.Backend != config.ClaudeAgentBackend {
+		t.Fatalf("launch backend=%q", launch.Backend)
+	}
+	if !strings.Contains(prompt, config.MCPToolPrefix) {
+		t.Fatalf("a claude dispatch was given Codex tool names: %q", prompt)
+	}
+}
+
+// TestADispatchedPromptNamesTheToolsItsOwnBackendWillServe is the assertion the
+// unit-level render tests cannot make. They call render with a backend a test
+// chose; only a real dispatch shows which backend the call site passes, and the
+// failure it catches is invisible everywhere else -- a prompt naming Codex tool
+// names for a Claude session is a valid prompt, and the session it starts passes
+// every launch check it has.
+func TestADispatchedPromptNamesTheToolsItsOwnBackendWillServe(t *testing.T) {
+	d := t.TempDir()
+	path := filepath.Join(d, "WORKFLOW.md")
+	body := "---\n" +
+		"tracker: {kind: linear, provider: {api_key: k, handoff_state: In Review}, active_states: [Todo], terminal_states: [Done]}\n" +
+		"github: {owner: pmrrasmussen, repository: symphony, token: $PMR52_COORDINATOR_TOKEN}\n" +
+		"agent: {backend: claude, max_concurrent_agents: 1, max_turns: 1}\n" +
+		"workspace: {root: " + filepath.Join(d, "work") + "}\n" +
+		"---\nWork on {{.issue.identifier}}"
+	t.Setenv("PMR52_COORDINATOR_TOKEN", "github-secret")
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	w, err := config.Load(path, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !w.Config.HostSidePublishPromised() || w.Config.Agent.Backend != config.ClaudeAgentBackend {
+		t.Fatalf("fixture does not exercise the claude host-publish path: %+v", w.Config.Agent)
+	}
+	agent := &fakeAgent{events: completedEvents}
+	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{})}
+	c := New(&fakeTracker{issue: testIssue()}, agent, ws, func() config.Settings { return w.Config }, nil)
+	c.Tick(context.Background())
+	<-ws.after
+	if err := c.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	requests := agent.requests()
+	if len(requests) != 1 {
+		t.Fatalf("dispatched %d requests, want 1", len(requests))
+	}
+	r := requests[0]
+	if r.Backend != config.ClaudeAgentBackend {
+		t.Fatalf("dispatched backend=%q", r.Backend)
+	}
+	for _, name := range []string{"github_publish_pr", "github_pr_context"} {
+		if strings.Count(r.Prompt, name) != strings.Count(r.Prompt, config.MCPToolPrefix+name) {
+			t.Fatalf("the dispatched prompt names %q bare for a %s session: %q", name, r.Backend, r.Prompt)
+		}
+	}
+	if !strings.Contains(r.Prompt, config.MCPToolPrefix+"github_publish_pr") {
+		t.Fatalf("the dispatched prompt named no MCP publish tool: %q", r.Prompt)
+	}
+}
+
+// TestContinuationGuidanceIsBackendNeutral covers the belt-and-braces half. The
+// only assertion the existing continuation test makes about this text is that the
+// coordinator sends what this function returns, which is true of any wording at
+// all.
+func TestContinuationGuidanceIsBackendNeutral(t *testing.T) {
+	guidance := continuationGuidance(2, 3)
+	for _, forbidden := range []string{"Codex", "codex", "workpad", "thread"} {
+		if strings.Contains(guidance, forbidden) {
+			t.Fatalf("continuation guidance names %q, which is one backend's vocabulary: %q", forbidden, guidance)
+		}
+	}
+	if !strings.Contains(guidance, "prefix included") {
+		t.Fatalf("continuation guidance dropped the tool-naming note: %q", guidance)
+	}
+	if !strings.Contains(guidance, "continuation turn #2 of 3") {
+		t.Fatalf("continuation guidance lost its turn counter: %q", guidance)
 	}
 }
 
@@ -589,11 +700,16 @@ type fakeAgent struct {
 	continueSessions   []domain.AgentSession
 	continuePrompts    []string
 	onContinue         func(int)
+	// startRequests is every request the coordinator dispatched. The prompt and
+	// the backend on it are one decision made at the call site, and this is the
+	// only place a test can see the pair the router was actually handed.
+	startRequests []domain.AgentRequest
 }
 
-func (f *fakeAgent) Start(context.Context, domain.AgentRequest) (domain.AgentSession, <-chan domain.Event, error) {
+func (f *fakeAgent) Start(_ context.Context, r domain.AgentRequest) (domain.AgentSession, <-chan domain.Event, error) {
 	f.mu.Lock()
 	f.starts++
+	f.startRequests = append(f.startRequests, r)
 	started := f.started
 	f.mu.Unlock()
 	if started != nil {
@@ -632,6 +748,12 @@ func (f *fakeAgent) counts() (starts, continues, cancels int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.starts, f.continues, f.cancels
+}
+
+func (f *fakeAgent) requests() []domain.AgentRequest {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]domain.AgentRequest(nil), f.startRequests...)
 }
 
 func (f *fakeAgent) continuations() ([]domain.AgentSession, []string) {

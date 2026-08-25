@@ -9,6 +9,26 @@
 //
 // The launch policy is fixed by launch.go, not configurable, and the only
 // confirmation that it applied is the CLI's own init event -- see verifyInit.
+//
+// One ordering problem is not solved here, and the consistency guard in Start is
+// the whole of what stands in for a solution, so it is worth naming. The prompt
+// that tells the model which bounded tools exist is rendered by the coordinator
+// before Start is called, from configuration alone; the registry that decides
+// which of them this session can actually reach is built inside Start, from
+// configuration plus the bound issue and the provider sessions that were
+// prepared for it. The component that promises a capability cannot see the
+// component that grants it, so the promise can be wrong -- an issue whose
+// identifier yields no usable branch name, for one, gets no GitHub session and
+// therefore no publish capability, while the prompt says host-side publish is
+// available. Start compares the two and refuses the launch, because the failure
+// is otherwise silent in the worst way available: every gate passes and the turn
+// ends completed with committed, unpublished work.
+//
+// The shape that removes the problem instead of detecting it is to hoist
+// capability.Build into the host and pass the *Registry on domain.AgentRequest,
+// so the prompt is rendered from the same registry the session serves and the
+// two cannot disagree. That touches internal/domain, both backends, and the
+// router, and is deliberately not done here.
 package claude
 
 import (
@@ -19,6 +39,7 @@ import (
 	"fmt"
 	"io"
 	"os/exec"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -202,7 +223,24 @@ func (b *Backend) Start(ctx context.Context, r domain.AgentRequest) (domain.Agen
 		return domain.AgentSession{}, nil, err
 	}
 	registry := capability.Build(capability.Bindings{Settings: settings, Issue: r.Issue, Handoff: handoff, GitHub: githubSession})
-	s := &session{id: id, ctx: ctx, registry: registry, advertised: advertisedNames(registry), secretMatcher: secretMatcher}
+	advertised := advertisedNames(registry)
+	// The launch-time consistency guard. config.HostSidePublishPromised is the
+	// exact condition config.DeliveryInstructions branched on when it rendered
+	// r.Prompt, called rather than restated so the two cannot drift, and the
+	// advertised set is this session's own. When the prompt promises host-side
+	// publish and the session cannot serve it, the launch fails here rather than
+	// at the point where the model calls a tool that does not exist -- which is
+	// not a point at all, because nothing observes it. See the package comment
+	// for why this is a cross-check and not a fix.
+	//
+	// Only github_publish_pr is checked, because it is the only capability the
+	// prompt promises unconditionally: github_land_pr's advertisement depends on
+	// the issue's current state, and create_followup_issue is described to the
+	// model as available only when it is present in the tool list.
+	if settings.HostSidePublishPromised() && !slices.Contains(advertised, capability.NameGitHubPublishPR) {
+		return domain.AgentSession{}, nil, fmt.Errorf("claude launch refused: the rendered prompt promises host-side publish but this session advertises no %s capability", capability.NameGitHubPublishPR)
+	}
+	s := &session{id: id, ctx: ctx, registry: registry, advertised: advertised, secretMatcher: secretMatcher}
 	b.mu.Lock()
 	b.sessions[id] = s
 	b.mu.Unlock()

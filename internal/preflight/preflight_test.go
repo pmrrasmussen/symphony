@@ -81,6 +81,59 @@ func TestRunReportsSafeLegacyProjectMigrationWarning(t *testing.T) {
 	}
 }
 
+// TestTheHandoffCheckReportsExactlyWhatAWorkerWillBeTold pins the github_handoff
+// result to the same predicate the rendered delivery guidance branches on. An
+// enabled GitHub integration is not on its own a publishing capability -- the
+// scoped session is only prepared on top of a review handoff -- so reporting one
+// as available would have preflight promise what the worker is then told is
+// unavailable.
+func TestTheHandoffCheckReportsExactlyWhatAWorkerWillBeTold(t *testing.T) {
+	t.Setenv("PMR52_PREFLIGHT_TOKEN", "github-secret")
+	for name, tc := range map[string]struct {
+		front string
+		want  Status
+	}{
+		"github enabled with no handoff state": {
+			front: "github: {owner: o, repository: r, token: $PMR52_PREFLIGHT_TOKEN}\n",
+			want:  StatusWarning,
+		},
+		"github enabled with a handoff state": {
+			front: "github: {owner: o, repository: r, token: $PMR52_PREFLIGHT_TOKEN}\n",
+			want:  StatusPassed,
+		},
+		"no github integration": {want: StatusWarning},
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			workflow := filepath.Join(dir, "WORKFLOW.md")
+			handoff := ""
+			if tc.want == StatusPassed {
+				handoff = ", handoff_state: In Review"
+			}
+			content := "---\n" +
+				"tracker:\n  kind: linear\n  provider: {project_slug_id: preflight, api_key: not-a-live-key" + handoff + "}\n" +
+				"  active_states: [Todo]\n  terminal_states: [Done]\n" +
+				tc.front +
+				"workspace: {root: " + filepath.Join(dir, "workspaces") + ", source_root: " + dir + "}\n" +
+				"codex: {command: go}\n" +
+				"---\nWork on {{.issue.identifier}}"
+			if err := os.WriteFile(workflow, []byte(content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			result := Run(context.Background(), workflow, filepath.Join(dir, "logs"))
+			var got Status
+			for _, check := range result.Checks {
+				if check.Name == "github_handoff" {
+					got = check.Status
+				}
+			}
+			if got != tc.want {
+				t.Fatalf("github_handoff status=%q, want %q: %+v", got, tc.want, result.Checks)
+			}
+		})
+	}
+}
+
 func writeWorkflow(t *testing.T, path, workspaceRoot, command, beforeRun string) {
 	t.Helper()
 	content := "---\n" +

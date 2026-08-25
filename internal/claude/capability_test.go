@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -32,13 +33,17 @@ var allCapabilityNames = []string{
 	capability.NameGitHubLandPR,
 }
 
-// TestTheLaunchContractWithoutACapabilityIsUnchanged is the test that makes the
-// rest of this file safe to land. Configuration still refuses a Claude workflow
-// that enables a Symphony capability, so every real session takes this path, and
-// the argument vector it produces has to be exactly the one it produced before
-// the endpoint existed -- not merely equivalent. A byte-level golden is the only
-// assertion that says so: an extra flag, a reordering, or an empty --mcp-config
-// would all pass a set comparison.
+// TestTheLaunchContractWithoutACapabilityIsUnchanged is the Codex-parity
+// statement. A workflow that configures no Symphony capability still takes this
+// path, and the argument vector it produces has to be exactly the one it
+// produced before the endpoint existed -- not merely equivalent. A byte-level
+// golden is the only assertion that says so: an extra flag, a reordering, or an
+// empty --mcp-config would all pass a set comparison.
+//
+// It is also what gives "no MCP server at all" in the init echo a single
+// meaning. Configuration is the other half: it refuses a Claude workflow that
+// configures a capability no session could advertise, so this argv cannot stand
+// for a capability that was asked for and silently not granted.
 func TestTheLaunchContractWithoutACapabilityIsUnchanged(t *testing.T) {
 	dir := t.TempDir()
 	r := request(t, dir, "unused")
@@ -1259,4 +1264,126 @@ func (f *failingRegistration) revocations() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.calls
+}
+
+// TestTheRenderedNameMatchesTheNameTheCLIWillServe pins the one duplicated fact
+// in this change. config.MCPToolPrefix is what the rendered prompt tells the
+// model to call; mcpToolName is what --tools actually pins and what the CLI
+// echoes back. They are in different packages because importing this launcher
+// from internal/config is a cycle, so the only thing that can keep them equal is
+// this assertion. Break either side and the prompt names a tool the session does
+// not serve, with no diagnostic anywhere: the launch contract is still
+// self-consistent, so verifyInit approves the turn.
+func TestTheRenderedNameMatchesTheNameTheCLIWillServe(t *testing.T) {
+	for _, name := range allCapabilityNames {
+		if got, want := mcpToolName(name), config.MCPToolPrefix+name; got != want {
+			t.Fatalf("the CLI will serve %q but the prompt names %q", got, want)
+		}
+	}
+}
+
+// TestStartRefusesToRunAPromiseTheSessionCannotKeep is the launch-time
+// consistency guard, in the form that reaches it without a hand-built session.
+//
+// The divergence is real rather than contrived: an issue whose identifier
+// contains no branch-safe character has no deterministic branch, so
+// github.Manager prepares no session for it and the registry advertises no
+// GitHub capability -- while configuration still promises host-side publish and
+// the coordinator has already rendered a prompt saying so. Without the guard the
+// turn runs, the model finds no publish tool, and the run ends completed with
+// committed, unpublished work; nothing in the launch contract is inconsistent, so
+// verifyInit approves it.
+func TestStartRefusesToRunAPromiseTheSessionCannotKeep(t *testing.T) {
+	tracker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		var query struct {
+			Query string `json:"query"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&query); err != nil {
+			t.Error(err)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.Contains(query.Query, "SymphonyLinearHandoffIssue"):
+			_, _ = w.Write([]byte(`{"data":{"issue":{"id":"issue-1","identifier":"###","title":"Parity","description":"safe",` +
+				`"url":"https://linear.app/issue/x","project":{"id":"project-uuid","slugId":"project-1"},` +
+				`"team":{"id":"team-1"},"state":{"id":"progress","name":"In Progress"}}}}`))
+		case strings.Contains(query.Query, "SymphonyLinearHandoffStates"):
+			_, _ = w.Write([]byte(`{"data":{"team":{"id":"team-1","states":{"nodes":[{"id":"review","name":"In Review"}]}}}}`))
+		default:
+			t.Errorf("unexpected query: %s", query.Query)
+		}
+	}))
+	defer tracker.Close()
+	settings := config.Settings{
+		Tracker: config.Tracker{
+			Provider:     map[string]any{"api_key": "linear-api-secret", "project_slug_id": "project-1", "endpoint": tracker.URL},
+			ActiveStates: []string{"In Progress"},
+			HandoffState: "In Review",
+		},
+		GitHub: config.GitHub{Enabled: true, Owner: "owner", Repository: "repo", BaseBranch: "main",
+			Token: "github-token-secret", Endpoint: tracker.URL},
+	}
+	snapshot := func() config.Settings { return settings }
+	if !settings.HostSidePublishPromised() {
+		t.Fatal("these settings do not promise host-side publish, so the guard is not under test")
+	}
+
+	dir := t.TempDir()
+	script := writeFakeClaude(t, dir, "cat <<'EOF'\n"+initLine(dir, allCodingTools)+"\n"+resultLine(false, "")+"\nEOF\n")
+	mcpEndpoint, err := mcpbridge.Listen()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = mcpEndpoint.Close(context.Background()) })
+	backend := NewWithProviders(snapshot, linear.NewHandoff(snapshot), githubhost.New(snapshot, nil), mcpEndpoint)
+
+	r := request(t, dir, script)
+	r.Issue = domain.Issue{ID: "issue-1", Identifier: "###", State: "In Progress"}
+	agentSession, events, err := backend.Start(context.Background(), r)
+	if err == nil {
+		t.Fatalf("a session that cannot publish was started anyway: %+v", agentSession)
+	}
+	if !strings.Contains(err.Error(), capability.NameGitHubPublishPR) {
+		t.Fatalf("the refusal does not name the missing capability: %v", err)
+	}
+	if events != nil {
+		t.Fatal("a refused launch returned an event stream")
+	}
+	// No child may run: the guard exists precisely because a turn that starts is
+	// a turn that ends completed with unpublished work.
+	if _, statErr := os.Stat(filepath.Join(dir, "args.txt")); statErr == nil {
+		t.Fatal("the refused launch still spawned the CLI")
+	}
+	backend.mu.Lock()
+	live := len(backend.sessions)
+	backend.mu.Unlock()
+	if live != 0 {
+		t.Fatalf("a refused launch left %d sessions registered", live)
+	}
+}
+
+// TestAnAdvertisedPublishCapabilitySatisfiesTheGuard is the other half: the guard
+// must not be a blanket refusal of a GitHub-enabled Claude workflow. Without
+// this, deleting the advertised-set term and refusing every promised publish
+// would still pass the test above.
+func TestAnAdvertisedPublishCapabilitySatisfiesTheGuard(t *testing.T) {
+	settings := config.Settings{
+		Tracker: config.Tracker{HandoffState: "In Review"},
+		GitHub:  config.GitHub{Enabled: true, MergeState: "Merging"},
+	}
+	registry := capability.Build(capability.Bindings{
+		Settings: settings,
+		Issue:    domain.Issue{ID: "issue-1", Identifier: "PMR-52", State: "In Progress"},
+		Handoff:  &linear.HandoffSession{},
+		GitHub:   &githubhost.Session{},
+	})
+	advertised := advertisedNames(registry)
+	if !slices.Contains(advertised, capability.NameGitHubPublishPR) {
+		t.Fatalf("advertised=%v, want the publish capability a promised session must serve", advertised)
+	}
+	if !settings.HostSidePublishPromised() {
+		t.Fatal("these settings do not promise host-side publish")
+	}
 }

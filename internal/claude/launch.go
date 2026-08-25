@@ -35,7 +35,9 @@ const mcpServerName = "symphony"
 const endpointTokenEnvName = "SYMPHONY_MCP_TOKEN"
 
 // mcpToolName is the tool name the CLI derives for one capability served by this
-// endpoint.
+// endpoint. It is the authority for that name; config.MCPToolPrefix is the
+// mirror the rendered prompt has to carry, and a test in this package asserts
+// the two agree.
 func mcpToolName(capability string) string { return "mcp__" + mcpServerName + "__" + capability }
 
 // deniedTools are refused in addition to being absent from the tool surface, so
@@ -208,11 +210,13 @@ type launchContract struct {
 // variadic, so a trailing positional prompt is consumed as a flag value; it goes
 // on stdin instead.
 //
-// endpoint is nil for a session with no reachable capability, which is every
-// session today: configuration still refuses a Claude workflow that enables one.
-// That path must render byte-identically to what it rendered before this
-// endpoint existed, which is what keeps the wiring inert rather than merely
-// unused.
+// endpoint is nil, or advertises nothing, for a session with no reachable
+// capability -- a workflow that configures none. That path must render
+// byte-identically to what it rendered before this endpoint existed: it is the
+// Codex-parity path, and it is what makes "no MCP server at all" in the init
+// echo mean exactly one thing. Configuration is what keeps that meaning single,
+// by refusing a Claude workflow that configures a capability no session could
+// advertise.
 func launchArgs(r domain.AgentRequest, sessionID string, resume bool, endpoint *capabilityEndpoint) (launchContract, error) {
 	contract := launchContract{tools: append([]string(nil), codingTools...)}
 	var mcp []byte

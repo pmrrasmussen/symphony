@@ -519,18 +519,35 @@ func decode(raw map[string]any, base, path, logRoot string, sources *sourceSnaps
 		if strings.TrimSpace(s.Claude.Command) == "" || s.Claude.TurnTimeout <= 0 || s.Claude.StallTimeout <= 0 {
 			return s, errors.New("invalid configuration: non-positive duration or agent limit")
 		}
-		// The transport exists and is wired: internal/claude prepares the same
-		// provider sessions internal/codex does, builds the same registry, and
-		// serves it over the private loopback MCP endpoint. What is missing is
-		// the prompt side. DeliveryInstructions names bare tool names, which is
-		// what a Codex dynamic tool is called and not what an MCP tool is
-		// called, and nothing yet cross-checks at launch that a capability the
-		// prompt promises is one the built registry advertises. Lifting this
-		// refusal before both exist passes every gate in the repository while
-		// the host tells the model to call a tool it cannot reach, and the turn
-		// then ends as a completed turn with committed, unpublished work.
-		if s.LinearSessionCapabilityEnabled() || s.GitHub.Enabled {
-			return s, errors.New("invalid configuration: agent.backend claude cannot yet be combined with Symphony session capabilities (tracker.provider.handoff_state, tracker.provider.followup_issue_creation, or an enabled github integration)")
+		// A Claude session may now hold Symphony's bounded capabilities: the
+		// transport is the private loopback MCP endpoint, DeliveryInstructions
+		// renders the MCP tool names for this backend, and claude.Backend.Start
+		// refuses a launch whose prompt promises a capability its own registry
+		// does not advertise. What is left is this residual rule, which is
+		// narrower than the refusal it replaces and is about configuration that
+		// grants the model nothing.
+		//
+		// A workflow that configures a session capability no session could ever
+		// advertise is refused rather than silently degraded. The two ways to
+		// write one are a handoff_state with no enabled github integration, and
+		// an enabled github integration with no handoff_state: in both, a
+		// capability was asked for and the resulting session serves none, since
+		// a GitHub session is only prepared on top of a prepared Linear handoff
+		// session and handoff_state alone drives nothing model-facing.
+		//
+		// It is refused only for this backend, and both halves of that are
+		// deliberate. Under codex the same configuration is equally inert, and it
+		// stays accepted there because it always has been -- narrowing it would
+		// reject workflows already in the field for no new safety. Under claude
+		// it is worth refusing, because "no MCP server at all" in the init echo
+		// is the only externally visible difference between a session that was
+		// configured to have no capability and one whose configured capability
+		// could not be reached; keeping those two states from sharing a
+		// representation is what makes the Codex-parity launch path in
+		// internal/claude mean what it says. This is a new backend with no
+		// deployed configurations, so it can be strict where codex cannot.
+		if (s.LinearSessionCapabilityEnabled() || s.GitHub.Enabled) && !s.SessionCapabilityAdvertisable() {
+			return s, errors.New("invalid configuration: agent.backend claude configures a Symphony session capability that no session could advertise: pair tracker.provider.handoff_state with an enabled github integration, or enable tracker.provider.followup_issue_creation")
 		}
 	case DefaultAgentBackend:
 		if strings.TrimSpace(s.Codex.Command) == "" || s.Codex.TurnTimeout <= 0 || s.Codex.ReadTimeout <= 0 || s.Codex.StartTimeout <= 0 {
@@ -1057,17 +1074,96 @@ func (s Settings) LinearSessionCapabilityEnabled() bool {
 	return strings.TrimSpace(s.Tracker.HandoffState) != "" || s.Tracker.FollowupIssueCreation
 }
 
+// HostSidePublishPromised reports whether a run under these settings is told
+// that host-side publish is available. It is the exact condition
+// DeliveryInstructions branches on, named so that a backend can cross-check the
+// promise against what its own session actually advertises.
+//
+// It exists as a predicate rather than as an inline condition for one reason: the
+// prompt is rendered before a session exists, so the only thing that can catch a
+// promise the session cannot keep is a comparison made at launch, and a
+// comparison against a paraphrase of this condition would drift from the branch
+// it is meant to mirror. internal/claude.Backend.Start is the caller.
+func (s Settings) HostSidePublishPromised() bool {
+	return s.GitHub.Enabled && s.Tracker.HandoffState != ""
+}
+
+// SessionCapabilityAdvertisable reports whether any bounded capability could be
+// advertised to this run's agent under these settings.
+//
+// It is deliberately the settings-only half of what internal/capability.Build
+// decides, and it is an upper bound: github_land_pr additionally depends on the
+// bound issue's current state, which no configuration can answer. What it does
+// answer exactly is the question configuration can be held to -- whether some
+// capability is reachable for some issue -- which is why it is what the Claude
+// residual configuration rule and the tool-naming guidance below both use.
+//
+// The github term is HostSidePublishPromised rather than GitHub.Enabled because
+// a GitHub session is prepared only on top of a prepared Linear handoff session,
+// so an enabled integration with no handoff_state advertises nothing.
+func (s Settings) SessionCapabilityAdvertisable() bool {
+	return s.Tracker.FollowupIssueCreation || s.HostSidePublishPromised()
+}
+
+// MCPToolPrefix is how an MCP-framed backend renames a Symphony capability: the
+// Claude Code CLI derives every tool name it serves from the MCP server the tool
+// came from, so the capability the registry calls github_publish_pr reaches the
+// model as mcp__symphony__github_publish_pr.
+//
+// The authority for the server name is internal/claude's --mcp-config payload,
+// not this constant. This is the mirror the prompt has to render, and
+// internal/claude owns the test that the two are identical. Importing the
+// launcher from here is a cycle, and the remaining alternative -- moving the
+// launcher's server name into the workflow schema -- would make a transport
+// detail look like repository policy and let a workflow rename it.
+const MCPToolPrefix = "mcp__symphony__"
+
 // DeliveryInstructions describe the only PR delivery capability available to
 // a worker. Host-generated guidance prevents a stale repository prompt from
 // telling a restricted worker to publish directly to GitHub.
-func (s Settings) DeliveryInstructions() string {
-	if s.GitHub.Enabled && s.Tracker.HandoffState != "" {
-		return `Delivery mode: host-side publish is available for this run.
+//
+// backend is the resolved backend this dispatch will start on. It is a parameter
+// rather than a field read off s.Agent.Backend, and rather than a new workflow
+// key, because the coordinator has already resolved it for this dispatch and
+// hands the same value to the agent router: passing it makes the prompt and the
+// launch one decision, so there is no representable state where guidance is
+// rendered for a backend other than the one that starts the session. How a
+// transport names a tool is also not repository policy, so it must not be
+// configurable.
+//
+// The Claude branch is why this function takes a backend at all. WORKFLOW.md's
+// prompt body is repository-owned and names Symphony's tools bare --
+// create_followup_issue, github_publish_pr, github_pr_context, github_land_pr --
+// which is what a Codex dynamic tool is called and not what the same capability
+// is called once it is served over MCP. Carrying that mechanical naming detail
+// here is the role the paragraph above already claims for host-generated
+// guidance: it keeps one repository prompt correct under both backends without
+// editing WORKFLOW.md, and it cannot go stale against a workflow that adds a
+// tool name to its body, because the rule is stated over the prefix rather than
+// over an enumeration of names this package would have to keep in step with
+// internal/capability.
+func (s Settings) DeliveryInstructions(backend string) string {
+	// Only the Claude transport renames Symphony's tools. Every other backend --
+	// today only codex, whose dynamic tools carry the registry's own names --
+	// keeps the bare names, so for those this function renders byte-identically
+	// to what it rendered before this parameter existed. A future MCP-framed
+	// backend has to opt in here explicitly rather than inherit either answer by
+	// default.
+	tool := func(name string) string { return name }
+	preamble := ""
+	if backend == ClaudeAgentBackend && s.SessionCapabilityAdvertisable() {
+		tool = func(name string) string { return MCPToolPrefix + name }
+		preamble = `Tool naming: Symphony's bounded tools reach you through a single MCP server, so each one is named ` + MCPToolPrefix + `<tool> and not <tool>. Wherever these instructions or the task above name a Symphony tool without that prefix, call ` + MCPToolPrefix + ` followed by that name. Your own tool list decides availability: a Symphony tool that is not in it is unavailable for this run, whatever the instructions say.
+
+`
+	}
+	if s.HostSidePublishPromised() {
+		return preamble + `Delivery mode: host-side publish is available for this run.
 
 - Make and validate the change in this workspace, then create a local commit.
 - Do not run gh, git push, or otherwise try to publish directly to GitHub.
-- When the worktree is clean and committed, call github_publish_pr with why, what_changed, and on_call. It is bound to this issue, repository, and branch and will create or update the PR body from those fields and hand the issue to review.
-- Call github_pr_context (no arguments) to read bounded check status, review state, and unresolved feedback for that same pull request.`
+- When the worktree is clean and committed, call ` + tool("github_publish_pr") + ` with why, what_changed, and on_call. It is bound to this issue, repository, and branch and will create or update the PR body from those fields and hand the issue to review.
+- Call ` + tool("github_pr_context") + ` (no arguments) to read bounded check status, review state, and unresolved feedback for that same pull request.`
 	}
 	requirements := "configure github.owner, github.repository, github.base_branch, and a repository-scoped GitHub token"
 	if s.GitHub.Enabled {
@@ -1075,7 +1171,7 @@ func (s Settings) DeliveryInstructions() string {
 	} else if s.Tracker.HandoffState != "" {
 		requirements = "configure the fixed github owner, repository, base branch, and repository-scoped token"
 	}
-	return `Delivery mode: manual. Host-side PR publishing is unavailable for this run.
+	return preamble + `Delivery mode: manual. Host-side PR publishing is unavailable for this run.
 
 - Do not run gh, git push, or try to open a pull request directly.
 - You may make and commit local changes, but leave the issue active after reporting the ready work.

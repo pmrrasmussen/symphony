@@ -813,14 +813,19 @@ func (c *Coordinator) launch(parent context.Context, i domain.Issue, attempt int
 		if state := c.transitionToStarted(ctx, i, s); state != "" {
 			i.State = state
 		}
-		prompt, err := render(s, i, attempt)
+		// The launch is resolved before the prompt, not after, because the
+		// prompt has to be rendered for the backend that will actually run it:
+		// how a bounded capability is named is a property of the transport. One
+		// resolution feeds both, so the guidance and the session cannot describe
+		// different backends.
+		launch := s.AgentLaunch()
+		prompt, err := render(s, i, attempt, launch.Backend)
 		if err != nil {
 			c.workspaces.AfterRun(context.Background(), ws, i)
 			c.unreserve(i.ID)
 			c.finishFailure(parent, i, attempt, "prompt_render", err)
 			return
 		}
-		launch := s.AgentLaunch()
 		c.log.Debug("agent launch requested", "issue_id", i.ID, "issue_identifier", i.Identifier, "attempt", attempt, "agent_backend", launch.Backend)
 		session, events, err := c.agent.Start(ctx, domain.AgentRequest{Issue: i, Backend: launch.Backend, Model: launch.Model, Workspace: ws.Path, GitMetadataRoots: ws.GitMetadataRoots, Prompt: prompt, Command: launch.Command, ApprovalPolicy: launch.ApprovalPolicy, ThreadSandbox: launch.ThreadSandbox, TurnSandboxPolicy: launch.TurnSandboxPolicy, TurnTimeout: launch.TurnTimeout, ReadTimeout: launch.ReadTimeout, StartTimeout: launch.StartTimeout})
 		if err != nil {
@@ -1029,12 +1034,25 @@ func continuationGuidance(turn, maxTurns int) string {
 	// The upstream workflow schema configures the turn bound but deliberately
 	// has no continuation-prompt field. Generate its prescribed guidance here
 	// so continuation turns do not resend the repository task template.
+	//
+	// This text is backend-neutral on purpose: "workpad" and "thread" were Codex
+	// vocabulary, and a Claude turn has neither. The tool-naming line is
+	// belt-and-braces rather than the fix for anything -- the naming rule that
+	// matters lives in config.DeliveryInstructions, which every fresh dispatch
+	// renders, and a resume replays that initial prompt. Which is also the rule
+	// for what may live where: anything that varies from turn to turn belongs
+	// here, and the name mapping is safe in DeliveryInstructions only because the
+	// advertised set is frozen when the session's registry is built (landAdvertised
+	// reads Issue.State once, at Build time) and no later turn can change it. A
+	// landing_waiting redispatch is not a continuation: it goes through
+	// scheduleRetry/retryLanding to a fresh Start and therefore a fresh render.
 	return fmt.Sprintf(`Continuation guidance:
 
 - The previous agent turn completed normally, but the tracker work item is still in an active state.
 - This is continuation turn #%d of %d for the current agent run.
-- Resume from the current workspace and workpad state instead of restarting from scratch.
-- The original task instructions and prior turn context are already present in this thread, so do not restate them before acting.
+- Resume from the current workspace and session state instead of restarting from scratch.
+- The original task instructions and prior turn context are already present in this session, so do not restate them before acting.
+- Symphony's bounded tools keep whatever names your current tool list gives them, prefix included; call one by that name rather than by a bare name quoted earlier in this session.
 - Focus on the remaining ticket work and do not end the turn while the issue stays active unless you are truly blocked.`, turn, maxTurns)
 }
 
@@ -1722,10 +1740,10 @@ func backoff(a int, max time.Duration) time.Duration {
 	}
 	return d
 }
-func render(s config.Settings, i domain.Issue, attempt int) (string, error) {
+func render(s config.Settings, i domain.Issue, attempt int, backend string) (string, error) {
 	prompt, err := s.Render(i, attempt)
 	if err != nil {
 		return "", err
 	}
-	return prompt + "\n\n" + s.DeliveryInstructions(), nil
+	return prompt + "\n\n" + s.DeliveryInstructions(backend), nil
 }
