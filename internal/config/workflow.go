@@ -243,6 +243,14 @@ func parse(b []byte) (map[string]any, string, error) {
 	return raw, strings.Join(lines[end+1:], "\n"), nil
 }
 
+// ParseRaw parses the workflow envelope without resolving configuration or
+// credential values. It is intended for host-side tooling that needs to find
+// credential *references* before it can construct the service environment.
+// Callers must still use LoadWithEnvironment for full validation.
+func ParseRaw(b []byte) (map[string]any, string, error) {
+	return parse(b)
+}
+
 func decode(raw map[string]any, base, path, logRoot string, sources *sourceSnapshot) (Settings, error) {
 	tr, err := object(raw, "tracker")
 	if err != nil {

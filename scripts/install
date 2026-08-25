@@ -1,0 +1,23 @@
+#!/bin/sh
+
+# Install one shared Symphony executable. Repository services reference this
+# path directly; this script intentionally does not create or alter services.
+set -eu
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+repository=$(CDPATH= cd -- "$script_dir/.." && pwd)
+install_dir=${SYMPHONY_INSTALL_DIR:-"$HOME/.local/bin"}
+target="$install_dir/symphony"
+
+mkdir -p "$install_dir"
+chmod 700 "$install_dir"
+temporary=$(mktemp "$install_dir/.symphony-install.XXXXXX")
+trap 'rm -f "$temporary"' EXIT HUP INT TERM
+
+cd "$repository"
+go build -o "$temporary" ./cmd/symphony
+chmod 755 "$temporary"
+mv -f "$temporary" "$target"
+trap - EXIT HUP INT TERM
+
+printf 'Installed Symphony at %s\n' "$target"

@@ -11,6 +11,43 @@ go run ./cmd/symphony --workflow ./WORKFLOW.md
 go run ./cmd/symphony ./WORKFLOW.md
 ```
 
+## macOS repository services
+
+Install one shared executable from this repository, then install a separate
+LaunchAgent from each repository that owns a valid `WORKFLOW.md`:
+
+```sh
+cd ~/repos/symphony
+./scripts/install
+
+cd ~/repos/foo
+symphony service install
+```
+
+The installer atomically updates `~/.local/bin/symphony`; it never copies a
+binary into a managed repository or self-updates a running service. Each
+repository service gets its own `.symphony/workspaces`, `.symphony/logs`, and
+`.symphony/service/{status.json,stdout.log,stderr.log}`, while its LaunchAgent
+is registered as `com.pmrrasmussen.symphony.<instance>` under
+`~/Library/LaunchAgents`.
+
+`service install` runs the normal workflow preflight and validates its
+generated plist before changing launchd. Repeating it is a no-op when the
+effective managed plist is unchanged; a changed managed plist is reloaded only
+for that repository. It rejects duplicate workflow/status registrations and
+never overwrites an unmarked LaunchAgent. Use `--workflow`, `--name`,
+`--linear-api-key-file`, or `--github-token-file` for explicit non-default
+configuration. `service status`, `service restart`, and `service uninstall`
+select only the current repository’s managed instance.
+
+Services pass credential file paths only, never credential values. The normal
+Linear reference is `$SYMPHONY_LINEAR_API_KEY_FILE` in `WORKFLOW.md`, resolved
+by default to `~/.config/symphony/linear-api-key`. For a GitHub-enabled
+workflow using `$SYMPHONY_GITHUB_TOKEN_FILE`, the documented default is
+`~/.config/symphony/github/<owner>-<repo>.token`; pass
+`--github-token-file` to select another file. All credential files must be
+owner-only.
+
 ## Canonical lifecycle
 
 `Todo -> In Progress -> In Review <-> Rework -> Merging -> Done`. `Todo`,
