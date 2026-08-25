@@ -46,13 +46,24 @@ func (r Result) OK() bool { return r.Status != StatusFailed }
 // in-memory implementations. It never calls Linear, starts Codex, executes a
 // hook, creates a log, or prepares a real workspace.
 func Run(ctx context.Context, workflowPath, logRoot string) Result {
+	return run(ctx, workflowPath, logRoot, nil)
+}
+
+// RunWithEnvironment is the read-only variant used to inspect a service whose
+// credential references are supplied by its own host environment, rather than
+// the invoking terminal. It has the same no-live-side-effect contract as Run.
+func RunWithEnvironment(ctx context.Context, workflowPath, logRoot string, environment map[string]string) Result {
+	return run(ctx, workflowPath, logRoot, environment)
+}
+
+func run(ctx context.Context, workflowPath, logRoot string, environment map[string]string) Result {
 	result := Result{Status: StatusPassed}
-	store, err := config.NewStore(workflowPath, logRoot)
+	workflow, err := config.LoadWithEnvironment(workflowPath, logRoot, environment)
 	if err != nil {
 		result.add("workflow", StatusFailed, err.Error())
 		return result
 	}
-	settings := store.Current().Config
+	settings := workflow.Config
 	result.add("workflow", StatusPassed, "workflow parsed and normalized")
 	for _, warning := range settings.Warnings {
 		result.add("workflow_migration", StatusWarning, warning)
