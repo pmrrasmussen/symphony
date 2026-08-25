@@ -197,13 +197,21 @@ func TestAuthenticationProbeReportsEachOutcomeWithoutClaimingAnUncheckedPass(t *
 	})
 
 	t.Run("a hanging CLI fails the check instead of hanging the dry run", func(t *testing.T) {
-		command := writeAuthCommand(t, "sleep 60")
+		// The background child is what makes this test meaningful everywhere.
+		// Killing the probe on its deadline does not close the output pipes a
+		// descendant still holds, so without a bounded wait the probe waits for
+		// that descendant instead of for its budget. A plain "sleep 60" only
+		// reproduces it where the shell forks rather than execs, which is why
+		// this first failed in CI and not locally.
+		command := writeAuthCommand(t, "sleep 60 &\nwait")
 		start := time.Now()
 		status, err := authenticated(context.Background(), command, 50*time.Millisecond)
 		if status || err == nil || !strings.Contains(err.Error(), "did not report authentication status") {
 			t.Fatalf("status=%v err=%v", status, err)
 		}
-		if elapsed := time.Since(start); elapsed > 30*time.Second {
+		// The budget is 50ms and the pipe wait is bounded in the same order, so
+		// anything approaching a second means the bound is not being applied.
+		if elapsed := time.Since(start); elapsed > 5*time.Second {
 			t.Fatalf("probe waited for the command rather than its budget: %v", elapsed)
 		}
 	})

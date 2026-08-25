@@ -221,6 +221,10 @@ const authenticationTimeout = 5 * time.Second
 //
 // The budget is a parameter so the bound itself is exercised by a test without
 // one waiting out the production value.
+// probeWaitDelay bounds how long the probe waits for its output pipes after the
+// command itself is gone.
+const probeWaitDelay = 500 * time.Millisecond
+
 func authenticated(ctx context.Context, command string, timeout time.Duration) (bool, error) {
 	fields := strings.Fields(command)
 	if len(fields) == 0 {
@@ -231,7 +235,14 @@ func authenticated(ctx context.Context, command string, timeout time.Duration) (
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, fields[0], "auth", "status").Output()
+	probe := exec.CommandContext(ctx, fields[0], "auth", "status")
+	// Killing the probe on the deadline is not enough to return on it. The
+	// deadline kills the command itself, but Output waits for the output pipes
+	// to close, and any grandchild the command left behind still holds them --
+	// so without a WaitDelay the probe waits for that descendant instead of for
+	// its own budget, which is the hang this timeout exists to prevent.
+	probe.WaitDelay = probeWaitDelay
+	out, err := probe.Output()
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		// A probe that had to be killed is a failed check, not a pass: nothing
 		// was learned about the session.
