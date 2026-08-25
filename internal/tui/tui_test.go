@@ -534,33 +534,6 @@ func TestWindowKeepsTheSelectionVisible(t *testing.T) {
 	}
 }
 
-func TestClampReportsWhatItDropped(t *testing.T) {
-	items := []string{"a", "b", "c", "d"}
-	for _, testCase := range []struct {
-		name   string
-		limit  int
-		kept   string
-		hidden int
-	}{
-		// An unknown height must clamp nothing: it is what the plain surface and
-		// every height-unaware caller passes.
-		{name: "unknown height", limit: 0, kept: "abcd", hidden: 0},
-		{name: "negative", limit: -3, kept: "abcd", hidden: 0},
-		{name: "room to spare", limit: 9, kept: "abcd", hidden: 0},
-		{name: "exact fit", limit: 4, kept: "abcd", hidden: 0},
-		// One row of the budget pays for the line reporting the remainder.
-		{name: "one over", limit: 3, kept: "ab", hidden: 2},
-		{name: "only the report fits", limit: 1, kept: "", hidden: 4},
-	} {
-		t.Run(testCase.name, func(t *testing.T) {
-			kept, hidden := clamp(items, testCase.limit)
-			if strings.Join(kept, "") != testCase.kept || hidden != testCase.hidden {
-				t.Fatalf("kept=%v hidden=%d, want %q and %d", kept, hidden, testCase.kept, testCase.hidden)
-			}
-		})
-	}
-}
-
 func TestWidthBandsDropTheNumericColumnsFirst(t *testing.T) {
 	now := time.Date(2026, 8, 25, 12, 0, 0, 0, time.UTC)
 	instances := []operator.Instance{
@@ -660,10 +633,13 @@ func TestEachLivenessHasItsOwnGlyph(t *testing.T) {
 	}
 }
 
-func TestShortWindowClampsTheDetailBodyAndSaysSo(t *testing.T) {
+// logFixture is a styled model whose Status page is taller than its window,
+// which is the case PMR-88 is about.
+func logFixture(t *testing.T, entries int, height int) Model {
+	t.Helper()
 	now := time.Date(2026, 8, 25, 12, 0, 0, 0, time.UTC)
-	log := make([]operator.LogEvent, 0, 20)
-	for index := range 20 {
+	log := make([]operator.LogEvent, 0, entries)
+	for index := range entries {
 		log = append(log, operator.LogEvent{Time: now, Level: "INFO", Message: fmt.Sprintf("event %d", index)})
 	}
 	model := styledFixture([]operator.Instance{{
@@ -672,18 +648,154 @@ func TestShortWindowClampsTheDetailBodyAndSaysSo(t *testing.T) {
 		Snapshot:  &operator.Snapshot{State: "running"},
 		RecentLog: log,
 	}}, now)
-	model.height = 20
+	model.height = height
 	model.page = statusPage
+	return model
+}
+
+func TestTallDetailBodyScrollsInsteadOfBeingCutOff(t *testing.T) {
+	now := time.Date(2026, 8, 25, 12, 0, 0, 0, time.UTC)
+	model := logFixture(t, 20, 20)
 	view := model.View(now)
-	if !strings.Contains(view, "more") {
-		t.Fatalf("a 20-row window drew a 20-entry log without reporting the remainder:\n%s", view)
+
+	// A position, not a bare count: the reader has to be able to tell whether
+	// there is more and which way.
+	if !strings.Contains(view, "of") || !strings.Contains(view, "▾") {
+		t.Fatalf("no position indicator on an overflowing page:\n%s", view)
 	}
-	// Silent truncation would read as a complete screen. The hint bar is the
-	// proof the frame still fits.
+	if strings.Contains(view, "▴") {
+		t.Fatalf("indicator claims content above while at the top:\n%s", view)
+	}
+	// The frame must still fit the window it was given.
+	if height := lipgloss.Height(view); height > model.height+1 {
+		t.Fatalf("frame is %d rows in a %d-row window:\n%s", height, model.height, view)
+	}
 	if !strings.Contains(view, "q back") {
-		t.Fatalf("clamped frame pushed the hint bar off screen:\n%s", view)
+		t.Fatalf("scrolled frame pushed the hint bar off screen:\n%s", view)
 	}
-	if height := lipgloss.Height(view); height > 21 {
-		t.Fatalf("frame is %d rows in a 20-row window:\n%s", height, view)
+}
+
+func TestScrollingReachesTheLastLine(t *testing.T) {
+	now := time.Date(2026, 8, 25, 12, 0, 0, 0, time.UTC)
+	model := logFixture(t, 20, 20)
+
+	// The whole point of the issue: the alternate screen has no scrollback, so
+	// the final entry has to be reachable from inside the view.
+	if strings.Contains(model.View(now), "event 19") {
+		t.Fatal("fixture is not tall enough to exercise scrolling")
+	}
+	bottom, _ := model.Update("G")
+	view := bottom.View(now)
+	if !strings.Contains(view, "event 19") {
+		t.Fatalf("G did not reach the last line:\n%s", view)
+	}
+	if !strings.Contains(view, "▴") {
+		t.Fatalf("indicator does not report content above at the bottom:\n%s", view)
+	}
+	if strings.Contains(view, "▾") {
+		t.Fatalf("indicator still claims content below at the bottom:\n%s", view)
+	}
+	back, _ := bottom.Update("g")
+	if back.offset != 0 {
+		t.Fatalf("g did not return to the top: offset=%d", back.offset)
+	}
+}
+
+func TestScrollKeysStepHalfAScreenAndStopAtTheTop(t *testing.T) {
+	model := logFixture(t, 40, 21)
+	step := model.scrollStep()
+	if step < 1 {
+		t.Fatalf("scroll step is %d", step)
+	}
+	down, _ := model.Update("ctrl+d")
+	if down.offset != step {
+		t.Fatalf("ctrl+d moved to %d, want %d", down.offset, step)
+	}
+	paged, _ := down.Update("pgdown")
+	if paged.offset != 2*step {
+		t.Fatalf("pgdown moved to %d, want %d", paged.offset, 2*step)
+	}
+	up, _ := paged.Update("ctrl+u")
+	if up.offset != step {
+		t.Fatalf("ctrl+u moved to %d, want %d", up.offset, step)
+	}
+	// Scrolling up at the top must not go negative.
+	top, _ := up.Update("ctrl+u")
+	top, _ = top.Update("ctrl+u")
+	if top.offset != 0 {
+		t.Fatalf("scrolling past the top reached %d", top.offset)
+	}
+}
+
+func TestDriverClampsAScrollThatRanPastTheEnd(t *testing.T) {
+	// G sets an offset past any content; the frame knows the real length, so the
+	// driver corrects it and scrolling back responds on the first keypress.
+	view := newTestApp([]operator.Instance{{ID: "one", Liveness: operator.LivenessRunning,
+		Snapshot: &operator.Snapshot{State: "running"},
+		RecentLog: []operator.LogEvent{
+			{Time: time.Now(), Level: "INFO", Message: "one"},
+			{Time: time.Now(), Level: "INFO", Message: "two"},
+		}}}, nil)
+	view.model.layout, view.model.color = true, true
+	view.model.width, view.model.height = 100, 14
+	view.model.page = statusPage
+	view.model.offset = scrollToEnd
+	view.View()
+	if view.model.offset >= scrollToEnd {
+		t.Fatalf("driver left the offset past the end: %d", view.model.offset)
+	}
+}
+
+func TestOffsetResetsWhenTheContentBehindItChanges(t *testing.T) {
+	model := logFixture(t, 40, 20)
+	scrolled, _ := model.Update("ctrl+d")
+	if scrolled.offset == 0 {
+		t.Fatal("fixture did not scroll")
+	}
+	// A different page and a different instance are different content, so the
+	// viewport starts at the top rather than part way down someone else's page.
+	if moved, _ := scrolled.Update("c"); moved.offset != 0 {
+		t.Fatalf("changing page kept offset %d", moved.offset)
+	}
+	// A second instance, so that j has somewhere to move to.
+	twoUp := scrolled
+	twoUp.instances = append(append([]operator.Instance(nil), scrolled.instances...),
+		operator.Instance{ID: "com.pmrrasmussen.symphony.other", Liveness: operator.LivenessStopped})
+	if moved, _ := twoUp.Update("j"); moved.selected != 1 || moved.offset != 0 {
+		t.Fatalf("changing instance left selected=%d offset=%d", moved.selected, moved.offset)
+	}
+	// Refreshing in place must not throw away the reader's position.
+	held := scrolled
+	held.Refresh(held.instances, nil, time.Now())
+	if held.offset != scrolled.offset {
+		t.Fatalf("refresh reset the offset from %d to %d", scrolled.offset, held.offset)
+	}
+}
+
+func TestScrollKeysAreInertOnTheOverview(t *testing.T) {
+	now := time.Date(2026, 8, 25, 12, 0, 0, 0, time.UTC)
+	model := styledFixture([]operator.Instance{{ID: "one", Liveness: operator.LivenessRunning}}, now)
+	model.height = 20
+	for _, key := range []string{"ctrl+d", "ctrl+u", "g", "G", "pgdown", "pgup"} {
+		if moved, quit := model.Update(key); moved.offset != 0 || quit {
+			t.Fatalf("%s scrolled the overview: offset=%d quit=%v", key, moved.offset, quit)
+		}
+	}
+}
+
+func TestRedirectedDetailIsNeverScrolled(t *testing.T) {
+	now := time.Date(2026, 8, 25, 12, 0, 0, 0, time.UTC)
+	model := logFixture(t, 20, 20)
+	// The redirected surface has no window to fit and its frames are read by
+	// pipes, so it prints every line and no indicator.
+	model.layout, model.color = false, false
+	view := model.View(now)
+	for index := range 20 {
+		if want := fmt.Sprintf("event %d", index); !strings.Contains(view, want) {
+			t.Fatalf("redirected detail dropped %q:\n%s", want, view)
+		}
+	}
+	if strings.Contains(view, "▾") || strings.Contains(view, "ctrl+d") {
+		t.Fatalf("redirected detail carries a scroll indicator:\n%s", view)
 	}
 }
