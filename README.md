@@ -469,7 +469,10 @@ instead fixed by Symphony and cannot be widened from `WORKFLOW.md`:
   capability is then added to `--tools` and `--allowedTools` as an explicit
   `mcp__symphony__<capability>`, never as an `mcp__symphony__*` glob: the init
   echo below is checked for set equality, and a glob would let the CLI advertise
-  a capability Symphony never asked for and still pass.
+  a capability Symphony never asked for and still pass. Those two flags govern
+  what the *CLI* offers the model; what is *reachable* is bounded separately, by
+  the endpoint refusing any capability its registry does not advertise -- see
+  limit 5.
 * `--setting-sources ""` -- excludes user, project, and local settings. The
   worktree is a checkout of a repository that may ship its own
   `.claude/settings.json`, `CLAUDE.md`, skills, plugins, and hooks, and hooks
@@ -545,6 +548,20 @@ Four limits of that boundary, stated rather than implied:
    a session whose capability tools are advertised, so the model will call them,
    while every call returns a transport failure. The event does **not** report
    sandbox state, so the sandbox's own status is not observable in the stream.
+5. When a session has a capability endpoint, **the child holds its bearer token**
+   -- it is in the environment `Bash` runs with, and loopback is inside the
+   sandbox, since `network.allowedDomains` is `["*"]`. So the tool surface the
+   CLI enforces is not by itself a bound on what the child can invoke: a shell
+   command can read the URL out of its own `/proc/self/cmdline` and the token out
+   of its own environment and call the endpoint directly, and no `tool_use`
+   record appears for such a call anywhere. Two things bound it. The endpoint
+   refuses any capability the session's registry does not advertise, so a
+   directly addressed call can only reach what the model was already permitted
+   to call and therefore grants no authority it did not already have. And every
+   provider re-validates its own preconditions immediately before mutating
+   anything -- a landing re-checks the tracker state, a follow-up re-checks that
+   creation is enabled. What remains is an observability gap, stated rather than
+   claimed away: a capability invoked this way runs unrecorded.
 
 So the operative boundary has nearly the same shape as the Codex one: Bash
 writes confined, no host Linear or GitHub credential in the child environment

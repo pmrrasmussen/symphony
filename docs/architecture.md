@@ -280,6 +280,20 @@ CLI advertise a capability Symphony never asked for and still pass. Both the
 registry frozen when the session was built, so a mid-run configuration reload
 cannot make them disagree.
 
+Those flags bound what the CLI offers the model, and they are not by themselves
+a bound on what the child can invoke. The child's shell holds the bearer token
+-- it is in the environment `Bash` runs with -- and loopback is inside the
+sandbox, so a command can read the URL out of its own command line and address
+the endpoint directly, naming a capability that appeared in neither flag nor in
+`tools/list`, and no `tool_use` record is produced for it. The endpoint
+therefore refuses any capability its registry does not advertise, which makes
+the launch contract's set equality a statement about what is reachable and not
+only about what is advertised: a directly addressed call can reach nothing the
+model was not already permitted to call, so it grants no authority. Combined
+with each provider re-validating its own preconditions before it mutates
+anything, what is left is an observability gap -- such a call runs unrecorded --
+and that is stated in README.md rather than claimed away.
+
 The registration itself is per turn and is retired before the next turn's is
 minted, not merely at turn end. After a turn emits its terminal event its
 goroutine is still waiting on stderr, on `Wait`, and on the process-group kill,
