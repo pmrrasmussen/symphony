@@ -158,7 +158,10 @@ local observations without changing them:
 symphony tui
 ```
 
-The TUI is an ephemeral, read-only process. It scans convention-matching
+The TUI is an ephemeral, read-only process. In a terminal it takes over the
+window as a full-screen dashboard and restores the previous screen on exit; a
+selected instance opens Status, Config, and Validation pages, and the strip
+marks which one is open. It scans convention-matching
 LaunchAgents in `~/Library/LaunchAgents`, reads launchd state, each configured
 status snapshot, effective configuration, validation findings, and a bounded
 redacted log tail. In a terminal it repeats that scan every five seconds, and
