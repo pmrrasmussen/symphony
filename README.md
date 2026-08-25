@@ -515,7 +515,7 @@ attempts to write to `$HOME` and to `$TMPDIR` were refused with "operation not
 permitted" and created nothing -- and per-domain network control works in both
 directions, an allowed domain succeeding and a denied one failing.
 
-Four limits of that boundary, stated rather than implied:
+Five limits of that boundary, stated rather than implied:
 
 1. The sandbox governs `Bash` and its children, and Bash writes were verified
    confined. `Edit` and `Write` are **not** sandboxed and have no path
