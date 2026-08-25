@@ -862,6 +862,132 @@ func TestActiveIssueAtTurnLimitIsBlockedAndRetriedWithoutCompletionMarker(t *tes
 	}
 }
 
+// TestLandingWaitEndsRunWithoutTurnsAndSchedulesBoundedLandingRetry reproduces
+// the PMR-77 defect: a non-terminal landing wait must end the run at once
+// instead of spending the remaining turns on repeated landing calls and then a
+// turn-limit agent retry. The run instead ends as a wait, releases its
+// orchestrator slot, keeps the duplicate-prevention claim, and schedules one
+// delayed landing retry at the configured GitHub poll interval.
+func TestLandingWaitEndsRunWithoutTurnsAndSchedulesBoundedLandingRetry(t *testing.T) {
+	w := testSettings(t)
+	w.Config.Agent.MaxTurns = 20
+	w.Config.Agent.MaxRetryBackoff = 10 * time.Minute
+	w.Config.GitHub.PollInterval = 30 * time.Second
+	issue := testIssue()
+	var log syncBuffer
+	agent := &fakeAgent{events: landingWaitingEvents}
+	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{}, 1)}
+	c := New(&fakeTracker{issue: issue}, agent, ws, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&log, nil)))
+	c.clock = fakeClock{now: time.Date(2026, 8, 25, 9, 41, 0, 0, time.UTC)}
+	timer := &fakeTimer{signal: make(chan struct{}, 1)}
+	c.timer = timer
+
+	c.Tick(context.Background())
+	<-ws.after
+	<-timer.signal
+
+	starts, continues, cancels := agent.counts()
+	if starts != 1 || continues != 0 || cancels != 1 {
+		t.Fatalf("starts=%d continues=%d cancels=%d, want one start, no continuation turn, one cancel", starts, continues, cancels)
+	}
+	c.mu.Lock()
+	retry := c.retries[issue.ID]
+	claimed, admitted, running := c.claimed[issue.ID], len(c.admitted), len(c.running)
+	c.mu.Unlock()
+	if retry.kind != retryLanding || retry.reason != "landing_waiting" || retry.attempt != 0 {
+		t.Fatalf("retry=%+v, want an unescalated landing retry", retry)
+	}
+	if !claimed || admitted != 0 || running != 0 {
+		t.Fatalf("claimed=%v admitted=%d running=%d, want the claim held with no slot occupied", claimed, admitted, running)
+	}
+	if timer.scheduled() != 1 || timer.delays[0] != 30*time.Second {
+		t.Fatalf("landing retry delays=%v, want one github poll interval", timer.delays)
+	}
+	if _, marks, cleanups, _ := ws.counts(); marks != 0 || cleanups != 0 {
+		t.Fatalf("landing wait marks=%d cleanups=%d, want neither completion nor cleanup", marks, cleanups)
+	}
+	for _, want := range []string{`"msg":"agent landing waiting"`, `"operation":"landing_waiting"`, `"reason":"required checks are pending"`, `"msg":"landing wait retry scheduled"`, `"status":"waiting"`, `"retry_kind":"landing"`} {
+		waitForSubstring(t, &log, want, time.Second)
+	}
+	if records := log.String(); strings.Contains(records, "turn_limit_exhausted") || strings.Contains(records, `"msg":"agent run retry scheduled"`) {
+		t.Fatalf("landing wait logged an agent failure: %s", records)
+	}
+	if err := c.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestLandingResolvedEndsRunWithoutAnotherTurn covers the PMR-77 duplicate
+// terminal call: once landing merged the pull request and reconciled the issue,
+// the run ends immediately — even when this tracker refresh still reports the
+// issue active — so no later turn can call the landing tool again.
+func TestLandingResolvedEndsRunWithoutAnotherTurn(t *testing.T) {
+	w := testSettings(t)
+	w.Config.Agent.MaxTurns = 20
+	issue := testIssue()
+	var log syncBuffer
+	agent := &fakeAgent{events: landingResolvedEvents}
+	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{}, 1)}
+	c := New(&fakeTracker{issue: issue}, agent, ws, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&log, nil)))
+	c.clock = fakeClock{now: time.Date(2026, 8, 25, 9, 41, 0, 0, time.UTC)}
+	timer := &fakeTimer{}
+	c.timer = timer
+
+	c.Tick(context.Background())
+	<-ws.after
+	waitForRelease(t, c, issue.ID)
+
+	starts, continues, cancels := agent.counts()
+	if starts != 1 || continues != 0 || cancels != 1 {
+		t.Fatalf("starts=%d continues=%d cancels=%d, want one start, no continuation turn, one cancel", starts, continues, cancels)
+	}
+	if timer.scheduled() != 0 {
+		t.Fatalf("terminal landing scheduled %d retries, want none", timer.scheduled())
+	}
+	records := log.String()
+	if !strings.Contains(records, `"msg":"agent landing resolved"`) || !strings.Contains(records, `"operation":"landing_resolved"`) {
+		t.Fatalf("log missing the landing resolution record: %s", records)
+	}
+	if !strings.Contains(records, `"status":"succeeded"`) {
+		t.Fatalf("terminal landing did not finish the run successfully: %s", records)
+	}
+}
+
+// waitForRelease waits until a finished run has released its claim, which the
+// launch goroutine does after the workspace after_run hook.
+func waitForRelease(t *testing.T, c *Coordinator, id string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		c.mu.Lock()
+		claimed, running := c.claimed[id], len(c.running)
+		c.mu.Unlock()
+		if !claimed && running == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("run for %s never released its claim (claimed=%v running=%d)", id, claimed, running)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+func landingWaitingEvents() <-chan domain.Event {
+	ch := make(chan domain.Event, 2)
+	ch <- domain.Event{Kind: domain.EventItem, At: time.Now(), ItemID: "1", ItemType: "dynamicToolCall", ToolName: "github_land_pr", Outcome: domain.ItemCompleted}
+	ch <- domain.Event{Kind: domain.EventLandingWaiting, At: time.Now(), SessionID: "t-u", Message: "required checks are pending"}
+	close(ch)
+	return ch
+}
+
+func landingResolvedEvents() <-chan domain.Event {
+	ch := make(chan domain.Event, 2)
+	ch <- domain.Event{Kind: domain.EventItem, At: time.Now(), ItemID: "1", ItemType: "dynamicToolCall", ToolName: "github_land_pr", Outcome: domain.ItemCompleted}
+	ch <- domain.Event{Kind: domain.EventLandingResolved, At: time.Now(), SessionID: "t-u"}
+	close(ch)
+	return ch
+}
+
 func TestBoundedRunRefreshesAndContinuesSameSessionToExactMaxTurns(t *testing.T) {
 	w := testSettings(t)
 	w.Config.Agent.MaxTurns = 3

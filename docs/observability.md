@@ -50,6 +50,23 @@ mitigation is to disable the tracker's native PR-to-status automation (see the
 handoff without overriding a legitimate human reactivation is a deferred
 follow-up.
 
+Landing decisions Symphony settles for the agent are visible at info level
+too, so a pending GitHub gate is never mistaken for an agent problem. A
+non-terminal landing wait logs `"msg":"agent landing waiting"` with
+`operation: landing_waiting` and the bounded, host-generated `reason`
+(`required checks are pending`, `github has not yet computed mergeability`, …),
+followed by `"msg":"landing wait retry scheduled"` (same `operation`, plus
+`attempt` and `delay_ms`) and the ordinary `"msg":"agent retry scheduled"`
+record carrying `retry_kind: landing`. The run itself finishes as
+`"status":"waiting"` in `"msg":"agent logical run finished"` — deliberately
+distinct from the `blocked`/`failed` statuses and from an agent failure's
+warn-level `"msg":"agent run retry scheduled"` (`reason: turn_limit_exhausted`
+and friends). A terminal landing logs `"msg":"agent landing resolved"` with
+`operation: landing_resolved`, and the hard-gate fallback keeps its existing
+`"msg":"Linear transition"` record with `operation: landing_refused`. Together
+these four records distinguish waiting, the delayed retry, a hard refusal, and
+an agent failure without reading the Codex rollout.
+
 At startup, the info log also records `startup credential configuration` with
 `linear_credentials_configured` and `github_credentials_configured` booleans.
 They confirm that the required Linear credential and any configured GitHub

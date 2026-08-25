@@ -40,6 +40,19 @@ const (
 	// so on). It never carries tool arguments, command bodies, or outputs; see
 	// ItemID, ItemType, ToolName, Outcome, and DurationMs.
 	EventItem EventKind = "item"
+	// EventLandingWaiting reports that the host-side landing capability returned
+	// a non-terminal waiting result: required checks or GitHub's own
+	// mergeability computation have not settled, so no model turn can advance
+	// the issue. It is terminal for the logical run — the coordinator ends the
+	// session and schedules its own delayed landing retry instead of spending
+	// Codex turns or an agent-exhaustion retry (PMR-78). Message carries the
+	// bounded, host-generated waiting reason, never model or provider text.
+	EventLandingWaiting EventKind = "landing_waiting"
+	// EventLandingResolved reports a terminal landing outcome: the pull request
+	// is merged (by this call or already) and the bound issue was reconciled to
+	// its terminal state. It ends the logical run immediately so no later turn
+	// or landing tool call is possible for it (PMR-78).
+	EventLandingResolved EventKind = "landing_resolved"
 )
 
 // ItemOutcome enumerates the safe, protocol-derived lifecycle outcomes an
@@ -79,6 +92,10 @@ const (
 	RunTimedOut  RunStatus = "timed_out"
 	RunStalled   RunStatus = "stalled"
 	RunBlocked   RunStatus = "blocked"
+	// RunWaiting is a run that ended on a non-terminal host gate outside the
+	// agent's control (a landing wait). It is deliberately not a failure: the
+	// coordinator redispatches the same attempt after a bounded delay.
+	RunWaiting RunStatus = "waiting"
 )
 
 type Run struct {

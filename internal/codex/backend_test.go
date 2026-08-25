@@ -491,6 +491,21 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{}}'
 	}
 }
 
+// TestLandingDecisionsAreTerminalEventsForTheRun pins the PMR-78 contract the
+// landing tool handler relies on: a settled landing decision must close the
+// active event stream, so the coordinator ends the run instead of starting
+// another turn that could only call github_land_pr again.
+func TestLandingDecisionsAreTerminalEventsForTheRun(t *testing.T) {
+	for _, kind := range []domain.EventKind{domain.EventLandingWaiting, domain.EventLandingResolved} {
+		if !terminal(kind) {
+			t.Fatalf("event kind %q must be terminal for the run", kind)
+		}
+	}
+	if terminal(domain.EventItem) || terminal(domain.EventProgress) {
+		t.Fatal("non-terminal event kinds must not end the run")
+	}
+}
+
 func TestRejectedLinearAndGitHubToolsDoNotBlockTheTurn(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer r.Body.Close()

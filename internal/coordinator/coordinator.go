@@ -37,7 +37,13 @@ func (realClock) Now() time.Time { return time.Now() }
 type retryKind string
 
 const (
-	retryAgent        retryKind = "agent"
+	retryAgent retryKind = "agent"
+	// retryLanding is a coordinator-owned landing redispatch after the
+	// host-side landing capability reported a non-terminal wait. It is
+	// deliberately distinct from retryAgent: it is not an agent failure, it does
+	// not escalate the attempt, and its delay follows the GitHub poll interval
+	// instead of the failure backoff (PMR-78).
+	retryLanding      retryKind = "landing"
 	continuationDelay           = time.Second
 )
 
@@ -58,6 +64,32 @@ type turnLimitError struct{ limit int }
 
 func (e turnLimitError) Error() string {
 	return fmt.Sprintf("agent turn limit exhausted after %d turns while issue remains active", e.limit)
+}
+
+// landingWaitError means the host-side landing capability returned a
+// non-terminal waiting result: required checks or GitHub's own mergeability
+// computation have not settled, so no further model turn can advance the issue.
+// It is deliberately NOT an agent failure — the run ends, the worker slot is
+// released, and the coordinator redispatches the same attempt after a bounded
+// delay, so a wait consumes neither agent.max_turns nor the failure backoff
+// escalation (PMR-78). The reason is the github package's own fixed, bounded,
+// secret-free waiting string.
+type landingWaitError struct{ reason string }
+
+func (e landingWaitError) Error() string {
+	if e.reason == "" {
+		return "landing waiting"
+	}
+	return "landing waiting: " + e.reason
+}
+
+// landingWait reports whether an agent run ended on a landing wait.
+func landingWait(err error) (landingWaitError, bool) {
+	var wait landingWaitError
+	if errors.As(err, &wait) {
+		return wait, true
+	}
+	return landingWaitError{}, false
 }
 
 // blockedError carries only a normalized blocker category. Agent event text
@@ -161,6 +193,11 @@ type running struct {
 	// matching completion. It is the actionable answer to "what is Codex
 	// waiting on" for heartbeat and stall records.
 	outstanding *outstandingOp
+	// landingResolved records that this run's landing capability reported a
+	// terminal outcome (the pull request is merged and the issue reconciled to
+	// its terminal state). The run then ends without another turn even if the
+	// tracker refresh has not yet observed the transition (PMR-78).
+	landingResolved bool
 	// lastGeneric* coalesce repeated generic progress notifications (protocol
 	// methods Symphony does not otherwise classify) so an idle-looking but
 	// chatty protocol stream cannot flood the log.
@@ -741,6 +778,10 @@ func (c *Coordinator) launch(parent context.Context, i domain.Issue, attempt int
 			return
 		}
 		c.unreserve(i.ID)
+		if wait, ok := landingWait(consumeErr); ok {
+			c.finishLandingWait(parent, i, attempt, wait.reason)
+			return
+		}
 		c.finishFailure(parent, i, attempt, agentFailureReason(consumeErr), consumeErr)
 	}()
 	return true
@@ -802,6 +843,15 @@ func (c *Coordinator) runTurns(ctx context.Context, r *running, events <-chan do
 			}
 			return true, current, nil
 		}
+		c.mu.Lock()
+		landingResolved := r.landingResolved
+		c.mu.Unlock()
+		if landingResolved {
+			// Landing already merged the pull request and reconciled the issue.
+			// End the run here even when this refresh still reports the pre-merge
+			// state, so no later turn or landing tool call is possible (PMR-78).
+			return true, current, nil
+		}
 		if turnCount >= settings.Agent.MaxTurns {
 			return false, current, turnLimitError{limit: settings.Agent.MaxTurns}
 		}
@@ -817,6 +867,11 @@ func (c *Coordinator) runTurns(ctx context.Context, r *running, events <-chan do
 		r.run.TurnCount++
 		c.mu.Unlock()
 	}
+}
+
+func isLandingWait(err error) bool {
+	_, ok := landingWait(err)
+	return ok
 }
 
 func agentFailureReason(err error) string {
@@ -865,6 +920,8 @@ func (c *Coordinator) finishRun(r *running, completed bool, stopped stopReason, 
 		r.run.Status = domain.RunCanceled
 	case completed:
 		r.run.Status = domain.RunSucceeded
+	case isLandingWait(err):
+		r.run.Status = domain.RunWaiting
 	case agentFailureReason(err) == "agent_blocked", agentFailureReason(err) == "turn_limit_exhausted":
 		r.run.Status = domain.RunBlocked
 	case err != nil && strings.Contains(strings.ToLower(err.Error()), "timeout"):
@@ -903,7 +960,16 @@ func (c *Coordinator) consume(ctx context.Context, r *running, events <-chan dom
 				return false, blockedError{category: blockerCategory(e.Message)}
 			case domain.EventFailed:
 				return false, fmt.Errorf("agent failed: %s", e.Message)
-			case domain.EventCompleted:
+			case domain.EventLandingWaiting:
+				// A landing wait ends the run without another turn; the
+				// coordinator owns the delayed landing retry from here (PMR-78).
+				return false, landingWaitError{reason: observability.Text(e.Message)}
+			case domain.EventLandingResolved, domain.EventCompleted:
+				if e.Kind == domain.EventLandingResolved {
+					c.mu.Lock()
+					r.landingResolved = true
+					c.mu.Unlock()
+				}
 				// Reconciliation and event delivery can race. An event that
 				// arrives after reconciliation has canceled this run must never
 				// turn into a successful terminal outcome.
@@ -978,6 +1044,14 @@ func (c *Coordinator) logEvent(r *running, event domain.Event) {
 	case domain.EventDiagnostic:
 		attrs = append(attrs, "stderr", observability.Text(event.Message))
 		c.log.Warn("agent stderr", attrs...)
+	case domain.EventLandingWaiting:
+		// The reason is the github package's own fixed waiting string, so it is
+		// safe to log; it is still redacted defensively like every other text.
+		attrs = append(attrs, "operation", "landing_waiting", "reason", observability.Text(event.Message))
+		c.log.Info("agent landing waiting", attrs...)
+	case domain.EventLandingResolved:
+		attrs = append(attrs, "operation", "landing_resolved")
+		c.log.Info("agent landing resolved", attrs...)
 	case domain.EventItem:
 		c.logItemEvent(r, event, attrs)
 	default:
@@ -1172,6 +1246,40 @@ func (c *Coordinator) finishFailure(ctx context.Context, i domain.Issue, attempt
 	}
 	c.log.Warn("agent run retry scheduled", attrs...)
 	c.scheduleRetry(ctx, i, domain.Workspace{}, attempt+1, retryAgent, reason, backoff(attempt+1, c.settings().Agent.MaxRetryBackoff))
+}
+
+// finishLandingWait ends a run whose landing capability reported a
+// non-terminal wait. A wait is not an agent failure: the same attempt is
+// redispatched after landingRetryDelay, so it consumes neither Codex turns nor
+// the failure backoff escalation, and while the timer waits it holds only the
+// duplicate-prevention claim — never an orchestrator slot (PMR-78).
+func (c *Coordinator) finishLandingWait(ctx context.Context, i domain.Issue, attempt int, reason string) {
+	if ctx.Err() != nil {
+		c.log.Info("agent run cancelled", "issue_id", i.ID, "issue_identifier", i.Identifier, "reason", cancellationReason("", ctx))
+		c.release(i.ID)
+		return
+	}
+	delay := landingRetryDelay(c.settings())
+	c.log.Info("landing wait retry scheduled", "operation", "landing_waiting", "issue_id", i.ID, "issue_identifier", i.Identifier, "reason", reason, "attempt", attempt, "delay_ms", delay.Milliseconds())
+	c.scheduleRetry(ctx, i, domain.Workspace{}, attempt, retryLanding, "landing_waiting", delay)
+}
+
+// landingRetryDelay is the bounded delay before a waiting landing is
+// redispatched: the configured GitHub poll interval (the cadence at which
+// GitHub state is expected to change), falling back to the tracker poll
+// interval, and never longer than the configured retry backoff ceiling.
+func landingRetryDelay(s config.Settings) time.Duration {
+	delay := s.GitHub.PollInterval
+	if delay <= 0 {
+		delay = s.Polling.Interval
+	}
+	if delay <= 0 {
+		delay = continuationDelay
+	}
+	if ceiling := s.Agent.MaxRetryBackoff; ceiling > 0 && delay > ceiling {
+		delay = ceiling
+	}
+	return delay
 }
 
 func (c *Coordinator) scheduleRetry(ctx context.Context, i domain.Issue, ws domain.Workspace, attempt int, kind retryKind, reason string, delay time.Duration) {

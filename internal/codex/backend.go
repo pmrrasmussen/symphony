@@ -688,7 +688,7 @@ func githubContextToolDefinition() map[string]any {
 func githubLandToolDefinition() map[string]any {
 	return map[string]any{
 		"type": "function", "name": "github_land_pr",
-		"description": "Merge the pull request already bound to this issue, repository, base, and branch using the configured merge method, once required checks pass, reviews have no effective changes-requested state, and no review thread is unresolved. Returns a non-terminal waiting result while required checks or GitHub's mergeability computation are pending; with github.update_stale_branch enabled, one clean stale-base update also waits for checks on its new head. Other hard gates (failing checks, requested changes, unresolved threads, a stale base, conflicts, or a closed/mismatched PR) refuse landing. No repository, issue, branch, PR, method, state, or credential input.",
+		"description": "Merge the pull request already bound to this issue, repository, base, and branch using the configured merge method, once required checks pass, reviews have no effective changes-requested state, and no review thread is unresolved. Returns a non-terminal waiting result while required checks or GitHub's mergeability computation are pending; with github.update_stale_branch enabled, one clean stale-base update also waits for checks on its new head. A waiting or merged result ends this run: Symphony itself retries landing later, so never call this tool again after either outcome. Other hard gates (failing checks, requested changes, unresolved threads, a stale base, conflicts, or a closed/mismatched PR) refuse landing. No repository, issue, branch, PR, method, state, or credential input.",
 		"inputSchema": map[string]any{"type": "object", "additionalProperties": false},
 	}
 }
@@ -753,6 +753,13 @@ func (c *client) handleToolCall(x rpc) {
 		}
 		callID := callIDText(x.ID)
 		started := c.emitCallStarted(callID, "github_land_pr")
+		if c.github.LandingResolved() {
+			// Landing already reached its terminal outcome in this run, so the
+			// capability is closed: refuse without invoking it again (PMR-78).
+			c.emitCallFinished(callID, "github_land_pr", domain.ItemDeclined, started)
+			c.toolFailure(x.ID, "GitHub landing already completed for this run.")
+			return
+		}
 		result, err := c.github.Land(c.ctx)
 		if err != nil {
 			c.emitCallFinished(callID, "github_land_pr", domain.ItemFailed, started)
@@ -777,6 +784,16 @@ func (c *client) handleToolCall(x rpc) {
 		}
 		c.emitCallFinished(callID, "github_land_pr", domain.ItemCompleted, started)
 		c.sendServerResponse(x.ID, map[string]any{"success": true, "contentItems": []any{map[string]any{"type": "inputText", "text": string(content)}}})
+		// A settled landing decision ends the run: no further model turn or tool
+		// call can advance it, so report it as a terminal event instead of
+		// letting the session spend turns on repeated landing calls (PMR-78).
+		// Reason is a fixed, bounded string owned by the github package.
+		switch result.Status {
+		case githubhost.LandWaiting:
+			c.emit(domain.Event{Kind: domain.EventLandingWaiting, At: time.Now(), Message: result.Reason})
+		case githubhost.LandMerged:
+			c.emit(domain.Event{Kind: domain.EventLandingResolved, At: time.Now()})
+		}
 		return
 	}
 	if request.Tool == "create_followup_issue" && c.handoff != nil {
@@ -983,7 +1000,8 @@ func drain(r io.Reader, report func(string)) error {
 	}
 }
 func terminal(kind domain.EventKind) bool {
-	return kind == domain.EventBlocked || kind == domain.EventCompleted || kind == domain.EventFailed
+	return kind == domain.EventBlocked || kind == domain.EventCompleted || kind == domain.EventFailed ||
+		kind == domain.EventLandingWaiting || kind == domain.EventLandingResolved
 }
 func nestedString(m map[string]any, a, b string) (string, bool) {
 	x, ok := m[a].(map[string]any)
