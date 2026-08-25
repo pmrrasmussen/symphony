@@ -147,12 +147,19 @@ codex:
 # output -- under ~/.claude/projects/, outside the worktree; see README.md and
 # docs/observability.md.
 #
-# A claude workflow may not also configure tracker.provider.handoff_state,
-# tracker.provider.followup_issue_creation, or an enabled github: integration
-# below: no capability bridge to a Claude session exists yet, so that
-# combination is rejected at load instead of dispatching an agent that cannot
-# hand off or publish. (A github: block that does not resolve stays disabled and
-# so does not trigger the refusal; it grants nothing either way.) The service
+# A claude workflow may configure Symphony's session capabilities --
+# tracker.provider.handoff_state, tracker.provider.followup_issue_creation, and
+# an enabled github: integration below. They reach the session over a private
+# loopback MCP endpoint, so the CLI serves each one as mcp__symphony__<tool>;
+# Symphony's host-generated delivery guidance renders those names, so the prompt
+# body below needs no per-backend wording. Two combinations are rejected at load
+# for this backend: an enabled github: integration without handoff_state (the
+# scoped publish tool is then either absent, or advertised while the run is told
+# publishing is unavailable and a publish would leave the pull request created
+# and the issue untransitioned), and a handoff_state with neither an enabled
+# github: integration nor followup_issue_creation (nothing model-facing uses it).
+# Both stay valid under codex. (A github: block that does not resolve stays
+# disabled, so it configures nothing and reaches neither rule.) The service
 # user must already be logged in to the CLI; --dry-run checks that with a
 # read-only, time-bounded claude auth status.
 # claude:

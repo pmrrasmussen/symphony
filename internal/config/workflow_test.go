@@ -624,12 +624,47 @@ func TestHostSidePublishPromisedIsTheConditionTheGuidanceBranchesOn(t *testing.T
 		{Tracker: Tracker{HandoffState: "In Review"}},
 		{Tracker: Tracker{HandoffState: "In Review", FollowupIssueCreation: true}},
 		hostPublishSettings(),
+		{GitHub: GitHub{Enabled: true}, Tracker: Tracker{HandoffState: "   "}},
 	} {
 		for _, backend := range AgentBackends() {
 			promised := strings.Contains(s.DeliveryInstructions(backend), "Delivery mode: host-side publish")
 			if promised != s.HostSidePublishPromised() {
 				t.Fatalf("settings %+v backend %q: guidance promises publish=%v, HostSidePublishPromised=%v", s, backend, promised, s.HostSidePublishPromised())
 			}
+		}
+	}
+}
+
+// TestAnAllWhitespaceHandoffStateIsNoHandoffStateAtAll asserts the trim against
+// fixed expectations rather than against another predicate. The agreement test
+// above cannot cover it: DeliveryInstructions branches on
+// HostSidePublishPromised, so comparing the two agrees for any definition of the
+// predicate, trimmed or not.
+//
+// The value is unreachable through Load, but this predicate is now consumed by
+// internal/claude and internal/preflight, and every sibling that reads the same
+// field trims it. Untrimmed, the promise is true while the handoff session and
+// the GitHub session built from that field are both nil -- so the guidance
+// promises a publish, no session serves it, and every claude launch refuses at
+// session_start with retry and backoff.
+func TestAnAllWhitespaceHandoffStateIsNoHandoffStateAtAll(t *testing.T) {
+	s := Settings{GitHub: GitHub{Enabled: true}, Tracker: Tracker{HandoffState: "   "}}
+	if s.HostSidePublishPromised() {
+		t.Fatal("an all-whitespace handoff state promised host-side publish")
+	}
+	if s.LinearSessionCapabilityEnabled() {
+		t.Fatal("an all-whitespace handoff state asked for a bound Linear session")
+	}
+	if s.SessionCapabilityAdvertisable() {
+		t.Fatal("an all-whitespace handoff state reported a capability as advertisable")
+	}
+	for _, backend := range AgentBackends() {
+		guidance := s.DeliveryInstructions(backend)
+		if strings.Contains(guidance, HostSidePublishPromiseMarker) {
+			t.Fatalf("backend %q was promised host-side publish: %q", backend, guidance)
+		}
+		if !strings.Contains(guidance, "Delivery mode: manual") {
+			t.Fatalf("backend %q was not told delivery is manual: %q", backend, guidance)
 		}
 	}
 }
@@ -1639,23 +1674,59 @@ func TestClaudeBackendConfiguration(t *testing.T) {
 	})
 
 	t.Run("a capability no session could advertise is refused", func(t *testing.T) {
-		// Both ways to write one. A handoff_state with no GitHub integration
-		// prepares a Linear handoff object that nothing model-facing uses, and an
-		// enabled integration with no handoff_state never gets a GitHub session at
-		// all, because one is only prepared on top of a prepared handoff.
+		// After the handoff_state rule below, the only way left to write one: the
+		// handoff object is prepared and nothing model-facing uses it.
+		body := "---\ntracker: {kind: linear, provider: {api_key: k, handoff_state: In Review}, active_states: [Todo], terminal_states: [Done]}\n" +
+			"polling: {interval_ms: 100}\nworkspace: {root: work}\nhooks: {timeout_ms: 100}\nagent: {backend: claude}\n---\nbody"
+		_, err := Load(write(t, body), "logs")
+		if err == nil || !strings.Contains(err.Error(), "configures a Symphony session capability that no session could advertise") {
+			t.Fatalf("err=%v", err)
+		}
+	})
+
+	// TestClaudeBackendConfiguration's other subtests describe configurations that
+	// grant the model nothing. This one describes the opposite, and is the reason
+	// the rule is unconditional rather than a special case of "advertises
+	// nothing": with follow-up issues on, followup_issue_creation alone satisfies
+	// LinearSessionCapabilityEnabled, so a Linear handoff session exists, so a
+	// GitHub session is built on top of it, so github_publish_pr IS advertised --
+	// while DeliveryInstructions branches on HostSidePublishPromised and tells the
+	// run that publishing is unavailable. A worker that believes its tool list
+	// over the prompt reaches LinkAndHandoff with no target state, which comments
+	// the pull request onto the issue and then transitions it to nothing. The
+	// refusal would arrive after the pull request exists.
+	t.Run("an enabled github integration requires a handoff state", func(t *testing.T) {
 		t.Setenv("PMR52_GITHUB_TOKEN", "github-secret")
-		for name, front := range map[string]string{
-			"handoff state with no github integration": "tracker: {kind: linear, provider: {api_key: k, handoff_state: In Review}, active_states: [Todo], terminal_states: [Done]}\n",
-			"github integration with no handoff state": "tracker: {kind: linear, provider: {api_key: k}, active_states: [Todo], terminal_states: [Done]}\n" +
-				"github: {owner: pmrrasmussen, repository: symphony, token: $PMR52_GITHUB_TOKEN}\n",
+		for name, provider := range map[string]string{
+			"no other capability":      "{api_key: k}",
+			"with follow-up issues on": "{api_key: k, followup_issue_creation: true}",
 		} {
 			t.Run(name, func(t *testing.T) {
-				body := "---\n" + front + "polling: {interval_ms: 100}\nworkspace: {root: work}\nhooks: {timeout_ms: 100}\nagent: {backend: claude}\n---\nbody"
+				body := "---\ntracker: {kind: linear, provider: " + provider + ", active_states: [Todo], terminal_states: [Done]}\n" +
+					"github: {owner: pmrrasmussen, repository: symphony, token: $PMR52_GITHUB_TOKEN}\n" +
+					"polling: {interval_ms: 100}\nworkspace: {root: work}\nhooks: {timeout_ms: 100}\nagent: {backend: claude}\n---\nbody"
 				_, err := Load(write(t, body), "logs")
-				if err == nil || !strings.Contains(err.Error(), "configures a Symphony session capability that no session could advertise") {
+				if err == nil || !strings.Contains(err.Error(), "requires tracker.provider.handoff_state for an enabled github integration") {
 					t.Fatalf("err=%v", err)
 				}
 			})
+		}
+	})
+
+	// The same configuration stays valid for codex. The prompt/advertisement
+	// mismatch above is pre-existing there and is deliberately not fixed by this
+	// rule: narrowing codex would reject workflows already in the field.
+	t.Run("codex still accepts github without a handoff state", func(t *testing.T) {
+		t.Setenv("PMR52_GITHUB_TOKEN", "github-secret")
+		body := "---\ntracker: {kind: linear, provider: {api_key: k, followup_issue_creation: true}, active_states: [Todo], terminal_states: [Done]}\n" +
+			"github: {owner: pmrrasmussen, repository: symphony, token: $PMR52_GITHUB_TOKEN}\n" +
+			"polling: {interval_ms: 100}\nworkspace: {root: work}\nhooks: {timeout_ms: 100}\nagent: {backend: codex}\n---\nbody"
+		w, err := Load(write(t, body), "logs")
+		if err != nil {
+			t.Fatalf("codex workflow was rejected: %v", err)
+		}
+		if !w.Config.GitHub.Enabled || w.Config.Tracker.HandoffState != "" {
+			t.Fatalf("fixture does not exercise the combination: %+v", w.Config.GitHub.Enabled)
 		}
 	})
 

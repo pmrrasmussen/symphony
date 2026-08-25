@@ -1035,24 +1035,29 @@ func continuationGuidance(turn, maxTurns int) string {
 	// has no continuation-prompt field. Generate its prescribed guidance here
 	// so continuation turns do not resend the repository task template.
 	//
-	// This text is backend-neutral on purpose: "workpad" and "thread" were Codex
-	// vocabulary, and a Claude turn has neither. The tool-naming line is
-	// belt-and-braces rather than the fix for anything -- the naming rule that
-	// matters lives in config.DeliveryInstructions, which every fresh dispatch
-	// renders, and a resume replays that initial prompt. Which is also the rule
-	// for what may live where: anything that varies from turn to turn belongs
-	// here, and the name mapping is safe in DeliveryInstructions only because the
-	// advertised set is frozen when the session's registry is built (landAdvertised
-	// reads Issue.State once, at Build time) and no later turn can change it. A
-	// landing_waiting redispatch is not a continuation: it goes through
-	// scheduleRetry/retryLanding to a fresh Start and therefore a fresh render.
+	// This text is backend-neutral on purpose, and neutral in both directions.
+	// "workpad" and "thread" were Codex vocabulary and a Claude turn has neither;
+	// a note about tool-name prefixes is Claude vocabulary and a Codex turn has no
+	// prefix, so it does not belong here either. One shared prompt cannot carry
+	// either transport's wording, and the rule that decides what may live here is
+	// what rules it out: anything that varies from turn to turn belongs in this
+	// function, and everything else belongs in the initial prompt.
+	//
+	// The tool naming is emphatically the second kind. config.DeliveryInstructions
+	// renders it, every fresh dispatch renders that, and a resume replays it --
+	// and it is safe there because the advertised set is frozen when the session's
+	// registry is built (capability.landAdvertised reads Issue.State once, at
+	// Build time) and no later turn can change it. A landing_waiting redispatch is
+	// not a continuation: it goes through scheduleRetry/retryLanding to a fresh
+	// Start and therefore a fresh render. So there is nothing for a continuation
+	// turn to correct, and adding a note anyway only leaked one backend's
+	// vocabulary into the other's prompt.
 	return fmt.Sprintf(`Continuation guidance:
 
 - The previous agent turn completed normally, but the tracker work item is still in an active state.
 - This is continuation turn #%d of %d for the current agent run.
 - Resume from the current workspace and session state instead of restarting from scratch.
 - The original task instructions and prior turn context are already present in this session, so do not restate them before acting.
-- Symphony's bounded tools keep whatever names your current tool list gives them, prefix included; call one by that name rather than by a bare name quoted earlier in this session.
 - Focus on the remaining ticket work and do not end the turn while the issue stays active unless you are truly blocked.`, turn, maxTurns)
 }
 

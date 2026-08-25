@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/pmrrasmussen/symphony/internal/config"
 )
 
 func TestRunExercisesLifecycleWithoutCreatingConfiguredState(t *testing.T) {
@@ -82,56 +84,59 @@ func TestRunReportsSafeLegacyProjectMigrationWarning(t *testing.T) {
 }
 
 // TestTheHandoffCheckReportsExactlyWhatAWorkerWillBeTold pins the github_handoff
-// result to the same predicate the rendered delivery guidance branches on. An
-// enabled GitHub integration is not on its own a publishing capability -- the
-// scoped session is only prepared on top of a review handoff -- so reporting one
-// as available would have preflight promise what the worker is then told is
-// unavailable.
+// result to the rendered delivery guidance, by comparing the two rather than by
+// restating the condition a third time. An enabled GitHub integration is not on
+// its own a publishing capability -- the scoped session is prepared only on top
+// of a review handoff -- so reporting one as available would have preflight
+// promise what the worker is then told is unavailable.
+//
+// Each row states its inputs independently of its expectation, and the
+// expectation is read out of config.DeliveryInstructions rather than written
+// down, so a row cannot agree with itself.
 func TestTheHandoffCheckReportsExactlyWhatAWorkerWillBeTold(t *testing.T) {
 	t.Setenv("PMR52_PREFLIGHT_TOKEN", "github-secret")
-	for name, tc := range map[string]struct {
-		front string
-		want  Status
-	}{
-		"github enabled with no handoff state": {
-			front: "github: {owner: o, repository: r, token: $PMR52_PREFLIGHT_TOKEN}\n",
-			want:  StatusWarning,
-		},
-		"github enabled with a handoff state": {
-			front: "github: {owner: o, repository: r, token: $PMR52_PREFLIGHT_TOKEN}\n",
-			want:  StatusPassed,
-		},
-		"no github integration": {want: StatusWarning},
+	const githubBlock = "github: {owner: o, repository: r, token: $PMR52_PREFLIGHT_TOKEN}\n"
+	for name, tc := range map[string]struct{ handoff, github string }{
+		"github enabled with no handoff state": {github: githubBlock},
+		"github enabled with a handoff state":  {handoff: ", handoff_state: In Review", github: githubBlock},
+		"a handoff state with no github":       {handoff: ", handoff_state: In Review"},
+		"neither":                              {},
 	} {
 		t.Run(name, func(t *testing.T) {
 			dir := t.TempDir()
 			workflow := filepath.Join(dir, "WORKFLOW.md")
-			handoff := ""
-			if tc.want == StatusPassed {
-				handoff = ", handoff_state: In Review"
-			}
 			content := "---\n" +
-				"tracker:\n  kind: linear\n  provider: {project_slug_id: preflight, api_key: not-a-live-key" + handoff + "}\n" +
+				"tracker:\n  kind: linear\n  provider: {project_slug_id: preflight, api_key: not-a-live-key" + tc.handoff + "}\n" +
 				"  active_states: [Todo]\n  terminal_states: [Done]\n" +
-				tc.front +
+				tc.github +
 				"workspace: {root: " + filepath.Join(dir, "workspaces") + ", source_root: " + dir + "}\n" +
 				"codex: {command: go}\n" +
 				"---\nWork on {{.issue.identifier}}"
 			if err := os.WriteFile(workflow, []byte(content), 0o600); err != nil {
 				t.Fatal(err)
 			}
-			result := Run(context.Background(), workflow, filepath.Join(dir, "logs"))
+			w, err := config.Load(workflow, filepath.Join(dir, "logs"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			// The expectation: what a worker on this workflow is actually told.
+			promised := strings.Contains(w.Config.DeliveryInstructions(w.Config.Agent.Backend), config.HostSidePublishPromiseMarker)
 			var got Status
-			for _, check := range result.Checks {
+			for _, check := range result(t, workflow, dir).Checks {
 				if check.Name == "github_handoff" {
 					got = check.Status
 				}
 			}
-			if got != tc.want {
-				t.Fatalf("github_handoff status=%q, want %q: %+v", got, tc.want, result.Checks)
+			if passed := got == StatusPassed; passed != promised {
+				t.Fatalf("preflight reports publish available=%v (%q) but the rendered guidance promises it=%v", passed, got, promised)
 			}
 		})
 	}
+}
+
+func result(t *testing.T, workflow, dir string) Result {
+	t.Helper()
+	return Run(context.Background(), workflow, filepath.Join(dir, "logs"))
 }
 
 func writeWorkflow(t *testing.T, path, workspaceRoot, command, beforeRun string) {

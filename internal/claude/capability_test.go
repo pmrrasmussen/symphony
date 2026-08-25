@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -1364,26 +1363,208 @@ func TestStartRefusesToRunAPromiseTheSessionCannotKeep(t *testing.T) {
 	}
 }
 
-// TestAnAdvertisedPublishCapabilitySatisfiesTheGuard is the other half: the guard
-// must not be a blanket refusal of a GitHub-enabled Claude workflow. Without
-// this, deleting the advertised-set term and refusing every promised publish
-// would still pass the test above.
-func TestAnAdvertisedPublishCapabilitySatisfiesTheGuard(t *testing.T) {
-	settings := config.Settings{
+// TestTheGuardRefusesEachDivergenceItClaimsToCover exercises verifyPromises
+// directly, over the three failures it distinguishes and the sessions it must
+// not refuse.
+//
+// It replaces a test that asserted two independent facts and never evaluated the
+// guard at all: mutating the guard into a blanket refusal of every promised
+// publish left that test passing, and only a pre-existing test caught it. The
+// acceptance rows here are what make a blanket refusal fail.
+func TestTheGuardRefusesEachDivergenceItClaimsToCover(t *testing.T) {
+	publish := capability.NameGitHubPublishPR
+	bound := config.Settings{
 		Tracker: config.Tracker{HandoffState: "In Review"},
-		GitHub:  config.GitHub{Enabled: true, MergeState: "Merging"},
+		GitHub:  config.GitHub{Enabled: true},
 	}
-	registry := capability.Build(capability.Bindings{
-		Settings: settings,
-		Issue:    domain.Issue{ID: "issue-1", Identifier: "PMR-52", State: "In Progress"},
-		Handoff:  &linear.HandoffSession{},
-		GitHub:   &githubhost.Session{},
-	})
-	advertised := advertisedNames(registry)
-	if !slices.Contains(advertised, capability.NameGitHubPublishPR) {
-		t.Fatalf("advertised=%v, want the publish capability a promised session must serve", advertised)
+	prefixedPrompt := "task\n\n" + bound.DeliveryInstructions(config.ClaudeAgentBackend)
+	barePrompt := "task\n\n" + bound.DeliveryInstructions(config.DefaultAgentBackend)
+
+	for name, tc := range map[string]struct {
+		settings   config.Settings
+		prompt     string
+		advertised []string
+		want       string
+	}{
+		"a fully bound session is accepted": {
+			settings: bound, prompt: prefixedPrompt, advertised: []string{publish, capability.NameGitHubPRContext},
+		},
+		"a manual run with nothing advertised is accepted": {
+			settings: config.Settings{}, prompt: "task\n\n" + (config.Settings{}).DeliveryInstructions(config.ClaudeAgentBackend),
+		},
+		"a follow-up-only session is accepted": {
+			settings:   config.Settings{Tracker: config.Tracker{FollowupIssueCreation: true}},
+			prompt:     "task\n\n" + config.Settings{Tracker: config.Tracker{FollowupIssueCreation: true}}.DeliveryInstructions(config.ClaudeAgentBackend),
+			advertised: []string{capability.NameCreateFollowupIssue},
+		},
+		// The settings term: this snapshot promises publish and the session
+		// serves none, which is the degenerate-identifier route.
+		"settings promise publish with nothing advertised": {
+			settings: bound, prompt: prefixedPrompt, want: "advertises no " + publish,
+		},
+		// The prompt term, and the reload this guard exists for: the prompt was
+		// rendered while github was enabled, the snapshot read here has it
+		// disabled, so the settings term is false and only the prompt sees it.
+		"a reload disabled github after the prompt was rendered": {
+			settings: config.Settings{}, prompt: prefixedPrompt, want: "advertises no " + publish,
+		},
+		// The reverse direction: publish reachable with no state to hand off to.
+		"publish advertised with no handoff state": {
+			settings: config.Settings{GitHub: config.GitHub{Enabled: true}}, prompt: barePrompt,
+			advertised: []string{publish}, want: "no tracker.provider.handoff_state",
+		},
+		// The naming term, which is the defect this pull request exists to fix:
+		// a prompt rendered for the wrong backend names the bare tool while the
+		// CLI is pinned to the prefixed one.
+		// The row that matters most, and the one whose absence let a guard that
+		// refused any bare mention look correct: a real dispatch prompt is a
+		// repository-owned body that names Symphony's tools bare, followed by the
+		// guidance that maps them. This must be accepted -- this repository's own
+		// WORKFLOW.md body names them seven times -- or every claude dispatch
+		// refuses at session_start.
+		"a repository body naming tools bare under the mapping rule is accepted": {
+			settings: bound,
+			prompt: "Call github_publish_pr once the worktree is clean, read github_pr_context for\n" +
+				"feedback, call github_land_pr in Merging, and use create_followup_issue for\n" +
+				"out-of-scope work.\n\n" + bound.DeliveryInstructions(config.ClaudeAgentBackend),
+			advertised: []string{publish, capability.NameGitHubPRContext},
+		},
+		// The same body with the guidance rendered for the wrong backend: the
+		// bare names are now unmapped, which is the whole failure.
+		"a repository body naming tools bare with no mapping rule is refused": {
+			settings: bound,
+			prompt: "Call github_publish_pr once the worktree is clean.\n\n" +
+				bound.DeliveryInstructions(config.DefaultAgentBackend),
+			advertised: []string{publish, capability.NameGitHubPRContext},
+			want:       "naming rule to map it",
+		},
+		// A whitespace-only handoff state promises nothing, prepares nothing, and
+		// must therefore not be refused. Without the TrimSpace in
+		// HostSidePublishPromised the promise is true, the session serves nothing,
+		// and every launch refuses at session_start with retry and backoff.
+		"a whitespace handoff state neither promises nor refuses": {
+			settings: config.Settings{GitHub: config.GitHub{Enabled: true}, Tracker: config.Tracker{HandoffState: "   "}},
+			prompt:   "task",
+		},
+		"the prompt names an advertised tool bare": {
+			settings: bound, prompt: barePrompt, advertised: []string{publish, capability.NameGitHubPRContext},
+			want: "naming rule to map it",
+		},
+		"a bare name with no mapping rule at all is refused": {
+			settings:   config.Settings{Tracker: config.Tracker{FollowupIssueCreation: true}},
+			prompt:     "capture leftovers with create_followup_issue",
+			advertised: []string{capability.NameCreateFollowupIssue},
+			want:       "naming rule to map it",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := verifyPromises(tc.settings, tc.prompt, tc.advertised)
+			if tc.want == "" {
+				if err != nil {
+					t.Fatalf("a consistent session was refused: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("a divergent session was accepted")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("refusal %q does not report %q", err, tc.want)
+			}
+		})
 	}
-	if !settings.HostSidePublishPromised() {
-		t.Fatal("these settings do not promise host-side publish")
+}
+
+// TestStartRefusesAPromptRenderedForTheWrongBackend is the naming refusal through
+// Start rather than through verifyPromises, on a session whose providers are all
+// really bound. It is the launch-time half of what the coordinator's dispatch
+// test asserts at the other end: between them, a prompt rendered for the wrong
+// backend fails at the call site and at the launch.
+func TestStartRefusesAPromptRenderedForTheWrongBackend(t *testing.T) {
+	backend, dir, settings := boundBackend(t)
+	// This session advertises publish and context, so the init echo has to name
+	// both prefixed tools and the connected server, or verifyInit refuses the
+	// accepted launch below for an unrelated reason.
+	tools := allCodingTools
+	for _, name := range []string{capability.NameGitHubPublishPR, capability.NameGitHubPRContext} {
+		tools += `,"` + mcpToolName(name) + `"`
 	}
+	script := writeFakeClaude(t, dir, "cat <<'EOF'\n"+
+		`{"type":"system","subtype":"init","cwd":"`+workspaceOf(dir)+`","permissionMode":"dontAsk","tools":[`+tools+
+		`],"mcp_servers":[{"name":"symphony","status":"connected"}]}`+"\n"+resultLine(false, "")+"\nEOF\n")
+	r := request(t, dir, script)
+	r.Issue = domain.Issue{ID: "issue-1", Identifier: "PMR-52", State: "In Progress"}
+	// Exactly what the coordinator would hand this session if it resolved the
+	// backend wrongly: valid guidance, bare tool names.
+	r.Prompt = "task\n\n" + settings.DeliveryInstructions(config.DefaultAgentBackend)
+
+	agentSession, events, err := backend.Start(context.Background(), r)
+	if err == nil {
+		t.Fatalf("a prompt naming tools this session does not serve was accepted: %+v", agentSession)
+	}
+	if !strings.Contains(err.Error(), config.MCPToolPrefix) {
+		t.Fatalf("the refusal does not name the missing prefix: %v", err)
+	}
+	if events != nil {
+		t.Fatal("a refused launch returned an event stream")
+	}
+	if _, statErr := os.Stat(filepath.Join(dir, "args.txt")); statErr == nil {
+		t.Fatal("the refused launch still spawned the CLI")
+	}
+
+	// And the same session with the prompt it should have been given starts and
+	// completes, so the refusal above is about the naming and not about the
+	// session.
+	r.Prompt = "task\n\n" + settings.DeliveryInstructions(config.ClaudeAgentBackend)
+	if _, events, err = backend.Start(context.Background(), r); err != nil {
+		t.Fatalf("a correctly rendered prompt was refused: %v", err)
+	}
+	if lastKind(t, drain(t, events)).Kind != domain.EventCompleted {
+		t.Fatal("a consistent session did not complete")
+	}
+}
+
+// boundBackend is a Claude backend whose Linear and GitHub providers really do
+// prepare sessions, against a scripted tracker. It is the fixture for asserting
+// what Start does with a session that has every capability available to it.
+func boundBackend(t *testing.T) (*Backend, string, config.Settings) {
+	t.Helper()
+	tracker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		var query struct {
+			Query string `json:"query"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&query); err != nil {
+			t.Error(err)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.Contains(query.Query, "SymphonyLinearHandoffIssue"):
+			_, _ = w.Write([]byte(`{"data":{"issue":{"id":"issue-1","identifier":"PMR-52","title":"Parity","description":"safe",` +
+				`"url":"https://linear.app/issue/PMR-52","project":{"id":"project-uuid","slugId":"project-1"},` +
+				`"team":{"id":"team-1"},"state":{"id":"progress","name":"In Progress"}}}}`))
+		case strings.Contains(query.Query, "SymphonyLinearHandoffStates"):
+			_, _ = w.Write([]byte(`{"data":{"team":{"id":"team-1","states":{"nodes":[{"id":"review","name":"In Review"}]}}}}`))
+		default:
+			t.Errorf("unexpected query: %s", query.Query)
+		}
+	}))
+	t.Cleanup(tracker.Close)
+	settings := config.Settings{
+		Tracker: config.Tracker{
+			Provider:     map[string]any{"api_key": "linear-api-secret", "project_slug_id": "project-1", "endpoint": tracker.URL},
+			ActiveStates: []string{"In Progress"},
+			HandoffState: "In Review",
+		},
+		GitHub: config.GitHub{Enabled: true, Owner: "owner", Repository: "repo", BaseBranch: "main",
+			Token: "github-token-secret", Endpoint: tracker.URL},
+	}
+	snapshot := func() config.Settings { return settings }
+	endpoint, err := mcpbridge.Listen()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = endpoint.Close(context.Background()) })
+	return NewWithProviders(snapshot, linear.NewHandoff(snapshot), githubhost.New(snapshot, nil), endpoint), t.TempDir(), settings
 }

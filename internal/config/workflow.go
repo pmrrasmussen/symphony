@@ -522,30 +522,49 @@ func decode(raw map[string]any, base, path, logRoot string, sources *sourceSnaps
 		// A Claude session may now hold Symphony's bounded capabilities: the
 		// transport is the private loopback MCP endpoint, DeliveryInstructions
 		// renders the MCP tool names for this backend, and claude.Backend.Start
-		// refuses a launch whose prompt promises a capability its own registry
-		// does not advertise. What is left is this residual rule, which is
-		// narrower than the refusal it replaces and is about configuration that
-		// grants the model nothing.
+		// cross-checks the rendered prompt against what the session it is about
+		// to start can serve. What is left are two residual rules, both narrower
+		// than the blanket refusal they replace, and both refused only for this
+		// backend.
 		//
-		// A workflow that configures a session capability no session could ever
-		// advertise is refused rather than silently degraded. The two ways to
-		// write one are a handoff_state with no enabled github integration, and
-		// an enabled github integration with no handoff_state: in both, a
-		// capability was asked for and the resulting session serves none, since
-		// a GitHub session is only prepared on top of a prepared Linear handoff
-		// session and handoff_state alone drives nothing model-facing.
+		// Rule one: an enabled github integration requires handoff_state. With
+		// one, host-side publish works. Without one there are two outcomes and
+		// neither is acceptable. If follow-up issues are off, no Linear handoff
+		// session is prepared, so no GitHub session is either, and the enabled
+		// integration grants nothing. If follow-up issues are on, a handoff
+		// session *is* prepared -- LinearSessionCapabilityEnabled is satisfied by
+		// followup_issue_creation alone -- so a GitHub session is built and
+		// github_publish_pr and github_pr_context are advertised, while
+		// DeliveryInstructions branches on HostSidePublishPromised and tells the
+		// model publishing is unavailable. That second case is the dangerous one,
+		// and not merely because the prompt disagrees with the tool list: the
+		// guidance tells a Claude worker its tool list decides availability, and a
+		// worker that acts on the advertised tool reaches
+		// HandoffSession.LinkAndHandoff with an empty targetStateID, which
+		// comments the pull request onto the issue and then attempts a Linear
+		// transition to no state at all. The refusal arrives after an
+		// irreversible GitHub mutation. Refusing the configuration is the only
+		// place this is cheap.
 		//
-		// It is refused only for this backend, and both halves of that are
-		// deliberate. Under codex the same configuration is equally inert, and it
-		// stays accepted there because it always has been -- narrowing it would
-		// reject workflows already in the field for no new safety. Under claude
-		// it is worth refusing, because "no MCP server at all" in the init echo
-		// is the only externally visible difference between a session that was
-		// configured to have no capability and one whose configured capability
-		// could not be reached; keeping those two states from sharing a
-		// representation is what makes the Codex-parity launch path in
-		// internal/claude mean what it says. This is a new backend with no
-		// deployed configurations, so it can be strict where codex cannot.
+		// Rule two: a configured capability that no session could advertise is
+		// refused rather than silently degraded. After rule one the only way left
+		// to write one is a handoff_state with no enabled github integration and
+		// no follow-up issues: the handoff object is prepared and nothing
+		// model-facing uses it.
+		//
+		// Both are claude-only, and that is deliberate in both directions. Under
+		// codex these configurations behave identically -- the advertisement is
+		// the same registry's -- and they stay accepted there because they always
+		// have been; narrowing them would reject workflows already in the field,
+		// and the prompt/advertisement mismatch rule one describes is pre-existing
+		// under codex and is not fixed here. Under claude they are worth refusing:
+		// this is a new backend with no deployed configurations, and "no MCP
+		// server at all" in the init echo then keeps a single meaning -- this
+		// workflow configures no capability -- rather than also standing for a
+		// capability that was configured and could not be reached.
+		if s.GitHub.Enabled && strings.TrimSpace(s.Tracker.HandoffState) == "" {
+			return s, errors.New("invalid configuration: agent.backend claude requires tracker.provider.handoff_state for an enabled github integration: without it the scoped publish capability either cannot be prepared at all or is advertised while the run is told host-side publishing is unavailable")
+		}
 		if (s.LinearSessionCapabilityEnabled() || s.GitHub.Enabled) && !s.SessionCapabilityAdvertisable() {
 			return s, errors.New("invalid configuration: agent.backend claude configures a Symphony session capability that no session could advertise: pair tracker.provider.handoff_state with an enabled github integration, or enable tracker.provider.followup_issue_creation")
 		}
@@ -1074,6 +1093,14 @@ func (s Settings) LinearSessionCapabilityEnabled() bool {
 	return strings.TrimSpace(s.Tracker.HandoffState) != "" || s.Tracker.FollowupIssueCreation
 }
 
+// HostSidePublishPromiseMarker opens the host-side publish delivery mode. It is
+// exported because it is the only part of the rendered prompt another package
+// reads: internal/claude's launch guard compares what the prompt actually says
+// against what the session it is about to start can actually serve, and reading
+// the artifact is strictly stronger than re-deriving the promise from settings --
+// the prompt was rendered from a settings snapshot the backend never sees.
+const HostSidePublishPromiseMarker = "Delivery mode: host-side publish is available for this run."
+
 // HostSidePublishPromised reports whether a run under these settings is told
 // that host-side publish is available. It is the exact condition
 // DeliveryInstructions branches on, named so that a backend can cross-check the
@@ -1084,8 +1111,16 @@ func (s Settings) LinearSessionCapabilityEnabled() bool {
 // promise the session cannot keep is a comparison made at launch, and a
 // comparison against a paraphrase of this condition would drift from the branch
 // it is meant to mirror. internal/claude.Backend.Start is the caller.
+//
+// HandoffState is trimmed for the same reason every sibling predicate trims it
+// (LinearSessionCapabilityEnabled here, linear.PrepareWithSettings,
+// capability.landAdvertised): an all-whitespace value is unreachable through
+// Load, but this predicate is now consumed by two other packages, and an
+// untrimmed one would make the promise true while the handoff session and the
+// GitHub session built from the same field are both nil -- every launch then
+// refusing at session_start, with retry and backoff.
 func (s Settings) HostSidePublishPromised() bool {
-	return s.GitHub.Enabled && s.Tracker.HandoffState != ""
+	return s.GitHub.Enabled && strings.TrimSpace(s.Tracker.HandoffState) != ""
 }
 
 // SessionCapabilityAdvertisable reports whether any bounded capability could be
@@ -1098,9 +1133,17 @@ func (s Settings) HostSidePublishPromised() bool {
 // capability is reachable for some issue -- which is why it is what the Claude
 // residual configuration rule and the tool-naming guidance below both use.
 //
-// The github term is HostSidePublishPromised rather than GitHub.Enabled because
-// a GitHub session is prepared only on top of a prepared Linear handoff session,
-// so an enabled integration with no handoff_state advertises nothing.
+// The github term is HostSidePublishPromised rather than GitHub.Enabled, and the
+// reason is narrower than it looks. A GitHub session is prepared only on top of a
+// prepared Linear handoff session, but followup_issue_creation alone prepares one
+// -- see LinearSessionCapabilityEnabled -- so an enabled integration with no
+// handoff_state does advertise github_publish_pr and github_pr_context whenever
+// follow-up issues are on. It is not the case that such a configuration
+// advertises nothing. What makes the term correct anyway is that the boolean is
+// already true through the FollowupIssueCreation term in exactly that case; and
+// that configuration is separately refused for claude, because advertising
+// publish with no handoff state is worse than advertising nothing. See the
+// residual rule in decode.
 func (s Settings) SessionCapabilityAdvertisable() bool {
 	return s.Tracker.FollowupIssueCreation || s.HostSidePublishPromised()
 }
@@ -1117,6 +1160,13 @@ func (s Settings) SessionCapabilityAdvertisable() bool {
 // launcher's server name into the workflow schema -- would make a transport
 // detail look like repository policy and let a workflow rename it.
 const MCPToolPrefix = "mcp__symphony__"
+
+// MCPNamingRuleMarker opens the tool-naming rule the Claude branch of
+// DeliveryInstructions prepends. Like HostSidePublishPromiseMarker it is exported
+// because internal/claude's launch guard reads the rendered prompt: a prompt that
+// names a capability without the prefix is safe exactly when it also carries this
+// rule, and unsafe otherwise.
+const MCPNamingRuleMarker = "Tool naming: Symphony's bounded tools reach you through a single MCP server"
 
 // DeliveryInstructions describe the only PR delivery capability available to
 // a worker. Host-generated guidance prevents a stale repository prompt from
@@ -1153,12 +1203,12 @@ func (s Settings) DeliveryInstructions(backend string) string {
 	preamble := ""
 	if backend == ClaudeAgentBackend && s.SessionCapabilityAdvertisable() {
 		tool = func(name string) string { return MCPToolPrefix + name }
-		preamble = `Tool naming: Symphony's bounded tools reach you through a single MCP server, so each one is named ` + MCPToolPrefix + `<tool> and not <tool>. Wherever these instructions or the task above name a Symphony tool without that prefix, call ` + MCPToolPrefix + ` followed by that name. Your own tool list decides availability: a Symphony tool that is not in it is unavailable for this run, whatever the instructions say.
+		preamble = MCPNamingRuleMarker + `, so each one is named ` + MCPToolPrefix + `<tool> and not <tool>. Wherever these instructions or the task above name a Symphony tool without that prefix, call ` + MCPToolPrefix + ` followed by that name. Your own tool list decides availability: a Symphony tool that is not in it is unavailable for this run, whatever the instructions say.
 
 `
 	}
 	if s.HostSidePublishPromised() {
-		return preamble + `Delivery mode: host-side publish is available for this run.
+		return preamble + HostSidePublishPromiseMarker + `
 
 - Make and validate the change in this workspace, then create a local commit.
 - Do not run gh, git push, or otherwise try to publish directly to GitHub.

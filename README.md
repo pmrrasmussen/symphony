@@ -583,17 +583,34 @@ correct under both backends with no per-backend prompt. As a fail-closed
 cross-check, a launch whose prompt promises host-side publish while the session's
 own registry advertises no `github_publish_pr` is refused rather than run.
 
-One narrow rule is still **rejected at load**, for `claude` only: a workflow that
-configures a session capability no session could advertise. That means a
-`handoff_state` with no enabled GitHub integration, or an enabled GitHub
-integration with no `handoff_state` -- a GitHub session is only prepared on top of
-a prepared Linear handoff session, so neither grants the model anything. Under
-`codex` the same configuration is equally inert and stays accepted; under
-`claude` it is refused so that a session launched with no MCP server at all
-always means "this workflow configures no capability". A `github:` block that
-does not resolve (an unreadable `token_file`, say) leaves the integration
-disabled, exactly as it does under `codex`, so it configures nothing and never
-reaches that rule.
+Two narrow combinations are still **rejected at load**, for `claude` only.
+
+An **enabled GitHub integration without `handoff_state`**. With follow-up issues
+off, no Linear handoff session is prepared, so no GitHub session is either and
+the enabled integration grants nothing. With follow-up issues on the outcome is
+worse rather than better: `followup_issue_creation` alone satisfies
+`LinearSessionCapabilityEnabled`, so a handoff session *is* prepared, a GitHub
+session is built on top of it, and `github_publish_pr` and `github_pr_context`
+are advertised -- while the delivery guidance branches on the handoff state and
+tells the run that publishing is unavailable. A worker that trusts its tool list
+over the prompt reaches `LinkAndHandoff` with no target state, which comments the
+pull request onto the issue and then attempts a transition to no state at all.
+The refusal arrives after the pull request already exists, which is why this is
+refused at load rather than left to the launch guard.
+
+A **`handoff_state` with neither an enabled GitHub integration nor
+`followup_issue_creation`**: the handoff object is prepared and nothing
+model-facing uses it.
+
+Both stay accepted under `codex`, where they behave identically -- the
+advertisement is the same registry's -- because they always have been and
+narrowing them would reject workflows already in the field. The
+prompt/advertisement mismatch described above is pre-existing under `codex` and
+is not addressed here. Under `claude` they are refused so that a session
+launched with no MCP server at all always means "this workflow configures no
+capability". A `github:` block that does not resolve (an unreadable
+`token_file`, say) leaves the integration disabled, exactly as it does under
+`codex`, so it configures nothing and reaches neither rule.
 
 `--dry-run` adds one check for this backend, `agent_authentication`: it runs
 `claude auth status` and reads only the `loggedIn` boolean. That command also

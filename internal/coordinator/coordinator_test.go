@@ -415,29 +415,6 @@ func TestRenderExplainsHostAndManualDeliveryModes(t *testing.T) {
 	}
 }
 
-// TestTheDispatchedBackendIsTheOneTheGuidanceIsRenderedFor closes the seam
-// between the two. The prompt and the session are resolved from one launch, so a
-// call site that resolved the backend twice -- or rendered before resolving --
-// could not disagree with itself.
-func TestTheDispatchedBackendIsTheOneTheGuidanceIsRenderedFor(t *testing.T) {
-	settings := config.Settings{Prompt: "task"}
-	settings.GitHub.Enabled = true
-	settings.Tracker.HandoffState = "In Review"
-	settings.Agent.Backend = config.ClaudeAgentBackend
-	settings.Claude = config.Claude{Command: "claude", TurnTimeout: time.Minute, StallTimeout: time.Minute}
-	launch := settings.AgentLaunch()
-	prompt, err := render(settings, domain.Issue{Identifier: "PMR-40"}, 0, launch.Backend)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if launch.Backend != config.ClaudeAgentBackend {
-		t.Fatalf("launch backend=%q", launch.Backend)
-	}
-	if !strings.Contains(prompt, config.MCPToolPrefix) {
-		t.Fatalf("a claude dispatch was given Codex tool names: %q", prompt)
-	}
-}
-
 // TestADispatchedPromptNamesTheToolsItsOwnBackendWillServe is the assertion the
 // unit-level render tests cannot make. They call render with a backend a test
 // chose; only a real dispatch shows which backend the call site passes, and the
@@ -452,7 +429,11 @@ func TestADispatchedPromptNamesTheToolsItsOwnBackendWillServe(t *testing.T) {
 		"github: {owner: pmrrasmussen, repository: symphony, token: $PMR52_COORDINATOR_TOKEN}\n" +
 		"agent: {backend: claude, max_concurrent_agents: 1, max_turns: 1}\n" +
 		"workspace: {root: " + filepath.Join(d, "work") + "}\n" +
-		"---\nWork on {{.issue.identifier}}"
+		// A body that names Symphony's tools bare, as this repository's own
+		// WORKFLOW.md does. A dispatch has to survive that: the mapping rule is
+		// what makes it safe, and a launch guard that refused any bare mention
+		// would refuse every real run.
+		"---\nWork on {{.issue.identifier}}. Call github_publish_pr when clean and read github_pr_context."
 	t.Setenv("PMR52_COORDINATOR_TOKEN", "github-secret")
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
@@ -480,13 +461,17 @@ func TestADispatchedPromptNamesTheToolsItsOwnBackendWillServe(t *testing.T) {
 	if r.Backend != config.ClaudeAgentBackend {
 		t.Fatalf("dispatched backend=%q", r.Backend)
 	}
-	for _, name := range []string{"github_publish_pr", "github_pr_context"} {
-		if strings.Count(r.Prompt, name) != strings.Count(r.Prompt, config.MCPToolPrefix+name) {
-			t.Fatalf("the dispatched prompt names %q bare for a %s session: %q", name, r.Backend, r.Prompt)
-		}
-	}
 	if !strings.Contains(r.Prompt, config.MCPToolPrefix+"github_publish_pr") {
 		t.Fatalf("the dispatched prompt named no MCP publish tool: %q", r.Prompt)
+	}
+	// The repository body's bare names survive verbatim, and the rule that maps
+	// them travels with them. Both halves matter: the first is why WORKFLOW.md
+	// needs no per-backend wording, the second is what the launch guard checks.
+	if !strings.Contains(r.Prompt, "Call github_publish_pr when clean") {
+		t.Fatalf("the repository body was rewritten rather than mapped: %q", r.Prompt)
+	}
+	if !strings.Contains(r.Prompt, config.MCPNamingRuleMarker) {
+		t.Fatalf("the dispatched prompt names tools bare with no mapping rule: %q", r.Prompt)
 	}
 }
 
@@ -496,13 +481,14 @@ func TestADispatchedPromptNamesTheToolsItsOwnBackendWillServe(t *testing.T) {
 // all.
 func TestContinuationGuidanceIsBackendNeutral(t *testing.T) {
 	guidance := continuationGuidance(2, 3)
-	for _, forbidden := range []string{"Codex", "codex", "workpad", "thread"} {
+	// Both backends' vocabulary is banned, and the second half is the half that
+	// was missing: this text is shared, so MCP wording leaks into every Codex
+	// continuation turn, where there is no prefix to speak of. That is the same
+	// mistake this change fixes, pointed the other way.
+	for _, forbidden := range []string{"Codex", "codex", "workpad", "thread", "mcp", "MCP", "prefix"} {
 		if strings.Contains(guidance, forbidden) {
 			t.Fatalf("continuation guidance names %q, which is one backend's vocabulary: %q", forbidden, guidance)
 		}
-	}
-	if !strings.Contains(guidance, "prefix included") {
-		t.Fatalf("continuation guidance dropped the tool-naming note: %q", guidance)
 	}
 	if !strings.Contains(guidance, "continuation turn #2 of 3") {
 		t.Fatalf("continuation guidance lost its turn counter: %q", guidance)
