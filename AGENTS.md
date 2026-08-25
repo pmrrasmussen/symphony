@@ -17,9 +17,9 @@ handoff, rework, landing, and completion instructions. Read it, and
 - `internal/github` — the optional, fixed-repository GitHub PR publish/context/land adapter.
 - `internal/agent` — routes new sessions to the configured `agent.backend` and pins continuation and cancellation to the backend that started each session.
 - `internal/capability` — the agent-neutral registry of bounded session capabilities: definitions, availability, argument validation, invocation, and typed results/refusals.
-- `internal/mcpbridge` — the in-process loopback MCP endpoint that serves that registry to an MCP-capable agent process: one listener, per-session bearer tokens, one invocation in flight per session, and drain-before-finalize revocation. Wired into no backend yet.
+- `internal/mcpbridge` — the in-process loopback MCP endpoint that serves that registry to an MCP-capable agent process: one listener, per-session bearer tokens, one invocation in flight per session, and drain-before-finalize revocation. Wired into the Claude backend; no workflow can bind a capability to it yet.
 - `internal/codex` — the Codex app-server JSON-RPC backend and dynamic tool wiring.
-- `internal/claude` — the Claude Code CLI backend: the fixed, non-configurable launch contract (tool surface, permission mode, settings sources, sandbox) re-applied on every turn, and the narrow `--print` stream decode.
+- `internal/claude` — the Claude Code CLI backend: the fixed, non-configurable launch contract (tool surface, permission mode, settings sources, sandbox, MCP configuration) re-applied and re-verified on every turn, the per-turn capability-endpoint registration retired before the next turn is minted, and the narrow `--print` stream decode.
 - `internal/workspace` — local Git worktree lifecycle, ownership, and recovery.
 - `internal/domain` — the shared, provider-agnostic issue/agent/workspace types.
 - `internal/observability` — structured log redaction and level policy.

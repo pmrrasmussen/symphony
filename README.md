@@ -454,8 +454,22 @@ instead fixed by Symphony and cannot be widened from `WORKFLOW.md`:
   `Read`, and `Write`, plus `--disallowedTools WebFetch,WebSearch`. `--tools`
   is what removes a tool from the surface; a permission allowlist alone still
   advertises it.
-* `--strict-mcp-config` -- required, not hygiene. Without it the child inherits
-  the operator's own user-level MCP servers, credentials included.
+* `--strict-mcp-config` -- required, not hygiene, and load-bearing in both
+  directions. It confines the session to the MCP configuration on its own
+  command line, so a session with no `--mcp-config` gets no MCP server at all
+  and a session with one can reach nothing but Symphony's own endpoint. Without
+  it the child additionally inherits the operator's own user-level MCP servers,
+  credentials included.
+* `--mcp-config`, inline, **only** for a session whose capability registry
+  advertises something -- which no workflow can configure yet. It names exactly
+  one `http` server, Symphony's private loopback capability endpoint, and
+  carries its bearer token as an `${SYMPHONY_MCP_TOKEN}` reference the CLI
+  expands from the child's environment, so the credential never appears in a
+  command line that on Linux any local account can read. Each advertised
+  capability is then added to `--tools` and `--allowedTools` as an explicit
+  `mcp__symphony__<capability>`, never as an `mcp__symphony__*` glob: the init
+  echo below is checked for set equality, and a glob would let the CLI advertise
+  a capability Symphony never asked for and still pass.
 * `--setting-sources ""` -- excludes user, project, and local settings. The
   worktree is a checkout of a repository that may ship its own
   `.claude/settings.json`, `CLAUDE.md`, skills, plugins, and hooks, and hooks
@@ -520,12 +534,17 @@ Four limits of that boundary, stated rather than implied:
    control exists and works; this configuration simply does not use it to
    restrict anything.
 4. The CLI's `system`/`init` event reports the working directory, tool surface,
-   permission mode, and attached MCP servers. Symphony checks that the tool
-   surface and the permission mode are exactly what it asked for, that no MCP
-   server is attached, and that the reported working directory resolves to this
-   issue's workspace, and fails the turn closed on a mismatch or when no init
-   event arrives. The event does **not** report sandbox state, so the sandbox's
-   own status is not observable in the stream.
+   permission mode, and attached MCP servers. Symphony checks all of them
+   against the contract that turn was launched under: the tool surface and the
+   permission mode exactly as asked, exactly the MCP servers asked for -- none
+   at all for a session with no capability, and Symphony's own endpoint
+   reporting itself `connected` rather than `pending` for a session with one --
+   and a reported working directory that resolves to this issue's workspace. A
+   mismatch, or no init event at all, fails the turn closed. Requiring
+   `connected` is what makes it fail closed: a `pending` or `failed` endpoint is
+   a session whose capability tools are advertised, so the model will call them,
+   while every call returns a transport failure. The event does **not** report
+   sandbox state, so the sandbox's own status is not observable in the stream.
 
 So the operative boundary has nearly the same shape as the Codex one: Bash
 writes confined, no host Linear or GitHub credential in the child environment

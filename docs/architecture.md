@@ -11,11 +11,21 @@ selected backend's launch contract has to be complete, so an absent `codex:` or
 `claude:` block fails a candidate only when that backend is the one selected.
 A `claude` workflow that also enables a Symphony session capability --
 `tracker.provider.handoff_state`, `tracker.provider.followup_issue_creation`,
-or a configured and enabled GitHub integration -- is rejected at load: the
-bridge that would expose those bounded capabilities to a Claude session
-(`internal/mcpbridge`) is not wired into that backend yet, and refusing the
-configuration is preferred over dispatching an agent that silently cannot hand
-off, publish, or file a follow-up.  A `github:`
+or a configured and enabled GitHub integration -- is rejected at load.  The
+transport that would expose those bounded capabilities to a Claude session
+exists and is wired: the backend prepares the same provider sessions Codex
+does, builds the same registry, and serves it over the private loopback MCP
+endpoint (`internal/mcpbridge`) described below.  What is not in place yet is
+the prompt side.  The delivery instructions `WORKFLOW.md` renders name bare
+tool names, which is what a Codex dynamic tool is called and not what an MCP
+tool is called, and nothing yet cross-checks at launch that a capability the
+prompt promises is one the built registry actually advertises.  Lifting the
+refusal before both exist would produce the worst available failure: every gate
+in the repository passes -- configuration valid, preflight green, init echo
+exactly as expected -- while the host tells the model to call a tool it cannot
+reach, and the turn ends `EventCompleted` with committed, unpublished work.  So
+the wiring lands inert and the refusal stays until the guidance and the
+consistency guard land with it.  A `github:`
 block that does not resolve stays disabled, as it does under `codex`, so it
 never reaches that refusal -- which grants nothing, because a disabled
 integration has no capability to bridge.
@@ -249,9 +259,41 @@ opposite of fail-closed), `--tools` and `--allowedTools` restricted to
 `--disallowedTools WebFetch,WebSearch`, `--strict-mcp-config`,
 `--setting-sources ""`, and an inline `--settings` payload. `--tools` is what
 removes a tool from the surface -- a permission allowlist alone still
-advertises it. `--strict-mcp-config` is load-bearing rather than hygienic:
-without it the child inherits the operator's own user-level MCP servers,
-credentials included. `--setting-sources ""` excludes user, project, and local
+advertises it. `--strict-mcp-config` is load-bearing rather than hygienic, and
+in both directions: it confines the session to the MCP configuration on its own
+command line, so a session with no `--mcp-config` gets no MCP server at all and
+a session with one can reach nothing but Symphony's own endpoint, while without
+it the child additionally inherits the operator's own user-level MCP servers,
+credentials included.
+
+A session whose registry advertises at least one capability adds two things to
+that contract. `--mcp-config` carries an inline configuration naming exactly one
+`http` server, Symphony's loopback endpoint, whose `Authorization` header is a
+`${SYMPHONY_MCP_TOKEN}` reference the CLI expands from the child's environment
+-- so the per-registration bearer token lives only in an environment the owner
+can read, never in a command line that on Linux any local account can. And
+`mcp__symphony__<capability>` is added to both `--tools` and `--allowedTools`,
+one explicit name per advertised capability rather than an `mcp__symphony__*`
+glob, because the init echo is checked for set equality and a glob would let the
+CLI advertise a capability Symphony never asked for and still pass. Both the
+`--tools` list and the `tools/list` the endpoint serves are derived from one
+registry frozen when the session was built, so a mid-run configuration reload
+cannot make them disagree.
+
+The registration itself is per turn and is retired before the next turn's is
+minted, not merely at turn end. After a turn emits its terminal event its
+goroutine is still waiting on stderr, on `Wait`, and on the process-group kill,
+while the coordinator has already asked for the next turn; a registration left
+live across that window would let an escaped descendant of the previous turn
+call a capability concurrently with the new one, against the same provider
+sessions whose idempotency latches are all that stand between that and a second
+landing attempt presenting itself as a first. Revocation drains any invocation
+still running before it fires the registry's turn-ended finalizer, and it runs
+on every path a turn can end on -- completion, failure, turn timeout, a hard
+cancellation, and a launch that never produced a child -- because a missed
+revocation is a credential lifetime leak rather than a leaked struct: the
+registration holds the GitHub session, so a stale one keeps a loopback-reachable,
+token-bearing capability set alive for the daemon's lifetime. `--setting-sources ""` excludes user, project, and local
 settings, which matters because the workspace is a checkout of a repository
 that may ship `.claude/settings.json`, `CLAUDE.md`, skills, plugins, and hooks,
 and hooks run arbitrary commands -- discovery left enabled would let repository
@@ -292,9 +334,12 @@ outbound access, the same deliberate choice as the Codex profile's
 restrict anything. Fourth, the only confirmation that the contract applied is
 the CLI's own `system`/`init` event, which reports the working directory, tool
 surface, permission mode, and attached MCP servers: Symphony requires the tool
-surface and permission mode to match exactly, requires no MCP server, requires
-the reported working directory to resolve to the issue's workspace, and fails
-the turn closed otherwise or when no init event arrives at all -- but the event does not report sandbox state, so
+surface and permission mode to match the contract that turn was launched under
+exactly, requires exactly the MCP servers that contract asked for -- none for a
+session with no capability, and Symphony's own endpoint reporting itself
+`connected` rather than `pending` for a session with one -- requires the
+reported working directory to resolve to the issue's workspace, and fails the
+turn closed otherwise or when no init event arrives at all -- but the event does not report sandbox state, so
 the sandbox's own status is not observable in the stream. Host Linear and
 GitHub secrets are stripped from the Claude child environment by variable name
 and by value, exactly as for Codex; everything else is inherited on purpose,
