@@ -1,4 +1,4 @@
-# Live Linear and Codex smoke profile
+# Live Linear and agent smoke profile
 
 The normal development and CI commands are credential-free and never contact
 Linear or launch Codex:
@@ -72,6 +72,43 @@ Interrupt the process, inspect the private logs, and remove the temporary
 workflow, smoke worktree, and smoke issue. Never upload raw logs or full agent
 prompts: they can contain sensitive issue content even though Symphony redacts
 known credential values.
+
+## Deliberate Claude exercise
+
+The same shape as the Codex exercise above, with the differences that matter.
+Run it only after `--dry-run` succeeds against a Claude workflow, and only with a
+disposable issue.
+
+Set `agent.backend: claude` and a `claude:` block in the copied smoke workflow
+(see `WORKFLOW.example.md`). There is no API key to export: the Claude backend
+authenticates through the operator's own CLI login, which is why `--dry-run`
+includes a bounded, read-only `agent_authentication` check. If that check does
+not pass, fix the login before running anything live -- a session that cannot
+authenticate still consumes a dispatch and a workspace.
+
+```sh
+export SYMPHONY_LINEAR_API_KEY_FILE
+go run ./cmd/symphony --workflow .symphony/smoke-workflow.md
+```
+
+Three things to confirm afterwards, none of which the Codex exercise covers:
+
+- **The capability endpoint is absent from the record.** Neither the endpoint URL
+  nor its bearer token may appear in any log line, event, or status snapshot. The
+  token is passed to the child through its environment and the URL through
+  `--mcp-config`; both are per turn. Grep the private logs for the port and for
+  `SYMPHONY_MCP_TOKEN` and expect nothing.
+- **The tool names the model saw carry the MCP prefix.** A Claude worker reaches
+  Symphony's bounded capabilities as `mcp__symphony__<tool>`, so a log search for
+  a bare `github_publish_pr` finds the host's own records and not the model's
+  calls. `--dry-run`'s `github_handoff` check prints the name this backend
+  actually uses.
+- **The issue reached the handoff state with a pull request attached**, and the
+  transition was applied by the host rather than the agent. No agent-facing
+  transition capability exists on either backend.
+
+Then remove the temporary workflow, the worktree, and the smoke issue, and stop
+the process. Never upload raw logs or full agent prompts.
 
 ## Opt-in local full-lifecycle landing exercise
 
