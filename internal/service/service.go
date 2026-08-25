@@ -23,7 +23,7 @@ import (
 const (
 	linearKeyEnvironment = "SYMPHONY_LINEAR_API_KEY_FILE"
 	githubKeyEnvironment = "SYMPHONY_GITHUB_TOKEN_FILE"
-	basePath             = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+	basePath             = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 )
 
 // Options controls service installation. Empty Repository and Binary select
@@ -77,13 +77,13 @@ func Install(ctx context.Context, options Options) (Instance, bool, error) {
 	if err != nil {
 		return Instance{}, false, err
 	}
-	if err := ensureDirectories(d); err != nil {
-		return Instance{}, false, err
-	}
 	if err := validatePlist(ctx, runner, d.Content); err != nil {
 		return Instance{}, false, err
 	}
 	if err := rejectConflicts(ctx, options, d); err != nil {
+		return Instance{}, false, err
+	}
+	if err := ensureDirectories(d); err != nil {
 		return Instance{}, false, err
 	}
 	old, err := os.ReadFile(d.PlistPath)
@@ -463,7 +463,7 @@ func failedChecks(result preflight.Result) string {
 }
 
 func ensureDirectories(d desired) error {
-	for _, dir := range []string{filepath.Dir(d.PlistPath), filepath.Join(d.Repository, ".symphony", "workspaces"), d.LogsRoot, filepath.Dir(d.StatusFile)} {
+	for _, dir := range []string{filepath.Join(d.Repository, ".symphony", "workspaces"), d.LogsRoot, filepath.Dir(d.StatusFile)} {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return fmt.Errorf("create service directory %s: %w", dir, err)
 		}
@@ -641,19 +641,31 @@ func atomicWrite(path string, content []byte, permission os.FileMode) error {
 func reload(ctx context.Context, runner Runner, d desired, old []byte) error {
 	service := launchService(d.Label)
 	// bootout is expected to fail for a first installation. Any prior plist was
-	// already validated; bootstrap failure restores and reloads it best-effort.
+	// already validated. If loading or starting the replacement fails, restore
+	// that prior registration before reporting the failed update.
 	_ = launchctl(ctx, runner, "bootout", service)
 	if err := launchctl(ctx, runner, "bootstrap", "gui/"+fmt.Sprint(os.Getuid()), d.PlistPath); err != nil {
-		if old != nil {
-			_ = atomicWrite(d.PlistPath, old, 0o600)
-			_ = launchctl(ctx, runner, "bootstrap", "gui/"+fmt.Sprint(os.Getuid()), d.PlistPath)
-		}
-		return fmt.Errorf("load %s: %w", d.Label, err)
+		return restoreAfterReloadFailure(ctx, runner, d, old, "load", err)
 	}
 	if err := launchctl(ctx, runner, "kickstart", "-k", service); err != nil {
-		return fmt.Errorf("start %s: %w", d.Label, err)
+		// Do not leave a replacement registration loaded when it did not start.
+		_ = launchctl(ctx, runner, "bootout", service)
+		return restoreAfterReloadFailure(ctx, runner, d, old, "start", err)
 	}
 	return nil
+}
+
+func restoreAfterReloadFailure(ctx context.Context, runner Runner, d desired, old []byte, operation string, cause error) error {
+	if old == nil {
+		return fmt.Errorf("%s %s: %w", operation, d.Label, cause)
+	}
+	if err := atomicWrite(d.PlistPath, old, 0o600); err != nil {
+		return fmt.Errorf("%s %s: %w (restore prior plist: %v)", operation, d.Label, cause, err)
+	}
+	if err := launchctl(ctx, runner, "bootstrap", "gui/"+fmt.Sprint(os.Getuid()), d.PlistPath); err != nil {
+		return fmt.Errorf("%s %s: %w (restore prior service: %v)", operation, d.Label, cause, err)
+	}
+	return fmt.Errorf("%s %s: %w", operation, d.Label, cause)
 }
 
 func launchService(label string) string { return "gui/" + fmt.Sprint(os.Getuid()) + "/" + label }

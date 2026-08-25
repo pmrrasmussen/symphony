@@ -159,6 +159,48 @@ func TestInstallValidationFailureLeavesExistingPlistUntouched(t *testing.T) {
 	}
 }
 
+func TestInstallStartFailureRestoresExistingService(t *testing.T) {
+	_, options, runner := serviceFixture(t)
+	instance, _, err := Install(context.Background(), options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(instance.PlistPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner.fail = "launchctl kickstart"
+	options.LogLevel = "debug"
+	_, _, err = Install(context.Background(), options)
+	if err == nil || !strings.Contains(err.Error(), "start "+instance.Label) {
+		t.Fatalf("err=%v", err)
+	}
+	after, err := os.ReadFile(instance.PlistPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(before) {
+		t.Fatalf("replacement plist was not restored\nbefore=%s\nafter=%s", before, after)
+	}
+}
+
+func TestInstallDoesNotChangeExistingLaunchAgentsPermissions(t *testing.T) {
+	_, options, _ := serviceFixture(t)
+	if err := os.Chmod(options.LaunchAgentsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := Install(context.Background(), options); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(options.LaunchAgentsDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o755 {
+		t.Fatalf("LaunchAgents permissions = %#o, want 0755", got)
+	}
+}
+
 func TestRenderPlistEscapesSpecialPathCharacters(t *testing.T) {
 	d := desired{Instance: Instance{Label: "com.pmrrasmussen.symphony.example", Workflow: "/tmp/a & b/WORKFLOW.md"}, Repository: "/tmp/a & b", LogsRoot: "/tmp/a & b/.symphony/logs", StatusFile: "/tmp/a & b/.symphony/service/status.json", Stdout: "/tmp/a & b/.symphony/service/stdout.log", Stderr: "/tmp/a & b/.symphony/service/stderr.log"}
 	content := string(renderPlist(d, "/tmp/a & b/symphony", "info", map[string]string{"PATH": "/bin"}))
