@@ -49,7 +49,7 @@ func TestDiscoverMultipleIndependentInstancesAndStaleSnapshot(t *testing.T) {
 }
 
 func TestParseXMLPlistFallback(t *testing.T) {
-	values, err := parseXMLPlist([]byte("<?xml version=\"1.0\"?><plist version=\"1.0\"><dict><key>Label</key><string>com.pmrrasmussen.symphony.test</string><key>ProgramArguments</key><array><string>/bin/sh</string><string>--workflow</string></array></dict></plist>"))
+	values, err := parseXMLPlist([]byte("<?xml version=\"1.0\"?><plist version=\"1.0\"><dict><key>Label</key><string>com.pmrrasmussen.symphony.test</string><key>ProgramArguments</key><array><string>/bin/sh</string><string>--workflow</string></array><key>ThrottleInterval</key><integer>10</integer></dict></plist>"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -58,6 +58,9 @@ func TestParseXMLPlistFallback(t *testing.T) {
 	}
 	if got, want := stringSlice(values["ProgramArguments"]), []string{"/bin/sh", "--workflow"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("arguments = %v, want %v", got, want)
+	}
+	if got, want := values["ThrottleInterval"], int64(10); got != want {
+		t.Fatalf("ThrottleInterval = %#v, want %#v", got, want)
 	}
 }
 

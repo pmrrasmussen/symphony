@@ -828,6 +828,12 @@ func xmlPlistValue(node *xmlPlistNode) (any, error) {
 	switch node.name {
 	case "string":
 		return strings.TrimSpace(node.text.String()), nil
+	case "integer":
+		value, err := strconv.ParseInt(strings.TrimSpace(node.text.String()), 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("parse plist integer: %w", err)
+		}
+		return value, nil
 	case "true":
 		return true, nil
 	case "false":
