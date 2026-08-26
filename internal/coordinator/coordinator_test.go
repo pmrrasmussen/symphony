@@ -1272,6 +1272,63 @@ func TestPermanentDispatchFailureStopsAtMaxAttempts(t *testing.T) {
 	}
 }
 
+// TestUnclassifiedAgentEventNeverAbandonsIssue covers the correction from
+// review round 3: agentFailureReason's fallback, "agent_event", means the
+// coordinator does not know why a run ended -- most commonly, in practice, a
+// Claude quota rejection that ends a run in under a second (PMR-131). That is
+// not the deterministic, classified failure the ceiling was built for, so it
+// must keep climbing the ordinary escalating backoff ladder without ever
+// arming abandonment, however many times it repeats -- unlike
+// workspace_prepare, before_run, prompt_render, or session_start, which stay
+// classified and still consume the ceiling.
+func TestUnclassifiedAgentEventNeverAbandonsIssue(t *testing.T) {
+	w := testSettings(t)
+	w.Config.Agent.MaxAttempts = 2
+	w.Config.Agent.MaxRetryBackoff = time.Minute
+	issue := testIssue()
+	var log syncBuffer
+	agent := &fakeAgent{events: closedEvents}
+	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{}, 8)}
+	c := New(&fakeTracker{issue: issue}, agent, ws, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&log, nil)))
+	c.clock = fakeClock{now: time.Date(2026, 8, 26, 9, 41, 0, 0, time.UTC)}
+	timer := &fakeTimer{signal: make(chan struct{}, 8)}
+	c.timer = timer
+
+	c.Tick(context.Background())
+	<-ws.after
+	<-timer.signal
+
+	const repeats = 6 // well past max_attempts=2, which an unclassified cause must never consume
+	for i := 0; i < repeats; i++ {
+		timer.fire(i)
+		<-ws.after
+		<-timer.signal
+	}
+
+	if starts, _, _ := agent.counts(); starts != repeats+1 {
+		t.Fatalf("starts=%d, want one dispatch per fire plus the initial one", starts)
+	}
+	c.mu.Lock()
+	claimed := c.claimed[issue.ID]
+	retry, stillRetrying := c.retries[issue.ID]
+	c.mu.Unlock()
+	if !claimed || !stillRetrying {
+		t.Fatal("an unclassified agent_event abandoned the issue before any classified failure occurred")
+	}
+	if retry.reason != "agent_event" {
+		t.Fatalf("reason=%q, want agent_event", retry.reason)
+	}
+	if retry.attempt <= w.Config.Agent.MaxAttempts {
+		t.Fatalf("attempt=%d, want it to keep climbing the ordinary ladder past max_attempts", retry.attempt)
+	}
+	if strings.Contains(log.String(), `"msg":"dispatch abandoned after max attempts"`) {
+		t.Fatalf("an unclassified agent_event armed an abandonment record: %s", log.String())
+	}
+	if err := c.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // TestLandingWaitRedispatchesPastMaxAttempts pins the exemption the ceiling
 // must not swallow: a non-terminal landing wait is not an agent failure, so it
 // keeps its unbounded redispatch and its unescalated attempt even after more

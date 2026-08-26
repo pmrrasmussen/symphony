@@ -1419,7 +1419,7 @@ func (c *Coordinator) finishFailure(ctx context.Context, i domain.Issue, attempt
 	if err != nil && reason != "prompt_render" && reason != "agent_event" {
 		attrs = append(attrs, "error", err)
 	}
-	if c.attemptsExhausted(i, retryAgent, next, s, attrs) {
+	if c.attemptsExhausted(i, retryAgent, reason, next, s, attrs) {
 		return
 	}
 	c.log.Warn("agent run retry scheduled", attrs...)
@@ -1428,16 +1428,27 @@ func (c *Coordinator) finishFailure(ctx context.Context, i domain.Issue, attempt
 
 // attemptsExhausted reports whether next has reached agent.max_attempts for a
 // retryAgent episode, abandoning the dispatch (and releasing its claim) if so.
-// Only retryAgent consumes the ceiling, and only on a genuine dispatch
-// failure: a retryLanding redispatch — whether from finishLandingWait or
-// either escalation in runRetry — never raises its attempt counter, and
-// neither does a retryAgent episode that merely lost an orchestrator slot
-// race (see agentSlotRetryDelay). config rejects a non-positive max_attempts,
-// so the MaxAttempts <= 0 case only covers a hand-built Settings, which keeps
-// the pre-PMR-111 unbounded ladder rather than having a zero ceiling abandon
-// every first failure.
-func (c *Coordinator) attemptsExhausted(i domain.Issue, kind retryKind, next int, s config.Settings, attrs []any) bool {
-	if kind != retryAgent || s.Agent.MaxAttempts <= 0 || next < s.Agent.MaxAttempts {
+// Only retryAgent consumes the ceiling, and only on a genuine, classified
+// dispatch failure: a retryLanding redispatch — whether from
+// finishLandingWait or either escalation in runRetry — never raises its
+// attempt counter, and neither does a retryAgent episode that merely lost an
+// orchestrator slot race (see agentSlotRetryDelay). config rejects a
+// non-positive max_attempts, so the MaxAttempts <= 0 case only covers a
+// hand-built Settings, which keeps the pre-PMR-111 unbounded ladder rather
+// than having a zero ceiling abandon every first failure.
+//
+// reason == "agent_event" is agentFailureReason's fallback for a run that
+// ended without a recognized cause -- most commonly, today, a Claude quota
+// rejection that ends a run in under a second (PMR-131). It still climbs the
+// ordinary escalating backoff ladder like any other failure, but it never
+// arms the ceiling: abandoning an issue on a cause the coordinator cannot
+// name would turn a transient, account-wide condition into permanent
+// abandonment of otherwise-healthy issues (observed: 203 such rejections
+// across six healthy issues in one 2.5-hour window). Once a sibling issue
+// gives quota rejection (or any other agent_event cause) a real, classified
+// reason, that reason -- not "agent_event" -- starts consuming the ceiling.
+func (c *Coordinator) attemptsExhausted(i domain.Issue, kind retryKind, reason string, next int, s config.Settings, attrs []any) bool {
+	if kind != retryAgent || reason == "agent_event" || s.Agent.MaxAttempts <= 0 || next < s.Agent.MaxAttempts {
 		return false
 	}
 	c.abandonDispatch(i, s.Agent.MaxAttempts, attrs)
@@ -1619,7 +1630,7 @@ func (c *Coordinator) runRetry(id string, generation uint64) {
 		}
 		attempt := retry.attempt + 1
 		attrs := []any{"issue_id", retry.issue.ID, "issue_identifier", retry.issue.Identifier, "reason", "retry_refresh", "attempt", attempt}
-		if c.attemptsExhausted(retry.issue, retry.kind, attempt, s, attrs) {
+		if c.attemptsExhausted(retry.issue, retry.kind, "retry_refresh", attempt, s, attrs) {
 			return
 		}
 		c.scheduleRetry(ctx, retry.issue, retry.workspace, attempt, retry.kind, "retry_refresh", backoff(attempt, s.Agent.MaxRetryBackoff))
