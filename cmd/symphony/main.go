@@ -201,20 +201,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 			}()
 		}
 	}
-	if terminals, err := tracker.ListTerminal(ctx, settings().Tracker.TerminalStates); err != nil {
-		log.Warn("startup terminal cleanup query failed", "error", err)
-	} else {
-		for _, issue := range terminals {
-			outcome, err := ws.Cleanup(ctx, issue)
-			if err != nil {
-				log.Warn("terminal workspace cleanup failed", "issue", issue.Identifier, "error", err)
-				continue
-			}
-			if outcome == domain.CleanupLanded {
-				log.Info("terminal workspace cleanup removed verified landed work", "issue", issue.Identifier)
-			}
-		}
-	}
+	cleanupTerminalWorkspaces(ctx, log, tracker, ws, settings().Tracker.TerminalStates)
 	c.Start(ctx)
 	<-ctx.Done()
 	if stopStatus != nil {
@@ -232,6 +219,43 @@ func run(args []string, stdout, stderr io.Writer) int {
 		}
 	}
 	return 0
+}
+
+// terminalLister and terminalCleaner are the two narrow behaviors startup
+// cleanup needs, named here so the loop below can be exercised without a live
+// tracker or a real worktree. The production values are the process's
+// linear.Tracker and workspace.Local.
+type terminalLister interface {
+	ListTerminal(context.Context, []string) ([]domain.Issue, error)
+}
+
+type terminalCleaner interface {
+	Cleanup(context.Context, domain.Issue) (domain.CleanupOutcome, error)
+}
+
+// cleanupTerminalWorkspaces discards the worktree of every issue the tracker
+// reports terminal, once, before scheduling starts. It is best-effort by
+// design: a failed query is warned about and skipped rather than failing
+// startup, and one issue's failed cleanup never stops the others. What may
+// actually be discarded is the workspace layer's decision, not this loop's --
+// committed work survives unless the host-owned landing verifier confirmed it
+// merged, which is the only case worth an info record here.
+func cleanupTerminalWorkspaces(ctx context.Context, log *observability.Logger, tracker terminalLister, ws terminalCleaner, terminalStates []string) {
+	terminals, err := tracker.ListTerminal(ctx, terminalStates)
+	if err != nil {
+		log.Warn("startup terminal cleanup query failed", "error", err)
+		return
+	}
+	for _, issue := range terminals {
+		outcome, err := ws.Cleanup(ctx, issue)
+		if err != nil {
+			log.Warn("terminal workspace cleanup failed", "issue", issue.Identifier, "error", err)
+			continue
+		}
+		if outcome == domain.CleanupLanded {
+			log.Info("terminal workspace cleanup removed verified landed work", "issue", issue.Identifier)
+		}
+	}
 }
 
 func runService(args []string, stdout, stderr io.Writer) int {

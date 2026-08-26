@@ -101,6 +101,13 @@ type linearLifecycle interface {
 	LandComment(context.Context, string) error
 }
 
+// The one production implementation of that seam. Session preparation already
+// binds the concrete type, so this compiles today either way; stating it at the
+// interface keeps the claim visible where the seam is defined -- this package's
+// tests substitute a fake for internal/linear.HandoffSession, never the reverse
+// -- and keeps it asserted if preparation ever stops taking the concrete type.
+var _ linearLifecycle = (*linear.HandoffSession)(nil)
+
 // LandGateError is returned by Land for a retryable hard gate when the
 // bounded-fix feature is enabled and attempts remain. It is non-terminal: the
 // backend surfaces Reason to Codex so it can fix, push, and call github_land_pr

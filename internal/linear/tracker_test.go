@@ -194,6 +194,36 @@ func TestOversizedPageRetriesSmallerAndMalformedPollRecovers(t *testing.T) {
 	}
 }
 
+// ListTerminal is the query startup workspace cleanup runs before scheduling
+// begins: it asks the same project-scoped list for the configured terminal
+// states, so a Done issue is returned rather than filtered out as undispatchable.
+func TestListTerminalReturnsTerminalProjectIssues(t *testing.T) {
+	var variables map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		request := decodeRequest(t, r)
+		variables = request["variables"].(map[string]any)
+		writeJSON(t, w, issuePage([]any{
+			issue("one", "PMR-1", "Landed", "Done", "", nil, nil),
+			issue("two", "PMR-2", "Dropped", "Canceled", "", nil, nil),
+		}, false, ""))
+	}))
+	defer server.Close()
+
+	issues, err := newTestTracker(server.URL, "").ListTerminal(context.Background(), []string{"Done", "Canceled"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := stringSlice(variables["stateNames"]), []string{"Done", "Canceled"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("state filter=%v want %v", got, want)
+	}
+	if got, want := variables["projectSlug"], "project-1"; got != want {
+		t.Fatalf("projectSlug=%v want %v", got, want)
+	}
+	if len(issues) != 2 || issues[0].Identifier != "PMR-1" || issues[1].State != "Canceled" {
+		t.Fatalf("issues=%#v", issues)
+	}
+}
+
 func TestRateLimitUsesLatestRedactedReset(t *testing.T) {
 	now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
