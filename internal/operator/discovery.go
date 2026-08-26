@@ -537,7 +537,7 @@ func credentialFrom(values map[string]any, valueKey, fileKey, base string, envir
 		result.Configured = true
 		if strings.HasPrefix(value, "$") {
 			name := strings.TrimPrefix(value, "$")
-			if validEnvironmentName(name) {
+			if config.ValidEnvironmentName(name) {
 				result.EnvironmentNames = append(result.EnvironmentNames, name)
 				if key == fileKey && strings.TrimSpace(environment[name]) != "" {
 					result.FileReferences = append(result.FileReferences, filepath.Clean(environment[name]))
@@ -553,18 +553,6 @@ func credentialFrom(values map[string]any, valueKey, fileKey, base string, envir
 	sort.Strings(result.EnvironmentNames)
 	sort.Strings(result.FileReferences)
 	return result
-}
-
-func validEnvironmentName(name string) bool {
-	if name == "" {
-		return false
-	}
-	for i, r := range name {
-		if !(r == '_' || r >= 'A' && r <= 'Z' || r >= 'a' && r <= 'z' || i > 0 && r >= '0' && r <= '9') {
-			return false
-		}
-	}
-	return true
 }
 
 func inspectRuntimeFiles(instance *Instance, logLimit int, secretValues []string) {

@@ -539,18 +539,10 @@ func requestWithSettingsAt(ctx context.Context, client *http.Client, s config.Se
 }
 
 func trackerSnapshot(s config.Settings) config.Settings {
-	s.Tracker.Provider = cloneMap(s.Tracker.Provider)
+	s.Tracker.Provider = config.CloneMap(s.Tracker.Provider)
 	s.Tracker.ActiveStates = append([]string(nil), s.Tracker.ActiveStates...)
 	s.Tracker.TerminalStates = append([]string(nil), s.Tracker.TerminalStates...)
 	return s
-}
-
-func cloneMap(source map[string]any) map[string]any {
-	out := make(map[string]any, len(source))
-	for key, value := range source {
-		out[key] = value
-	}
-	return out
 }
 
 func isOversized(err error) bool {
@@ -629,7 +621,7 @@ func normalizeIssue(record linearIssue, assignee string, terminalStates []string
 	labels := make([]string, 0, len(record.Labels.Nodes))
 	seenLabels := map[string]bool{}
 	for _, label := range record.Labels.Nodes {
-		name := norm(label.Name)
+		name := config.Norm(label.Name)
 		if name != "" && !seenLabels[name] {
 			seenLabels[name] = true
 			labels = append(labels, name)
@@ -639,7 +631,7 @@ func normalizeIssue(record linearIssue, assignee string, terminalStates []string
 
 	blockers := make([]domain.Blocker, 0, len(record.InverseRelations.Nodes))
 	for _, relation := range record.InverseRelations.Nodes {
-		if norm(relation.Type) != "blocks" {
+		if config.Norm(relation.Type) != "blocks" {
 			continue
 		}
 		blockers = append(blockers, domain.Blocker{
@@ -678,7 +670,7 @@ func dispatchable(state, actualAssignee, configuredAssignee string, blockers []d
 	}
 	// Linear's inverse `blocks` relation is a dependency only before initial
 	// dispatch. An already in-progress issue remains visible for reconciliation.
-	if norm(state) != "todo" {
+	if config.Norm(state) != "todo" {
 		return true
 	}
 	// The relation query is bounded. Never dispatch a Todo issue when Linear
@@ -688,10 +680,10 @@ func dispatchable(state, actualAssignee, configuredAssignee string, blockers []d
 	}
 	terminal := map[string]bool{}
 	for _, name := range terminalStates {
-		terminal[norm(name)] = true
+		terminal[config.Norm(name)] = true
 	}
 	for _, blocker := range blockers {
-		if blocker.State == "" || !terminal[norm(blocker.State)] {
+		if blocker.State == "" || !terminal[config.Norm(blocker.State)] {
 			return false
 		}
 	}
@@ -720,7 +712,6 @@ func optionalTime(raw json.RawMessage) *time.Time {
 
 func nullableString(value string) string { return strings.TrimSpace(value) }
 func stringValue(value any) string       { text, _ := value.(string); return text }
-func norm(value string) string           { return strings.ToLower(strings.TrimSpace(value)) }
 
 func uniqueNonEmpty(values []string) []string {
 	seen := map[string]bool{}

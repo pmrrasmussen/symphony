@@ -55,6 +55,16 @@ const (
 	EventLandingResolved EventKind = "landing_resolved"
 )
 
+// Terminal reports whether an event of this kind ends the logical run: no
+// later event follows it on the same stream.
+func (k EventKind) Terminal() bool {
+	switch k {
+	case EventCompleted, EventFailed, EventBlocked, EventLandingWaiting, EventLandingResolved:
+		return true
+	}
+	return false
+}
+
 // ItemOutcome enumerates the safe, protocol-derived lifecycle outcomes an
 // EventItem can report. These mirror the Codex app-server's own status enum
 // values plus the synthetic "started" outcome Symphony assigns on arrival.

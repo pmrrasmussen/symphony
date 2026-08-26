@@ -173,7 +173,7 @@ func TestInvalidReloadKeepsLastValid(t *testing.T) {
 	if err := os.WriteFile(p, []byte("---\nbroken"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Reload(); err == nil {
+	if _, err := s.ReloadIfChanged(); err == nil {
 		t.Fatal("expected reload failure")
 	}
 	if s.Current().Prompt != "ok" {
@@ -328,7 +328,7 @@ func TestEmptyAPIKeyReferenceRejectsReloadAndPreservesLastGoodWorkflow(t *testin
 	if err := os.WriteFile(p, []byte(invalid), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Reload(); err == nil || !strings.Contains(err.Error(), "resolved secret is empty") {
+	if _, err := s.ReloadIfChanged(); err == nil || !strings.Contains(err.Error(), "resolved secret is empty") {
 		t.Fatalf("empty key reload error=%v", err)
 	}
 	current := s.Current()
@@ -398,7 +398,7 @@ func TestCanonicalAndLegacyProjectSlugAreAmbiguousAndReloadIsTransactional(t *te
 	if err := os.WriteFile(p, []byte(ambiguous), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.Reload(); err == nil || !strings.Contains(err.Error(), "must not both be set") {
+	if _, err := store.ReloadIfChanged(); err == nil || !strings.Contains(err.Error(), "must not both be set") {
 		t.Fatalf("ambiguous reload error=%v", err)
 	}
 	current := store.Current()
@@ -685,7 +685,7 @@ func TestReloadAppliesValidChangesAndRetainsLastValidWorkflow(t *testing.T) {
 	if err := os.WriteFile(p, []byte(updated), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Reload(); err != nil {
+	if _, err := s.ReloadIfChanged(); err != nil {
 		t.Fatal(err)
 	}
 	if got := s.Current().Config.Polling.Interval; got != 200*time.Millisecond {
@@ -694,7 +694,7 @@ func TestReloadAppliesValidChangesAndRetainsLastValidWorkflow(t *testing.T) {
 	if err := os.WriteFile(p, []byte("---\ntracker: []\n---\nbad"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Reload(); err == nil {
+	if _, err := s.ReloadIfChanged(); err == nil {
 		t.Fatal("invalid reload succeeded")
 	}
 	if got := s.Current().Prompt; got != "updated {{.issue.title}}" {
@@ -726,7 +726,7 @@ func TestHandoffPolicyIsOptInAndInvalidReloadRetainsLastKnownGood(t *testing.T) 
 		if err := os.WriteFile(p, []byte("---\n"+invalid+"\n---\nprompt"), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if err := s.Reload(); err == nil {
+		if _, err := s.ReloadIfChanged(); err == nil {
 			t.Fatalf("invalid handoff policy reloaded: %s", invalid)
 		}
 		if got := s.Current().Config.Tracker.HandoffState; got != "In Review" {
@@ -773,7 +773,7 @@ func TestHostTransitionPolicyIsExactAndReloadSafe(t *testing.T) {
 		if err := os.WriteFile(p, []byte("---\n"+invalid+"\n---\nprompt"), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if err := s.Reload(); err == nil {
+		if _, err := s.ReloadIfChanged(); err == nil {
 			t.Fatalf("invalid host transition policy reloaded: %s", invalid)
 		}
 		if got := s.Current().Config.Tracker.HostTransitions.Start["todo"]; got != "In Progress" {
@@ -805,7 +805,7 @@ func TestFollowupIssueCreationPolicyIsOptInBooleanBacklogGatedAndReloadSafe(t *t
 	}
 
 	write("followup_issue_creation: true")
-	if err := s.Reload(); err != nil {
+	if _, err := s.ReloadIfChanged(); err != nil {
 		t.Fatal(err)
 	}
 	if !s.Current().Config.Tracker.FollowupIssueCreation {
@@ -816,7 +816,7 @@ func TestFollowupIssueCreationPolicyIsOptInBooleanBacklogGatedAndReloadSafe(t *t
 	}
 
 	write("followup_issue_creation: \"true\"")
-	if err := s.Reload(); err == nil {
+	if _, err := s.ReloadIfChanged(); err == nil {
 		t.Fatal("non-boolean followup_issue_creation reloaded")
 	}
 	if !s.Current().Config.Tracker.FollowupIssueCreation {
@@ -824,7 +824,7 @@ func TestFollowupIssueCreationPolicyIsOptInBooleanBacklogGatedAndReloadSafe(t *t
 	}
 
 	write("followup_issue_creation: false")
-	if err := s.Reload(); err != nil {
+	if _, err := s.ReloadIfChanged(); err != nil {
 		t.Fatal(err)
 	}
 	if s.Current().Config.Tracker.FollowupIssueCreation {
@@ -835,7 +835,7 @@ func TestFollowupIssueCreationPolicyIsOptInBooleanBacklogGatedAndReloadSafe(t *t
 	if err := os.WriteFile(p, []byte(dispatchableBacklog), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Reload(); err == nil {
+	if _, err := s.ReloadIfChanged(); err == nil {
 		t.Fatal("follow-up issue creation accepted dispatchable Backlog")
 	}
 }
@@ -1325,7 +1325,7 @@ func TestConcurrentReadersNeverObserveMixedSnapshots(t *testing.T) {
 		if err := os.WriteFile(workflow, []byte(versions[index%2]), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if err := store.Reload(); err != nil {
+		if _, err := store.ReloadIfChanged(); err != nil {
 			t.Fatal(err)
 		}
 	}
