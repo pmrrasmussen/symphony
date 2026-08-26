@@ -2260,6 +2260,35 @@ func TestEventFailedStaysAgentEventAndPassesThroughObservabilityText(t *testing.
 	}
 }
 
+// TestRateLimitStatusIsRedactedLikeAnyOtherWireText guards against the raw
+// CLI-reported status bypassing observability.Text's redaction: both the
+// terminal EventRateLimited record and the non-terminal EventDiagnostic
+// record (PMR-126's "allowed_warning" case) log the status through the same
+// redaction every other wire-sourced field goes through.
+func TestRateLimitStatusIsRedactedLikeAnyOtherWireText(t *testing.T) {
+	w := testSettings(t)
+	issue := testIssue()
+	events := make(chan domain.Event, 1)
+	events <- domain.Event{Kind: domain.EventRateLimited, At: time.Now(), Message: "claude reported a rate limit: rejected (five_hour)", RateLimitStatus: "token=do-not-log-this"}
+	close(events)
+	agent := &fakeAgent{events: func() <-chan domain.Event { return events }}
+	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{})}
+	var logs bytes.Buffer
+	c := New(&fakeTracker{issue: issue}, agent, ws, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&logs, nil)))
+	c.Tick(context.Background())
+	<-ws.after
+	if err := c.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	output := logs.String()
+	if strings.Contains(output, "do-not-log-this") {
+		t.Fatalf("rejection status leaked unredacted wire text: %s", output)
+	}
+	if !strings.Contains(output, "[REDACTED]") {
+		t.Fatalf("rejection status was not redacted at all: %s", output)
+	}
+}
+
 // TestRateLimitedEventEndsTheRunAndSchedulesFromTheReportedResetTime drives a
 // full dispatch through a domain.EventRateLimited terminal event, the shape
 // the Claude backend now reports for a quota rejection (PMR-131), and checks

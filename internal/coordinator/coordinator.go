@@ -1322,14 +1322,14 @@ func (c *Coordinator) logEvent(r *running, event domain.Event) {
 			// "allowed_warning") is a decoded protocol event, not undecodable
 			// child output, so it gets its own name and status attribute
 			// rather than "agent stderr" (PMR-126).
-			attrs = append(attrs, "status", event.RateLimitStatus)
+			attrs = append(attrs, "status", observability.Text(event.RateLimitStatus))
 			c.log.Warn("agent rate limit", attrs...)
 			return
 		}
 		attrs = append(attrs, "stderr", observability.Text(event.Message))
 		c.log.Warn("agent stderr", attrs...)
 	case domain.EventRateLimited:
-		attrs = append(attrs, "status", event.RateLimitStatus, "retry_after_ms", event.RetryAfter.Milliseconds())
+		attrs = append(attrs, "status", observability.Text(event.RateLimitStatus), "retry_after_ms", event.RetryAfter.Milliseconds())
 		c.log.Warn("agent rate limit rejected", attrs...)
 	case domain.EventLandingWaiting:
 		// The reason is the github package's own fixed waiting string, so it is
