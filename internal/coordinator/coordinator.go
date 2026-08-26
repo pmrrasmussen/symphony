@@ -150,6 +150,10 @@ type Coordinator struct {
 	timer      Timer
 	clock      Clock
 	log        *observability.Logger
+	// forget is the optional host integration told that an issue is finished.
+	// It is installed once at startup, before Start, and never replaced, so the
+	// scheduling goroutines that read it need no lock of their own.
+	forget domain.IssueForgetter
 
 	mu         sync.Mutex
 	running    map[string]*running
@@ -242,6 +246,11 @@ func New(t domain.Tracker, a domain.AgentBackend, w domain.WorkspaceExecutor, se
 		handoffs: map[string]handoffObservation{}, landingWaits: map[string]int{},
 	}
 }
+
+// SetIssueForgetter installs the host integration notified when an issue
+// reaches its terminal tracker state. Call it before Start; with none
+// installed the coordinator simply reports nothing, exactly as before.
+func (c *Coordinator) SetIssueForgetter(f domain.IssueForgetter) { c.forget = f }
 
 // Snapshot is a read-only, intentionally reduced view of coordinator state.
 // It excludes issue bodies, prompts, workspace paths, raw events, and tracker
@@ -1345,13 +1354,21 @@ func normalizedRateLimit(raw map[string]any) map[string]int64 {
 	return result
 }
 
-// cleanupWorkspace removes a terminal issue's workspace and reports the
-// lifecycle outcome an operator needs to know without reading the workspace
-// package's own error text: a clean removal, a removal that discarded local
-// commits Symphony verified as merged, or why the workspace was kept
-// (uncommitted/untracked changes, or local commits ahead of the recorded base
-// revision that a human should review before it is discarded).
+// cleanupWorkspace releases what Symphony still holds for an issue it has just
+// decided is finished. It is the single place that decision is made, so it is
+// also where the host's IssueForgetter is told (PMR-112) -- an issue that will
+// never be dispatched again needs no linked pull request polled on its behalf.
+//
+// It then removes the issue's workspace and reports the lifecycle outcome an
+// operator needs to know without reading the workspace package's own error
+// text: a clean removal, a removal that discarded local commits Symphony
+// verified as merged, or why the workspace was kept (uncommitted/untracked
+// changes, or local commits ahead of the recorded base revision that a human
+// should review before it is discarded).
 func (c *Coordinator) cleanupWorkspace(ctx context.Context, issue domain.Issue) {
+	if c.forget != nil {
+		c.forget.Forget(issue.ID)
+	}
 	outcome, err := c.workspaces.Cleanup(ctx, issue)
 	status := cleanupStatus(outcome, err)
 	attrs := []any{"issue_id", issue.ID, "issue_identifier", issue.Identifier, "status", status}

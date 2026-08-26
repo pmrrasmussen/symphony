@@ -182,6 +182,10 @@ type apiFixture struct {
 	created       int
 	patches       []map[string]any
 	multiplePulls bool
+	// pullGets counts single-pull-request reads, the one request the linked
+	// pull request poll loop issues per tick. A test asserts it stops growing
+	// once a link settles (PMR-112).
+	pullGets int
 
 	statuses     []map[string]any
 	overall      string
@@ -241,6 +245,28 @@ func (f *apiFixture) mergedAt() any {
 
 func boolPtr(b bool) *bool { return &b }
 
+// pullReads reports how many single-pull-request GETs the fixture has served.
+func (f *apiFixture) pullReads() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.pullGets
+}
+
+// reconciliations reads the merged-poll completion count under the fake's own
+// mutex, so a test may observe it while Manager.Run polls on another goroutine.
+func (l *fakeLinear) reconciliations() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.reconciled
+}
+
+// tracked reports how many linked pull requests the manager still polls.
+func tracked(m *Manager) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.linked)
+}
+
 func (f *apiFixture) serve(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -288,6 +314,7 @@ func (f *apiFixture) serve(w http.ResponseWriter, r *http.Request) {
 		encoded, _ := json.Marshal(f.pullJSON())
 		_, _ = w.Write(encoded)
 	case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/pulls/7":
+		f.pullGets++
 		encoded, _ := json.Marshal(f.pullJSON())
 		_, _ = w.Write(encoded)
 	case r.Method == http.MethodPut && r.URL.Path == "/repos/owner/repo/pulls/7/update-branch":
@@ -730,7 +757,13 @@ func TestParsePublishInputAllowsBlankOnCallForHumanFillIn(t *testing.T) {
 	}
 }
 
-func TestPollMergedCompletesOnceAndClosedUnmergedOnlyWarns(t *testing.T) {
+// TestPollSettlesAndSweepsBothTerminalPullRequestStates covers the two ends of
+// a link's life. Merged reconciles Linear exactly once; closed-unmerged only
+// warns. Both are terminal for polling: the link leaves the table on the walk
+// that observed it, so every later tick issues no request at all for it, which
+// is what keeps a process that runs for weeks from polling and holding on to
+// every issue it ever published (PMR-112).
+func TestPollSettlesAndSweepsBothTerminalPullRequestStates(t *testing.T) {
 	api, git, linear := newAPI(t), &fakeGit{}, &fakeLinear{}
 	var logs bytes.Buffer
 	m, session := testSession(t, api, git, linear, &logs)
@@ -741,12 +774,19 @@ func TestPollMergedCompletesOnceAndClosedUnmergedOnlyWarns(t *testing.T) {
 	api.prMerged = true
 	api.mu.Unlock()
 	m.Poll(context.Background())
+	reads := api.pullReads()
 	m.Poll(context.Background())
 	if linear.reconciled != 1 {
 		t.Fatalf("reconciliations=%d", linear.reconciled)
 	}
 	if strings.Count(logs.String(), "GitHub merge completed Linear issue") != 1 {
 		t.Fatalf("merge completion log=%s", logs.String())
+	}
+	if tracked(m) != 0 {
+		t.Fatalf("merged link retained: tracked=%d", tracked(m))
+	}
+	if api.pullReads() != reads {
+		t.Fatalf("merged link still polled: reads=%d after the sweep, %d before", api.pullReads(), reads)
 	}
 
 	api2, linear2 := newAPI(t), &fakeLinear{}
@@ -759,12 +799,77 @@ func TestPollMergedCompletesOnceAndClosedUnmergedOnlyWarns(t *testing.T) {
 	api2.prState = "closed"
 	api2.mu.Unlock()
 	m2.Poll(context.Background())
+	closedReads := api2.pullReads()
 	m2.Poll(context.Background())
 	if linear2.reconciled != 0 || strings.Count(closedLogs.String(), "closed without merge") != 1 {
 		t.Fatalf("reconciled=%d logs=%s", linear2.reconciled, closedLogs.String())
 	}
+	if tracked(m2) != 0 {
+		t.Fatalf("closed-unmerged link retained: tracked=%d", tracked(m2))
+	}
+	if api2.pullReads() != closedReads {
+		t.Fatalf("closed-unmerged link still polled: reads=%d after the sweep, %d before", api2.pullReads(), closedReads)
+	}
 	if strings.Contains(logs.String()+closedLogs.String(), "private-token") {
 		t.Fatal("logs exposed credential")
+	}
+}
+
+// TestPollRetainsAMergedLinkWhoseLinearReconciliationFailed pins the one thing
+// the sweep must not do: drop a merged pull request whose Linear completion
+// call failed. Nothing else would ever reconcile that issue to Done.
+func TestPollRetainsAMergedLinkWhoseLinearReconciliationFailed(t *testing.T) {
+	api, git := newAPI(t), &fakeGit{}
+	linear := &fakeLinear{reconcileErr: errors.New("linear unavailable")}
+	m, session := testSession(t, api, git, linear, nil)
+	if _, err := session.Publish(context.Background(), testInput()); err != nil {
+		t.Fatal(err)
+	}
+	api.mu.Lock()
+	api.prMerged = true
+	api.mu.Unlock()
+	m.Poll(context.Background())
+	if tracked(m) != 1 {
+		t.Fatalf("failed reconciliation dropped the link: tracked=%d", tracked(m))
+	}
+	linear.mu.Lock()
+	linear.reconcileErr = nil
+	linear.mu.Unlock()
+	m.Poll(context.Background())
+	if linear.reconciliations() != 1 || tracked(m) != 0 {
+		t.Fatalf("retried reconciliation=%d tracked=%d, want 1 and 0", linear.reconciliations(), tracked(m))
+	}
+}
+
+// TestForgetStopsPollingAndRepublicationTracksAgain covers the retention rule
+// for a link that is neither merged nor closed: only the host's explicit
+// terminal-issue signal evicts it, and doing so must not make the issue
+// un-trackable if it publishes again.
+func TestForgetStopsPollingAndRepublicationTracksAgain(t *testing.T) {
+	api, git, linear := newAPI(t), &fakeGit{}, &fakeLinear{}
+	m, session := testSession(t, api, git, linear, nil)
+	if _, err := session.Publish(context.Background(), testInput()); err != nil {
+		t.Fatal(err)
+	}
+	m.Forget("no-such-issue")
+	if tracked(m) != 1 {
+		t.Fatalf("an unknown issue ID evicted a live link: tracked=%d", tracked(m))
+	}
+	m.Forget("issue-27")
+	reads := api.pullReads()
+	m.Poll(context.Background())
+	if tracked(m) != 0 || api.pullReads() != reads {
+		t.Fatalf("forgotten issue still polled: tracked=%d reads=%d after, %d before", tracked(m), api.pullReads(), reads)
+	}
+	if _, err := session.Publish(context.Background(), testInput()); err != nil {
+		t.Fatal(err)
+	}
+	api.mu.Lock()
+	api.prMerged = true
+	api.mu.Unlock()
+	m.Poll(context.Background())
+	if tracked(m) != 0 || linear.reconciliations() != 1 {
+		t.Fatalf("re-tracked issue did not poll again: tracked=%d reconciliations=%d", tracked(m), linear.reconciliations())
 	}
 }
 
@@ -800,7 +905,7 @@ func TestPollMergedReconcilesWithConfiguredMergeStateAndFailsClosedWithout(t *te
 	}
 }
 
-func TestPollStillOpenPullRequestDoesNotReconcile(t *testing.T) {
+func TestPollStillOpenPullRequestDoesNotReconcileAndKeepsBeingPolled(t *testing.T) {
 	api, git, linear := newAPI(t), &fakeGit{}, &fakeLinear{}
 	m, session := testSession(t, api, git, linear, nil)
 	if _, err := session.Publish(context.Background(), testInput()); err != nil {
@@ -811,6 +916,11 @@ func TestPollStillOpenPullRequestDoesNotReconcile(t *testing.T) {
 	m.Poll(context.Background())
 	if linear.reconciled != 0 {
 		t.Fatalf("open pull request reconciled: reconciliations=%d", linear.reconciled)
+	}
+	// An unsettled link is never swept, however many ticks pass over it: the
+	// merge this poll exists to observe may still be ahead of it.
+	if tracked(m) != 1 || api.pullReads() != 2 {
+		t.Fatalf("open pull request stopped being polled: tracked=%d reads=%d, want 1 and 2", tracked(m), api.pullReads())
 	}
 }
 
@@ -1789,6 +1899,70 @@ func TestVerifyLandedConfirmsOnlyTheMergedPullRequestHead(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestRunPollsOnItsIntervalUntilCancelled exercises the loop the daemon
+// actually starts: it must keep polling on the configured interval, reconcile
+// a merge it observes there, and return as soon as its context is cancelled.
+func TestRunPollsOnItsIntervalUntilCancelled(t *testing.T) {
+	api, git, linear := newAPI(t), &fakeGit{}, &fakeLinear{}
+	m, session := testSession(t, api, git, linear, nil)
+	if _, err := session.Publish(context.Background(), testInput()); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		m.Run(ctx)
+	}()
+	// The pull request is still open, so the loop must come back for it. Only
+	// then is the merge published, so the reconciliation below can only have
+	// come from a later tick of this same loop.
+	waitUntil(t, "the poll loop read the open pull request twice", func() bool { return api.pullReads() >= 2 })
+	api.mu.Lock()
+	api.prMerged = true
+	api.mu.Unlock()
+	waitUntil(t, "the poll loop reconciled the merge", func() bool { return linear.reconciliations() == 1 })
+	waitUntil(t, "the poll loop swept the settled link", func() bool { return tracked(m) == 0 })
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after its context was cancelled")
+	}
+}
+
+// An unconfigured poll interval must fall back to the built-in default rather
+// than spin, and cancellation must still be observed while that timer waits.
+func TestRunWithNoConfiguredIntervalWaitsAndStopsOnCancellation(t *testing.T) {
+	m := New(func() config.Settings { return config.Settings{GitHub: config.GitHub{Enabled: true}} }, slog.Default())
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		m.Run(ctx)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not observe cancellation while waiting out its default interval")
+	}
+}
+
+// waitUntil polls a condition the poll loop satisfies on another goroutine.
+func waitUntil(t *testing.T, what string, condition func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if condition() {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("timed out waiting until %s", what)
 }
 
 // A branch name Symphony would never have produced must not be verified

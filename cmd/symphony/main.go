@@ -180,6 +180,11 @@ func run(args []string, stdout, stderr io.Writer) int {
 	var a domain.AgentBackend = agent.NewRouter(settings, backends)
 	var w domain.WorkspaceExecutor = ws
 	c := coordinator.New(t, a, w, settings, slog.New(log.Handler()))
+	// The scheduler is the only component that knows an issue is finished, and
+	// the poll loop above is the one that would otherwise keep requesting that
+	// issue's pull request, and holding its credential snapshot and Linear
+	// session, for the rest of this process's life (PMR-112).
+	c.SetIssueForgetter(githubLifecycle)
 	var statusPublisher *status.Publisher
 	var stopStatus context.CancelFunc
 	var statusDone chan struct{}
