@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -18,11 +19,11 @@ func TestRunExercisesLifecycleWithoutCreatingConfiguredState(t *testing.T) {
 	workflow := filepath.Join(dir, "WORKFLOW.md")
 	writeWorkflow(t, workflow, workspaceRoot, `go version`, "")
 
-	result := Run(context.Background(), workflow, logRoot)
+	result := Run(context.Background(), workflow, logRoot, "")
 	if !result.OK() {
 		t.Fatalf("result=%+v", result)
 	}
-	for _, check := range []string{"workflow", "github_handoff", "tracker", "workspace_root", "workspace_source", "log_root", "agent_command", "hooks", "scheduler_lifecycle"} {
+	for _, check := range []string{"workflow", "github_handoff", "tracker", "workspace_root", "workspace_source", "log_root", "status_file", "agent_command", "hooks", "scheduler_lifecycle"} {
 		if !hasCheck(result, check) {
 			t.Fatalf("missing %s check: %+v", check, result)
 		}
@@ -39,7 +40,7 @@ func TestRunReportsIndependentBoundaryFailures(t *testing.T) {
 	workflow := filepath.Join(dir, "WORKFLOW.md")
 	writeWorkflow(t, workflow, filepath.Join(dir, "workspaces"), `symphony-command-that-does-not-exist`, "if then")
 
-	result := Run(context.Background(), workflow, filepath.Join(dir, "logs"))
+	result := Run(context.Background(), workflow, filepath.Join(dir, "logs"), "")
 	if result.OK() || result.Status != StatusFailed {
 		t.Fatalf("result=%+v", result)
 	}
@@ -56,6 +57,73 @@ func TestRunReportsIndependentBoundaryFailures(t *testing.T) {
 	}
 }
 
+// TestStatusFileCheckReportsAWarningWhenNotConfigured pins the never-silently-
+// missing rule PMR-122 argues for on agent_authentication: an operator who
+// never set --status-file still finds a status_file check, rather than
+// having to notice its total absence, and it never fails the overall result.
+func TestStatusFileCheckReportsAWarningWhenNotConfigured(t *testing.T) {
+	status, message := inspectStatusFile("")
+	if status != StatusWarning || !strings.Contains(message, "not configured") {
+		t.Fatalf("status=%v message=%q", status, message)
+	}
+}
+
+// TestStatusFileCheckAcceptsAMissingParentDirectory pins that a status
+// directory Symphony has not created yet is not a failure: status.Publisher
+// creates it mode 0700 on first write, so there is nothing to flag.
+func TestStatusFileCheckAcceptsAMissingParentDirectory(t *testing.T) {
+	dir := t.TempDir()
+	status, message := inspectStatusFile(filepath.Join(dir, "runtime", "status.json"))
+	if status != StatusPassed || !strings.Contains(message, "0700") {
+		t.Fatalf("status=%v message=%q", status, message)
+	}
+}
+
+// TestStatusFileCheckCatchesTheNonOwnerOnlyDirectoryPMR125Observed
+// reproduces the PMR-125 finding directly: --dry-run must fail, not pass all
+// green, when the status directory's mode would make every runtime status
+// write fail identically for the rest of the process's life.
+func TestStatusFileCheckCatchesTheNonOwnerOnlyDirectoryPMR125Observed(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows does not expose Unix permission semantics")
+	}
+	dir := t.TempDir()
+	statusDir := filepath.Join(dir, ".symphony")
+	if err := os.Mkdir(statusDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	status, message := inspectStatusFile(filepath.Join(statusDir, "status.json"))
+	if status != StatusFailed || !strings.Contains(message, "owner-only") {
+		t.Fatalf("status=%v message=%q", status, message)
+	}
+
+	workflow := filepath.Join(dir, "WORKFLOW.md")
+	writeWorkflow(t, workflow, filepath.Join(dir, "workspaces"), `go version`, "")
+	result := Run(context.Background(), workflow, filepath.Join(dir, "logs"), filepath.Join(statusDir, "status.json"))
+	if result.OK() {
+		t.Fatalf("result reported ok with a non-owner-only status directory: %+v", result)
+	}
+}
+
+// TestStatusFileCheckAcceptsAnExistingOwnerOnlyDirectory is the accepting
+// counterpart: a correctly configured status directory must not turn the
+// overall preflight result into a failure or warning.
+func TestStatusFileCheckAcceptsAnExistingOwnerOnlyDirectory(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows does not expose Unix permission semantics")
+	}
+	dir := t.TempDir()
+	statusDir := filepath.Join(dir, ".symphony")
+	if err := os.Mkdir(statusDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	status, message := inspectStatusFile(filepath.Join(statusDir, "status.json"))
+	if status != StatusPassed {
+		t.Fatalf("status=%v message=%q", status, message)
+	}
+}
+
 func TestRunReportsSafeLegacyProjectMigrationWarning(t *testing.T) {
 	dir := t.TempDir()
 	workflow := filepath.Join(dir, "WORKFLOW.md")
@@ -68,7 +136,7 @@ func TestRunReportsSafeLegacyProjectMigrationWarning(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	result := Run(context.Background(), workflow, filepath.Join(dir, "logs"))
+	result := Run(context.Background(), workflow, filepath.Join(dir, "logs"), "")
 	found := false
 	for _, check := range result.Checks {
 		if check.Name == "workflow_migration" && check.Status == StatusWarning {
@@ -136,7 +204,7 @@ func TestTheHandoffCheckReportsExactlyWhatAWorkerWillBeTold(t *testing.T) {
 
 func result(t *testing.T, workflow, dir string) Result {
 	t.Helper()
-	return Run(context.Background(), workflow, filepath.Join(dir, "logs"))
+	return Run(context.Background(), workflow, filepath.Join(dir, "logs"), "")
 }
 
 func writeWorkflow(t *testing.T, path, workspaceRoot, command, beforeRun string) {
@@ -298,7 +366,7 @@ func TestAuthenticationCheckKeepsAccountDetailsOutOfEveryResult(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	result := Run(context.Background(), workflow, filepath.Join(dir, "logs"))
+	result := Run(context.Background(), workflow, filepath.Join(dir, "logs"), "")
 	found := false
 	for _, check := range result.Checks {
 		assertNoAccountDetails(t, check.Message)

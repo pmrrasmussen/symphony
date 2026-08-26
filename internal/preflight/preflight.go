@@ -48,15 +48,19 @@ func (r Result) OK() bool { return r.Status != StatusFailed }
 // Run validates static boundaries and then exercises the real coordinator with
 // in-memory implementations. It never calls Linear, starts Codex, executes a
 // hook, creates a log, or prepares a real workspace.
-func Run(ctx context.Context, workflowPath, logRoot string) Result {
-	return run(ctx, workflowPath, logRoot, nil)
+//
+// statusFile is the operator's --status-file value, or empty if runtime status
+// snapshots are disabled; either way it always produces a status_file check,
+// so the check is never silently missing.
+func Run(ctx context.Context, workflowPath, logRoot, statusFile string) Result {
+	return run(ctx, workflowPath, logRoot, statusFile, nil)
 }
 
 // RunWithEnvironment is the read-only variant used to inspect a service whose
 // credential references are supplied by its own host environment, rather than
 // the invoking terminal. It has the same no-live-side-effect contract as Run.
-func RunWithEnvironment(ctx context.Context, workflowPath, logRoot string, environment map[string]string) Result {
-	return run(ctx, workflowPath, logRoot, environment)
+func RunWithEnvironment(ctx context.Context, workflowPath, logRoot, statusFile string, environment map[string]string) Result {
+	return run(ctx, workflowPath, logRoot, statusFile, environment)
 }
 
 // handoffToolName is how a worker on the selected backend actually names the
@@ -77,7 +81,7 @@ func handoffToolName(settings config.Settings) string {
 	return capability.NameGitHubPublishPR
 }
 
-func run(ctx context.Context, workflowPath, logRoot string, environment map[string]string) Result {
+func run(ctx context.Context, workflowPath, logRoot, statusFile string, environment map[string]string) Result {
 	result := Result{Status: StatusPassed}
 	workflow, err := config.LoadWithEnvironment(workflowPath, logRoot, environment)
 	if err != nil {
@@ -116,6 +120,7 @@ func run(ctx context.Context, workflowPath, logRoot string, environment map[stri
 		result.addPath("workspace_source", settings.Workspace.SourceRoot)
 	}
 	result.addPath("log_root", settings.LogRoot)
+	result.addStatusFile(statusFile)
 
 	// The check is named for the role, not the runtime, so selecting another
 	// backend does not rename a machine-readable result. The message and every
@@ -170,6 +175,43 @@ func (r *Result) add(name string, status Status, message string) {
 func (r *Result) addPath(name, path string) {
 	status, message := inspectPath(path)
 	r.add(name, status, message)
+}
+
+func (r *Result) addStatusFile(path string) {
+	status, message := inspectStatusFile(path)
+	r.add("status_file", status, message)
+}
+
+// inspectStatusFile validates the operator-supplied --status-file contract
+// that status.Publisher enforces: the file's parent directory, if it already
+// exists, must be owner-only. Unlike workspace_root and log_root, a missing
+// parent is not a warning: status.Publisher creates it mode 0700 on first
+// write (status.secureDirectory), so there is nothing for an operator to fix.
+// A statusFile of "" reports a warning rather than being left out of the
+// result, so an operator scanning checks always finds one for this flag.
+func inspectStatusFile(statusFile string) (Status, string) {
+	if statusFile == "" {
+		return StatusWarning, "--status-file is not configured; runtime status snapshots are disabled"
+	}
+	path, err := filepath.Abs(statusFile)
+	if err != nil {
+		return StatusFailed, fmt.Sprintf("resolve --status-file %s: %v", statusFile, err)
+	}
+	dir := filepath.Dir(path)
+	info, err := os.Stat(dir)
+	if os.IsNotExist(err) {
+		return StatusPassed, fmt.Sprintf("%s does not exist; Symphony creates it mode 0700 on first status write", dir)
+	}
+	if err != nil {
+		return StatusFailed, fmt.Sprintf("inspect status directory %s: %v", dir, err)
+	}
+	if !info.IsDir() {
+		return StatusFailed, fmt.Sprintf("status directory %s is not a directory", dir)
+	}
+	if info.Mode().Perm()&0o077 != 0 {
+		return StatusFailed, fmt.Sprintf("status directory %s must be owner-only (mode %#o); see docs/runtime-status.md", dir, info.Mode().Perm())
+	}
+	return StatusPassed, fmt.Sprintf("%s is an existing owner-only directory", dir)
 }
 
 func inspectPath(path string) (Status, string) {
