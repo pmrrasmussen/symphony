@@ -9,6 +9,36 @@ import (
 	githubhost "github.com/pmrrasmussen/symphony/internal/github"
 )
 
+// refreshBaseRefCapability fetches the configured base branch into this
+// worktree's shared refs/remotes/origin/<base>, host-side, so a session whose
+// base went stale mid-run can clear it without the write access to the
+// source repository's common Git directory that fetching itself would
+// require (PMR-141).
+type refreshBaseRefCapability struct{ session *githubhost.Session }
+
+func (c refreshBaseRefCapability) Lifecycle() bool { return true }
+
+func (c refreshBaseRefCapability) Definition() Definition {
+	return Definition{
+		Name:        NameGitHubRefreshBaseRef,
+		Description: "Fetch the configured base branch from origin into refs/remotes/origin/<base>, refreshing a base that moved since dispatch, and return its resolved commit. Call this before merging or rebasing onto the base branch. No input; a fetch failure is refused so the run can proceed against the base ref it already has.",
+		InputSchema: map[string]any{"type": "object", "additionalProperties": false},
+	}
+}
+
+func (c refreshBaseRefCapability) Prepare(arguments json.RawMessage) (Invocation, *Failure) {
+	if failure := decodeNoInput(arguments); failure != nil {
+		return nil, failure
+	}
+	return func(ctx context.Context) (Result, *Failure) {
+		commit, err := c.session.RefreshBaseRef(ctx)
+		if err != nil {
+			return Result{}, &Failure{Message: "GitHub base branch refresh was rejected.", Outcome: domain.ItemFailed}
+		}
+		return Result{Success: true, Payload: map[string]any{"base_commit": commit}}, nil
+	}, nil
+}
+
 // publishCapability hands a committed, clean worktree to human review.
 type publishCapability struct{ session *githubhost.Session }
 

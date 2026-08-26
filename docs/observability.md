@@ -198,7 +198,8 @@ diagnose a run that looks idle:
   `duration_ms` once known. `item_name` appears only when the protocol
   supplies a fixed tool name directly (an MCP tool's name), or when the name is
   a registry-owned constant for one of Symphony's own bound capabilities
-  (`github_publish_pr`, `github_pr_context`, and `github_land_pr`); it is never
+  (`refresh_base_ref`, `github_publish_pr`, `github_pr_context`, and
+  `github_land_pr`); it is never
   derived from command bodies, tool arguments, or the tool name an agent sent.
   `create_followup_issue` deliberately emits no `dynamicToolCall` records: it is
   a single bounded tracker round trip, so there is no slow outstanding operation
@@ -207,7 +208,7 @@ diagnose a run that looks idle:
 
   `dynamicToolCall` records are emitted for **both** backends, by the one shared
   capability dispatch (`internal/capability`), so which capabilities are reported
-  does not depend on which transport carried the call: the three GitHub
+  does not depend on which transport carried the call: the four GitHub
   capabilities are, and `create_followup_issue` is not, under `codex` and under
   `claude` alike. `duration_ms` is measured by Symphony around the provider round
   trip. The `item_id` is the app-server's own request ID under `codex`, and a

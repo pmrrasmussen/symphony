@@ -69,6 +69,12 @@ type Manager struct {
 	git      gitRunner
 	logger   *slog.Logger
 	mu       sync.Mutex
+	// fetchMu serializes every base-ref fetch this manager issues.
+	// refs/remotes/origin/<base> and packed-refs live in the shared Git common
+	// directory, not in any one session's worktree, so two sessions racing
+	// RefreshBaseRef (PMR-141) at once are racing the same repository-wide
+	// ref, not independent state the per-Session mu already guards.
+	fetchMu sync.Mutex
 	// linked holds, by issue ID, every pull request this manager still has a
 	// reason to request. Symphony runs for weeks, so the table is deliberately
 	// bounded by a defined end of life rather than by process lifetime
@@ -323,6 +329,34 @@ func ParsePublishInput(arguments json.RawMessage) (PublishInput, error) {
 // reused pull request is left untouched.
 func canonicalBody(input PublishInput, issueURL string) string {
 	return fmt.Sprintf("## Why\n%s\n\n## What changed\n%s\n\n## On Call\n%s\n\nLinear: %s\n", input.Why, input.WhatChanged, input.OnCall, strings.TrimSpace(issueURL))
+}
+
+// RefreshBaseRef fetches the configured base branch from origin into this
+// worktree's shared refs/remotes/origin/<base> -- the same refspec workspace
+// creation uses -- and returns its resolved commit. It is the host-mediated
+// stand-in for a fetch the sandboxed agent cannot perform itself: updating
+// refs/remotes/origin/<base> writes the Git common directory, which is
+// outside every path the agent's own worktree grant covers (PMR-141). A
+// fetch failure is returned as an error so the capability layer can refuse
+// the call and let the run proceed against whatever base ref it already has,
+// rather than ending the run. The fetch itself runs under manager.fetchMu,
+// because refs/remotes/origin/<base> and packed-refs are shared across every
+// session's worktree: at raised agent.max_concurrent_agents, an unserialized
+// fetch would race another session's fetch on that same repository-wide ref.
+func (s *Session) RefreshBaseRef(ctx context.Context) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.manager.fetchMu.Lock()
+	defer s.manager.fetchMu.Unlock()
+	refspec := "+refs/heads/" + s.settings.BaseBranch + ":refs/remotes/origin/" + s.settings.BaseBranch
+	if _, err := s.manager.git.Run(ctx, s.workspace, []string{"fetch", "--no-tags", "origin", refspec}, nil); err != nil {
+		return "", errors.New("github base ref refresh could not fetch the configured base branch")
+	}
+	base, err := s.manager.git.Run(ctx, s.workspace, []string{"rev-parse", "--verify", "refs/remotes/origin/" + s.settings.BaseBranch + "^{commit}"}, nil)
+	if err != nil {
+		return "", errors.New("github base ref refresh requires the configured base branch")
+	}
+	return base, nil
 }
 
 // Publish verifies a clean committed worktree, publishes only HEAD to the

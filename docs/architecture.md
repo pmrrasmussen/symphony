@@ -136,11 +136,12 @@ profile](linear-tracker.md) for the exact bounded fields.
 
 The optional GitHub adapter follows the same capability model. Configuration
 fixes one owner, repository, base branch, and host-only fine-grained token.
-Each Codex session can receive only two capabilities bound to its active
-Linear issue and managed worktree: a publish capability that accepts bounded
-`why`, `what_changed`, and `on_call` structured fields (no repository, issue,
-or branch selection), and a read-only `github_pr_context` capability with no
-input at all. The host verifies a clean, committed descendant of the
+Each Codex session can receive three capabilities bound to its active
+Linear issue and managed worktree: a zero-argument `refresh_base_ref`
+capability, a publish capability that accepts bounded `why`, `what_changed`,
+and `on_call` structured fields (no repository, issue, or branch selection),
+and a read-only `github_pr_context` capability with no input at all. The host
+verifies a clean, committed descendant of the
 configured base, pushes a deterministic issue branch, and creates or reuses
 that branch's PR with a deterministic `Why`/`What changed`/`On Call` body
 built from the structured fields plus the bound Linear issue URL; repeat
@@ -162,6 +163,27 @@ issue to `Done` after GitHub confirms a human merge; it has no merge
 operation. Closed-unmerged PRs only produce an operator warning. The
 linked-pair and completion guard are process-local, while retries reconcile
 durable GitHub PRs and Linear comments.
+
+`refresh_base_ref` exists because a merge that lands on the base branch mid-run
+leaves a session's `refs/remotes/origin/<base>` stale, and the session cannot
+fix that itself by design. `git merge origin/main` only writes objects and its
+own worktree HEAD, both inside the sandbox's per-worktree grant
+(`internal/workspace/local.go`'s `GitMetadataRoots`: the shared object store
+plus this session's own worktree directory, never the Git common directory's
+`refs` or `packed-refs`), so the `WORKFLOW.md` guidance to merge onto the base
+branch works unmodified. `git fetch`, in contrast, must update
+`refs/remotes/origin/<base>` in the common directory, and a fetch may rewrite
+`packed-refs`, which also holds `refs/heads/*` -- exactly the source
+repository write access PMR-65 narrowed the grant to prevent, and one no
+static grant can safely widen for, since whether a given fetch touches it
+depends on packing state and auto-gc. `refresh_base_ref` is the bounded,
+zero-argument capability that performs that one fetch host-side instead: it
+runs the same `git fetch --no-tags origin +refs/heads/<base>:refs/remotes/origin/<base>`
+workspace creation already runs, keyed by `github.base_branch`, and returns
+the resolved base commit so the caller can tell whether anything moved. It is
+advertised whenever a GitHub session is bound, independent of issue state, and
+a fetch failure is a refusal rather than a fatal error, so a transient network
+failure costs a refused tool call rather than the run.
 
 That linked-pair table is bounded by a defined end of life rather than by
 process lifetime, because Symphony runs for weeks (PMR-112). A pair leaves it

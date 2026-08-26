@@ -935,8 +935,8 @@ func TestDynamicToolsWrapEveryDefinitionInTheAppServerEnvelope(t *testing.T) {
 		GitHub:   &githubhost.Session{},
 	})
 	tools := dynamicTools(registry)
-	if len(tools) != 4 {
-		t.Fatalf("wrapped %d tools, want 4", len(tools))
+	if len(tools) != 5 {
+		t.Fatalf("wrapped %d tools, want 5", len(tools))
 	}
 	for _, tool := range tools {
 		if tool["type"] != "function" {
@@ -1386,10 +1386,10 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{}}'
 	if err != nil {
 		t.Fatal(err)
 	}
-	// The GitHub manager reached capability.Build (all three GitHub tools, land
+	// The GitHub manager reached capability.Build (all four GitHub tools, land
 	// included for the configured Merging state) and so did the Linear handoff:
 	// without a prepared handoff the GitHub session is never prepared at all.
-	for _, tool := range []string{"github_publish_pr", "github_pr_context", "github_land_pr"} {
+	for _, tool := range []string{"refresh_base_ref", "github_publish_pr", "github_pr_context", "github_land_pr"} {
 		if !strings.Contains(string(params), tool) {
 			t.Fatalf("passed providers did not advertise %s: %s", tool, params)
 		}

@@ -27,6 +27,7 @@ import (
 // silently changing what a Claude session is told exists.
 var allCapabilityNames = []string{
 	capability.NameCreateFollowupIssue,
+	capability.NameGitHubRefreshBaseRef,
 	capability.NameGitHubPublishPR,
 	capability.NameGitHubPRContext,
 	capability.NameGitHubLandPR,
@@ -81,14 +82,14 @@ func TestTheLaunchContractWithoutACapabilityIsUnchanged(t *testing.T) {
 }
 
 // TestTheLaunchContractPinsExactlyTheAdvertisedCapabilities covers the sets a
-// session can actually be built with: none, all four, the Merging-state landing
+// session can actually be built with: none, all five, the Merging-state landing
 // set, and a tracker-only follow-up set. Flag order is asserted along with the
 // values because the contract is a fixed argument vector, and because the
 // resume/session-id and model flags must stay last however many tools there are.
 func TestTheLaunchContractPinsExactlyTheAdvertisedCapabilities(t *testing.T) {
 	for name, names := range map[string][]string{
 		"nothing advertised": nil,
-		"all four":           allCapabilityNames,
+		"all five":           allCapabilityNames,
 		"landing only":       {capability.NameGitHubLandPR},
 		"follow-up only":     {capability.NameCreateFollowupIssue},
 	} {
@@ -892,7 +893,7 @@ func TestStartBindsTheHostProvidersAndTheirSecrets(t *testing.T) {
 	snapshot := func() config.Settings { return settings }
 
 	dir := t.TempDir()
-	// The init echo has to name all four capabilities, which is itself part of
+	// The init echo has to name all five capabilities, which is itself part of
 	// the assertion: a contract built from a registry missing its bindings would
 	// refuse this turn.
 	tools := allCodingTools
@@ -953,7 +954,7 @@ func TestStartBindsTheHostProvidersAndTheirSecrets(t *testing.T) {
 
 // TestTheAdvertisedSetIsTheRegistrysOwn is the parity assertion PMR-52 asked
 // for, in the only form this package can make it: the same bindings that give
-// internal/codex its four dynamic tools give this backend the same four names,
+// internal/codex its five dynamic tools give this backend the same five names,
 // in the same order, with the mcp__symphony__ prefix applied to each and nothing
 // added, dropped, or reordered. internal/codex asserts the app-server half of
 // the same statement over the same bindings, so neither transport can quietly
@@ -1482,11 +1483,11 @@ func TestTheGuardRefusesEachDivergenceItClaimsToCover(t *testing.T) {
 // backend fails at the call site and at the launch.
 func TestStartRefusesAPromptRenderedForTheWrongBackend(t *testing.T) {
 	backend, dir, settings := boundBackend(t)
-	// This session advertises publish and context, so the init echo has to name
-	// both prefixed tools and the connected server, or verifyInit refuses the
-	// accepted launch below for an unrelated reason.
+	// This session advertises refresh, publish, and context, so the init echo
+	// has to name all three prefixed tools and the connected server, or
+	// verifyInit refuses the accepted launch below for an unrelated reason.
 	tools := allCodingTools
-	for _, name := range []string{capability.NameGitHubPublishPR, capability.NameGitHubPRContext} {
+	for _, name := range []string{capability.NameGitHubRefreshBaseRef, capability.NameGitHubPublishPR, capability.NameGitHubPRContext} {
 		tools += `,"` + mcpToolName(name) + `"`
 	}
 	script := writeFakeClaude(t, dir, "cat <<'EOF'\n"+
@@ -1521,6 +1522,56 @@ func TestStartRefusesAPromptRenderedForTheWrongBackend(t *testing.T) {
 	}
 	if lastKind(t, drain(t, events)).Kind != domain.EventCompleted {
 		t.Fatal("a consistent session did not complete")
+	}
+}
+
+// TestRefreshBaseRefAdvertisedDoesNotWidenSandboxWriteGrants pins the
+// acceptance criterion the whole design rationale for refresh_base_ref rests
+// on: a session advertising the capability gets exactly the same sandbox
+// write grant as one that does not -- the workspace plus its two narrow Git
+// metadata roots, never the shared Git common directory those roots live in.
+// That common directory holds refs/remotes/origin/<base> and packed-refs;
+// granting it directly would reopen the source-repository write access
+// PMR-65 closed, which is the whole reason this fetch is host-mediated rather
+// than a sandbox change (PMR-141).
+func TestRefreshBaseRefAdvertisedDoesNotWidenSandboxWriteGrants(t *testing.T) {
+	backend, dir, settings := boundBackend(t)
+	tools := allCodingTools
+	for _, name := range []string{capability.NameGitHubRefreshBaseRef, capability.NameGitHubPublishPR, capability.NameGitHubPRContext} {
+		tools += `,"` + mcpToolName(name) + `"`
+	}
+	script := writeFakeClaude(t, dir, "cat <<'EOF'\n"+
+		`{"type":"system","subtype":"init","cwd":"`+workspaceOf(dir)+`","permissionMode":"dontAsk","tools":[`+tools+
+		`],"mcp_servers":[{"name":"symphony","status":"connected"}]}`+"\n"+resultLine(false, "")+"\nEOF\n")
+	r := request(t, dir, script)
+	r.Issue = domain.Issue{ID: "issue-1", Identifier: "PMR-52", State: "In Progress"}
+	r.Prompt = "task\n\n" + settings.DeliveryInstructions(config.ClaudeAgentBackend)
+
+	_, events, err := backend.Start(context.Background(), r)
+	if err != nil {
+		t.Fatalf("Start refused a session advertising refresh_base_ref: %v", err)
+	}
+	drain(t, events)
+
+	var rendered policy
+	if err := json.Unmarshal([]byte(flagValue(t, readArgs(t, dir), "--settings")), &rendered); err != nil {
+		t.Fatalf("settings payload is not valid JSON: %v", err)
+	}
+	want := map[string]bool{r.Workspace: true}
+	for _, root := range r.GitMetadataRoots {
+		want[root] = true
+	}
+	if len(rendered.Sandbox.Filesystem.AllowWrite) != len(want) {
+		t.Fatalf("allowWrite=%v, want exactly %v", rendered.Sandbox.Filesystem.AllowWrite, want)
+	}
+	commonDir := filepath.Dir(r.GitMetadataRoots[0])
+	for _, root := range rendered.Sandbox.Filesystem.AllowWrite {
+		if !want[root] {
+			t.Fatalf("allowWrite granted an unexpected root %q", root)
+		}
+		if root == commonDir {
+			t.Fatal("allowWrite granted the shared Git common directory itself, reopening PMR-65")
+		}
 	}
 }
 

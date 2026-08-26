@@ -51,13 +51,13 @@ func TestAdvertisedCapabilitiesAndOrderPerConfiguration(t *testing.T) {
 		{"nothing configured", bindings(false, false, "Todo", ""), nil},
 		{"followup only", bindings(true, false, "Todo", ""), []string{NameCreateFollowupIssue}},
 		{"github without merge state configured", bindings(false, true, "Merging", ""),
-			[]string{NameGitHubPublishPR, NameGitHubPRContext}},
+			[]string{NameGitHubRefreshBaseRef, NameGitHubPublishPR, NameGitHubPRContext}},
 		{"github with issue outside merge state", bindings(false, true, "In Progress", "Merging"),
-			[]string{NameGitHubPublishPR, NameGitHubPRContext}},
+			[]string{NameGitHubRefreshBaseRef, NameGitHubPublishPR, NameGitHubPRContext}},
 		{"github with issue in merge state", bindings(false, true, "Merging", "Merging"),
-			[]string{NameGitHubPublishPR, NameGitHubPRContext, NameGitHubLandPR}},
+			[]string{NameGitHubRefreshBaseRef, NameGitHubPublishPR, NameGitHubPRContext, NameGitHubLandPR}},
 		{"everything enabled", bindings(true, true, "merging", " Merging "),
-			[]string{NameCreateFollowupIssue, NameGitHubPublishPR, NameGitHubPRContext, NameGitHubLandPR}},
+			[]string{NameCreateFollowupIssue, NameGitHubRefreshBaseRef, NameGitHubPublishPR, NameGitHubPRContext, NameGitHubLandPR}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got := names(Build(tc.bindings).Definitions())
@@ -100,8 +100,8 @@ func TestNoTrackerTransitionCapabilityIsEverRegistered(t *testing.T) {
 			t.Fatalf("capability %q must not exist", name)
 		}
 	}
-	if got := len(registry.Definitions()); got != 4 {
-		t.Fatalf("advertised %d capabilities, want exactly the 4 known ones", got)
+	if got := len(registry.Definitions()); got != 5 {
+		t.Fatalf("advertised %d capabilities, want exactly the 5 known ones", got)
 	}
 }
 
@@ -119,7 +119,7 @@ func TestUnknownCapabilityIsNotResolved(t *testing.T) {
 // refusal and never an invocation, so nothing is reported as a started call.
 func TestZeroArgumentCapabilitiesRejectAnyInputBeforeInvocation(t *testing.T) {
 	registry := Build(bindings(false, true, "Merging", "Merging"))
-	for _, name := range []string{NameGitHubPRContext, NameGitHubLandPR} {
+	for _, name := range []string{NameGitHubRefreshBaseRef, NameGitHubPRContext, NameGitHubLandPR} {
 		bound, ok := registry.Lookup(name)
 		if !ok {
 			t.Fatalf("%s not registered", name)
@@ -299,6 +299,21 @@ func TestLandCapabilityHasNoInput(t *testing.T) {
 	}
 }
 
+func TestRefreshBaseRefCapabilityHasNoInput(t *testing.T) {
+	definition := refreshBaseRefCapability{}.Definition()
+	schema := definition.InputSchema
+	if schema["type"] != "object" || schema["additionalProperties"] != false {
+		t.Fatalf("schema=%#v", schema)
+	}
+	if _, hasProperties := schema["properties"]; hasProperties {
+		t.Fatalf("refresh_base_ref capability unexpectedly accepts caller-controlled input: %#v", schema)
+	}
+	encoded, err := json.Marshal(definition)
+	if err != nil || strings.Contains(string(encoded), "token") || strings.Contains(string(encoded), "\"owner\"") || strings.Contains(string(encoded), "\"repository\"") {
+		t.Fatalf("definition exposed host scope: %s err=%v", encoded, err)
+	}
+}
+
 func TestFollowupIssueSchemaHasNoCallerControlledScopeFields(t *testing.T) {
 	definition := followupIssueCapability{}.Definition()
 	schema := definition.InputSchema
@@ -352,7 +367,7 @@ func TestFollowupIssueSchemaHasNoCallerControlledScopeFields(t *testing.T) {
 func TestEveryDefinitionIsNamedByARegistryConstant(t *testing.T) {
 	known := map[string]bool{
 		NameCreateFollowupIssue: true, NameGitHubPublishPR: true,
-		NameGitHubPRContext: true, NameGitHubLandPR: true,
+		NameGitHubPRContext: true, NameGitHubLandPR: true, NameGitHubRefreshBaseRef: true,
 	}
 	for _, definition := range Build(bindings(true, true, "Merging", "Merging")).Definitions() {
 		if !known[definition.Name] {
@@ -372,10 +387,11 @@ func TestEveryDefinitionIsNamedByARegistryConstant(t *testing.T) {
 func TestLifecycleReportingPerCapability(t *testing.T) {
 	registry := Build(bindings(true, true, "Merging", "Merging"))
 	for name, want := range map[string]bool{
-		NameCreateFollowupIssue: false,
-		NameGitHubPublishPR:     true,
-		NameGitHubPRContext:     true,
-		NameGitHubLandPR:        true,
+		NameCreateFollowupIssue:  false,
+		NameGitHubPublishPR:      true,
+		NameGitHubPRContext:      true,
+		NameGitHubLandPR:         true,
+		NameGitHubRefreshBaseRef: true,
 	} {
 		bound, ok := registry.Lookup(name)
 		if !ok {

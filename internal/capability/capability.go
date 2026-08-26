@@ -26,10 +26,11 @@ import (
 // strings that may reach a log or an event: the "tool" value decoded from an
 // agent's call is never logged, so a hostile name cannot be echoed anywhere.
 const (
-	NameCreateFollowupIssue = "create_followup_issue"
-	NameGitHubPublishPR     = "github_publish_pr"
-	NameGitHubPRContext     = "github_pr_context"
-	NameGitHubLandPR        = "github_land_pr"
+	NameCreateFollowupIssue  = "create_followup_issue"
+	NameGitHubPublishPR      = "github_publish_pr"
+	NameGitHubPRContext      = "github_pr_context"
+	NameGitHubLandPR         = "github_land_pr"
+	NameGitHubRefreshBaseRef = "refresh_base_ref"
 )
 
 // Definition is the transport-neutral advertisement of one capability. The
@@ -198,6 +199,12 @@ func Build(b Bindings) *Registry {
 	}
 	if b.GitHub != nil {
 		r.entries = append(r.entries,
+			// refresh_base_ref is advertised whenever a workspace is bound, not
+			// gated on issue state (Todo, In Progress, and Rework all publish);
+			// it is the tool WORKFLOW.md's Base branch section calls before
+			// merging or rebasing onto the base branch, so it precedes publish
+			// and context here (PMR-141).
+			entry{capability: refreshBaseRefCapability{session: b.GitHub}, advertised: true},
 			entry{capability: publishCapability{session: b.GitHub}, advertised: true},
 			entry{capability: contextCapability{session: b.GitHub}, advertised: true},
 			// github_land_pr is advertised only for a session bound to an issue
