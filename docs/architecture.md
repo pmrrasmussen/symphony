@@ -475,7 +475,13 @@ itself, and the CLI restores none of the contract on `--resume`.
 That payload sets `sandbox.enabled` with `failIfUnavailable: true` and
 `allowUnsandboxedCommands: false`, `filesystem.allowWrite` to the worktree plus
 the same two narrow Git metadata roots the Codex profile is granted, and
-`network.allowedDomains` to `["*"]`. `failIfUnavailable` is mandatory because
+`network.allowedDomains` to `["*"]` with `network.allowLocalBinding: true`.
+The two network grants are separate in the CLI's own sandbox schema:
+`allowedDomains` covers outbound connect, and without `allowLocalBinding` a
+session cannot `bind(2)` a loopback listener at all -- `net.Listen("tcp",
+"127.0.0.1:0")` fails with "bind: operation not permitted" regardless of the
+domain allowlist (PMR-143), which is what several of this repository's own
+`httptest`- and `mcpbridge`-backed test suites need to run. `failIfUnavailable` is mandatory because
 the CLI otherwise fails open: verified on `claude` 2.1.245, a sandbox that
 cannot initialize is announced only as "Sandboxing is disabled for the rest of
 this session!" inside a tool result, after which the turn continues unconfined
@@ -498,7 +504,14 @@ observed. Second, reads are not confined,
 exactly as for Codex. Third, `network.allowedDomains: ["*"]` is unrestricted
 outbound access, the same deliberate choice as the Codex profile's
 `networkAccess: true`; per-domain control exists and works but is not used to
-restrict anything. Fourth, the only confirmation that the contract applied is
+restrict anything. `allowLocalBinding: true` is the separate grant that lets a
+session bind loopback, matching what `networkAccess: true` already covers in
+the Codex profile in one flag; a Bash call that still fails to bind despite
+the grant is reported as an `EventDiagnostic` naming the sandbox denial
+(`internal/claude`'s stream decoder recognizes the fixed "bind: operation not
+permitted" marker in a failed tool result), rather than surfacing only as an
+undifferentiated failed item indistinguishable from a real regression.
+Fourth, the only confirmation that the contract applied is
 the CLI's own `system`/`init` event, which reports the working directory, tool
 surface, permission mode, and attached MCP servers: Symphony requires the tool
 surface and permission mode to match the contract that turn was launched under

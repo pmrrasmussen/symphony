@@ -925,6 +925,14 @@ func (t *turn) stream(s *session, r domain.AgentRequest, turnNumber int) {
 				outcome := domain.ItemCompleted
 				if content.IsError {
 					outcome = domain.ItemFailed
+					if toolResultDeniedLoopbackBind(content.Content) {
+						// A bind failure and a real test regression otherwise look
+						// identical to an operator reading only the item outcome
+						// below: both are just a failed Bash call. This is the one
+						// case worth a diagnostic of its own.
+						emit(domain.Event{Kind: domain.EventDiagnostic, At: time.Now(),
+							Message: "sandbox denied a loopback bind; the invoked command could not validate itself in this session"})
+					}
 				}
 				event := domain.Event{
 					Kind: domain.EventItem, At: time.Now(),

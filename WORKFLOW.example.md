@@ -155,8 +155,10 @@ codex:
 # the codex profile is granted.
 #
 # The same honest limits apply as above, plus one that is narrower than it
-# sounds: *reads* are not confined, outbound network is unrestricted, and the
-# sandbox governs Bash but not Edit and Write. Those two are allowed by bare
+# sounds: *reads* are not confined, outbound network is unrestricted, loopback
+# binding is separately granted so repository tests that stand up an httptest
+# server or similar can run in-session, and the sandbox governs Bash but not
+# Edit and Write. Those two are allowed by bare
 # tool name with no path restriction at all, so a write outside the worktree is
 # neither sandbox-confined nor detected by anything Symphony checks -- the
 # post-run Git integrity check looks only at the source repository's own branch
