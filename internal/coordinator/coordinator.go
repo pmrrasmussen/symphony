@@ -1386,10 +1386,14 @@ func (c *Coordinator) cleanupWorkspace(ctx context.Context, issue domain.Issue) 
 // about to clean up on and turning a healthy landing into a killed git
 // subprocess (PMR-130). So this attempt runs on a context detached from the
 // run's own cancellation (bounded by workspaceCleanupTimeout instead), and if
-// r.stopped is already set once it finishes, reconcile's own stopTerminal
+// r.stopped is stopTerminal once it finishes, reconcile's own stopTerminal
 // branch holds -- or is about to hold -- an authoritative attempt on its own
 // live context right after stopRun returns; this attempt's failure is then a
-// duplicate, not a call to action, and is reported below WARN.
+// duplicate, not a call to action, and is reported below WARN. Any other stop
+// reason (ineligible, stalled) does not carry that guarantee -- reconcile
+// only re-cleans up on stopTerminal -- so a failure raced by one of those must
+// still reach WARN, or a genuine leak is swallowed as a duplicate that never
+// actually gets retried.
 func (c *Coordinator) cleanupWorkspaceAtRunEnd(ctx context.Context, r *running, issue domain.Issue) {
 	cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), workspaceCleanupTimeout)
 	defer cancel()
@@ -1414,7 +1418,7 @@ func (c *Coordinator) finalizeWorkspace(ctx context.Context, issue domain.Issue,
 	attrs = append(attrs, "error", err)
 	if r != nil {
 		c.mu.Lock()
-		superseded := r.stopped != ""
+		superseded := r.stopped == stopTerminal
 		c.mu.Unlock()
 		if superseded {
 			c.log.Info("workspace cleanup", attrs...)

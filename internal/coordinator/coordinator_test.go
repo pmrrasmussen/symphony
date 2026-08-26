@@ -1235,6 +1235,40 @@ func TestRunEndCleanupFailureIsNotActionableWhenReconciliationSucceeds(t *testin
 	}
 }
 
+// TestRunEndCleanupFailureStaysActionableForANonTerminalStopReason guards the
+// narrower half of the same fix: reconciliation only ever re-cleans up a run
+// it stopped for stopTerminal (coordinator.go:733), so a run-end failure
+// raced by any other stop reason -- ineligible or stalled -- names a genuine
+// leak that nothing will retry. Treating every non-empty r.stopped as
+// superseded, as an earlier version of this fix did, would swallow that leak
+// at Info and reintroduce exactly the silence PMR-130 exists to prevent.
+func TestRunEndCleanupFailureStaysActionableForANonTerminalStopReason(t *testing.T) {
+	for _, reason := range []stopReason{stopIneligible, stopStalled} {
+		t.Run(string(reason), func(t *testing.T) {
+			issue := testIssue()
+			var log syncBuffer
+			ws := &fakeWorkspace{
+				cleanupErr: errors.New("refusing to remove Git workspace whose HEAD c6e8a98 differs from recorded base commit 54bccf5; merged landing could not be verified"),
+			}
+			c := New(&fakeTracker{issue: issue}, &fakeAgent{}, ws, func() config.Settings { return testSettings(t).Config }, slog.New(slog.NewJSONHandler(&log, nil)))
+			r := &running{issue: issue, stopped: reason}
+
+			c.cleanupWorkspaceAtRunEnd(context.Background(), r, issue)
+
+			lines := cleanupLogLines(log.String())
+			if len(lines) != 1 {
+				t.Fatalf("workspace cleanup records=%v, want exactly one", lines)
+			}
+			if !strings.Contains(lines[0], `"level":"WARN"`) {
+				t.Fatalf("a failure raced by stop reason %q has no guaranteed retry and must stay a call to action: %s", reason, lines[0])
+			}
+			if !strings.Contains(lines[0], `"status":"committed"`) {
+				t.Fatalf("run-end cleanup record=%s, want the classified committed refusal", lines[0])
+			}
+		})
+	}
+}
+
 // waitForRelease waits until a finished run has released its claim, which the
 // launch goroutine does after the workspace after_run hook.
 func waitForRelease(t *testing.T, c *Coordinator, id string) {
