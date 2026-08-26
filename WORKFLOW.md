@@ -69,13 +69,26 @@ workspace:
 hooks:
   timeout_ms: 60000
 agent:
-  # Four-agent operation: implementation/rework work can scale across the
-  # available global capacity while max_concurrent_agents_by_state keeps
-  # landing serialized at exactly one Merging agent.
+  # Four-agent operation. The load-bearing gate is PMR-131 (merged
+  # 2026-08-26): a Claude quota rejection now ends its own attempt as a
+  # classified terminal event instead of being retried as a generic agent
+  # failure, so four concurrent sessions -- which burn a five-hour usage
+  # window roughly twice as fast as two -- fail visibly as one quota wall
+  # instead of as four issues each looking like an unrelated failure.
+  # refresh_base_ref (PMR-141, PR #98, merged 2026-08-26) is the other half:
+  # each concurrent implementation/rework agent can clear its own stale
+  # origin/main when a peer's merge lands mid-run, instead of failing a
+  # stale-base publish. max_concurrent_agents_by_state keeps landing
+  # serialized at exactly one Merging agent regardless.
   max_concurrent_agents: 4
   max_concurrent_agents_by_state:
     Merging: 1
-  max_turns: 20
+  # Lowered from 20 (PMR-134): across the 2026-08-26 dogfood session
+  # (.symphony/logs/symphony.jsonl), no run that published used more than 5
+  # turns -- including landing (always 1) and Rework runs -- while doomed runs
+  # burned the full 20-turn budget without publishing. 8 leaves headroom above
+  # every observed success without paying for as long a death spiral.
+  max_turns: 8
   # Bounds the number of runs, which max_turns (turns inside a run) and
   # max_retry_backoff_ms (the delay between runs) do not: after this many
   # dispatches of the same issue fail, Symphony logs one error-level
@@ -96,6 +109,11 @@ codex:
   turn_sandbox_policy:
     type: workspaceWrite
     networkAccess: true
+  # Left at its default: PMR-134's turn-timeout evidence came from
+  # agent.backend claude sessions -- an operator-side override never
+  # committed to this file -- so it does not bear on the codex backend this
+  # block configures. See WORKFLOW.example.md's commented-out claude: block
+  # for that number and the incident that set it.
   turn_timeout_ms: 3600000
   # read_timeout_ms bounds every steady-state JSON-RPC round trip; keep it small
   # so a hung session is detected mid-turn.
