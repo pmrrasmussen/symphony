@@ -131,6 +131,10 @@ type rateLimitEvent struct {
 		Status        string  `json:"status"`
 		RateLimitType string  `json:"rateLimitType"`
 		Utilization   float64 `json:"utilization"`
+		// ResetsAt is Unix epoch seconds naming when the reported window
+		// reopens. It is absent for a status the CLI reports with no reset at
+		// all (in practice, a fresh "allowed").
+		ResetsAt int64 `json:"resetsAt"`
 	} `json:"rate_limit_info"`
 }
 

@@ -949,15 +949,42 @@ func (t *turn) stream(s *session, r domain.AgentRequest, turnNumber int) {
 		case "rate_limit_event":
 			var event rateLimitEvent
 			_ = json.Unmarshal(line, &event)
-			// This is reported as a diagnostic rather than EventRateLimit on
-			// purpose. The scheduler normalizes rate-limit payloads through a
-			// fixed numeric allowlist (limit, remaining, used, reset_seconds,
-			// window_seconds); the CLI's actionable fields are strings under
-			// different names, so an EventRateLimit here would be silently
-			// discarded and never reach a log.
-			emit(domain.Event{Kind: domain.EventDiagnostic, At: time.Now(),
-				Message: "claude reported a rate limit: " + observability.Text(firstNonEmpty(event.RateLimitInfo.Status, "unspecified")) +
-					" (" + observability.Text(firstNonEmpty(event.RateLimitInfo.RateLimitType, "unspecified")) + ")"})
+			// This is reported through RateLimitStatus rather than
+			// EventRateLimit on purpose. The scheduler normalizes
+			// EventRateLimit payloads through a fixed numeric allowlist
+			// (limit, remaining, used, reset_seconds, window_seconds); the
+			// CLI's actionable status is a string under a different name, so
+			// an EventRateLimit here would be silently discarded and never
+			// reach a log.
+			status := firstNonEmpty(event.RateLimitInfo.Status, "unspecified")
+			rateLimitType := firstNonEmpty(event.RateLimitInfo.RateLimitType, "unspecified")
+			if status == "rejected" {
+				// A rejection is definitive: the account's quota for this
+				// window is closed, which says nothing about this issue's
+				// work and nothing a retried turn can change before the
+				// window reopens. Ending the run here, rather than waiting
+				// for the result event the CLI still sends a moment later,
+				// stops it from spending any more of a launch already denied
+				// (PMR-131).
+				t.sink.emitTerminal(domain.Event{
+					Kind: domain.EventRateLimited, At: time.Now(),
+					Message:         "claude reported a rate limit: rejected (" + observability.Text(rateLimitType) + ")",
+					RateLimitStatus: status,
+					RetryAfter:      rateLimitRetryAfter(event.RateLimitInfo.ResetsAt, time.Now()),
+				})
+				t.kill()
+				continue
+			}
+			if status != "allowed" {
+				// "allowed" is the default, healthy state and arrives on
+				// effectively every turn; only a non-allowed, non-terminal
+				// status (today, "allowed_warning") is worth an operator's
+				// attention (PMR-126).
+				emit(domain.Event{Kind: domain.EventDiagnostic, At: time.Now(),
+					Message:         "claude reported a rate limit: " + observability.Text(status) + " (" + observability.Text(rateLimitType) + ")",
+					RateLimitStatus: status,
+				})
+			}
 		case "result":
 			if t.sink.settled() {
 				// Something already ended this turn -- a refused init, or a
@@ -1052,6 +1079,21 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+// rateLimitRetryAfter converts the CLI's absolute reset time into a duration
+// from now, floored at zero so a reset already in the past (clock skew, or a
+// reset observed slightly late) never produces a negative retry delay. A
+// resetsAt of zero means the CLI reported no reset at all, which the
+// scheduler's own floor covers (PMR-131).
+func rateLimitRetryAfter(resetsAt int64, now time.Time) time.Duration {
+	if resetsAt <= 0 {
+		return 0
+	}
+	if delay := time.Unix(resetsAt, 0).Sub(now); delay > 0 {
+		return delay
+	}
+	return 0
 }
 
 // exitText reports an exit status without the child's own output.
