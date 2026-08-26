@@ -70,11 +70,17 @@ func (c publishCapability) Prepare(arguments json.RawMessage) (Invocation, *Fail
 	return func(ctx context.Context) (Result, *Failure) {
 		result, err := c.session.Publish(ctx, input)
 		if err != nil {
-			// Every reason Publish returns is a fixed, repository-config-derived,
-			// secret-free string (unclean worktree, stale base, non-fast-forward
-			// remote, and so on), so it is passed straight through: the agent can
-			// act on it and retry, instead of looping on a refusal it has no way
-			// to diagnose (PMR-132).
+			// Publish's error surface is wider than its own six local gate checks
+			// (unclean worktree, stale base, non-fast-forward remote, and so on):
+			// it also forwards EnsureActive, findPull, publishPullRequest, and
+			// LinkAndHandoff failures verbatim. internal/github and internal/linear
+			// guarantee every one of those is host-authored and free of provider or
+			// wire-decoded text -- see
+			// TestPublishForwardedFailuresAtEveryCallSiteCarryNoProviderOrWireDecodedText
+			// and TestEnsureActiveAndLinkAndHandoffErrorsCarryNoProviderWireContent --
+			// so err.Error() is passed straight through: the agent can act on it and
+			// retry, instead of looping on a refusal it has no way to diagnose
+			// (PMR-132, PMR-149).
 			return Result{}, &Failure{Message: "GitHub publish needs a fix: " + err.Error() + ".", Outcome: domain.ItemFailed}
 		}
 		// The payload shape is built explicitly rather than marshaled from the
