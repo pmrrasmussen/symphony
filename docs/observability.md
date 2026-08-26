@@ -327,6 +327,45 @@ with the `repository`, the shortened `workspace_commit`, and, when verified,
 the `pr_number`. See [workspace ownership and
 recovery](completion-markers.md) for the full cleanup safety table.
 
+The `internal/workspace` package logs three more records, all through the same
+redaction boundary rather than to `os.Stderr` — the JSONL log is the operator's
+complete record of them:
+
+* `"msg":"workspace source integrity alert"` is the
+  [PMR-65](https://linear.app/pmrrasmussen/issue/PMR-65) defense-in-depth
+  backstop: after a run, Symphony re-checks that the source repository's
+  branch heads (other than the `symphony/*` publish branches it creates
+  itself) and primary working tree index are exactly as they were before the
+  run, and this **error**-level record is written if they are not — the
+  narrowed sandbox grant a linked worktree receives is supposed to make that
+  impossible, so this is the highest-signal record the package can produce. It
+  carries `operation: source_integrity_alert`, `issue_id`/`issue_identifier`,
+  and `source_root`. A failure to even compute the post-run fingerprint (for
+  example, the source repository became unreadable) instead logs
+  `"msg":"workspace source integrity check failed"` at **warn**, with the same
+  issue attributes and a bounded `error`.
+* `"msg":"workspace hook failed"` covers an `after_run` or `before_remove` hook
+  that exits non-zero. Neither hook's failure stops the run or the cleanup it
+  brackets, so unlike `before_run` (whose failure reaches the coordinator's own
+  `"msg":"agent run retry scheduled"` record) this package logs it directly, at
+  **warn**, with `hook` naming which hook (`after_run` or `before_remove`),
+  the issue attributes, and a bounded `error`.
+
+Every hook's stdout/stderr is bounded and credential-masked once, in
+`internal/workspace`, before it reaches either an error a caller may format
+into a log record or one of the two records above: both paths carry the same
+`observability.Text`-bounded (`observability.MaxDiagnosticBytes`, currently
+512 bytes) and masked diagnostic, so a hook that dumps its environment or a
+failing `curl -v` on failure cannot write a credential into either the JSONL
+log or an error string.
+
+Query for the integrity alert specifically:
+
+```sh
+tail -F .symphony/logs/symphony.jsonl \
+  | jq 'select(.msg == "workspace source integrity alert")'
+```
+
 ## What never appears in the log
 
 Regardless of level, Symphony never logs: Linear or GitHub credentials or

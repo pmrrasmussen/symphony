@@ -1,11 +1,14 @@
 package workspace
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -17,6 +20,7 @@ import (
 
 	"github.com/pmrrasmussen/symphony/internal/config"
 	"github.com/pmrrasmussen/symphony/internal/domain"
+	"github.com/pmrrasmussen/symphony/internal/observability"
 )
 
 func TestKeyAndWorkspaceRemainBelowRoot(t *testing.T) {
@@ -1157,6 +1161,133 @@ func TestSourceIntegrityDigestDetectsBranchAndIndexWrites(t *testing.T) {
 	afterIndex, err := sourceIntegrityDigest(ctx, source, commonDir)
 	if err != nil || afterIndex == afterBranch {
 		t.Fatalf("a primary index write was not detected: got=%q previous=%q err=%v", afterIndex, afterBranch, err)
+	}
+}
+
+// TestSourceIntegrityAlertIsStructuredAndNeverReachesStderr proves the PMR-65
+// backstop alert lands in the operator log -- with the dedicated Operation and
+// the issue attributes an operator needs to query for it -- instead of
+// launchd's stderr file, which is not queryable and carries no issue
+// attribution.
+func TestSourceIntegrityAlertIsStructuredAndNeverReachesStderr(t *testing.T) {
+	source := newGitRepository(t)
+	root := filepath.Join(t.TempDir(), "workspaces")
+	s := config.Settings{Workspace: config.Workspace{Root: root, SourceRoot: source}}
+	l := New(func() config.Settings { return s })
+	var logs bytes.Buffer
+	l.SetLogger(slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	issue := domain.Issue{ID: "issue-65", Identifier: "PMR-65"}
+	ws, err := l.Prepare(context.Background(), issue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ws.GitIntegrityBaseline == "" {
+		t.Fatal("expected Prepare to record an integrity baseline")
+	}
+	// Simulate the breach the backstop exists to catch: a source branch head
+	// moves during the run, despite the narrowed sandbox grant.
+	runGit(t, source, "branch", "unexpected")
+
+	stderrRead, stderrWrite, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	origStderr := os.Stderr
+	os.Stderr = stderrWrite
+	l.AfterRun(context.Background(), ws, issue)
+	os.Stderr = origStderr
+	if err := stderrWrite.Close(); err != nil {
+		t.Fatal(err)
+	}
+	leaked, err := io.ReadAll(stderrRead)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(leaked) != 0 {
+		t.Fatalf("integrity alert wrote to os.Stderr: %q", leaked)
+	}
+
+	var record struct {
+		Level           string `json:"level"`
+		Msg             string `json:"msg"`
+		Operation       string `json:"operation"`
+		IssueID         string `json:"issue_id"`
+		IssueIdentifier string `json:"issue_identifier"`
+		SourceRoot      string `json:"source_root"`
+	}
+	found := false
+	for _, line := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
+		if line == "" {
+			continue
+		}
+		if err := json.Unmarshal([]byte(line), &record); err != nil {
+			t.Fatal(err)
+		}
+		if record.Msg == "workspace source integrity alert" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("integrity alert was not logged as a structured record: %s", logs.String())
+	}
+	if record.Level != "ERROR" {
+		t.Fatalf("integrity alert logged at %q, want ERROR", record.Level)
+	}
+	if record.Operation != string(observability.OperationSourceIntegrityAlert) {
+		t.Fatalf("integrity alert operation=%q, want %q", record.Operation, observability.OperationSourceIntegrityAlert)
+	}
+	if record.IssueID != issue.ID || record.IssueIdentifier != issue.Identifier {
+		t.Fatalf("integrity alert missing issue attributes: %+v", record)
+	}
+	if record.SourceRoot == "" {
+		t.Fatal("integrity alert missing source_root")
+	}
+}
+
+// TestHookDiagnosticsAreBoundedAndMaskedOnBothPaths proves observability.Text
+// is applied once, at the source in hook, so a token-shaped credential in hook
+// output is masked and the diagnostics are bounded to
+// observability.MaxDiagnosticBytes on both the returned-error path
+// (BeforeRun, which the coordinator logs) and the logged path (AfterRun,
+// which this package logs directly).
+func TestHookDiagnosticsAreBoundedAndMaskedOnBothPaths(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "workspaces")
+	const secret = "token=super-secret-hook-value"
+	script := fmt.Sprintf(`echo %s; (yes filler | head -c 4000); exit 1`, secret)
+	s := config.Settings{Workspace: config.Workspace{Root: root}, Hooks: config.Hooks{BeforeRun: script, AfterRun: script}}
+	l := New(func() config.Settings { return s })
+	var logs bytes.Buffer
+	l.SetLogger(slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	issue := domain.Issue{ID: "issue-114", Identifier: "PMR-114"}
+	ws, err := l.Prepare(context.Background(), issue)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The returned-error path: what the coordinator's BeforeRun failure carries.
+	beforeRunErr := l.BeforeRun(context.Background(), ws, issue)
+	if beforeRunErr == nil {
+		t.Fatal("BeforeRun unexpectedly succeeded")
+	}
+	if strings.Contains(beforeRunErr.Error(), secret) {
+		t.Fatalf("hook secret leaked through the returned error: %v", beforeRunErr)
+	}
+	if !strings.Contains(beforeRunErr.Error(), "[REDACTED]") {
+		t.Fatalf("returned hook error was not masked: %v", beforeRunErr)
+	}
+	if got := len(beforeRunErr.Error()); got > observability.MaxDiagnosticBytes+256 {
+		t.Fatalf("returned hook error is not bounded: %d bytes: %v", got, beforeRunErr)
+	}
+
+	// The logged path: AfterRun's hook failure never returns to a caller, it is
+	// logged directly.
+	l.AfterRun(context.Background(), ws, issue)
+	if strings.Contains(logs.String(), secret) {
+		t.Fatalf("hook secret leaked into the log: %s", logs.String())
+	}
+	if !strings.Contains(logs.String(), "[REDACTED]") {
+		t.Fatalf("logged hook diagnostics were not masked: %s", logs.String())
 	}
 }
 

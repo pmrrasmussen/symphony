@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -21,6 +22,7 @@ import (
 	"github.com/pmrrasmussen/symphony/internal/config"
 	"github.com/pmrrasmussen/symphony/internal/domain"
 	"github.com/pmrrasmussen/symphony/internal/hostenv"
+	"github.com/pmrrasmussen/symphony/internal/observability"
 )
 
 const maxHookOutput = 16 << 10
@@ -54,6 +56,21 @@ type Local struct {
 	// nil until an integration is wired, and a nil verifier keeps the original
 	// fail-closed refusal.
 	landing domain.LandingVerifier
+	// log routes the PMR-65 integrity alert and hook diagnostics through the
+	// shared redaction boundary instead of os.Stderr. It stays nil until
+	// SetLogger is called or logger is first used, at which point logger falls
+	// back to the process default, so the zero value and existing tests keep
+	// working.
+	log *observability.Logger
+}
+
+// logger returns the operator log sink, defaulting to the process-wide
+// handler for a Local built without SetLogger (including the zero value).
+func (l *Local) logger() *observability.Logger {
+	if l.log != nil {
+		return l.log
+	}
+	return observability.FromSlog(nil)
 }
 
 // workspaceState is deliberately stored below workspace.root rather than in a
@@ -77,13 +94,25 @@ type workspaceState struct {
 	CompletedUpdatedAt *time.Time `json:"completed_updated_at,omitempty"`
 }
 
-func New(settings func() config.Settings) *Local { return &Local{settings: settings} }
+func New(settings func() config.Settings) *Local {
+	return &Local{settings: settings, log: observability.FromSlog(nil)}
+}
 
 // SetLandingVerifier installs the host-side merge verification terminal
 // cleanup uses to tell a published, merged commit apart from unpublished local
 // work. It must only ever be given a Symphony-owned, read-only verifier; it is
 // never reachable from an agent session.
 func (l *Local) SetLandingVerifier(v domain.LandingVerifier) { l.landing = v }
+
+// SetLogger routes the PMR-65 integrity alert and hook failure diagnostics at
+// the operator log handler instead of the process default, the same way
+// linear.Tracker and github.Manager are wired, so those records land in
+// symphony.jsonl instead of launchd's stderr file.
+func (l *Local) SetLogger(logger *slog.Logger) {
+	if logger != nil {
+		l.log = observability.FromSlog(logger)
+	}
+}
 func Key(identifier string) string {
 	clean := unsafe.ReplaceAllString(identifier, "_")
 	if clean == identifier && clean != "" && clean != "." && clean != ".." && clean != stateDirectory {
@@ -266,7 +295,7 @@ func (l *Local) BeforeRun(ctx context.Context, ws domain.Workspace, issue domain
 }
 func (l *Local) AfterRun(ctx context.Context, ws domain.Workspace, issue domain.Issue) {
 	if err := l.hook(ctx, ws, issue, "after_run", l.settings().Hooks.AfterRun); err != nil {
-		fmt.Fprintf(os.Stderr, "symphony after_run hook error issue=%s: %v\n", issue.Identifier, err)
+		l.logger().Warn("workspace hook failed", "hook", "after_run", "issue_id", issue.ID, "issue_identifier", issue.Identifier, "error", err)
 	}
 	l.assertSourceIntegrity(ctx, ws, issue)
 }
@@ -289,11 +318,12 @@ func (l *Local) assertSourceIntegrity(ctx context.Context, ws domain.Workspace, 
 	}
 	current, err := sourceIntegrityDigest(ctx, state.SourceRoot, state.GitCommonDir)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "symphony source integrity check error issue=%s: %v\n", issue.Identifier, err)
+		l.logger().Warn("workspace source integrity check failed", "issue_id", issue.ID, "issue_identifier", issue.Identifier, "error", err)
 		return
 	}
 	if current != ws.GitIntegrityBaseline {
-		fmt.Fprintf(os.Stderr, "symphony source integrity alert issue=%s: source branches or primary index changed during the run; an isolated worktree must never modify them; inspect %s\n", issue.Identifier, state.SourceRoot)
+		l.logger().Error("workspace source integrity alert", "operation", observability.OperationSourceIntegrityAlert,
+			"issue_id", issue.ID, "issue_identifier", issue.Identifier, "source_root", state.SourceRoot)
 	}
 }
 
@@ -352,7 +382,7 @@ func (l *Local) Cleanup(ctx context.Context, issue domain.Issue) (domain.Cleanup
 	}
 	ws := domain.Workspace{Path: path, Key: Key(issue.Identifier)}
 	if err := l.hook(ctx, ws, issue, "before_remove", l.settings().Hooks.BeforeRemove); err != nil {
-		fmt.Fprintf(os.Stderr, "symphony before_remove hook error issue=%s: %v\n", issue.Identifier, err)
+		l.logger().Warn("workspace hook failed", "hook", "before_remove", "issue_id", issue.ID, "issue_identifier", issue.Identifier, "error", err)
 	}
 	git, err := isGitWorkspace(path)
 	if err != nil {
@@ -710,7 +740,12 @@ func (l *Local) hook(ctx context.Context, ws domain.Workspace, issue domain.Issu
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	err = cmd.Run()
 	if err != nil {
-		diagnostics := strings.TrimSpace(strings.Join([]string{stdout.String(), stderr.String()}, "\n"))
+		// Bounded and masked here, at the source, so every consumer of this error
+		// -- the coordinator's BeforeRun failure path and the after_run/
+		// before_remove records this package logs directly -- sees the same
+		// redacted diagnostics rather than depending on the caller to apply
+		// observability.Text itself.
+		diagnostics := observability.Text(strings.TrimSpace(strings.Join([]string{stdout.String(), stderr.String()}, "\n")))
 		return fmt.Errorf("%s hook failed: %w: %s", name, err, diagnostics)
 	}
 	return nil
