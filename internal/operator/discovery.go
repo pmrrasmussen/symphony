@@ -466,7 +466,7 @@ func inspectWorkflow(instance *Instance, environment map[string]string) []string
 		GitHubMergeMethod: settings.GitHub.MergeMethod, GitHubRequiredChecks: append([]string(nil), settings.GitHub.RequiredChecks...),
 		Credentials: credentialPresence(workflow.Raw, instance.Paths.Workflow, environment),
 	}
-	for _, check := range preflight.RunWithEnvironment(context.Background(), instance.Paths.Workflow, instance.Paths.LogsRoot, environment).Checks {
+	for _, check := range preflight.RunWithEnvironment(context.Background(), instance.Paths.Workflow, instance.Paths.LogsRoot, instance.Paths.StatusFile, environment).Checks {
 		if check.Status == preflight.StatusPassed {
 			continue
 		}
