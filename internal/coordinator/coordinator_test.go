@@ -142,6 +142,12 @@ func TestIneligibleReasonCategorizesEachRejection(t *testing.T) {
 			reason: "not_routable",
 		},
 		{
+			name:   "blocked by relation",
+			issue:  domain.Issue{ID: "a", Identifier: "X-1", Title: "t", State: "Todo", Dispatchable: false, BlockedBy: []domain.Blocker{{ID: "b", Identifier: "X-0", State: "In Progress", Dispatchable: false}}},
+			s:      config.Settings{Tracker: config.Tracker{ActiveStates: []string{"Todo"}}},
+			reason: "blocked_by_relation",
+		},
+		{
 			name:   "eligible",
 			issue:  domain.Issue{ID: "a", Identifier: "X-1", Title: "t", State: "Todo", Dispatchable: true},
 			s:      config.Settings{Tracker: config.Tracker{ActiveStates: []string{"Todo"}}},
@@ -223,6 +229,29 @@ func TestPollSummaryCategorizesRejectionsAndOmitsAtInfoLevel(t *testing.T) {
 	}
 	if !strings.Contains(output, `"issue_identifier":"ENG-6"`) || !strings.Contains(output, `"reason":"already_claimed"`) {
 		t.Fatalf("per-issue rejection record missing: %s", output)
+	}
+}
+
+// TestPollRejectionNamesTheBlockingIssue guards the PMR-146 operator-visibility
+// requirement: a Todo issue held non-dispatchable by an open blocker relation
+// must be identifiable, and its blocker named, from the poll log -- not lumped
+// into the generic not_routable rejection an assignee mismatch or a missing
+// required label also produces.
+func TestPollRejectionNamesTheBlockingIssue(t *testing.T) {
+	w := testSettings(t)
+	blocked := testIssue()
+	blocked.Dispatchable = false
+	blocked.BlockedBy = []domain.Blocker{{ID: "blocker-id", Identifier: "ENG-0", State: "In Progress", Dispatchable: false}}
+	tracker := &issueMapTracker{candidates: []domain.Issue{blocked}, issues: map[string]domain.Issue{blocked.ID: blocked}}
+	var logs bytes.Buffer
+	c := New(tracker, &fakeAgent{}, &fakeWorkspace{}, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	c.Tick(context.Background())
+	output := logs.String()
+	if !strings.Contains(output, `"blocked_by_relation":1`) {
+		t.Fatalf("poll summary missing blocked_by_relation rejection: %s", output)
+	}
+	if !strings.Contains(output, `"issue_identifier":"ENG-1"`) || !strings.Contains(output, `"reason":"blocked_by_relation"`) || !strings.Contains(output, `"blocked_by":"ENG-0"`) {
+		t.Fatalf("per-issue rejection record missing the blocking issue: %s", output)
 	}
 }
 

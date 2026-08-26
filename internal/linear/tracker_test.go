@@ -38,7 +38,7 @@ func TestListCandidatesPaginatesScopesAndNormalizes(t *testing.T) {
 		}
 		if variables["after"] == nil {
 			writeJSON(t, w, issuePage([]any{
-				issue("one", "PMR-1", " First ", "Todo", "owner", []string{" Feature ", "bug", "feature", " "}, []relation{{Type: "blocks", ID: "blocker", Identifier: "PMR-0", State: "In Progress"}}),
+				issue("one", "PMR-1", " First ", "Todo", "owner", []string{" Feature ", "bug", "feature", " "}, []relation{{Type: "blocks", ID: "blocker", Identifier: "PMR-0", State: "In Progress", StateType: "started"}}),
 			}, true, "cursor-1"))
 			return
 		}
@@ -46,7 +46,7 @@ func TestListCandidatesPaginatesScopesAndNormalizes(t *testing.T) {
 			t.Errorf("after=%v want %v", got, want)
 		}
 		writeJSON(t, w, issuePage([]any{
-			issue("two", "PMR-2", "Second", "Todo", "owner", nil, []relation{{Type: "blocks", ID: "done", Identifier: "PMR-3", State: "Done"}}),
+			issue("two", "PMR-2", "Second", "Todo", "owner", nil, []relation{{Type: "blocks", ID: "done", Identifier: "PMR-3", State: "Done", StateType: "completed"}}),
 		}, false, ""))
 	}))
 	defer server.Close()
@@ -130,7 +130,7 @@ func TestListCandidatesFreezesSettingsAcrossPages(t *testing.T) {
 			writeJSON(t, w, issuePage(nil, true, "next"))
 			return
 		}
-		writeJSON(t, w, issuePage([]any{issue("one", "PMR-1", "First", "Todo", "owner", nil, []relation{{Type: "blocks", ID: "done", Identifier: "PMR-0", State: "Done"}})}, false, ""))
+		writeJSON(t, w, issuePage([]any{issue("one", "PMR-1", "First", "Todo", "owner", nil, []relation{{Type: "blocks", ID: "done", Identifier: "PMR-0", State: "Done", StateType: "completed"}})}, false, ""))
 	}))
 	defer server.Close()
 	settings = config.Settings{Tracker: config.Tracker{
@@ -796,6 +796,50 @@ func TestTodoWithTruncatedBlockersIsNotDispatchable(t *testing.T) {
 	}
 }
 
+// TestTodoBlockedByDuplicateIsDispatchable guards against PMR-146: a blocker
+// parked in a resolved status the workflow's terminal_states does not happen
+// to name (Duplicate is not in newTestTracker's ["Done", "Canceled"] list)
+// must not freeze the blocked issue forever. The decision follows Linear's
+// workflow-state type, not the configured name list.
+func TestTodoBlockedByDuplicateIsDispatchable(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(t, w, issuePage([]any{
+			issue("one", "PMR-1", "First", "Todo", "", nil, []relation{{Type: "blocks", ID: "dup", Identifier: "PMR-0", State: "Duplicate", StateType: "duplicate"}}),
+		}, false, ""))
+	}))
+	defer server.Close()
+
+	issues, err := newTestTracker(server.URL, "").ListCandidates(context.Background(), []string{"Todo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(issues) != 1 || !issues[0].Dispatchable {
+		t.Fatalf("a blocker resolved as Duplicate must not block dispatch: %#v", issues)
+	}
+}
+
+// TestTodoBlockedByOpenStatusIsNotDispatchable asserts a blocker in a
+// genuinely open state -- one whose workflow-state type is neither completed,
+// canceled, nor duplicate -- still makes the issue non-dispatchable, even
+// though its display name ("Duplicate Review") could be mistaken for a
+// resolved status by a name-based check.
+func TestTodoBlockedByOpenStatusIsNotDispatchable(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(t, w, issuePage([]any{
+			issue("one", "PMR-1", "First", "Todo", "", nil, []relation{{Type: "blocks", ID: "open", Identifier: "PMR-0", State: "Duplicate Review", StateType: "started"}}),
+		}, false, ""))
+	}))
+	defer server.Close()
+
+	issues, err := newTestTracker(server.URL, "").ListCandidates(context.Background(), []string{"Todo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(issues) != 1 || issues[0].Dispatchable {
+		t.Fatalf("a blocker in an open workflow-state type must still block dispatch: %#v", issues)
+	}
+}
+
 func TestEndpointRequiresHTTPSOutsideLocalTestHosts(t *testing.T) {
 	for _, endpoint := range []string{
 		"http://example.com/graphql",
@@ -891,7 +935,7 @@ func assertCategory(t *testing.T, err error, category string) {
 	}
 }
 
-type relation struct{ Type, ID, Identifier, State string }
+type relation struct{ Type, ID, Identifier, State, StateType string }
 
 func issue(id, identifier, title, state, assignee string, labels []string, relations []relation) map[string]any {
 	labelNodes := make([]map[string]string, 0, len(labels))
@@ -902,7 +946,7 @@ func issue(id, identifier, title, state, assignee string, labels []string, relat
 	for _, relation := range relations {
 		relationNodes = append(relationNodes, map[string]any{
 			"type":  relation.Type,
-			"issue": map[string]any{"id": relation.ID, "identifier": relation.Identifier, "state": map[string]string{"name": relation.State}},
+			"issue": map[string]any{"id": relation.ID, "identifier": relation.Identifier, "state": map[string]string{"name": relation.State, "type": relation.StateType}},
 		})
 	}
 	value := map[string]any{
