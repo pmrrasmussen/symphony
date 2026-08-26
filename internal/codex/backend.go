@@ -675,87 +675,50 @@ func dynamicTools(registry *capability.Registry) []map[string]any {
 	return tools
 }
 
-// handleToolCall decodes one app-server tool call, runs the named capability,
-// and writes the protocol response. Every decision about what a capability is,
-// whether it accepts these arguments, and what it refuses belongs to the
-// registry; this function owns only the transport.
+// handleToolCall decodes one app-server tool call and hands it to the shared
+// capability dispatch, which owns the whole lookup-to-terminal-event sequence
+// for both of Symphony's agent transports. What is left here is what is
+// genuinely this protocol's: the request envelope, the JSON-RPC ID that both
+// answers the call and identifies it in item records, and the response envelope.
 func (c *client) handleToolCall(x rpc) {
 	var request struct {
 		Tool      string          `json:"tool"`
 		Arguments json.RawMessage `json:"arguments"`
 	}
 	if err := json.Unmarshal(x.Params, &request); err != nil {
-		c.unsupportedTool(x.ID)
+		// An envelope this adapter cannot read names no capability, so it is
+		// answered exactly as an unknown one is.
+		c.respondToCall(x.ID, capability.Outcome{Refusal: capability.Unsupported()})
 		return
 	}
-	bound, ok := c.capabilities.Lookup(request.Tool)
-	if !ok {
-		// No other client-side tool is bound: the agent has no Linear
-		// state-transition capability.
-		c.unsupportedTool(x.ID)
-		return
-	}
-	// The capability's own name is used from here on, never the decoded wire
-	// value, so nothing an agent chooses can reach a log or an event.
-	name := bound.Definition().Name
-	invoke, failure := bound.Prepare(request.Arguments)
-	if failure != nil {
-		// A rejected argument list precedes the call, so it is not reported as one.
-		c.toolFailure(x.ID, failure.Message)
-		return
-	}
-	observed := bound.Lifecycle()
-	callID := callIDText(x.ID)
-	var started time.Time
-	if observed {
-		started = c.emitCallStarted(callID, name)
-	}
-	result, failure := invoke(c.ctx)
-	if failure != nil {
-		if observed {
-			c.emitCallFinished(callID, name, failure.Outcome, started)
-		}
-		c.toolFailure(x.ID, failure.Message)
-		return
-	}
-	content, err := json.Marshal(result.Payload)
-	if err != nil {
-		if observed {
-			c.emitCallFinished(callID, name, domain.ItemFailed, started)
-		}
-		c.unsupportedTool(x.ID)
-		return
-	}
-	if observed {
-		c.emitCallFinished(callID, name, domain.ItemCompleted, started)
-	}
-	c.sendServerResponse(x.ID, map[string]any{"success": result.Success, "contentItems": []any{map[string]any{"type": "inputText", "text": string(content)}}})
-	if result.Terminal != "" {
-		// A capability may settle the whole run. Reason is a fixed, bounded string
-		// owned by the provider.
-		c.emit(domain.Event{Kind: result.Terminal, At: time.Now(), Message: result.Reason})
-	}
+	capability.Dispatch(c.ctx, c.capabilities, capability.Transport{
+		// The protocol-assigned request ID: it is the app-server's own, not a
+		// value the model chose, and it is the identity the response is keyed to.
+		CallID:  callIDText(x.ID),
+		Respond: func(outcome capability.Outcome) { c.respondToCall(x.ID, outcome) },
+		Emit:    c.emit,
+		// Neither gate applies here. Advertisement is this transport's only route
+		// to a call, so dispatch stays open and each provider re-validates its own
+		// preconditions; and a call runs inline on the read loop, so there is no
+		// concurrent second invocation for a slot to refuse.
+	}, request.Tool, request.Arguments)
 }
 
-// emitCallStarted and emitCallFinished report the lifecycle of Symphony's own
-// bound dynamic tools (a registry-owned capability name, never a value read
-// from the model's call arguments) so a slow provider round trip is visible the
-// same way an app-server item is. The call ID is the protocol-assigned JSON-RPC
-// request ID.
-func (c *client) emitCallStarted(callID, tool string) time.Time {
-	started := time.Now()
-	c.emit(domain.Event{Kind: domain.EventItem, At: started, ItemID: callID, ItemType: "dynamicToolCall", ToolName: tool, Outcome: domain.ItemStarted})
-	return started
+// respondToCall frames one dispatched outcome in the app-server's tool response
+// envelope. A refusal is a normal app-server response carrying success:false --
+// the model can inspect the structured rejection and keep working in the same
+// turn -- so EventBlocked stays reserved for interactive approval or user-input
+// requests.
+func (c *client) respondToCall(id any, outcome capability.Outcome) {
+	text, success := string(outcome.Payload), outcome.Success
+	if outcome.Refusal != nil {
+		text, success = outcome.Refusal.Message, false
+	}
+	c.sendServerResponse(id, map[string]any{"success": success, "contentItems": []any{map[string]any{"type": "inputText", "text": text}}})
 }
-func (c *client) emitCallFinished(callID, tool, outcome string, started time.Time) {
-	c.emit(domain.Event{Kind: domain.EventItem, At: time.Now(), ItemID: callID, ItemType: "dynamicToolCall", ToolName: tool, Outcome: outcome, DurationMs: time.Since(started).Milliseconds()})
-}
+
 func callIDText(id any) string {
 	return observability.Text(fmt.Sprint(id))
-}
-
-func (c *client) unsupportedTool(id any) {
-	c.toolFailure(id, "Unsupported client-side tool.")
 }
 
 // finalizeLanding settles capability state that outlives a single call once this
@@ -783,12 +746,6 @@ func (c *client) finalizeLanding() {
 	c.capabilities.TurnEnded(ctx)
 }
 
-// Tool failures are normal app-server responses: the model can inspect the
-// structured rejection and keep working in the same turn. EventBlocked is
-// reserved for interactive approval or user-input requests.
-func (c *client) toolFailure(id any, message string) {
-	c.sendServerResponse(id, map[string]any{"success": false, "contentItems": []any{map[string]any{"type": "inputText", "text": message}}})
-}
 func (c *client) sendServerResponse(id, result any) bool {
 	if err := c.send(map[string]any{"jsonrpc": "2.0", "id": id, "result": result}); err != nil {
 		c.abort(fmt.Errorf("codex server response write failed: %w", err))

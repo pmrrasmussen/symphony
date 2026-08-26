@@ -24,11 +24,17 @@ import (
 // test controls.
 type stubCapability struct {
 	definition capability.Definition
+	lifecycle  bool
 	prepare    func(json.RawMessage) (capability.Invocation, *capability.Failure)
 }
 
 func (c stubCapability) Definition() capability.Definition { return c.definition }
-func (c stubCapability) Lifecycle() bool                   { return true }
+
+// Lifecycle defaults to false, which is create_followup_issue's answer: most
+// tests here assert what the endpoint emits, and an unreported capability keeps
+// the terminal outcome the only event in the sink. The reported case has its own
+// builder and its own test.
+func (c stubCapability) Lifecycle() bool { return c.lifecycle }
 func (c stubCapability) Prepare(arguments json.RawMessage) (capability.Invocation, *capability.Failure) {
 	return c.prepare(arguments)
 }
@@ -111,6 +117,16 @@ func (s *stubRegistry) withPrepare(name string, prepare func(json.RawMessage) (c
 	}
 	s.definitions = append(s.definitions, definition)
 	s.bound[name] = stubCapability{definition: definition, prepare: prepare}
+	return s
+}
+
+// withReported advertises a capability that reports its invocations as item
+// records, which is what the three GitHub capabilities do.
+func (s *stubRegistry) withReported(name string, invoke capability.Invocation) *stubRegistry {
+	s.with(name, invoke)
+	bound := s.bound[name].(stubCapability)
+	bound.lifecycle = true
+	s.bound[name] = bound
 	return s
 }
 
@@ -326,7 +342,66 @@ func TestHandshakeListingAndInvocation(t *testing.T) {
 		t.Fatalf("tools/call returned %q (isError %v), want the marshaled payload", text, isError)
 	}
 	if emitted := events.all(); len(emitted) != 0 {
-		t.Fatalf("a successful call emitted %v; the CLI's own stream already reports it", emitted)
+		t.Fatalf("a call to a capability that reports no lifecycle emitted %v", emitted)
+	}
+}
+
+// TestAReportedCapabilityCallIsADynamicToolCallPair is the observability parity
+// this transport lacked (PMR-100): the same capability call was visible with a
+// duration under Codex and produced nothing here, so a Claude session's landing
+// round trip was absent from the log. Both transports now emit these records from
+// the shared dispatch, which is also what keeps create_followup_issue unreported
+// on both.
+func TestAReportedCapabilityCallIsADynamicToolCallPair(t *testing.T) {
+	registry := newRegistry().withReported("github_land_pr", func(context.Context) (capability.Result, *capability.Failure) {
+		time.Sleep(5 * time.Millisecond)
+		return capability.Result{Success: true, Payload: map[string]any{"status": "waiting"},
+			Terminal: domain.EventLandingWaiting, Reason: "required checks are pending"}, nil
+	})
+	registration, events := register(t, endpoint(t), registry)
+
+	// The request carries a JSON-RPC ID the child chose. It answers the call and
+	// must not become the identity of the record: nothing decoded from the wire
+	// reaches an event.
+	response, payload := send(t, http.MethodPost, registration.URL(), registration.Token(),
+		`{"jsonrpc":"2.0","id":"wire-chosen-id","method":"tools/call","params":{"name":"github_land_pr","arguments":{}}}`)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("tools/call returned status %d (%s)", response.StatusCode, payload)
+	}
+
+	waitFor(t, func() bool { return len(events.all()) == 3 }, "the item pair and the terminal event")
+	emitted := events.all()
+	started, finished, terminal := emitted[0], emitted[1], emitted[2]
+	for _, item := range []domain.Event{started, finished} {
+		if item.Kind != domain.EventItem || item.ItemType != "dynamicToolCall" || item.ToolName != "github_land_pr" {
+			t.Fatalf("item record = %+v, want a dynamicToolCall named github_land_pr", item)
+		}
+		if item.ItemID == "" || !strings.HasPrefix(item.ItemID, "mcp-call-") || strings.Contains(item.ItemID, "wire-chosen-id") {
+			t.Fatalf("item record ID = %q, want a host-minted call ID", item.ItemID)
+		}
+	}
+	if started.ItemID != finished.ItemID {
+		t.Fatalf("the pair carried IDs %q and %q, so no consumer can match them", started.ItemID, finished.ItemID)
+	}
+	if started.Outcome != domain.ItemStarted || finished.Outcome != domain.ItemCompleted {
+		t.Fatalf("outcomes = %q and %q", started.Outcome, finished.Outcome)
+	}
+	if finished.DurationMs < 1 {
+		t.Fatalf("the completed record reported %d ms, want the measured round trip", finished.DurationMs)
+	}
+	// The terminal outcome still arrives last, after the call has been answered.
+	if terminal.Kind != domain.EventLandingWaiting || terminal.Message != "required checks are pending" {
+		t.Fatalf("terminal event = %+v", terminal)
+	}
+
+	// A second call is a second operation: repeating an ID would let one call's
+	// completion clear another's outstanding record.
+	if _, isError := toolOutcome(t, callTool(t, registration, registration.Token(), "github_land_pr")); isError {
+		t.Fatal("the second call was refused")
+	}
+	waitFor(t, func() bool { return len(events.all()) == 6 }, "the second call's records")
+	if second := events.all()[3]; second.ItemID == started.ItemID {
+		t.Fatalf("both calls were reported under item ID %q", second.ItemID)
 	}
 }
 
