@@ -99,21 +99,31 @@ func TestConfigViewShowsCredentialPresenceNotReferences(t *testing.T) {
 	}
 }
 
-func TestConfigViewLabelsAgentLineWithSelectedBackend(t *testing.T) {
+func TestConfigViewRendersOnlyTheSelectedBackendSettings(t *testing.T) {
 	now := time.Now()
-	for _, testCase := range []struct{ backend, want string }{
-		{backend: "codex", want: "\nCodex: codex app-server\n"},
+	for _, testCase := range []struct {
+		backend, want string
+		config        operator.EffectiveConfig
+		absent        []string
+	}{
+		{backend: "codex", want: "\nCodex:\nCommand: codex app-server\nTimeouts: turn 1h0m0s; read 5s; start 2m0s; stall 5m0s\nApproval policy: never\nThread sandbox: workspace-write\n", config: operator.EffectiveConfig{AgentBackend: "codex", CodexCommand: "codex app-server", CodexApprovalPolicy: "never", CodexThreadSandbox: "workspace-write", TurnTimeout: time.Hour, ReadTimeout: 5 * time.Second, StartTimeout: 2 * time.Minute, StallTimeout: 5 * time.Minute}, absent: []string{"Model:"}},
+		{backend: "claude", want: "\nClaude:\nCommand: claude\nModel: sonnet\nTimeouts: turn 30m0s; stall 5m0s\n", config: operator.EffectiveConfig{AgentBackend: "claude", ClaudeCommand: "claude", ClaudeModel: "sonnet", TurnTimeout: 30 * time.Minute, StallTimeout: 5 * time.Minute}, absent: []string{"Approval policy:", "Thread sandbox:", "read 0s", "start 0s"}},
 		// A snapshot written before backend selection existed reports no
 		// backend, which must still render a label.
-		{backend: "", want: "\nAgent: codex app-server\n"},
+		{backend: "", want: "\nAgent:\nCommand: codex app-server\n", config: operator.EffectiveConfig{CodexCommand: "codex app-server"}},
 	} {
-		instance := operator.Instance{ID: "safe", Config: &operator.EffectiveConfig{AgentBackend: testCase.backend, CodexCommand: "codex app-server"}}
+		instance := operator.Instance{ID: "safe", Config: &testCase.config}
 		model := New([]operator.Instance{instance}, now)
 		model, _ = model.Update("enter")
 		model, _ = model.Update("c")
 		view := model.View(now)
 		if !strings.Contains(view, testCase.want) {
 			t.Fatalf("backend %q view missing %q:\n%s", testCase.backend, testCase.want, view)
+		}
+		for _, forbidden := range testCase.absent {
+			if strings.Contains(view, forbidden) {
+				t.Fatalf("backend %q view exposed %q:\n%s", testCase.backend, forbidden, view)
+			}
 		}
 	}
 }

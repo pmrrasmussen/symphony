@@ -282,13 +282,7 @@ func (m Model) configPanel(instance operator.Instance, style theme) string {
 			{"Merge state", empty(config.MergeState)},
 		}},
 		{caption: "Scheduling", rows: scheduling},
-		{caption: backendLabel(config.AgentBackend), rows: [][2]string{
-			{"Command", empty(config.CodexCommand)},
-			{"Timeouts", fmt.Sprintf("turn %s; read %s; start %s; stall %s",
-				config.TurnTimeout, config.ReadTimeout, config.StartTimeout, config.StallTimeout)},
-			{"Approval policy", empty(config.CodexApprovalPolicy)},
-			{"Thread sandbox", empty(config.CodexThreadSandbox)},
-		}},
+		{caption: backendLabel(config.AgentBackend), rows: backendConfigRows(config)},
 		{caption: "GitHub", rows: [][2]string{
 			{"Repository", empty(config.GitHubOwner) + "/" + empty(config.GitHubRepository)},
 			{"Base branch", empty(config.GitHubBaseBranch)},
@@ -300,6 +294,26 @@ func (m Model) configPanel(instance operator.Instance, style theme) string {
 			{"GitHub", style.presence(config.Credentials.GitHub.Configured)},
 		}},
 	})
+}
+
+// backendConfigRows renders only the controls the selected backend consults.
+// In particular, Claude has no app-server read/start handshake and no
+// workflow-configurable approval or sandbox policy.
+func backendConfigRows(config *operator.EffectiveConfig) [][2]string {
+	if config.AgentBackend == "claude" {
+		return [][2]string{
+			{"Command", empty(config.ClaudeCommand)},
+			{"Model", empty(config.ClaudeModel)},
+			{"Timeouts", fmt.Sprintf("turn %s; stall %s", config.TurnTimeout, config.StallTimeout)},
+		}
+	}
+	return [][2]string{
+		{"Command", empty(config.CodexCommand)},
+		{"Timeouts", fmt.Sprintf("turn %s; read %s; start %s; stall %s",
+			config.TurnTimeout, config.ReadTimeout, config.StartTimeout, config.StallTimeout)},
+		{"Approval policy", empty(config.CodexApprovalPolicy)},
+		{"Thread sandbox", empty(config.CodexThreadSandbox)},
+	}
 }
 
 // presence colors a credential's presence. It never renders the name or path

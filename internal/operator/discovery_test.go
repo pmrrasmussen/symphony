@@ -175,6 +175,87 @@ func TestEffectiveConfigReportsResolvedAgentBackendAlongsideCodexKeys(t *testing
 	}
 }
 
+func TestEffectiveConfigReportsOnlyTheSelectedBackendSettings(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Date(2026, 8, 26, 14, 55, 0, 0, time.UTC)
+	status := filepath.Join(ownerOnlyDir(t, dir, "backend-status"), "status.json")
+	write(t, status, `{"state":"running","updated_at":"2026-08-26T14:54:30Z"}`)
+
+	for _, test := range []struct {
+		backend string
+		block   string
+		turn    time.Duration
+		stall   time.Duration
+		present []string
+		absent  []string
+	}{
+		{
+			backend: "codex",
+			block:   "codex: {command: codex-run, approval_policy: never, thread_sandbox: workspace-write, turn_timeout_ms: 1001, read_timeout_ms: 1002, start_timeout_ms: 1003, stall_timeout_ms: 1004}\nclaude: {command: claude-run, model: opus, turn_timeout_ms: 2001, stall_timeout_ms: 2004}",
+			turn:    1001 * time.Millisecond,
+			stall:   1004 * time.Millisecond,
+			present: []string{`"codex_command":"codex-run"`, `"read_timeout":1002000000`, `"start_timeout":1003000000`},
+			absent:  []string{"claude_command", "claude_model"},
+		},
+		{
+			backend: "claude",
+			// Give Codex deliberately different values so this test cannot pass
+			// by projecting a shared default or coincidentally equal timeout.
+			block:   "codex: {command: codex-run, approval_policy: never, thread_sandbox: workspace-write, turn_timeout_ms: 1001, read_timeout_ms: 1002, start_timeout_ms: 1003, stall_timeout_ms: 1004}\nclaude: {command: claude-run, model: opus, turn_timeout_ms: 2001, stall_timeout_ms: 2004}",
+			turn:    2001 * time.Millisecond,
+			stall:   2004 * time.Millisecond,
+			present: []string{`"claude_command":"claude-run"`, `"claude_model":"opus"`},
+			absent:  []string{"codex_command", "codex_approval_policy", "codex_thread_sandbox", "read_timeout", "start_timeout"},
+		},
+	} {
+		t.Run(test.backend, func(t *testing.T) {
+			workflow := filepath.Join(dir, test.backend+".md")
+			source := filepath.Join(dir, test.backend+"-source")
+			if err := os.Mkdir(source, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			write(t, workflow, "---\ntracker: {kind: linear, provider: {project_slug_id: project, api_key: dummy}, active_states: [Todo], terminal_states: [Done]}\nworkspace: {root: work, source_root: "+source+"}\nagent: {backend: "+test.backend+"}\n"+test.block+"\n---\nprompt")
+			label := labelPrefix + "." + test.backend
+			writePlist(t, dir, label, workflow, filepath.Join(dir, "logs"), status)
+
+			instances, err := Discover(context.Background(), Options{LaunchAgentsDir: dir, Now: func() time.Time { return now }, Inspector: fakeInspector{label: {Loaded: true, PID: 21, Process: true}}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var instance *Instance
+			for i := range instances {
+				if instances[i].ID == label {
+					instance = &instances[i]
+					break
+				}
+			}
+			if instance == nil || instance.Config == nil {
+				t.Fatalf("missing effective configuration: %#v", instances)
+			}
+			if got := instance.Config.TurnTimeout; got != test.turn {
+				t.Fatalf("turn timeout = %s, want %s", got, test.turn)
+			}
+			if got := instance.Config.StallTimeout; got != test.stall {
+				t.Fatalf("stall timeout = %s, want %s", got, test.stall)
+			}
+			encoded, err := json.Marshal(instance.Config)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, want := range test.present {
+				if !strings.Contains(string(encoded), want) {
+					t.Fatalf("effective configuration missing %s:\n%s", want, encoded)
+				}
+			}
+			for _, forbidden := range test.absent {
+				if strings.Contains(string(encoded), forbidden) {
+					t.Fatalf("effective configuration exposed %s for %s:\n%s", forbidden, test.backend, encoded)
+				}
+			}
+		})
+	}
+}
+
 func TestRecentLogReadsBoundedTail(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "symphony.jsonl")
 	write(t, path, strings.Repeat("x", maxRecentLogBytes+1)+"\n"+`{"time":"2026-08-25T12:00:00Z","level":"INFO","msg":"workspace prepared"}`+"\n")

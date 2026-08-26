@@ -32,6 +32,16 @@ type/name and start/age. It deliberately excludes credentials, environment
 values, issue descriptions, prompts, workspace paths or contents, command
 bodies, tool arguments and output, and raw Codex payloads.
 
+`symphony service status` and `symphony tui` combine this runtime document with
+a separately loaded, display-safe effective configuration. That configuration
+is backend-aware: both backends report the common `turn_timeout` and
+`stall_timeout`; a Codex daemon additionally reports `codex_command`,
+`codex_approval_policy`, `codex_thread_sandbox`, `read_timeout`, and
+`start_timeout`; a Claude daemon instead reports `claude_command` and, when
+configured, `claude_model`. Fields for the other backend are omitted. The
+runtime snapshot schema remains version 1 because this effective-configuration
+projection is not part of `status.json`.
+
 Symphony writes the snapshot on startup and every second while it runs, then
 writes a final `"state":"stopped"` record after graceful shutdown. Snapshot
 publication is observational: a filesystem failure is logged but never blocks
