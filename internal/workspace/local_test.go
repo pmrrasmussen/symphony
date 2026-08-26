@@ -1133,34 +1133,99 @@ func TestNarrowedGrantSufficesForDetachedCommitAndProtectsSource(t *testing.T) {
 	}
 }
 
-// TestSourceIntegrityDigestDetectsBranchAndIndexWrites unit-tests the PMR-65
-// backstop's detection primitive: the digest ignores the symphony/* publish
-// branches Symphony itself creates, but changes when any other branch head moves
-// or the primary index is written.
-func TestSourceIntegrityDigestDetectsBranchAndIndexWrites(t *testing.T) {
+// TestSourceIntegritySnapshotIgnoresSymphonyBranches unit-tests the PMR-65
+// backstop's capture primitive: the snapshot excludes the symphony/* publish
+// branches Symphony itself creates, but records any other branch head.
+func TestSourceIntegritySnapshotIgnoresSymphonyBranches(t *testing.T) {
 	source := newGitRepository(t)
-	commonDir := filepath.Join(source, ".git")
 	ctx := context.Background()
-	base, err := sourceIntegrityDigest(ctx, source, commonDir)
+	base, err := captureSourceIntegrity(ctx, source)
 	if err != nil {
 		t.Fatal(err)
 	}
 	runGit(t, source, "branch", "symphony/pmr-1")
-	if got, err := sourceIntegrityDigest(ctx, source, commonDir); err != nil || got != base {
-		t.Fatalf("symphony/* branch changed the digest: got=%q base=%q err=%v", got, base, err)
-	}
-	runGit(t, source, "branch", "feature")
-	afterBranch, err := sourceIntegrityDigest(ctx, source, commonDir)
-	if err != nil || afterBranch == base {
-		t.Fatalf("a new non-symphony branch head was not detected: got=%q base=%q err=%v", afterBranch, base, err)
-	}
-	if err := os.WriteFile(filepath.Join(source, "staged.txt"), []byte("staged\n"), 0o600); err != nil {
+	afterSymphony, err := captureSourceIntegrity(ctx, source)
+	if err != nil {
 		t.Fatal(err)
 	}
-	runGit(t, source, "add", "staged.txt")
-	afterIndex, err := sourceIntegrityDigest(ctx, source, commonDir)
-	if err != nil || afterIndex == afterBranch {
-		t.Fatalf("a primary index write was not detected: got=%q previous=%q err=%v", afterIndex, afterBranch, err)
+	if !reflect.DeepEqual(afterSymphony.Refs, base.Refs) {
+		t.Fatalf("symphony/* branch changed the snapshot: got=%v base=%v", afterSymphony.Refs, base.Refs)
+	}
+	runGit(t, source, "branch", "feature")
+	afterFeature, err := captureSourceIntegrity(ctx, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reflect.DeepEqual(afterFeature.Refs, base.Refs) {
+		t.Fatalf("a new non-symphony branch head was not recorded: %v", afterFeature.Refs)
+	}
+}
+
+// TestDiffSourceRefsExplainsOperatorFastForwardPulls proves the PMR-145 fix:
+// an operator fast-forwarding a branch to a commit reachable from its
+// remote-tracking ref -- the ordinary `git pull --ff-only` workflow -- is
+// explained rather than flagged, while an arbitrary local write that does not
+// land a commit any remote knows about still alerts.
+func TestDiffSourceRefsExplainsOperatorFastForwardPulls(t *testing.T) {
+	source := newGitRepository(t)
+	ctx := context.Background()
+
+	baseline, err := captureSourceIntegrity(ctx, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate a second operator pushing to the remote, then this checkout
+	// running `git pull --ff-only`: refs/heads/main moves forward to a commit
+	// reachable from refs/remotes/origin/main.
+	publisher := cloneRepository(t, source)
+	if err := os.WriteFile(filepath.Join(publisher, "upstream.txt"), []byte("landed\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, publisher, "add", "upstream.txt")
+	runGit(t, publisher, "commit", "-m", "operator landed a PR")
+	runGit(t, publisher, "push", "origin", "main")
+	runGit(t, source, "pull", "--ff-only")
+
+	pulled, err := captureSourceIntegrity(ctx, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	alerts, explained, err := diffSourceRefs(ctx, source, baseline.Refs, pulled.Refs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(alerts) != 0 {
+		t.Fatalf("operator fast-forward pull was flagged as an alert: %+v", alerts)
+	}
+	if len(explained) != 1 || explained[0].Name != "refs/heads/main" {
+		t.Fatalf("operator fast-forward pull was not explained: %+v", explained)
+	}
+
+	// Now simulate the breach the backstop exists to catch: main advances to a
+	// commit no remote-tracking ref has ever heard of.
+	if err := os.WriteFile(filepath.Join(source, "escape.txt"), []byte("agent write\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, source, "add", "escape.txt")
+	runGit(t, source, "commit", "-m", "agent wrote the source repository")
+
+	written, err := captureSourceIntegrity(ctx, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	alerts, explained, err = diffSourceRefs(ctx, source, pulled.Refs, written.Refs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(explained) != 0 {
+		t.Fatalf("an unreachable local write was explained away: %+v", explained)
+	}
+	if len(alerts) != 1 || alerts[0].Name != "refs/heads/main" {
+		t.Fatalf("an unreachable local write was not flagged: %+v", alerts)
+	}
+	if alerts[0].Before != pulled.Refs["refs/heads/main"] || alerts[0].After != written.Refs["refs/heads/main"] {
+		t.Fatalf("alert did not name the before/after values: %+v", alerts[0])
 	}
 }
 
@@ -1214,6 +1279,7 @@ func TestSourceIntegrityAlertIsStructuredAndNeverReachesStderr(t *testing.T) {
 		IssueID         string `json:"issue_id"`
 		IssueIdentifier string `json:"issue_identifier"`
 		SourceRoot      string `json:"source_root"`
+		ChangedRefs     string `json:"changed_refs"`
 	}
 	found := false
 	for _, line := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
@@ -1242,6 +1308,60 @@ func TestSourceIntegrityAlertIsStructuredAndNeverReachesStderr(t *testing.T) {
 	}
 	if record.SourceRoot == "" {
 		t.Fatal("integrity alert missing source_root")
+	}
+	if !strings.Contains(record.ChangedRefs, "refs/heads/unexpected") || !strings.Contains(record.ChangedRefs, "(none)") {
+		t.Fatalf("integrity alert did not name the changed ref with its before/after values: %q", record.ChangedRefs)
+	}
+}
+
+// TestSourceIntegrityAlertIsSilentForOperatorFastForwardPulls proves the
+// PMR-145 fix end to end: an operator running `git pull --ff-only` in the
+// source checkout while a run is in flight -- the documented operator
+// workflow, and the scenario this issue observed firing on every run -- does
+// not trip the PMR-65 backstop.
+func TestSourceIntegrityAlertIsSilentForOperatorFastForwardPulls(t *testing.T) {
+	source := newGitRepository(t)
+	root := filepath.Join(t.TempDir(), "workspaces")
+	s := config.Settings{Workspace: config.Workspace{Root: root, SourceRoot: source}}
+	l := New(func() config.Settings { return s })
+	var logs bytes.Buffer
+	l.SetLogger(slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	issue := domain.Issue{ID: "issue-145", Identifier: "PMR-145"}
+	ws, err := l.Prepare(context.Background(), issue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ws.GitIntegrityBaseline == "" {
+		t.Fatal("expected Prepare to record an integrity baseline")
+	}
+
+	// A second operator merges a PR while the run is in flight, and this
+	// checkout runs its ordinary `git pull --ff-only`.
+	publisher := cloneRepository(t, source)
+	if err := os.WriteFile(filepath.Join(publisher, "landed.txt"), []byte("landed\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, publisher, "add", "landed.txt")
+	runGit(t, publisher, "commit", "-m", "operator landed a PR")
+	runGit(t, publisher, "push", "origin", "main")
+	runGit(t, source, "pull", "--ff-only")
+
+	l.AfterRun(context.Background(), ws, issue)
+
+	for _, line := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
+		if line == "" {
+			continue
+		}
+		var record struct {
+			Level string `json:"level"`
+			Msg   string `json:"msg"`
+		}
+		if err := json.Unmarshal([]byte(line), &record); err != nil {
+			t.Fatal(err)
+		}
+		if record.Msg == "workspace source integrity alert" {
+			t.Fatalf("operator fast-forward pull was reported as an integrity alert: %s", logs.String())
+		}
 	}
 }
 

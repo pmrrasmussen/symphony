@@ -255,7 +255,12 @@ func (l *Local) Prepare(ctx context.Context, issue domain.Issue) (domain.Workspa
 // packed-refs, and other worktrees' directories -- so a misbehaving agent cannot
 // write the source repository's branches or primary index (PMR-65). It also
 // records an integrity baseline so AfterRun can detect any drift that slips past
-// this narrowed grant.
+// this narrowed grant. The baseline covers refs/heads only, not the primary
+// index: the index is outside these two granted roots already, and unlike a
+// branch head it has no ancestry to check, so a legitimate concurrent `git add`
+// or `git pull` in the operator's own checkout cannot be told apart from a
+// write worth alerting on -- it would only add back the false-positive class
+// this baseline exists to avoid (PMR-145).
 func (l *Local) setGitMetadataRoot(ctx context.Context, ws *domain.Workspace, issue domain.Issue) error {
 	state, found, err := l.loadState(issue)
 	if err != nil {
@@ -285,8 +290,10 @@ func (l *Local) setGitMetadataRoot(ctx context.Context, ws *domain.Workspace, is
 	// The integrity baseline is a best-effort backstop: an unexpected failure to
 	// fingerprint the source must not fail an otherwise valid workspace. An empty
 	// baseline simply skips the post-run assertion.
-	if baseline, err := sourceIntegrityDigest(ctx, state.SourceRoot, state.GitCommonDir); err == nil {
-		ws.GitIntegrityBaseline = baseline
+	if snapshot, err := captureSourceIntegrity(ctx, state.SourceRoot); err == nil {
+		if encoded, err := json.Marshal(snapshot); err == nil {
+			ws.GitIntegrityBaseline = string(encoded)
+		}
 	}
 	return nil
 }
@@ -303,61 +310,177 @@ func (l *Local) AfterRun(ctx context.Context, ws domain.Workspace, issue domain.
 // assertSourceIntegrity is the PMR-65 defense-in-depth backstop. Even though the
 // narrowed sandbox grant should make it impossible, it re-checks that the run
 // left the source repository's branches (other than the symphony/* publish
-// branches Symphony itself creates) and primary working tree index exactly as
-// they were when the workspace was prepared, and alerts if not. It deliberately
-// only detects and alerts; it never rewrites the operator's refs or index,
-// because it cannot distinguish an agent breach from a legitimate concurrent
-// operator change and a destructive "repair" could lose real work.
+// branches Symphony itself creates) exactly as they were when the workspace was
+// prepared, and alerts if not. It deliberately only detects and alerts; it
+// never rewrites the operator's refs, because it cannot distinguish an agent
+// breach from a legitimate concurrent operator change and a destructive
+// "repair" could lose real work.
+//
+// A moved ref is not automatically an alert: an operator fast-forwarding
+// refs/heads/<branch> to a commit reachable from that branch's remote-tracking
+// ref (typically `git pull --ff-only`, the documented operator workflow) is
+// indistinguishable in outcome from a legitimate concurrent pull, and at the
+// cadence this project merges, essentially every run now spans one (PMR-145).
+// That movement is explained and logged at Debug instead of alerted on. Any
+// other change to refs/heads/* -- a rewrite, a reset, a brand-new ref, or a
+// fast-forward to a commit no remote knows about -- still alerts at Error.
 func (l *Local) assertSourceIntegrity(ctx context.Context, ws domain.Workspace, issue domain.Issue) {
 	if ws.GitIntegrityBaseline == "" {
+		return
+	}
+	var baseline sourceIntegritySnapshot
+	if err := json.Unmarshal([]byte(ws.GitIntegrityBaseline), &baseline); err != nil {
+		l.logger().Warn("workspace source integrity check failed", "issue_id", issue.ID, "issue_identifier", issue.Identifier, "error", err)
 		return
 	}
 	state, found, err := l.loadState(issue)
 	if err != nil || !found || state.SourceRoot == "" {
 		return
 	}
-	current, err := sourceIntegrityDigest(ctx, state.SourceRoot, state.GitCommonDir)
+	current, err := captureSourceIntegrity(ctx, state.SourceRoot)
 	if err != nil {
 		l.logger().Warn("workspace source integrity check failed", "issue_id", issue.ID, "issue_identifier", issue.Identifier, "error", err)
 		return
 	}
-	if current != ws.GitIntegrityBaseline {
-		l.logger().Error("workspace source integrity alert", "operation", observability.OperationSourceIntegrityAlert,
-			"issue_id", issue.ID, "issue_identifier", issue.Identifier, "source_root", state.SourceRoot)
+	alerts, explained, err := diffSourceRefs(ctx, state.SourceRoot, baseline.Refs, current.Refs)
+	if err != nil {
+		l.logger().Warn("workspace source integrity check failed", "issue_id", issue.ID, "issue_identifier", issue.Identifier, "error", err)
+		return
 	}
+	if len(explained) > 0 {
+		l.logger().Debug("workspace source integrity change explained by a fast-forward reachable from a remote-tracking ref",
+			"issue_id", issue.ID, "issue_identifier", issue.Identifier, "changed_refs", formatRefChanges(explained))
+	}
+	if len(alerts) == 0 {
+		return
+	}
+	l.logger().Error("workspace source integrity alert", "operation", observability.OperationSourceIntegrityAlert,
+		"issue_id", issue.ID, "issue_identifier", issue.Identifier, "source_root", state.SourceRoot, "changed_refs", formatRefChanges(alerts))
 }
 
-// sourceIntegrityDigest fingerprints the source repository state an isolated
-// detached worktree must never modify: every branch head except the symphony/*
-// publish branches Symphony itself creates, plus the primary working tree's
-// index. It ignores unrelated churn (object packing, other worktrees) so a
-// post-run comparison flags exactly a source branch or primary-index write.
-func sourceIntegrityDigest(ctx context.Context, sourceRoot, commonDir string) (string, error) {
+// sourceIntegritySnapshot is the JSON-encoded shape of GitIntegrityBaseline: the
+// source repository's branch heads an isolated detached worktree must never
+// modify, keyed by full ref name and excluding the symphony/* publish branches
+// Symphony itself creates.
+type sourceIntegritySnapshot struct {
+	Refs map[string]string `json:"refs"`
+}
+
+// captureSourceIntegrity reads the current refs/heads state to compare against
+// or record as a sourceIntegritySnapshot.
+func captureSourceIntegrity(ctx context.Context, sourceRoot string) (sourceIntegritySnapshot, error) {
 	refs, err := gitMetadataAllowEmpty(ctx, sourceRoot, "for-each-ref", "--format=%(refname) %(objectname)", "refs/heads/")
 	if err != nil {
-		return "", fmt.Errorf("read source branch heads: %w", err)
+		return sourceIntegritySnapshot{}, fmt.Errorf("read source branch heads: %w", err)
 	}
-	kept := make([]string, 0)
+	kept := make(map[string]string)
 	for _, line := range strings.Split(refs, "\n") {
 		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "refs/heads/symphony/") {
+		if line == "" {
 			continue
 		}
-		kept = append(kept, line)
+		name, oid, ok := strings.Cut(line, " ")
+		if !ok || strings.HasPrefix(name, "refs/heads/symphony/") {
+			continue
+		}
+		kept[name] = oid
 	}
-	sort.Strings(kept)
-	digest := sha256.New()
-	for _, line := range kept {
-		digest.Write([]byte(line))
-		digest.Write([]byte{0})
+	return sourceIntegritySnapshot{Refs: kept}, nil
+}
+
+// refChange describes a single refs/heads/* entry whose value differs between
+// the prepare-time baseline and the post-run snapshot. Before or After is
+// empty when the ref did not exist on that side.
+type refChange struct{ Name, Before, After string }
+
+// diffSourceRefs classifies every ref that moved between baseline and current
+// into alerts (report at Error) and explained (a fast-forward reachable from a
+// remote-tracking ref -- ordinary operator pull activity, report at Debug). A
+// ref that is new, deleted, or moved by anything other than a fast-forward
+// landing a commit some remote already has is always an alert: only the one
+// documented, narrow shape of concurrent operator activity is explained.
+func diffSourceRefs(ctx context.Context, sourceRoot string, baseline, current map[string]string) (alerts, explained []refChange, err error) {
+	names := make(map[string]struct{}, len(baseline)+len(current))
+	for name := range baseline {
+		names[name] = struct{}{}
 	}
-	index, err := os.ReadFile(filepath.Join(commonDir, "index"))
-	if err != nil && !os.IsNotExist(err) {
-		return "", fmt.Errorf("read primary index: %w", err)
+	for name := range current {
+		names[name] = struct{}{}
 	}
-	indexSum := sha256.Sum256(index)
-	digest.Write(indexSum[:])
-	return fmt.Sprintf("%x", digest.Sum(nil)), nil
+	for name := range names {
+		before, hadBefore := baseline[name]
+		after, hasAfter := current[name]
+		if hadBefore && hasAfter && before == after {
+			continue
+		}
+		change := refChange{Name: name, Before: before, After: after}
+		if hadBefore && hasAfter {
+			ff, ffErr := isAncestor(ctx, sourceRoot, before, after)
+			if ffErr != nil {
+				return nil, nil, ffErr
+			}
+			if ff {
+				reachable, reachErr := reachableFromRemote(ctx, sourceRoot, after)
+				if reachErr != nil {
+					return nil, nil, reachErr
+				}
+				if reachable {
+					explained = append(explained, change)
+					continue
+				}
+			}
+		}
+		alerts = append(alerts, change)
+	}
+	sort.Slice(alerts, func(i, j int) bool { return alerts[i].Name < alerts[j].Name })
+	sort.Slice(explained, func(i, j int) bool { return explained[i].Name < explained[j].Name })
+	return alerts, explained, nil
+}
+
+// isAncestor reports whether ancestor is an ancestor of (or equal to)
+// descendant, i.e. whether descendant is a fast-forward from ancestor.
+func isAncestor(ctx context.Context, dir, ancestor, descendant string) (bool, error) {
+	cmd := exec.CommandContext(ctx, "git", "-C", dir, "merge-base", "--is-ancestor", ancestor, descendant)
+	var stderr boundedBuffer
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	if err == nil {
+		return true, nil
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+		return false, nil
+	}
+	return false, fmt.Errorf("git merge-base --is-ancestor: %w: %s", err, stderr.String())
+}
+
+// reachableFromRemote reports whether commit is reachable from any
+// remote-tracking ref, the mark of a commit the operator's own `git pull` (or
+// equivalent fetch) could plausibly have introduced.
+func reachableFromRemote(ctx context.Context, dir, commit string) (bool, error) {
+	out, err := gitMetadataAllowEmpty(ctx, dir, "for-each-ref", "--contains="+commit, "refs/remotes/")
+	if err != nil {
+		return false, fmt.Errorf("check remote-tracking reachability: %w", err)
+	}
+	return strings.TrimSpace(out) != "", nil
+}
+
+// formatRefChanges renders ref changes for a log attribute: one
+// "name before->after" entry per change, "(none)" standing in for a ref that
+// did not exist on that side.
+func formatRefChanges(changes []refChange) string {
+	parts := make([]string, 0, len(changes))
+	for _, c := range changes {
+		before, after := c.Before, c.After
+		if before == "" {
+			before = "(none)"
+		}
+		if after == "" {
+			after = "(none)"
+		}
+		parts = append(parts, fmt.Sprintf("%s %s->%s", c.Name, before, after))
+	}
+	return strings.Join(parts, "; ")
 }
 
 func (l *Local) Cleanup(ctx context.Context, issue domain.Issue) (domain.CleanupOutcome, error) {
