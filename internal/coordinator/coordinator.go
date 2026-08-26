@@ -103,6 +103,34 @@ type blockedError struct{ category string }
 
 func (e blockedError) Error() string { return "agent blocked: " + e.category }
 
+// errStreamClosed means consume's event channel closed without ever
+// delivering a terminal event. Every backend emits EventFailed or
+// EventCompleted before it closes its channel (see claude/backend.go and
+// codex/backend.go), so this is not a model- or provider-reported failure at
+// all -- it is the host's own event plumbing failing to deliver a verdict,
+// and it is a sentinel rather than a wrapped cause because there is no
+// further error upstream to name.
+var errStreamClosed = errors.New("agent event stream closed before completion")
+
+// issueRefreshError wraps the tracker error from runTurns' post-turn
+// GetIssues refresh, so agentFailureReason can name it distinctly from a
+// stream failure or a continuation failure -- it is the case PMR-115
+// confirmed live: a Linear timeout on the refresh that follows a turn the
+// agent completed successfully.
+type issueRefreshError struct{ err error }
+
+func (e issueRefreshError) Error() string { return "refresh issue after turn: " + e.err.Error() }
+func (e issueRefreshError) Unwrap() error { return e.err }
+
+// sessionContinueError wraps the backend error from runTurns' agent.Continue
+// call. It is Symphony's own backend adapter refusing or failing to resume a
+// session, never model text, so it carries the same distinct treatment as
+// issueRefreshError.
+type sessionContinueError struct{ err error }
+
+func (e sessionContinueError) Error() string { return "continue agent session: " + e.err.Error() }
+func (e sessionContinueError) Unwrap() error { return e.err }
+
 func blockerCategory(message string) string {
 	switch {
 	case strings.Contains(message, "interactive approval or input"):
@@ -955,7 +983,7 @@ func (c *Coordinator) runTurns(ctx context.Context, r *running, events <-chan do
 		}
 		fresh, err := c.tracker.GetIssues(ctx, []string{current.ID})
 		if err != nil {
-			return false, current, fmt.Errorf("refresh issue after turn: %w", err)
+			return false, current, issueRefreshError{err: err}
 		}
 		if len(fresh) != 1 || fresh[0].ID != current.ID {
 			return true, current, nil
@@ -992,7 +1020,7 @@ func (c *Coordinator) runTurns(ctx context.Context, r *running, events <-chan do
 		guidance := continuationGuidance(turnCount+1, settings.Agent.MaxTurns)
 		events, err = c.agent.Continue(ctx, r.session, guidance)
 		if err != nil {
-			return false, current, fmt.Errorf("continue agent session: %w", err)
+			return false, current, sessionContinueError{err: err}
 		}
 		c.mu.Lock()
 		r.run.TurnCount++
@@ -1014,6 +1042,20 @@ func agentFailureReason(err error) string {
 	if errors.As(err, &exhausted) {
 		return "turn_limit_exhausted"
 	}
+	if errors.Is(err, errStreamClosed) {
+		return "stream_closed"
+	}
+	var refresh issueRefreshError
+	if errors.As(err, &refresh) {
+		return "issue_refresh"
+	}
+	var cont sessionContinueError
+	if errors.As(err, &cont) {
+		return "session_continue"
+	}
+	// Anything else reaching here is domain.EventFailed carrying e.Message
+	// verbatim (consume, "agent failed: %s") -- genuine model or provider
+	// text, the one case this reason is now reserved for.
 	return "agent_event"
 }
 
@@ -1089,9 +1131,6 @@ func (c *Coordinator) finishRun(r *running, completed bool, stopped stopReason, 
 	default:
 		r.run.Status = domain.RunFailed
 	}
-	if err != nil {
-		r.run.Error = err.Error()
-	}
 	run := r.run
 	c.mu.Unlock()
 	c.log.Info("agent logical run finished", "issue_id", run.IssueID, "issue_identifier", run.IssueIdentifier, "session_id", run.SessionID, "status", string(run.Status), "attempt", run.Attempt, "turn_count", run.TurnCount)
@@ -1104,7 +1143,7 @@ func (c *Coordinator) consume(ctx context.Context, r *running, events <-chan dom
 			return false, ctx.Err()
 		case e, ok := <-events:
 			if !ok {
-				return false, errors.New("agent event stream closed before completion")
+				return false, errStreamClosed
 			}
 			at := e.At
 			if at.IsZero() {
@@ -1416,7 +1455,16 @@ func (c *Coordinator) finishFailure(ctx context.Context, i domain.Issue, attempt
 	if errors.As(err, &blocked) {
 		attrs = append(attrs, "blocker", blocked.category)
 	}
-	if err != nil && reason != "prompt_render" && reason != "agent_event" {
+	// The error is attached for every reason, including prompt_render (a Go
+	// template error over repository-owned WORKFLOW.md content) and
+	// agent_event (which, after PMR-115, is reserved for domain.EventFailed's
+	// verbatim model/provider text). observability.safeAttr already routes an
+	// "error"-valued attribute through observability.Text for every log call,
+	// masking credential-shaped text and truncating it, so excluding a reason
+	// here bought no additional safety -- it only discarded the three
+	// host-generated diagnostics (stream_closed, issue_refresh,
+	// session_continue) this issue exists to stop discarding.
+	if err != nil {
 		attrs = append(attrs, "error", err)
 	}
 	if c.attemptsExhausted(i, retryAgent, reason, next, s, attrs) {
@@ -1437,16 +1485,21 @@ func (c *Coordinator) finishFailure(ctx context.Context, i domain.Issue, attempt
 // hand-built Settings, which keeps the pre-PMR-111 unbounded ladder rather
 // than having a zero ceiling abandon every first failure.
 //
-// reason == "agent_event" is agentFailureReason's fallback for a run that
-// ended without a recognized cause -- most commonly, today, a Claude quota
-// rejection that ends a run in under a second (PMR-131). It still climbs the
-// ordinary escalating backoff ladder like any other failure, but it never
-// arms the ceiling: abandoning an issue on a cause the coordinator cannot
-// name would turn a transient, account-wide condition into permanent
-// abandonment of otherwise-healthy issues (observed: 203 such rejections
-// across six healthy issues in one 2.5-hour window). Once a sibling issue
-// gives quota rejection (or any other agent_event cause) a real, classified
-// reason, that reason -- not "agent_event" -- starts consuming the ceiling.
+// reason == "agent_event" is agentFailureReason's fallback for
+// domain.EventFailed carrying model or provider text the coordinator cannot
+// itself name -- most commonly, today, a Claude quota rejection that ends a
+// run in under a second (PMR-131). It still climbs the ordinary escalating
+// backoff ladder like any other failure, but it never arms the ceiling:
+// abandoning an issue on a cause the coordinator cannot name would turn a
+// transient, account-wide condition into permanent abandonment of otherwise-
+// healthy issues (observed: 203 such rejections across six healthy issues in
+// one 2.5-hour window). PMR-115 gave three other former "agent_event" causes
+// -- a closed event stream, a failed post-turn tracker refresh, and a failed
+// session continuation -- their own classified reasons (stream_closed,
+// issue_refresh, session_continue), and per this same comment's original
+// intent, each one now consumes the ceiling like any other classified
+// dispatch failure: only genuine unclassified model/provider text stays
+// exempt.
 func (c *Coordinator) attemptsExhausted(i domain.Issue, kind retryKind, reason string, next int, s config.Settings, attrs []any) bool {
 	if kind != retryAgent || reason == "agent_event" || s.Agent.MaxAttempts <= 0 || next < s.Agent.MaxAttempts {
 		return false

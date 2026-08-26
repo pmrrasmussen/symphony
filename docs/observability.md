@@ -89,8 +89,19 @@ before the coordinator gives up on that episode — Symphony logs a single
 **error**-level `"msg":"dispatch abandoned after max attempts"` with
 `operation: dispatch_abandoned`, the issue, the classified failure `reason`
 (`workspace_prepare`, `before_run`, `prompt_render`, `session_start`,
-`stalled`, `agent_blocked`, `turn_limit_exhausted`, `agent_event`), the final
-`attempt`, and `max_attempts`. That record is deliberately the *whole* outcome:
+`stalled`, `agent_blocked`, `turn_limit_exhausted`, `stream_closed`,
+`issue_refresh`, `session_continue`), the final `attempt`, and
+`max_attempts`. `agent_event` — a run that ended on `domain.EventFailed`
+carrying model or provider text the coordinator cannot itself classify, most
+commonly a Claude quota rejection (PMR-131) — never appears here: it keeps
+climbing the ordinary backoff ladder without ever arming this ceiling, so a
+transient, account-wide condition cannot abandon an otherwise-healthy issue.
+Every one of these `reason`s, on the `"msg":"agent run retry scheduled"`
+warning that precedes abandonment as well as on the abandonment record
+itself, also carries the underlying `error` — including `agent_event`'s
+model/provider text, which is redacted and bounded the same way as any other
+`error`-keyed attribute (`internal/observability.Text`) rather than omitted.
+That record is deliberately the *whole* outcome:
 the claim and the retry timer are dropped, and the tracker is left exactly as
 it was. That is what
 makes the record load-bearing — the board will keep showing the issue as
