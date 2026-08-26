@@ -4,13 +4,16 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/pmrrasmussen/symphony/internal/config"
+	"github.com/pmrrasmussen/symphony/internal/domain"
 	githubhost "github.com/pmrrasmussen/symphony/internal/github"
 	"github.com/pmrrasmussen/symphony/internal/observability"
 	"github.com/pmrrasmussen/symphony/internal/operator"
@@ -153,6 +156,79 @@ func TestLogStartupCredentialStatusReportsConfigurationWithoutSecrets(t *testing
 	}
 	if strings.Contains(output.String(), "github-secret") {
 		t.Fatalf("credential appeared in log: %s", output.String())
+	}
+}
+
+type fakeTerminalTracker struct {
+	states []string
+	issues []domain.Issue
+	err    error
+}
+
+func (f *fakeTerminalTracker) ListTerminal(_ context.Context, states []string) ([]domain.Issue, error) {
+	f.states = states
+	return f.issues, f.err
+}
+
+type fakeTerminalCleaner struct {
+	cleaned  []string
+	outcomes map[string]domain.CleanupOutcome
+	errs     map[string]error
+}
+
+func (f *fakeTerminalCleaner) Cleanup(_ context.Context, issue domain.Issue) (domain.CleanupOutcome, error) {
+	f.cleaned = append(f.cleaned, issue.Identifier)
+	if err := f.errs[issue.Identifier]; err != nil {
+		return "", err
+	}
+	return f.outcomes[issue.Identifier], nil
+}
+
+// Startup cleanup runs before the scheduler and against a tracker and a
+// worktree root Symphony does not control, so its whole contract is that it
+// stays out of the way: it asks for the configured terminal states, it reports
+// a discarded landed worktree, and neither a failing issue nor a failing query
+// stops it or startup.
+func TestCleanupTerminalWorkspacesVisitsEveryTerminalIssueAndSurvivesFailures(t *testing.T) {
+	var output bytes.Buffer
+	log := observability.New(slog.NewJSONHandler(&output, nil), &output)
+	tracker := &fakeTerminalTracker{issues: []domain.Issue{
+		{ID: "one", Identifier: "PMR-1"}, {ID: "two", Identifier: "PMR-2"}, {ID: "three", Identifier: "PMR-3"},
+	}}
+	ws := &fakeTerminalCleaner{
+		outcomes: map[string]domain.CleanupOutcome{"PMR-1": domain.CleanupLanded, "PMR-3": domain.CleanupClean},
+		errs:     map[string]error{"PMR-2": errors.New("worktree busy")},
+	}
+
+	cleanupTerminalWorkspaces(context.Background(), log, tracker, ws, []string{"Done", "Canceled"})
+
+	if !reflect.DeepEqual(tracker.states, []string{"Done", "Canceled"}) {
+		t.Fatalf("cleanup queried states=%v", tracker.states)
+	}
+	if !reflect.DeepEqual(ws.cleaned, []string{"PMR-1", "PMR-2", "PMR-3"}) {
+		t.Fatalf("a failed cleanup stopped the sweep: cleaned=%v", ws.cleaned)
+	}
+	if !strings.Contains(output.String(), "terminal workspace cleanup removed verified landed work") ||
+		!strings.Contains(output.String(), "terminal workspace cleanup failed") {
+		t.Fatalf("logs did not report the landed removal and the failure: %s", output.String())
+	}
+	if strings.Count(output.String(), "removed verified landed work") != 1 {
+		t.Fatalf("only the landed workspace may be reported as removed: %s", output.String())
+	}
+}
+
+func TestCleanupTerminalWorkspacesSkipsCleanupWhenTheQueryFails(t *testing.T) {
+	var output bytes.Buffer
+	log := observability.New(slog.NewJSONHandler(&output, nil), &output)
+	ws := &fakeTerminalCleaner{}
+
+	cleanupTerminalWorkspaces(context.Background(), log, &fakeTerminalTracker{err: errors.New("linear unavailable")}, ws, []string{"Done"})
+
+	if len(ws.cleaned) != 0 {
+		t.Fatalf("an unreadable tracker still drove cleanup: cleaned=%v", ws.cleaned)
+	}
+	if !strings.Contains(output.String(), "startup terminal cleanup query failed") {
+		t.Fatalf("failed query was not reported: %s", output.String())
 	}
 }
 
