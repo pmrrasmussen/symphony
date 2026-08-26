@@ -19,11 +19,12 @@ import (
 )
 
 type fakeGit struct {
-	mu       sync.Mutex
-	dirty    bool
-	noChange bool
-	calls    [][]string
-	envs     [][]string
+	mu        sync.Mutex
+	dirty     bool
+	noChange  bool
+	failFetch bool
+	calls     [][]string
+	envs      [][]string
 }
 
 func (g *fakeGit) Run(_ context.Context, _ string, args, env []string) (string, error) {
@@ -37,6 +38,10 @@ func (g *fakeGit) Run(_ context.Context, _ string, args, env []string) (string, 
 	case "status":
 		if g.dirty {
 			return " M file.go", nil
+		}
+	case "fetch":
+		if g.failFetch {
+			return "", errors.New("git fetch failed")
 		}
 	case "rev-parse":
 		if args[1] == "HEAD" {
@@ -410,6 +415,58 @@ func testSession(t *testing.T, api *apiFixture, git *fakeGit, linear *fakeLinear
 
 func testInput() PublishInput {
 	return PublishInput{Why: "Fix a bug", WhatChanged: "Adjusted the handler", OnCall: "no rotation"}
+}
+
+// refreshBaseRefSession builds a Session for RefreshBaseRef alone: it needs
+// no GitHub REST/GraphQL fixture, only the configured base branch and a
+// gitRunner, so it starts no httptest server (PMR-141).
+func refreshBaseRefSession(t *testing.T, git *fakeGit, baseBranch string) *Session {
+	t.Helper()
+	settings := config.GitHub{Enabled: true, Owner: "owner", Repository: "repo", BaseBranch: baseBranch, Token: "private-token"}
+	m := New(func() config.Settings { return config.Settings{GitHub: settings} }, slog.Default())
+	m.git = git
+	return &Session{manager: m, settings: settings, issue: domain.Issue{ID: "issue-27", Identifier: "PMR-27"}, workspace: t.TempDir(), branch: "symphony/pmr-27"}
+}
+
+// TestRefreshBaseRefFetchesTheConfiguredBaseBranch asserts the exact refspec
+// addWorktree already uses, driven by github.base_branch rather than a
+// literal "main", and that the resolved commit reaches the caller.
+func TestRefreshBaseRefFetchesTheConfiguredBaseBranch(t *testing.T) {
+	git := &fakeGit{}
+	s := refreshBaseRefSession(t, git, "develop")
+	commit, err := s.RefreshBaseRef(context.Background())
+	if err != nil {
+		t.Fatalf("RefreshBaseRef returned %v", err)
+	}
+	if commit != "base" {
+		t.Fatalf("resolved base commit = %q, want %q", commit, "base")
+	}
+	if len(git.calls) != 2 {
+		t.Fatalf("git calls = %#v, want exactly a fetch then a rev-parse", git.calls)
+	}
+	wantFetch := []string{"fetch", "--no-tags", "origin", "+refs/heads/develop:refs/remotes/origin/develop"}
+	if strings.Join(git.calls[0], " ") != strings.Join(wantFetch, " ") {
+		t.Fatalf("fetch call = %#v, want %#v", git.calls[0], wantFetch)
+	}
+	wantRevParse := []string{"rev-parse", "--verify", "refs/remotes/origin/develop^{commit}"}
+	if strings.Join(git.calls[1], " ") != strings.Join(wantRevParse, " ") {
+		t.Fatalf("rev-parse call = %#v, want %#v", git.calls[1], wantRevParse)
+	}
+}
+
+// TestRefreshBaseRefFailureIsARefusalNotAFatalError asserts a failed fetch
+// returns an error the capability layer turns into a non-terminal refusal,
+// rather than panicking or fabricating a commit.
+func TestRefreshBaseRefFailureIsARefusalNotAFatalError(t *testing.T) {
+	git := &fakeGit{failFetch: true}
+	s := refreshBaseRefSession(t, git, "main")
+	commit, err := s.RefreshBaseRef(context.Background())
+	if err == nil {
+		t.Fatal("RefreshBaseRef succeeded despite a failed fetch")
+	}
+	if commit != "" {
+		t.Fatalf("resolved base commit = %q on failure, want empty", commit)
+	}
 }
 
 // testLandingSession builds a Session configured for github_land_pr: the

@@ -325,6 +325,29 @@ func canonicalBody(input PublishInput, issueURL string) string {
 	return fmt.Sprintf("## Why\n%s\n\n## What changed\n%s\n\n## On Call\n%s\n\nLinear: %s\n", input.Why, input.WhatChanged, input.OnCall, strings.TrimSpace(issueURL))
 }
 
+// RefreshBaseRef fetches the configured base branch from origin into this
+// worktree's shared refs/remotes/origin/<base> -- the same refspec workspace
+// creation uses -- and returns its resolved commit. It is the host-mediated
+// stand-in for a fetch the sandboxed agent cannot perform itself: updating
+// refs/remotes/origin/<base> writes the Git common directory, which is
+// outside every path the agent's own worktree grant covers (PMR-141). A
+// fetch failure is returned as an error so the capability layer can refuse
+// the call and let the run proceed against whatever base ref it already has,
+// rather than ending the run.
+func (s *Session) RefreshBaseRef(ctx context.Context) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	refspec := "+refs/heads/" + s.settings.BaseBranch + ":refs/remotes/origin/" + s.settings.BaseBranch
+	if _, err := s.manager.git.Run(ctx, s.workspace, []string{"fetch", "--no-tags", "origin", refspec}, nil); err != nil {
+		return "", errors.New("github base ref refresh could not fetch the configured base branch")
+	}
+	base, err := s.manager.git.Run(ctx, s.workspace, []string{"rev-parse", "--verify", "refs/remotes/origin/" + s.settings.BaseBranch + "^{commit}"}, nil)
+	if err != nil {
+		return "", errors.New("github base ref refresh requires the configured base branch")
+	}
+	return base, nil
+}
+
 // Publish verifies a clean committed worktree, publishes only HEAD to the
 // deterministic issue branch, creates/reuses its PR with the canonical
 // structured body, and performs the bound Linear link/review handoff.

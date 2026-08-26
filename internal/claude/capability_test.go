@@ -27,6 +27,7 @@ import (
 // silently changing what a Claude session is told exists.
 var allCapabilityNames = []string{
 	capability.NameCreateFollowupIssue,
+	capability.NameGitHubRefreshBaseRef,
 	capability.NameGitHubPublishPR,
 	capability.NameGitHubPRContext,
 	capability.NameGitHubLandPR,
@@ -81,14 +82,14 @@ func TestTheLaunchContractWithoutACapabilityIsUnchanged(t *testing.T) {
 }
 
 // TestTheLaunchContractPinsExactlyTheAdvertisedCapabilities covers the sets a
-// session can actually be built with: none, all four, the Merging-state landing
+// session can actually be built with: none, all five, the Merging-state landing
 // set, and a tracker-only follow-up set. Flag order is asserted along with the
 // values because the contract is a fixed argument vector, and because the
 // resume/session-id and model flags must stay last however many tools there are.
 func TestTheLaunchContractPinsExactlyTheAdvertisedCapabilities(t *testing.T) {
 	for name, names := range map[string][]string{
 		"nothing advertised": nil,
-		"all four":           allCapabilityNames,
+		"all five":           allCapabilityNames,
 		"landing only":       {capability.NameGitHubLandPR},
 		"follow-up only":     {capability.NameCreateFollowupIssue},
 	} {
@@ -892,7 +893,7 @@ func TestStartBindsTheHostProvidersAndTheirSecrets(t *testing.T) {
 	snapshot := func() config.Settings { return settings }
 
 	dir := t.TempDir()
-	// The init echo has to name all four capabilities, which is itself part of
+	// The init echo has to name all five capabilities, which is itself part of
 	// the assertion: a contract built from a registry missing its bindings would
 	// refuse this turn.
 	tools := allCodingTools
@@ -953,7 +954,7 @@ func TestStartBindsTheHostProvidersAndTheirSecrets(t *testing.T) {
 
 // TestTheAdvertisedSetIsTheRegistrysOwn is the parity assertion PMR-52 asked
 // for, in the only form this package can make it: the same bindings that give
-// internal/codex its four dynamic tools give this backend the same four names,
+// internal/codex its five dynamic tools give this backend the same five names,
 // in the same order, with the mcp__symphony__ prefix applied to each and nothing
 // added, dropped, or reordered. internal/codex asserts the app-server half of
 // the same statement over the same bindings, so neither transport can quietly

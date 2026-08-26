@@ -159,6 +159,12 @@ state.
   promotes it to an eligible state such as Todo.
 
 ## Base branch
+- Call refresh_base_ref before bringing the worktree onto the base branch and
+  before every github_publish_pr call. It fetches the configured base branch
+  host-side and returns its resolved commit, so origin/main is never more
+  stale than your last call to it -- including a merge that landed on main
+  after you were dispatched. A fetch failure is refused rather than fatal:
+  proceed against the base ref you already have.
 - Bring the worktree onto the current base branch before every
   github_publish_pr call, and re-run validation if the update moved anything.
   Publishing is refused outright when the worktree HEAD no longer descends from
