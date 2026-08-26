@@ -571,6 +571,7 @@ type fakeTracker struct {
 	fresh         domain.Issue
 	hasFresh      bool
 	gets          int
+	getErr        error
 	transitions   []trackerTransition
 	transitionErr error
 }
@@ -588,6 +589,9 @@ func (f *fakeTracker) GetIssues(context.Context, []string) ([]domain.Issue, erro
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.gets++
+	if f.getErr != nil {
+		return nil, f.getErr
+	}
 	if f.hasFresh {
 		return []domain.Issue{f.fresh}, nil
 	}
@@ -1275,19 +1279,22 @@ func TestPermanentDispatchFailureStopsAtMaxAttempts(t *testing.T) {
 // TestUnclassifiedAgentEventNeverAbandonsIssue covers the correction from
 // review round 3: agentFailureReason's fallback, "agent_event", means the
 // coordinator does not know why a run ended -- most commonly, in practice, a
-// Claude quota rejection that ends a run in under a second (PMR-131). That is
-// not the deterministic, classified failure the ceiling was built for, so it
-// must keep climbing the ordinary escalating backoff ladder without ever
-// arming abandonment, however many times it repeats -- unlike
-// workspace_prepare, before_run, prompt_render, or session_start, which stay
-// classified and still consume the ceiling.
+// Claude quota rejection reported as domain.EventFailed carrying model or
+// provider text (PMR-131). That is not the deterministic, classified failure
+// the ceiling was built for, so it must keep climbing the ordinary
+// escalating backoff ladder without ever arming abandonment, however many
+// times it repeats -- unlike workspace_prepare, before_run, prompt_render,
+// and session_start, which are issue-attributable and still consume the
+// ceiling. See systemicAgentFailureReasons for the three PMR-115 added
+// alongside it (stream_closed, issue_refresh, session_continue) and why none
+// of them consumes the ceiling either.
 func TestUnclassifiedAgentEventNeverAbandonsIssue(t *testing.T) {
 	w := testSettings(t)
 	w.Config.Agent.MaxAttempts = 2
 	w.Config.Agent.MaxRetryBackoff = time.Minute
 	issue := testIssue()
 	var log syncBuffer
-	agent := &fakeAgent{events: closedEvents}
+	agent := &fakeAgent{events: failedEvents("model reported a failure")}
 	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{}, 8)}
 	c := New(&fakeTracker{issue: issue}, agent, ws, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&log, nil)))
 	c.clock = fakeClock{now: time.Date(2026, 8, 26, 9, 41, 0, 0, time.UTC)}
@@ -1323,6 +1330,151 @@ func TestUnclassifiedAgentEventNeverAbandonsIssue(t *testing.T) {
 	}
 	if strings.Contains(log.String(), `"msg":"dispatch abandoned after max attempts"`) {
 		t.Fatalf("an unclassified agent_event armed an abandonment record: %s", log.String())
+	}
+	if err := c.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestClosedEventStreamNeverAbandonsIssue pins the review-round-4 decision in
+// systemicAgentFailureReasons for "stream_closed": by construction (see
+// errStreamClosed) it is never a repository- or issue-specific outcome, only
+// ever a host bug in the coordinator's own event plumbing, so -- like
+// agent_event -- it must keep climbing the ordinary escalating backoff
+// ladder without ever arming abandonment, however many times it repeats. It
+// drives finishFailure directly, the same way TestRetryAtCapacityNeverAbandons
+// drives scheduleRetry directly, rather than replaying a full dispatch for
+// every repeat: the reason and the ceiling interaction are what is under
+// test, not the dispatch machinery TestClosedEventStreamSchedulesDeterministicAgentRetry
+// already covers for a single occurrence.
+func TestClosedEventStreamNeverAbandonsIssue(t *testing.T) {
+	w := testSettings(t)
+	w.Config.Agent.MaxAttempts = 2
+	issue := testIssue()
+	var log syncBuffer
+	c := New(&fakeTracker{issue: issue}, &fakeAgent{}, &fakeWorkspace{}, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&log, nil)))
+	c.timer = &fakeTimer{}
+	if !c.claim(issue, w.Config) {
+		t.Fatal("issue was not claimed")
+	}
+
+	attempt := 0
+	const repeats = 6 // well past max_attempts=2, which a host-generated cause must never consume
+	for i := 0; i < repeats; i++ {
+		c.finishFailure(context.Background(), issue, attempt, agentFailureReason(errStreamClosed), errStreamClosed)
+		c.mu.Lock()
+		retry, stillRetrying := c.retries[issue.ID]
+		c.mu.Unlock()
+		if !stillRetrying {
+			t.Fatalf("stream_closed abandoned the issue on repeat %d", i)
+		}
+		if retry.reason != "stream_closed" {
+			t.Fatalf("reason=%q, want stream_closed", retry.reason)
+		}
+		attempt = retry.attempt
+	}
+
+	if attempt <= w.Config.Agent.MaxAttempts {
+		t.Fatalf("attempt=%d, want it to keep climbing the ordinary ladder past max_attempts", attempt)
+	}
+	if strings.Contains(log.String(), `"msg":"dispatch abandoned after max attempts"`) {
+		t.Fatalf("a closed event stream armed an abandonment record: %s", log.String())
+	}
+	if err := c.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestPostTurnRefreshFailureNeverAbandonsIssue is the ceiling-interaction
+// test review round 4 asked for: PMR-115's confirmed-live failure mode -- a
+// Linear timeout on the post-turn GetIssues refresh -- is this codebase's
+// shared tracker infrastructure, not this issue, so repeating it past
+// agent.max_attempts must keep retrying rather than abandon the issue (see
+// systemicAgentFailureReasons). It drives finishFailure directly rather than
+// replaying a full dispatch (see TestClosedEventStreamNeverAbandonsIssue):
+// a permanently failing tracker would also fail runRetry's own pre-dispatch
+// refresh, reclassifying every retry after the first as "retry_refresh" (a
+// separate, already-covered ceiling interaction -- TestRetryRefreshFailureAbandonsAtMaxAttempts,
+// PMR-128) instead of exercising "issue_refresh" a second time.
+func TestPostTurnRefreshFailureNeverAbandonsIssue(t *testing.T) {
+	w := testSettings(t)
+	w.Config.Agent.MaxAttempts = 2
+	issue := testIssue()
+	var log syncBuffer
+	c := New(&fakeTracker{issue: issue}, &fakeAgent{}, &fakeWorkspace{}, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&log, nil)))
+	c.timer = &fakeTimer{}
+	if !c.claim(issue, w.Config) {
+		t.Fatal("issue was not claimed")
+	}
+
+	refreshErr := issueRefreshError{err: errors.New("linear tracker_request: Linear request failed")}
+	attempt := 0
+	const repeats = 6 // well past max_attempts=2, which a Linear-infrastructure cause must never consume
+	for i := 0; i < repeats; i++ {
+		c.finishFailure(context.Background(), issue, attempt, agentFailureReason(refreshErr), refreshErr)
+		c.mu.Lock()
+		retry, stillRetrying := c.retries[issue.ID]
+		c.mu.Unlock()
+		if !stillRetrying {
+			t.Fatalf("issue_refresh abandoned the issue on repeat %d", i)
+		}
+		if retry.reason != "issue_refresh" {
+			t.Fatalf("reason=%q, want issue_refresh", retry.reason)
+		}
+		attempt = retry.attempt
+	}
+
+	if attempt <= w.Config.Agent.MaxAttempts {
+		t.Fatalf("attempt=%d, want it to keep climbing the ordinary ladder past max_attempts", attempt)
+	}
+	if strings.Contains(log.String(), `"msg":"dispatch abandoned after max attempts"`) {
+		t.Fatalf("issue_refresh armed an abandonment record: %s", log.String())
+	}
+	if err := c.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestContinuationFailureNeverAbandonsIssue pins the same decision for
+// "session_continue": it is Symphony's own backend adapter (agent.Continue)
+// failing to resume a session, so a broken `claude` binary or lapsed backend
+// auth would fail every running issue's next turn identically -- the same
+// account-wide shape as the quota rejection that motivates agent_event's
+// exemption, just raised by Symphony's own code instead of the model's (see
+// systemicAgentFailureReasons).
+func TestContinuationFailureNeverAbandonsIssue(t *testing.T) {
+	w := testSettings(t)
+	w.Config.Agent.MaxAttempts = 2
+	issue := testIssue()
+	var log syncBuffer
+	c := New(&fakeTracker{issue: issue}, &fakeAgent{}, &fakeWorkspace{}, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&log, nil)))
+	c.timer = &fakeTimer{}
+	if !c.claim(issue, w.Config) {
+		t.Fatal("issue was not claimed")
+	}
+
+	continueErr := sessionContinueError{err: errors.New("continuation unavailable")}
+	attempt := 0
+	const repeats = 6 // well past max_attempts=2, which a backend-adapter cause must never consume
+	for i := 0; i < repeats; i++ {
+		c.finishFailure(context.Background(), issue, attempt, agentFailureReason(continueErr), continueErr)
+		c.mu.Lock()
+		retry, stillRetrying := c.retries[issue.ID]
+		c.mu.Unlock()
+		if !stillRetrying {
+			t.Fatalf("session_continue abandoned the issue on repeat %d", i)
+		}
+		if retry.reason != "session_continue" {
+			t.Fatalf("reason=%q, want session_continue", retry.reason)
+		}
+		attempt = retry.attempt
+	}
+
+	if attempt <= w.Config.Agent.MaxAttempts {
+		t.Fatalf("attempt=%d, want it to keep climbing the ordinary ladder past max_attempts", attempt)
+	}
+	if strings.Contains(log.String(), `"msg":"dispatch abandoned after max attempts"`) {
+		t.Fatalf("session_continue armed an abandonment record: %s", log.String())
 	}
 	if err := c.Shutdown(context.Background()); err != nil {
 		t.Fatal(err)
@@ -1600,7 +1752,9 @@ func TestBoundedRunContinuationFailureStopsSessionAndUsesFailureRetry(t *testing
 	issue := testIssue()
 	agent := &fakeAgent{events: completedEvents, continueErr: errors.New("continuation unavailable")}
 	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{}, 1)}
-	c := testCoordinator(w.Config, &fakeTracker{issue: issue}, agent, ws)
+	var log syncBuffer
+	c := New(&fakeTracker{issue: issue}, agent, ws, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&log, nil)))
+	c.clock = fakeClock{now: time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)}
 	timer := &fakeTimer{signal: make(chan struct{}, 2)}
 	c.timer = timer
 
@@ -1621,8 +1775,11 @@ func TestBoundedRunContinuationFailureStopsSessionAndUsesFailureRetry(t *testing
 	c.mu.Lock()
 	retry := c.retries[issue.ID]
 	c.mu.Unlock()
-	if retry.kind != retryAgent || retry.reason != "agent_event" || retry.attempt != 1 {
+	if retry.kind != retryAgent || retry.reason != "session_continue" || retry.attempt != 1 {
 		t.Fatalf("failed continuation retry=%+v", retry)
+	}
+	if records := log.String(); !strings.Contains(records, "continuation unavailable") {
+		t.Fatalf("failed continuation dropped the backend error: %s", records)
 	}
 }
 
@@ -1643,8 +1800,73 @@ func TestClosedEventStreamSchedulesDeterministicAgentRetry(t *testing.T) {
 	c.mu.Lock()
 	retry := c.retries[issue.ID]
 	c.mu.Unlock()
-	if retry.kind != retryAgent || retry.reason != "agent_event" || retry.attempt != 1 {
+	if retry.kind != retryAgent || retry.reason != "stream_closed" || retry.attempt != 1 {
 		t.Fatalf("retry=%+v", retry)
+	}
+}
+
+// TestPostTurnRefreshFailureSchedulesDistinctAgentRetry pins the PMR-115 fix:
+// a tracker error from runTurns' post-turn GetIssues -- confirmed live as a
+// Linear request timeout following a turn the agent completed successfully
+// -- is named "issue_refresh" rather than collapsing into "agent_event", and
+// the underlying tracker error text is not discarded.
+func TestPostTurnRefreshFailureSchedulesDistinctAgentRetry(t *testing.T) {
+	w := testSettings(t)
+	issue := testIssue()
+	var log syncBuffer
+	agent := &fakeAgent{events: completedEvents}
+	tracker := &fakeTracker{issue: issue, getErr: errors.New("linear tracker_request: Linear request failed")}
+	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{}, 1)}
+	c := New(tracker, agent, ws, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&log, nil)))
+	timer := &fakeTimer{signal: make(chan struct{}, 1)}
+	c.timer = timer
+
+	c.Tick(context.Background())
+	<-timer.signal
+
+	c.mu.Lock()
+	retry := c.retries[issue.ID]
+	c.mu.Unlock()
+	if retry.kind != retryAgent || retry.reason != "issue_refresh" || retry.attempt != 1 {
+		t.Fatalf("retry=%+v", retry)
+	}
+	if records := log.String(); !strings.Contains(records, "linear tracker_request: Linear request failed") {
+		t.Fatalf("post-turn refresh failure dropped the tracker error: %s", records)
+	}
+}
+
+// TestEventFailedStaysAgentEventAndPassesThroughObservabilityText covers the
+// one case "agent_event" still names after PMR-115: domain.EventFailed
+// carrying model or provider text. That text is attached to the retry log
+// like every other reason's error, but only because observability.safeAttr
+// routes an "error" attribute through observability.Text for every log call
+// regardless of reason -- so it is masked and bounded exactly like any other
+// diagnostic, never verbatim.
+func TestEventFailedStaysAgentEventAndPassesThroughObservabilityText(t *testing.T) {
+	w := testSettings(t)
+	issue := testIssue()
+	var log syncBuffer
+	agent := &fakeAgent{events: failedEvents("claude turn failed: token=super-secret-value unspecified")}
+	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{}, 1)}
+	c := New(&fakeTracker{issue: issue}, agent, ws, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&log, nil)))
+	timer := &fakeTimer{signal: make(chan struct{}, 1)}
+	c.timer = timer
+
+	c.Tick(context.Background())
+	<-timer.signal
+
+	c.mu.Lock()
+	retry := c.retries[issue.ID]
+	c.mu.Unlock()
+	if retry.kind != retryAgent || retry.reason != "agent_event" || retry.attempt != 1 {
+		t.Fatalf("retry=%+v, want agent_event", retry)
+	}
+	records := log.String()
+	if strings.Contains(records, "super-secret-value") {
+		t.Fatalf("model text reached the log unredacted: %s", records)
+	}
+	if !strings.Contains(records, "token=[REDACTED]") {
+		t.Fatalf("model text was not passed through observability.Text: %s", records)
 	}
 }
 
@@ -2829,4 +3051,17 @@ func closedEvents() <-chan domain.Event {
 	ch := make(chan domain.Event)
 	close(ch)
 	return ch
+}
+
+// failedEvents returns a domain.EventFailed carrying message, the shape a
+// real backend uses for model/provider-reported text (see
+// claude/backend.go's emitTerminal calls) -- unlike closedEvents, which is
+// the host's own event plumbing giving up with no verdict at all.
+func failedEvents(message string) func() <-chan domain.Event {
+	return func() <-chan domain.Event {
+		ch := make(chan domain.Event, 1)
+		ch <- domain.Event{Kind: domain.EventFailed, At: time.Now(), Message: message}
+		close(ch)
+		return ch
+	}
 }

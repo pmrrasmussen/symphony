@@ -89,8 +89,42 @@ before the coordinator gives up on that episode — Symphony logs a single
 **error**-level `"msg":"dispatch abandoned after max attempts"` with
 `operation: dispatch_abandoned`, the issue, the classified failure `reason`
 (`workspace_prepare`, `before_run`, `prompt_render`, `session_start`,
-`stalled`, `agent_blocked`, `turn_limit_exhausted`, `agent_event`), the final
-`attempt`, and `max_attempts`. That record is deliberately the *whole* outcome:
+`stalled`, `agent_blocked`, `turn_limit_exhausted`), the final `attempt`, and
+`max_attempts`. Each of these names something about *this issue's* run — its
+template, its own agent, its own turn budget — never the shared environment
+dispatching it.
+
+Four reasons never appear on that abandonment record, because none of them is
+evidence the issue itself is unworkable (`systemicAgentFailureReasons` in
+`internal/coordinator/coordinator.go`):
+
+* `agent_event` — a run that ended on `domain.EventFailed` carrying model or
+  provider text the coordinator cannot itself classify, most commonly a Claude
+  quota rejection (PMR-131).
+* `issue_refresh` — a tracker error from the post-turn `GetIssues` refresh
+  that follows a turn the agent completed successfully (PMR-115; confirmed
+  live as a 30s Linear client timeout). This is tracker infrastructure, not
+  the issue: with an escalating backoff ladder, a Linear outage lasting a
+  couple of minutes would otherwise abandon every issue running at the time,
+  since they would all fail the post-turn refresh the same way at once.
+* `session_continue` — Symphony's own backend adapter (`agent.Continue`)
+  failing to resume a session. A broken agent binary or lapsed backend auth
+  fails every running issue's next turn identically.
+* `stream_closed` — the coordinator's own event plumbing closing its channel
+  without ever delivering `EventFailed` or `EventCompleted`. Every backend
+  emits one of those before it closes its channel, so this is never a
+  repository- or issue-specific outcome, only ever a host bug.
+
+Each of these four keeps climbing the ordinary backoff ladder without ever
+arming the ceiling, so a transient, account-wide condition cannot abandon an
+otherwise-healthy issue. Every classified `reason` — armed or exempt alike, on
+the `"msg":"agent run retry scheduled"` warning that precedes abandonment as
+well as on the abandonment record itself — also carries the underlying
+`error`, redacted and bounded the same way as any other `error`-keyed
+attribute (`internal/observability.Text`) rather than omitted, including
+`agent_event`'s model/provider text.
+
+That record is deliberately the *whole* outcome:
 the claim and the retry timer are dropped, and the tracker is left exactly as
 it was. That is what
 makes the record load-bearing — the board will keep showing the issue as

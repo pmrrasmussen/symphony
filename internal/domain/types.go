@@ -113,7 +113,6 @@ type Run struct {
 	Attempt, TurnCount                                 int
 	StartedAt                                          time.Time
 	Status                                             RunStatus
-	Error                                              string
 	Usage                                              Usage
 }
 
