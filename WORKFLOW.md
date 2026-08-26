@@ -157,6 +157,25 @@ state.
   scope, wait for the follow-up, or treat it as child-agent orchestration. The
   new issue remains parentless and non-dispatchable in Backlog until a human
   promotes it to an eligible state such as Todo.
+
+## Base branch
+- Bring the worktree onto the current base branch before every
+  github_publish_pr call, and re-run validation if the update moved anything.
+  Publishing is refused outright when the worktree HEAD no longer descends from
+  origin/main, and any merge to main while you were working causes exactly that.
+  Updating your own worktree is expected: the delivery instructions below
+  prohibit pushing and opening pull requests yourself, not fetching or merging.
+- Which command to use depends on whether this branch has already been
+  published, and github_pr_context is how you tell -- you hold no credential
+  with which to inspect the remote directly:
+  - No pull request yet: `git rebase origin/main`.
+  - A pull request already exists: `git merge origin/main`. **Do not rebase.**
+    A rebase rewrites commits the remote branch already carries, and publishing
+    pushes without force, so the push is then rejected as a non-fast-forward --
+    permanently, with no remedy available to you. A merge commit satisfies the
+    same descendant check while keeping the push a fast-forward.
+- An issue in Rework always has a published pull request, because Rework is
+  reachable only through review. Merge; never rebase.
 {{end}}
 {{if or (eq .issue.state "Todo") (eq .issue.state "In Progress")}}
 ## Implementation and validation
