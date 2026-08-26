@@ -1077,13 +1077,16 @@ func (c *Coordinator) launch(parent context.Context, i domain.Issue, attempt int
 		// resolution feeds both, so the guidance and the session cannot describe
 		// different backends.
 		launch := s.AgentLaunch()
-		prompt, err := render(s, i, attempt, launch.Backend)
+		prompt, deliveryBytes, err := render(s, i, attempt, launch.Backend)
 		if err != nil {
 			c.workspaces.AfterRun(context.Background(), ws, i)
 			c.unreserve(i.ID)
 			c.finishFailure(parent, i, attempt, "prompt_render", err)
 			return
 		}
+		// Byte lengths only, never the prompt itself: this is what answers
+		// whether trimming WORKFLOW.md's prompt body is worth anything.
+		c.log.Debug("prompt rendered", "issue_id", i.ID, "issue_identifier", i.Identifier, "attempt", attempt, "prompt_bytes", len(prompt), "delivery_instruction_bytes", deliveryBytes)
 		c.log.Debug("agent launch requested", "issue_id", i.ID, "issue_identifier", i.Identifier, "attempt", attempt, "agent_backend", launch.Backend)
 		session, events, err := c.agent.Start(ctx, domain.AgentRequest{Issue: i, Backend: launch.Backend, Model: launch.Model, Workspace: ws.Path, GitMetadataRoots: ws.GitMetadataRoots, Prompt: prompt, Command: launch.Command, ApprovalPolicy: launch.ApprovalPolicy, ThreadSandbox: launch.ThreadSandbox, TurnSandboxPolicy: launch.TurnSandboxPolicy, TurnTimeout: launch.TurnTimeout, ReadTimeout: launch.ReadTimeout, StartTimeout: launch.StartTimeout})
 		if err != nil {
@@ -2329,10 +2332,15 @@ func backoff(a int, max time.Duration) time.Duration {
 	}
 	return d
 }
-func render(s config.Settings, i domain.Issue, attempt int, backend string) (string, error) {
+
+// render returns the prompt sent to the agent along with the byte length of
+// the delivery-instruction suffix, so a caller can report the rendered size
+// without ever logging the prompt itself.
+func render(s config.Settings, i domain.Issue, attempt int, backend string) (string, int, error) {
 	prompt, err := s.Render(i, attempt)
 	if err != nil {
-		return "", err
+		return "", 0, err
 	}
-	return prompt + "\n\n" + s.DeliveryInstructions(backend), nil
+	instructions := s.DeliveryInstructions(backend)
+	return prompt + "\n\n" + instructions, len(instructions), nil
 }
