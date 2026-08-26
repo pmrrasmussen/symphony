@@ -175,10 +175,11 @@ type AgentBackend interface {
 type Workspace struct {
 	Path, Key        string
 	GitMetadataRoots []string
-	// GitIntegrityBaseline fingerprints the source repository state an isolated
-	// worktree must never modify (its non-symphony branch heads and primary
-	// index) at preparation time, so a post-run assertion can detect drift that
-	// slips past the narrowed sandbox grant (PMR-65). Empty for non-Git
+	// GitIntegrityBaseline is a JSON-encoded snapshot of the source
+	// repository's non-symphony branch heads at preparation time, so a
+	// post-run assertion can detect drift that slips past the narrowed
+	// sandbox grant (PMR-65) while telling an agent's write apart from a
+	// concurrent operator fast-forward pull (PMR-145). Empty for non-Git
 	// workspaces or when the baseline could not be captured.
 	GitIntegrityBaseline string
 	CreatedNow           bool
