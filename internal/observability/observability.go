@@ -3,6 +3,7 @@
 package observability
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log/slog"
@@ -136,13 +137,20 @@ func opaqueKey(key string) bool {
 	return key == "prompt" || key == "description" || key == "message" || key == "tool" || key == "tools" || key == "tool_arguments" || key == "environment" || key == "env" || key == "raw" || key == "raw_event"
 }
 
+// Logger is deliberately context-free: many call sites (background poll
+// loops, fallback paths, struct methods with no ctx parameter) have no
+// request-scoped context in hand, and threading one through every Debug/Info/
+// Warn/Error call for handlers that don't yet read it is not worth the
+// churn. context.TODO() satisfies the slog.Handler contract without implying
+// a real context is available.
 func (l *Logger) log(level slog.Level, message string, attrs ...slog.Attr) {
-	if !l.handler.Enabled(nil, level) {
+	ctx := context.TODO()
+	if !l.handler.Enabled(ctx, level) {
 		return
 	}
 	record := slog.NewRecord(now(), level, message, 0)
 	record.AddAttrs(attrs...)
-	if err := l.handler.Handle(nil, record); err != nil {
+	if err := l.handler.Handle(ctx, record); err != nil {
 		_, _ = fmt.Fprintf(l.fallback, "symphony log sink failure: %s\n", Text(err.Error()))
 	}
 }

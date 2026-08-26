@@ -54,6 +54,60 @@ func (failingHandler) Handle(context.Context, slog.Record) error {
 	return errors.New("token=do-not-log-this")
 }
 
+// TestLoggerPassesAUsableContextToTheHandler proves the slog.Handler
+// contract is honored by every level, not merely by the accident that the
+// handlers this package has installed so far ignore their context argument.
+// A handler that dereferences ctx (Value/Done, as a tracing or sampling
+// wrapper would) must not panic and must observe a non-nil context.
+func TestLoggerPassesAUsableContextToTheHandler(t *testing.T) {
+	handler := &contextCheckingHandler{}
+	logger := New(handler, nil)
+
+	logger.Debug("debug event")
+	logger.Info("info event")
+	logger.Warn("warn event")
+	logger.Error("error event")
+
+	if handler.calls != 4 {
+		t.Fatalf("handler observed %d calls, want 4", handler.calls)
+	}
+}
+
+func TestFromSlogUsesTheGivenHandlerAndSurvivesANilLogger(t *testing.T) {
+	var out bytes.Buffer
+	logger := FromSlog(slog.New(slog.NewJSONHandler(&out, nil)))
+	logger.Info("from slog event")
+	if !strings.Contains(out.String(), "from slog event") {
+		t.Fatalf("FromSlog did not forward to the given handler's writer: %s", out.String())
+	}
+
+	if logger := FromSlog(nil); logger == nil || logger.Handler() == nil {
+		t.Fatalf("FromSlog(nil) did not fall back to a default handler")
+	}
+}
+
+// contextCheckingHandler dereferences its context argument the way a
+// tracing, sampling, or request-scoped-attribute wrapper would. Enabled and
+// Handle both panic on a nil context, so this handler fails the test loudly
+// if Logger ever regresses to passing one.
+type contextCheckingHandler struct {
+	calls int
+}
+
+func (h *contextCheckingHandler) Enabled(ctx context.Context, _ slog.Level) bool {
+	_ = ctx.Done()
+	return true
+}
+
+func (h *contextCheckingHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *contextCheckingHandler) WithGroup(string) slog.Handler      { return h }
+
+func (h *contextCheckingHandler) Handle(ctx context.Context, _ slog.Record) error {
+	_ = ctx.Value("probe")
+	h.calls++
+	return nil
+}
+
 // TestOperationVocabularyIsLoggedByName proves the bounded operation
 // vocabulary survives the redaction boundary as its own name: it is a defined
 // string type, so without an explicit allowance every `operation` field would
