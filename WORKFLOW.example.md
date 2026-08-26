@@ -75,10 +75,15 @@ agent:
   # session keeps the backend it started on. Only the selected backend's launch
   # block below has to be complete.
   backend: codex
-  # Four-agent operation, gated on refresh_base_ref (PMR-141) landing: each of
-  # up to four concurrent implementation/rework agents can clear its own stale
-  # origin/main when a concurrent peer's merge lands mid-run, instead of
-  # failing a stale-base publish. max_concurrent_agents_by_state keeps landing
+  # Four-agent operation. The load-bearing gate is PMR-131: a Claude quota
+  # rejection now ends its own attempt as a classified terminal event instead
+  # of being retried as a generic agent failure, so four concurrent sessions
+  # -- which burn a five-hour usage window roughly twice as fast as two --
+  # fail visibly as one quota wall instead of as four issues each looking like
+  # an unrelated failure. refresh_base_ref (PMR-141) is the other half: each
+  # concurrent implementation/rework agent can clear its own stale
+  # origin/main when a peer's merge lands mid-run, instead of failing a
+  # stale-base publish. max_concurrent_agents_by_state keeps landing
   # serialized at exactly one Merging agent regardless.
   max_concurrent_agents: 4
   max_concurrent_agents_by_state:
@@ -134,12 +139,10 @@ codex:
   turn_sandbox_policy:
     type: workspaceWrite
     networkAccess: true
-  # Lowered from one hour (PMR-134): a dogfood session's longest turn in any
-  # run that published was under 13 minutes; 900000 (15 min) covers that with
-  # headroom while cutting off a runaway turn that would otherwise run to
-  # completion (one observed turn ran 1,033,186 ms and reported 10.4M input
-  # tokens).
-  turn_timeout_ms: 900000
+  # Left at its default: PMR-134's turn-timeout evidence concerned
+  # agent.backend claude, not codex -- see the commented-out claude: block
+  # below for that number and the incident that set it.
+  turn_timeout_ms: 3600000
   # read_timeout_ms bounds every steady-state JSON-RPC round trip; keep it small
   # so a hung session is detected mid-turn.
   read_timeout_ms: 5000
@@ -203,7 +206,13 @@ codex:
 #   command: claude
 #   # Optional. Omit it to let the CLI select its own model.
 #   model: sonnet
-#   turn_timeout_ms: 900000
+#   # Lowered from one hour (PMR-134), but not to the 900000 (15 min) first
+#   # tried: that value was live-tested during a dogfood session and killed a
+#   # real, productive turn at exactly 900000 ms, destroying 433 uncommitted
+#   # insertions across 7 files that a resumed turn went on to commit in 3
+#   # minutes. 1800000 (30 min) is still half the one-hour ceiling that let a
+#   # legitimate 17-minute, 10.4M-token turn run to completion.
+#   turn_timeout_ms: 1800000
 #   # There is no read_timeout_ms or start_timeout_ms counterpart: one turn is
 #   # one process, so there is no steady-state round trip to bound.
 #   stall_timeout_ms: 300000
