@@ -207,11 +207,20 @@ type Coordinator struct {
 	// instead of respawning a session at the GitHub poll cadence forever. It is
 	// cleared with the claim, so any other landing outcome resets it (PMR-78).
 	landingWaits map[string]int
-	nextRetry    uint64
-	stopping     bool
-	ctx          context.Context
-	cancel       context.CancelFunc
-	wg           sync.WaitGroup
+	// landingEscalated records, per claimed issue, whether the "landing wait
+	// retry scheduled" log has already been raised to Warn once landingWaits
+	// crossed the point where landingRetryDelay's backoff saturates at
+	// agent.max_retry_backoff_ms (see landingWaitEscalated). It keeps that
+	// escalation a one-time signal -- naming a stuck landing once it stops
+	// being distinguishable from a slow one -- rather than a Warn on every
+	// subsequent poll-cadence wait. Cleared with the claim alongside
+	// landingWaits (PMR-116).
+	landingEscalated map[string]bool
+	nextRetry        uint64
+	stopping         bool
+	ctx              context.Context
+	cancel           context.CancelFunc
+	wg               sync.WaitGroup
 }
 
 // handoffObservation is the coordinator's memory of one host-driven transition
@@ -273,6 +282,7 @@ func New(t domain.Tracker, a domain.AgentBackend, w domain.WorkspaceExecutor, se
 		running: map[string]*running{}, claimed: map[string]bool{},
 		claimState: map[string]string{}, admitted: map[string]string{}, retries: map[string]retryState{},
 		handoffs: map[string]handoffObservation{}, landingWaits: map[string]int{},
+		landingEscalated: map[string]bool{},
 	}
 }
 
@@ -418,6 +428,7 @@ func (c *Coordinator) Shutdown(ctx context.Context) error {
 		delete(c.claimed, id)
 		delete(c.claimState, id)
 		delete(c.landingWaits, id)
+		delete(c.landingEscalated, id)
 	}
 	c.mu.Unlock()
 	c.cancelAll(ctx, runs)
@@ -1596,12 +1607,21 @@ func (c *Coordinator) finishLandingWait(ctx context.Context, i domain.Issue, att
 	c.mu.Lock()
 	c.landingWaits[i.ID]++
 	waits := c.landingWaits[i.ID]
+	escalate := landingWaitEscalated(s, waits) && !c.landingEscalated[i.ID]
+	if escalate {
+		c.landingEscalated[i.ID] = true
+	}
 	c.mu.Unlock()
 	delay := landingRetryDelay(s, waits)
 	if !c.scheduleRetry(ctx, i, domain.Workspace{}, attempt, retryLanding, "landing_waiting", delay) {
 		return
 	}
-	c.log.Info("landing wait retry scheduled", "operation", "landing_waiting", "issue_id", i.ID, "issue_identifier", i.Identifier, "reason", reason, "attempt", attempt, "wait_attempt", waits, "delay_ms", delay.Milliseconds())
+	attrs := []any{"operation", "landing_waiting", "issue_id", i.ID, "issue_identifier", i.Identifier, "reason", reason, "attempt", attempt, "wait_attempt", waits, "delay_ms", delay.Milliseconds()}
+	if escalate {
+		c.log.Warn("landing wait retry scheduled", attrs...)
+		return
+	}
+	c.log.Info("landing wait retry scheduled", attrs...)
 }
 
 // landingRetryDelay bounds the wait before a landing is redispatched. Its floor
@@ -1633,6 +1653,19 @@ func landingRetryDelay(s config.Settings, waits int) time.Duration {
 		delay = escalated
 	}
 	return delay
+}
+
+// landingWaitEscalated reports whether waits has reached the point where
+// backoff's own escalation has saturated at agent.max_retry_backoff_ms: the
+// ceiling landingRetryDelay's ladder climbs toward and then holds at. Below
+// that point a wait's Info-level log is enough -- the redispatch delay is
+// still climbing on its own. At and above it a wait that is still recurring
+// is no longer distinguishable, on the timeline alone, from a landing that
+// will never settle (PMR-116), so finishLandingWait raises the log level to
+// Warn the first time this turns true for the issue and leaves it there.
+func landingWaitEscalated(s config.Settings, waits int) bool {
+	max := s.Agent.MaxRetryBackoff
+	return backoff(waits, max) >= max
 }
 
 // agentSlotRetryDelay bounds the wait before a retryAgent episode that lost
@@ -1819,6 +1852,7 @@ func (c *Coordinator) release(id string) {
 	delete(c.admitted, id)
 	delete(c.retries, id)
 	delete(c.landingWaits, id)
+	delete(c.landingEscalated, id)
 	c.mu.Unlock()
 }
 

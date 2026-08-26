@@ -1568,6 +1568,79 @@ func TestLandingRetryDelayFloorsEscalatesAndCaps(t *testing.T) {
 	}
 }
 
+func TestLandingWaitEscalatedMatchesBackoffSaturation(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		max  time.Duration
+		// waits is the smallest wait count at which backoff(waits, max) first
+		// reaches max, so landingWaitEscalated must be false immediately
+		// before it and true from it onward.
+		waits int
+	}{
+		{name: "saturates on the fourth wait", max: 80 * time.Second, waits: 4},
+		{name: "saturates on the third wait", max: 40 * time.Second, waits: 3},
+		{name: "saturates immediately when the ceiling is at the starting delay", max: 10 * time.Second, waits: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			settings := config.Settings{Agent: config.Agent{MaxRetryBackoff: test.max}}
+			if test.waits > 1 && landingWaitEscalated(settings, test.waits-1) {
+				t.Fatalf("landingWaitEscalated(waits=%d) = true, want false (backoff not yet saturated)", test.waits-1)
+			}
+			if !landingWaitEscalated(settings, test.waits) {
+				t.Fatalf("landingWaitEscalated(waits=%d) = false, want true (backoff saturated)", test.waits)
+			}
+			if !landingWaitEscalated(settings, test.waits+1) {
+				t.Fatalf("landingWaitEscalated(waits=%d) = false, want true (backoff stays saturated)", test.waits+1)
+			}
+		})
+	}
+}
+
+// TestLandingWaitLogEscalatesOnceThenStaysAtInfo reproduces the PMR-116 gap:
+// a landing stuck behind a required check that will never report retries
+// forever at Info, indistinguishable in the log from a slow but healthy
+// check. Once landingWaits crosses the point where landingRetryDelay's
+// backoff has saturated at the configured ceiling, one Warn record must name
+// the issue and wait count -- and only one, not a repeat on every
+// subsequent poll-cadence wait.
+func TestLandingWaitLogEscalatesOnceThenStaysAtInfo(t *testing.T) {
+	w := testSettings(t)
+	w.Config.Agent.MaxRetryBackoff = 80 * time.Second
+	w.Config.GitHub.PollInterval = time.Second
+	issue := testIssue()
+	var log syncBuffer
+	c := New(&fakeTracker{issue: issue}, &fakeAgent{}, &fakeWorkspace{}, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&log, nil)))
+	c.timer = &fakeTimer{}
+	c.mu.Lock()
+	c.claimed[issue.ID] = true
+	c.mu.Unlock()
+
+	const consecutiveWaits = 5
+	for i := 0; i < consecutiveWaits; i++ {
+		c.finishLandingWait(context.Background(), issue, 0, "required checks have not reported: ci/build")
+	}
+
+	var warnLine string
+	warnCount := 0
+	for _, line := range strings.Split(strings.TrimSpace(log.String()), "\n") {
+		if !strings.Contains(line, `"msg":"landing wait retry scheduled"`) {
+			continue
+		}
+		if strings.Contains(line, `"level":"WARN"`) {
+			warnCount++
+			warnLine = line
+		} else if !strings.Contains(line, `"level":"INFO"`) {
+			t.Fatalf("unexpected log level: %s", line)
+		}
+	}
+	if warnCount != 1 {
+		t.Fatalf("want exactly one Warn escalation across %d consecutive waits, got %d:\n%s", consecutiveWaits, warnCount, log.String())
+	}
+	if !strings.Contains(warnLine, `"wait_attempt":4`) || !strings.Contains(warnLine, `"issue_identifier":"ENG-1"`) || !strings.Contains(warnLine, `"reason":"required checks have not reported: ci/build"`) {
+		t.Fatalf("warn line missing issue/wait_attempt/reason: %s", warnLine)
+	}
+}
+
 func landingWaitingEvents() <-chan domain.Event {
 	ch := make(chan domain.Event, 2)
 	ch <- domain.Event{Kind: domain.EventItem, At: time.Now(), ItemID: "1", ItemType: "dynamicToolCall", ToolName: "github_land_pr", Outcome: domain.ItemCompleted}

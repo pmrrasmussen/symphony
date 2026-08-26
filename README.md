@@ -431,6 +431,26 @@ session every interval. `agent.max_attempts` does not apply here either — the
 wait leaves the attempt where it was, so it can never reach that ceiling.
 Symphony never gives up on it by itself: returning the issue to review remains
 the landing capability's own bounded fallback.
+
+A `required_checks` name that never appears in either the combined-status or
+check-run table for the evaluated commit — a typo, a renamed CI job, or a
+workflow whose job is skipped on this path — cannot be told apart from a
+genuinely slow check on a single snapshot, so it waits rather than refuses. It
+is not silent, though: the landing wait reason distinguishes the two cases,
+`required checks have not reported: <names>` for a purely-missing check versus
+`required checks are pending` when any of the configured names has actually
+been seen pending, so the log and `RetrySnapshot.Reason` in the status file
+name the specific failure mode. And once `wait_attempt` for an issue reaches
+the point where the redispatch delay above has climbed to (and saturated at)
+`agent.max_retry_backoff_ms`, the coordinator raises that one `landing wait
+retry scheduled` log record to Warn — once, not on every subsequent wait — so
+a landing stuck behind a check name that will never report is greppable
+instead of visible only to someone watching the TUI or status file. Because a
+mistyped `required_checks` name still holds the issue's `Merging` slot
+(`Merging: 1` in the canonical lifecycle), and that slot is shared across the
+whole project, get the exact check/status names right before relying on this
+feature: mismatch one and every subsequent landing queues behind it.
+
 A terminal result (merged, already merged, or a completed reconciliation) ends
 the run the same way and closes `github_land_pr` for it, so a normal landing
 invokes the capability exactly once. With `github.update_stale_branch: true`, one
