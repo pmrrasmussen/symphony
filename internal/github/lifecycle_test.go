@@ -1029,13 +1029,14 @@ func TestContextRejectsGraphQLFailureWithoutLeakingRawPayload(t *testing.T) {
 
 func TestLandWaitsWhileRequiredChecksAreMissingOrPending(t *testing.T) {
 	for _, test := range []struct {
-		name      string
-		configure func(*apiFixture)
+		name       string
+		configure  func(*apiFixture)
+		wantReason string
 	}{
-		{name: "missing", configure: func(api *apiFixture) {}},
+		{name: "missing", configure: func(api *apiFixture) {}, wantReason: "required checks have not reported: ci/build"},
 		{name: "pending", configure: func(api *apiFixture) {
 			api.checkRuns = append(api.checkRuns, map[string]any{"name": "ci/build", "status": "in_progress", "conclusion": nil})
-		}},
+		}, wantReason: "required checks are pending"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			api, git, linear := newAPI(t), &fakeGit{}, &fakeLinear{}
@@ -1046,13 +1047,33 @@ func TestLandWaitsWhileRequiredChecksAreMissingOrPending(t *testing.T) {
 			if err != nil {
 				t.Fatalf("waiting on pending checks must not be an error: %v", err)
 			}
-			if result.Status != LandWaiting {
-				t.Fatalf("result=%+v", result)
+			if result.Status != LandWaiting || result.Reason != test.wantReason {
+				t.Fatalf("result=%+v want reason=%q", result, test.wantReason)
 			}
 			if linear.refused != 0 || linear.landCompleted != 0 || api.merges != 0 {
 				t.Fatalf("waiting mutated Linear or GitHub: refused=%d completed=%d merges=%d", linear.refused, linear.landCompleted, api.merges)
 			}
 		})
+	}
+}
+
+// TestLandWaitReasonMixedMissingAndPending asserts that a mix of a
+// never-reported check and a genuinely pending one keeps the original
+// "required checks are pending" reason: with only a single GitHub snapshot,
+// a name that has not yet reported cannot be distinguished from one that is
+// merely slow to start, so mixing in even one confirmed-pending check must
+// not produce a false-positive "missing" diagnosis for the whole wait.
+func TestLandWaitReasonMixedMissingAndPending(t *testing.T) {
+	api, git, linear := newAPI(t), &fakeGit{}, &fakeLinear{}
+	api.prExists = true
+	api.checkRuns = append(api.checkRuns, map[string]any{"name": "ci/build", "status": "in_progress", "conclusion": nil})
+	_, session := testLandingSession(t, api, git, linear, []string{"ci/build", "ci/lint"}, "merge")
+	result, err := session.Land(context.Background())
+	if err != nil {
+		t.Fatalf("waiting on mixed checks must not be an error: %v", err)
+	}
+	if result.Status != LandWaiting || result.Reason != "required checks are pending" {
+		t.Fatalf("result=%+v", result)
 	}
 }
 
@@ -1179,7 +1200,7 @@ func TestLandUpdatesCleanStaleBranchThenWaitsForNewChecks(t *testing.T) {
 	}
 
 	result, err = session.Land(context.Background())
-	if err != nil || result.Status != LandWaiting || result.Reason != "required checks are pending" {
+	if err != nil || result.Status != LandWaiting || result.Reason != "required checks have not reported: ci/build" {
 		t.Fatalf("new-head checks result=%+v err=%v", result, err)
 	}
 	passingRequiredChecks(api, "ci/build")

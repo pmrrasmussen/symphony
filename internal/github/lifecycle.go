@@ -622,12 +622,13 @@ func (s *Session) Land(ctx context.Context) (LandResult, error) {
 	if err != nil {
 		return LandResult{}, err
 	}
-	waiting := false
-	var failing []string
+	var missing, pending, failing []string
 	for _, name := range s.settings.RequiredChecks {
 		switch outcomes[strings.ToLower(strings.TrimSpace(name))] {
-		case checkMissing, checkPending:
-			waiting = true
+		case checkMissing:
+			missing = append(missing, name)
+		case checkPending:
+			pending = append(pending, name)
 		case checkFailed:
 			failing = append(failing, name)
 		}
@@ -635,8 +636,8 @@ func (s *Session) Land(ctx context.Context) (LandResult, error) {
 	if len(failing) > 0 {
 		return s.gate(ctx, "github required checks failed: "+strings.Join(failing, ", "), true)
 	}
-	if waiting {
-		return s.waiting(fresh.Number, fresh.URL, "required checks are pending"), nil
+	if len(missing) > 0 || len(pending) > 0 {
+		return s.waiting(fresh.Number, fresh.URL, requiredCheckWaitReason(missing, pending)), nil
 	}
 
 	// Moving the issue to Merging is the human approval to land (see policy
@@ -1091,8 +1092,11 @@ func checkRunOutcome(status, conclusion string) checkOutcome {
 // requiredCheckOutcomes reads the exact-named required checks configured by
 // github.required_checks and classifies each by name (case-insensitively)
 // against both the combined-status and check-run tables. A required name
-// that never appears in either table stays checkMissing (treated the same
-// as pending: github_land_pr waits rather than refuses).
+// that never appears in either table stays checkMissing: github_land_pr
+// still waits rather than refuses (a genuinely slow check and a name that
+// will never report are both possible from a single snapshot), but
+// requiredCheckWaitReason surfaces the distinction in the wait reason so a
+// stuck landing is diagnosable instead of indistinguishable from a slow one.
 func (m *Manager) requiredCheckOutcomes(ctx context.Context, s config.GitHub, sha string, required []string) (map[string]checkOutcome, error) {
 	outcomes := make(map[string]checkOutcome, len(required))
 	for _, name := range required {
@@ -1115,6 +1119,23 @@ func (m *Manager) requiredCheckOutcomes(ctx context.Context, s config.GitHub, sh
 		}
 	}
 	return outcomes, nil
+}
+
+// requiredCheckWaitReason distinguishes a required check that has never
+// reported -- most likely a typo in required_checks, a renamed CI job, or a
+// workflow whose job is skipped on this path, none of which will ever
+// resolve on their own -- from one that is genuinely still running. Only the
+// purely-missing case gets the more specific reason: any pending check keeps
+// the original "required checks are pending" reason, since a name that has
+// not yet reported cannot be told apart from a job that is merely slow to
+// start. Both strings stay fixed and configuration-derived (check names
+// only), preserving the existing bounded, secret-free property of landing
+// wait reasons.
+func requiredCheckWaitReason(missing, pending []string) string {
+	if len(missing) > 0 && len(pending) == 0 {
+		return "required checks have not reported: " + strings.Join(missing, ", ")
+	}
+	return "required checks are pending"
 }
 
 func validPull(settings config.GitHub, branch string, pr pull) bool {

@@ -608,7 +608,7 @@ func TestMergingLandingWaitEndsRunAndDefersToCoordinatorRetry(t *testing.T) {
 	if landCalls != 1 || continues != 0 || refused != 0 || unrefused != 0 {
 		t.Fatalf("landCalls=%d continues=%d refused=%d unrefused=%d, want exactly one landing call and no continuation turn", landCalls, continues, refused, unrefused)
 	}
-	if len(waits) != 1 || waits[0] != "required checks are pending" {
+	if len(waits) != 1 || waits[0] != "required checks have not reported: ci" {
 		t.Fatalf("waits=%v", waits)
 	}
 	linearFixture.mu.Lock()
