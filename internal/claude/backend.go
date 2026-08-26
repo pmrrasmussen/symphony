@@ -58,6 +58,7 @@ import (
 	"github.com/pmrrasmussen/symphony/internal/linear"
 	"github.com/pmrrasmussen/symphony/internal/mcpbridge"
 	"github.com/pmrrasmussen/symphony/internal/observability"
+	"github.com/pmrrasmussen/symphony/internal/procgroup"
 )
 
 // maxLine bounds one stdout line. A single assistant message or tool result is
@@ -738,16 +739,6 @@ func spawn(ctx context.Context, r domain.AgentRequest, contract launchContract, 
 	return t, nil
 }
 
-func (t *turn) killProcessGroup() error {
-	if t.cmd.Process == nil {
-		return nil
-	}
-	if err := syscall.Kill(-t.cmd.Process.Pid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
-		return err
-	}
-	return nil
-}
-
 // kill terminates the turn. Killing the process group is not sufficient on its
 // own: a descendant that leaves the group -- setsid, nohup, any double fork --
 // keeps the inherited stdout write end open, so the reader would never see EOF
@@ -757,7 +748,7 @@ func (t *turn) kill() {
 	t.mu.Lock()
 	t.killed = true
 	t.mu.Unlock()
-	t.killOnce.Do(func() { _ = t.killProcessGroup() })
+	t.killOnce.Do(func() { _ = procgroup.Kill(t.cmd) })
 	t.closePipes()
 }
 
@@ -1003,7 +994,7 @@ func (t *turn) stream(s *session, r domain.AgentRequest, turnNumber int) {
 	waitErr := t.cmd.Wait()
 	// Kill the group again: the leader can exit while descendants still hold
 	// inherited pipes.
-	_ = t.killProcessGroup()
+	_ = procgroup.Kill(t.cmd)
 
 	// The loop ended without a terminal event, so this is the last chance to
 	// report why -- unless this turn's outcome was already reported elsewhere.
@@ -1087,7 +1078,7 @@ type sink struct {
 // emit reports progress. A terminal event handed to it still goes through the
 // latch, so there is no path to an unclaimed outcome.
 func (s *sink) emit(event domain.Event) {
-	if terminal(event.Kind) {
+	if event.Kind.Terminal() {
 		s.emitTerminal(event)
 		return
 	}
@@ -1144,15 +1135,6 @@ func (s *sink) sendLocked(event domain.Event) {
 	case s.events <- event:
 	default:
 	}
-}
-
-func terminal(kind domain.EventKind) bool {
-	switch kind {
-	case domain.EventCompleted, domain.EventFailed, domain.EventBlocked,
-		domain.EventLandingWaiting, domain.EventLandingResolved:
-		return true
-	}
-	return false
 }
 
 // boundedTail keeps only the last bounded, redacted slice of stderr, so a noisy

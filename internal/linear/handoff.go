@@ -809,9 +809,6 @@ func (i handoffIssue) StateID() string     { return strings.TrimSpace(i.State.ID
 func (i handoffIssue) toDomain() domain.Issue {
 	return domain.Issue{ID: i.ID, Identifier: i.Identifier, Title: i.Title, Description: i.Description, URL: i.URL, State: i.State.Name}
 }
-func (i handoffIssue) metadata() map[string]string {
-	return map[string]string{"id": i.ID, "identifier": i.Identifier, "title": i.Title, "description": i.Description, "url": i.URL, "state": i.State.Name}
-}
 
 // Keep every GraphQL operation fixed and intentionally small. Variables are
 // generated solely from the already-bound session, never from tool input.

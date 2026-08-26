@@ -164,15 +164,26 @@ diagnose a run that looks idle:
   to make visible, and its argument validation belongs to the provider rather
   than to a reported call.
 
-  All of this describes `agent.backend: codex`. Under `agent.backend: claude` a
-  bounded capability is invoked over the private MCP endpoint rather than as an
-  app-server item, and the Claude `--print` stream reports no item lifecycle for
-  it, so **none** of the four capabilities emits these records -- including the
-  three whose `Lifecycle()` is the documented reason they do under Codex. The
-  `outstanding_item_type`/`outstanding_item_id` fields in the heartbeat records
-  below therefore never name a Claude capability call, and a capability call that
-  runs long is not what makes a Claude turn look stalled. Closing that gap is not
-  part of the capability wiring.
+  `dynamicToolCall` records are emitted for **both** backends, by the one shared
+  capability dispatch (`internal/capability`), so which capabilities are reported
+  does not depend on which transport carried the call: the three GitHub
+  capabilities are, and `create_followup_issue` is not, under `codex` and under
+  `claude` alike. `duration_ms` is measured by Symphony around the provider round
+  trip. The `item_id` is the app-server's own request ID under `codex`, and a
+  host-minted `mcp-call-<n>` under `claude` — never the JSON-RPC ID the child
+  chose, which is a value from the wire and so may not reach a record.
+
+  One `claude` capability call therefore appears twice, under two item types, and
+  neither record replaces the other. The CLI's own stream reports the model's tool
+  call as an `mcpToolCall` named `mcp__symphony__<tool>`, timed by the backend's
+  `tool_use`/`tool_result` pairing: that is what the model did. The capability
+  endpoint reports the same work as a `dynamicToolCall` named `github_land_pr`,
+  timed around the provider round trip: that is what the host ran, and it is the
+  only record produced at all by a capability call the child made by some route
+  other than the model's own tool use (its shell holds the endpoint token). The
+  two carry different `item_id`s. The `outstanding_item_type`/`outstanding_item_id`
+  fields in the heartbeat records below name a running Claude capability call the
+  same way they name a Codex one.
 * **Heartbeat and stall records** — every reconciliation pass for a still-active
   run logs `"msg":"agent heartbeat"` with `last_activity_age_ms` and, when one
   tool/item is outstanding, `outstanding_item_type`, `outstanding_item_id`, and
@@ -209,7 +220,10 @@ CLI's `--print` stream is not the app-server protocol.
   tool, and `toolCall` for everything else. `item_name` is the CLI's own fixed
   tool name; nothing is derived from tool arguments or command bodies. A refused
   call appears as `outcome: declined`, and the terminating result's own list of
-  refusals is logged as a diagnostic naming only the tool.
+  refusals is logged as a diagnostic naming only the tool. A call to one of
+  Symphony's own bounded capabilities also produces the `dynamicToolCall` pair
+  the capability endpoint emits, as described above; that pair, not this one, is
+  the host-side view of the provider round trip.
 * **Token usage** — the CLI reports usage per turn, while the coordinator keeps
   a component-wise maximum across a run (app-server notifications are
   cumulative). The backend therefore accumulates turns itself and reports a

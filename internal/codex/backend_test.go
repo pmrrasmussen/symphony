@@ -482,7 +482,8 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{}}'
 	if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	b := NewWithLinearHandoff(func() config.Settings { return config.Settings{} })
+	settings := func() config.Settings { return config.Settings{} }
+	b := NewWithProviders(settings, linear.NewHandoff(settings), nil)
 	_, events, err := b.Start(context.Background(), domain.AgentRequest{Workspace: dir, Prompt: "work", Command: "sh " + script, ApprovalPolicy: "never", ThreadSandbox: "workspace-write", TurnTimeout: time.Minute})
 	if err != nil {
 		t.Fatal(err)
@@ -505,11 +506,11 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{}}'
 // another turn that could only call github_land_pr again.
 func TestLandingDecisionsAreTerminalEventsForTheRun(t *testing.T) {
 	for _, kind := range []domain.EventKind{domain.EventLandingWaiting, domain.EventLandingResolved} {
-		if !terminal(kind) {
+		if !kind.Terminal() {
 			t.Fatalf("event kind %q must be terminal for the run", kind)
 		}
 	}
-	if terminal(domain.EventItem) || terminal(domain.EventProgress) {
+	if domain.EventItem.Terminal() || domain.EventProgress.Terminal() {
 		t.Fatal("non-terminal event kinds must not end the run")
 	}
 }
@@ -588,14 +589,40 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{}}'
 		t.Fatal(err)
 	}
 	seenCompleted := false
+	reported := map[string][]domain.Event{}
 	for event := range events {
 		if event.Kind == domain.EventBlocked {
 			t.Fatalf("tool rejection blocked a non-interactive turn: %+v", event)
+		}
+		if event.ItemType == "dynamicToolCall" {
+			reported[event.ToolName] = append(reported[event.ToolName], event)
 		}
 		seenCompleted = seenCompleted || event.Kind == domain.EventCompleted
 	}
 	if !seenCompleted {
 		t.Fatal("tool rejection did not allow turn completion")
+	}
+	// The item records this transport hands to the shared dispatch, asserted
+	// where a real capability is actually invoked over the app-server protocol.
+	// Only the two calls whose arguments validated reached an invocation; every
+	// other call above was refused before it, and a refusal that precedes a call
+	// is never reported as one.
+	for name := range reported {
+		if name != "github_pr_context" && name != "github_land_pr" {
+			t.Fatalf("a call that never reached an invocation was reported as %q: %+v", name, reported[name])
+		}
+	}
+	for _, name := range []string{"github_pr_context", "github_land_pr"} {
+		pair := reported[name]
+		if len(pair) != 2 {
+			t.Fatalf("%s produced %d item records, want a started/finished pair: %+v", name, len(pair), pair)
+		}
+		if pair[0].Outcome != domain.ItemStarted || pair[1].Outcome != domain.ItemFailed {
+			t.Fatalf("%s outcomes = %q and %q, want started then failed", name, pair[0].Outcome, pair[1].Outcome)
+		}
+		if pair[0].ItemID == "" || pair[0].ItemID != pair[1].ItemID {
+			t.Fatalf("%s reported IDs %q and %q, so no consumer can match them", name, pair[0].ItemID, pair[1].ItemID)
+		}
 	}
 }
 
@@ -700,10 +727,11 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn-1"}}}'
 printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{}}'`
 	settings := config.Settings{HostSecretEnvNames: []string{"PMR33_LINEAR_TOKEN", "PMR33_GITHUB_TOKEN"}, HostSecretValues: []string{"linear-token", "github-token"}}
 	settingsCalls := 0
-	b := NewWithLinearHandoff(func() config.Settings {
+	settingsFn := func() config.Settings {
 		settingsCalls++
 		return settings
-	})
+	}
+	b := NewWithProviders(settingsFn, linear.NewHandoff(settingsFn), nil)
 	_, events, err := b.Start(context.Background(), domain.AgentRequest{Workspace: dir, Prompt: "work", Command: command, ApprovalPolicy: "never", ThreadSandbox: "workspace-write", TurnTimeout: time.Minute})
 	if err != nil {
 		t.Fatal(err)
@@ -864,7 +892,8 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{}}'
 		ActiveStates:          []string{"todo"},
 		FollowupIssueCreation: true,
 	}}
-	b := NewWithLinearHandoff(func() config.Settings { return settings }, "LINEAR_API_KEY")
+	settingsFn := func() config.Settings { return settings }
+	b := NewWithProviders(settingsFn, linear.NewHandoff(settingsFn), nil, "LINEAR_API_KEY")
 	_, events, err := b.Start(context.Background(), domain.AgentRequest{Issue: domain.Issue{ID: "active"}, Workspace: dir, Prompt: "work", Command: "sh " + script, ApprovalPolicy: "never", ThreadSandbox: "workspace-write", TurnTimeout: time.Minute})
 	if err != nil {
 		t.Fatal(err)
@@ -1069,7 +1098,8 @@ printf '%s' "$line" > turn.json
 printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn-1"}}}'
 printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{}}'
 `)
-	b := NewWithLinearHandoff(func() config.Settings { return settings })
+	settingsFn := func() config.Settings { return settings }
+	b := NewWithProviders(settingsFn, linear.NewHandoff(settingsFn), nil)
 	_, events, err := b.Start(context.Background(), domain.AgentRequest{
 		Workspace: dir, GitMetadataRoots: []string{gitMetadata}, Prompt: "work", Command: "sh " + script,
 		ApprovalPolicy: settings.Codex.ApprovalPolicy, ThreadSandbox: settings.Codex.ThreadSandbox,
@@ -1239,7 +1269,8 @@ IFS= read -r line
 printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn-1"}}}'
 printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{}}'
 `)
-	b := NewWithLinearHandoff(func() config.Settings { return settings })
+	settingsFn := func() config.Settings { return settings }
+	b := NewWithProviders(settingsFn, linear.NewHandoff(settingsFn), nil)
 	_, events, err := b.Start(context.Background(), domain.AgentRequest{
 		Workspace: dir, Prompt: "work", Command: "sh " + script,
 		ApprovalPolicy: settings.Codex.ApprovalPolicy, ThreadSandbox: settings.Codex.ThreadSandbox,
@@ -1292,7 +1323,7 @@ func TestProvidersArePassedInAndNotConstructedPerBackend(t *testing.T) {
 	// A nil provider stays nil: an unconfigured integration must not be
 	// implicitly constructed, because Start treats a bound manager as consent to
 	// prepare a GitHub session.
-	if linearOnly := NewWithLinearHandoff(settings); linearOnly.github != nil {
+	if linearOnly := NewWithProviders(settings, linear.NewHandoff(settings), nil); linearOnly.github != nil {
 		t.Fatal("the Linear-only constructor bound a GitHub manager")
 	}
 }

@@ -55,6 +55,16 @@ const (
 	EventLandingResolved EventKind = "landing_resolved"
 )
 
+// Terminal reports whether an event of this kind ends the logical run: no
+// later event follows it on the same stream.
+func (k EventKind) Terminal() bool {
+	switch k {
+	case EventCompleted, EventFailed, EventBlocked, EventLandingWaiting, EventLandingResolved:
+		return true
+	}
+	return false
+}
+
 // ItemOutcome enumerates the safe, protocol-derived lifecycle outcomes an
 // EventItem can report. These mirror the Codex app-server's own status enum
 // values plus the synthetic "started" outcome Symphony assigns on arrival.
@@ -199,6 +209,19 @@ const (
 // answer, an unconfigured integration, or any error keeps cleanup fail-closed.
 type LandingVerifier interface {
 	VerifyLanded(ctx context.Context, issue Issue, commit string) (bool, error)
+}
+
+// IssueForgetter releases the in-process state a host integration still holds
+// for an issue that reached a terminal tracker state and will never be
+// dispatched again. It is the explicit end-of-life signal the GitHub
+// linked-pull-request poller needs: without one, a process that runs for weeks
+// keeps requesting the pull request of every issue it ever published and keeps
+// that issue's credential snapshot and tracker session resident (PMR-112). It
+// is deliberately a notification and not a question -- there is nothing for the
+// scheduler to do about a failure -- so implementations must be idempotent,
+// non-blocking, and safe for an issue ID they never saw.
+type IssueForgetter interface {
+	Forget(issueID string)
 }
 
 type WorkspaceExecutor interface {

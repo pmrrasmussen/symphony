@@ -381,8 +381,12 @@ reports bounded check status, effective review state, and redacted
 comment/review excerpts and unresolved review-thread counts, with no
 repository, issue, branch, or pull request selection of its own. A confirmed
 human merge moves the linked issue to `Done`; closing without merge leaves it
-in review and emits a warning. Invalid or incomplete GitHub settings disable
-both tools, preserving the manual workflow. In host-publish mode, workers
+in review and emits a warning. Either outcome ends that pull request's
+polling, and so does the issue reaching a terminal tracker state, so a process
+that runs for weeks does not keep requesting every pull request it ever
+published; a pull request that is still open on an active issue keeps being
+polled however long it takes to merge. Invalid or incomplete GitHub settings
+disable both tools, preserving the manual workflow. In host-publish mode, workers
 create local commits but do not use `gh` or `git push`; they invoke these
 host capabilities instead. Without them, Symphony tells workers that PR
 delivery is unavailable and reports the missing configuration rather than

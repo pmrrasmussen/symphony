@@ -33,9 +33,12 @@
 //
 // Nothing in this package logs. Its entire state -- endpoint URL, bearer token,
 // tool arguments, tool results -- is exactly what must never reach an operator
-// log or a domain.Event, so a log record here would carry a disclosure risk that
-// a call record cannot repay: a call the agent CLI makes is already reported in
-// its own stream, and for a call made by other means see callTool.
+// log, so a log record written here would carry a disclosure risk no call record
+// can repay. What it does emit is the events a session's own consumer needs: a
+// capability's terminal outcome, and the bounded dynamicToolCall item records the
+// shared dispatch builds, which carry a registry-owned capability name, a
+// host-minted call ID, an outcome, and a duration, and have no field an argument,
+// a result, a URL, or a token could reach. See callTool.
 package mcpbridge
 
 import (
@@ -540,7 +543,8 @@ func (g *Registration) endCall() {
 	}
 }
 
-// emit forwards a terminal capability outcome to the owning session's sink.
+// emit forwards a capability call's item records and terminal outcome to the
+// owning session's sink.
 //
 // It is gated on retirement, not on activity, and the difference is the whole
 // point. A revocation clears active and then waits for the invocation already

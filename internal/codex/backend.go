@@ -23,6 +23,7 @@ import (
 	"github.com/pmrrasmussen/symphony/internal/hostenv"
 	"github.com/pmrrasmussen/symphony/internal/linear"
 	"github.com/pmrrasmussen/symphony/internal/observability"
+	"github.com/pmrrasmussen/symphony/internal/procgroup"
 )
 
 type Backend struct {
@@ -98,13 +99,6 @@ func NewWithProviders(settings func() config.Settings, handoff *linear.Handoff, 
 	b.handoff = handoff
 	b.github = github
 	return b
-}
-
-// NewWithLinearHandoff enables the sole supported client-side tool. The
-// Linear adapter owns its configuration and HTTP transport; Codex sees only a
-// session-bound capability once the policy has been validated.
-func NewWithLinearHandoff(settings func() config.Settings, secretNames ...string) *Backend {
-	return NewWithProviders(settings, linear.NewHandoff(settings), nil, secretNames...)
 }
 
 // GitHubManager reports the manager this backend was given. The host reads its
@@ -300,7 +294,7 @@ func start(ctx context.Context, r domain.AgentRequest, environment []string, cap
 	cmd.Stdout = outWriter
 	cmd.Stderr = stderrWriter
 	c := &client{cmd: cmd, in: in, workspace: r.Workspace, approval: r.ApprovalPolicy, policy: r.TurnSandboxPolicy, readTimeout: r.ReadTimeout, startTimeout: r.StartTimeout, turnTimeout: r.TurnTimeout, ctx: ctx, capabilities: capabilities, pending: map[int]chan callResult{}, done: make(chan struct{}), exited: make(chan struct{})}
-	cmd.Cancel = func() error { return c.killProcessGroup() }
+	cmd.Cancel = func() error { return procgroup.Kill(c.cmd) }
 	if err := cmd.Start(); err != nil {
 		_ = out.Close()
 		_ = outWriter.Close()
@@ -328,7 +322,7 @@ func start(ctx context.Context, r domain.AgentRequest, environment []string, cap
 		waitErr := cmd.Wait()
 		// The leader can exit while descendants still hold inherited pipes.
 		// Terminating the group makes both reader completions deterministic.
-		_ = c.killProcessGroup()
+		_ = procgroup.Kill(c.cmd)
 		stdoutErr := <-stdoutDone
 		stderrErr := <-stderrDone
 		switch {
@@ -675,87 +669,50 @@ func dynamicTools(registry *capability.Registry) []map[string]any {
 	return tools
 }
 
-// handleToolCall decodes one app-server tool call, runs the named capability,
-// and writes the protocol response. Every decision about what a capability is,
-// whether it accepts these arguments, and what it refuses belongs to the
-// registry; this function owns only the transport.
+// handleToolCall decodes one app-server tool call and hands it to the shared
+// capability dispatch, which owns the whole lookup-to-terminal-event sequence
+// for both of Symphony's agent transports. What is left here is what is
+// genuinely this protocol's: the request envelope, the JSON-RPC ID that both
+// answers the call and identifies it in item records, and the response envelope.
 func (c *client) handleToolCall(x rpc) {
 	var request struct {
 		Tool      string          `json:"tool"`
 		Arguments json.RawMessage `json:"arguments"`
 	}
 	if err := json.Unmarshal(x.Params, &request); err != nil {
-		c.unsupportedTool(x.ID)
+		// An envelope this adapter cannot read names no capability, so it is
+		// answered exactly as an unknown one is.
+		c.respondToCall(x.ID, capability.Outcome{Refusal: capability.Unsupported()})
 		return
 	}
-	bound, ok := c.capabilities.Lookup(request.Tool)
-	if !ok {
-		// No other client-side tool is bound: the agent has no Linear
-		// state-transition capability.
-		c.unsupportedTool(x.ID)
-		return
-	}
-	// The capability's own name is used from here on, never the decoded wire
-	// value, so nothing an agent chooses can reach a log or an event.
-	name := bound.Definition().Name
-	invoke, failure := bound.Prepare(request.Arguments)
-	if failure != nil {
-		// A rejected argument list precedes the call, so it is not reported as one.
-		c.toolFailure(x.ID, failure.Message)
-		return
-	}
-	observed := bound.Lifecycle()
-	callID := callIDText(x.ID)
-	var started time.Time
-	if observed {
-		started = c.emitCallStarted(callID, name)
-	}
-	result, failure := invoke(c.ctx)
-	if failure != nil {
-		if observed {
-			c.emitCallFinished(callID, name, failure.Outcome, started)
-		}
-		c.toolFailure(x.ID, failure.Message)
-		return
-	}
-	content, err := json.Marshal(result.Payload)
-	if err != nil {
-		if observed {
-			c.emitCallFinished(callID, name, domain.ItemFailed, started)
-		}
-		c.unsupportedTool(x.ID)
-		return
-	}
-	if observed {
-		c.emitCallFinished(callID, name, domain.ItemCompleted, started)
-	}
-	c.sendServerResponse(x.ID, map[string]any{"success": result.Success, "contentItems": []any{map[string]any{"type": "inputText", "text": string(content)}}})
-	if result.Terminal != "" {
-		// A capability may settle the whole run. Reason is a fixed, bounded string
-		// owned by the provider.
-		c.emit(domain.Event{Kind: result.Terminal, At: time.Now(), Message: result.Reason})
-	}
+	capability.Dispatch(c.ctx, c.capabilities, capability.Transport{
+		// The protocol-assigned request ID: it is the app-server's own, not a
+		// value the model chose, and it is the identity the response is keyed to.
+		CallID:  callIDText(x.ID),
+		Respond: func(outcome capability.Outcome) { c.respondToCall(x.ID, outcome) },
+		Emit:    c.emit,
+		// Neither gate applies here. Advertisement is this transport's only route
+		// to a call, so dispatch stays open and each provider re-validates its own
+		// preconditions; and a call runs inline on the read loop, so there is no
+		// concurrent second invocation for a slot to refuse.
+	}, request.Tool, request.Arguments)
 }
 
-// emitCallStarted and emitCallFinished report the lifecycle of Symphony's own
-// bound dynamic tools (a registry-owned capability name, never a value read
-// from the model's call arguments) so a slow provider round trip is visible the
-// same way an app-server item is. The call ID is the protocol-assigned JSON-RPC
-// request ID.
-func (c *client) emitCallStarted(callID, tool string) time.Time {
-	started := time.Now()
-	c.emit(domain.Event{Kind: domain.EventItem, At: started, ItemID: callID, ItemType: "dynamicToolCall", ToolName: tool, Outcome: domain.ItemStarted})
-	return started
+// respondToCall frames one dispatched outcome in the app-server's tool response
+// envelope. A refusal is a normal app-server response carrying success:false --
+// the model can inspect the structured rejection and keep working in the same
+// turn -- so EventBlocked stays reserved for interactive approval or user-input
+// requests.
+func (c *client) respondToCall(id any, outcome capability.Outcome) {
+	text, success := string(outcome.Payload), outcome.Success
+	if outcome.Refusal != nil {
+		text, success = outcome.Refusal.Message, false
+	}
+	c.sendServerResponse(id, map[string]any{"success": success, "contentItems": []any{map[string]any{"type": "inputText", "text": text}}})
 }
-func (c *client) emitCallFinished(callID, tool, outcome string, started time.Time) {
-	c.emit(domain.Event{Kind: domain.EventItem, At: time.Now(), ItemID: callID, ItemType: "dynamicToolCall", ToolName: tool, Outcome: outcome, DurationMs: time.Since(started).Milliseconds()})
-}
+
 func callIDText(id any) string {
 	return observability.Text(fmt.Sprint(id))
-}
-
-func (c *client) unsupportedTool(id any) {
-	c.toolFailure(id, "Unsupported client-side tool.")
 }
 
 // finalizeLanding settles capability state that outlives a single call once this
@@ -783,12 +740,6 @@ func (c *client) finalizeLanding() {
 	c.capabilities.TurnEnded(ctx)
 }
 
-// Tool failures are normal app-server responses: the model can inspect the
-// structured rejection and keep working in the same turn. EventBlocked is
-// reserved for interactive approval or user-input requests.
-func (c *client) toolFailure(id any, message string) {
-	c.sendServerResponse(id, map[string]any{"success": false, "contentItems": []any{map[string]any{"type": "inputText", "text": message}}})
-}
 func (c *client) sendServerResponse(id, result any) bool {
 	if err := c.send(map[string]any{"jsonrpc": "2.0", "id": id, "result": result}); err != nil {
 		c.abort(fmt.Errorf("codex server response write failed: %w", err))
@@ -801,7 +752,7 @@ func (c *client) emit(e domain.Event) {
 	ch := c.active
 	if ch != nil {
 		if !c.activeReady {
-			if terminal(e.Kind) && c.pendingTerminal == nil {
+			if e.Kind.Terminal() && c.pendingTerminal == nil {
 				copy := e
 				c.pendingTerminal = &copy
 			} else if c.pendingTerminal == nil && len(c.pendingEvents) < cap(ch)-2 {
@@ -810,7 +761,7 @@ func (c *client) emit(e domain.Event) {
 			c.mu.Unlock()
 			return
 		}
-		if terminal(e.Kind) {
+		if e.Kind.Terminal() {
 			// Non-terminal sends reserve one slot, so terminal delivery cannot
 			// block even when the consumer falls behind.
 			ch <- e
@@ -870,18 +821,8 @@ func (c *client) abort(err error) {
 func (c *client) kill() {
 	c.killOnce.Do(func() {
 		_ = c.in.Close()
-		_ = c.killProcessGroup()
+		_ = procgroup.Kill(c.cmd)
 	})
-}
-func (c *client) killProcessGroup() error {
-	if c.cmd == nil || c.cmd.Process == nil {
-		return nil
-	}
-	err := syscall.Kill(-c.cmd.Process.Pid, syscall.SIGKILL)
-	if errors.Is(err, syscall.ESRCH) {
-		return nil
-	}
-	return err
 }
 func (c *client) removePending(id int) {
 	c.mu.Lock()
@@ -933,10 +874,6 @@ func drain(r io.Reader, report func(string)) error {
 			return nil
 		}
 	}
-}
-func terminal(kind domain.EventKind) bool {
-	return kind == domain.EventBlocked || kind == domain.EventCompleted || kind == domain.EventFailed ||
-		kind == domain.EventLandingWaiting || kind == domain.EventLandingResolved
 }
 func nestedString(m map[string]any, a, b string) (string, bool) {
 	x, ok := m[a].(map[string]any)

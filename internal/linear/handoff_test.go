@@ -33,6 +33,7 @@ type handoffFixture struct {
 	commentProject      string
 	commentTeam         string
 	readAttempts        int
+	failRead            bool
 	changeOnRead        int
 	changedStateID      string
 	changedStateName    string
@@ -80,6 +81,10 @@ func (f *handoffFixture) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case strings.Contains(query, "SymphonyLinearHandoffIssue"):
 		f.readAttempts++
+		if f.failRead {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
 		if f.changeOnRead == f.readAttempts {
 			f.stateID, f.stateName = f.changedStateID, f.changedStateName
 		}
@@ -173,6 +178,56 @@ func callHandoff(session *HandoffSession) error {
 	return session.handoffLocked(context.Background())
 }
 
+// EnsureActive is the revalidation github_publish_pr performs immediately
+// before it creates a pull request, so these tests drive the real scoped read
+// and the real scope check rather than internal/github's lifecycle fake.
+
+func TestEnsureActiveAcceptsTheBoundInitialAndHandoffTargetStates(t *testing.T) {
+	for name, state := range map[string][2]string{
+		"initial state":  {"todo", "Todo"},
+		"handoff target": {"review", "In Review"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newHandoffFixture(t)
+			session := f.session(t, nil)
+			f.stateID, f.stateName = state[0], state[1]
+			if err := session.EnsureActive(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			// Revalidation is a read: it must never write the tracker itself.
+			if f.commentAttempts != 0 || f.transitionAttempts != 0 {
+				t.Fatalf("revalidation mutated the issue: comments=%d transitions=%d", f.commentAttempts, f.transitionAttempts)
+			}
+		})
+	}
+}
+
+func TestEnsureActiveRefusesAStateAHumanChangedAfterSessionSetup(t *testing.T) {
+	f := newHandoffFixture(t)
+	session := f.session(t, nil)
+	// Neither the state the session was bound to nor the review handoff target:
+	// a pull request must not be created for an issue that has moved.
+	f.stateID, f.stateName = "in-progress", "In Progress"
+	err := session.EnsureActive(context.Background())
+	if err == nil {
+		t.Fatal("a stale session was cleared to perform an irreversible mutation")
+	}
+	assertCategory(t, err, "handoff_scope")
+}
+
+func TestEnsureActivePropagatesAScopedReadFailure(t *testing.T) {
+	f := newHandoffFixture(t)
+	session := f.session(t, nil)
+	// An unavailable tracker leaves the current state unknown, which must fail
+	// closed rather than be read as "unchanged".
+	f.failRead = true
+	err := session.EnsureActive(context.Background())
+	if err == nil {
+		t.Fatal("an unreadable issue was cleared to perform an irreversible mutation")
+	}
+	assertCategory(t, err, "tracker_status")
+}
+
 // The following tests exercise the PMR-37 github_land_pr Linear surface:
 // EnsureMergeState (exact-state preflight/postflight gate), RefuseLanding
 // (the Merging -> In Review hard-gate fallback), and CompleteLanding (the
@@ -262,6 +317,55 @@ func TestCompleteLandingRejectsIssueNoLongerInTheMergingState(t *testing.T) {
 	}
 	if f.transitionAttempts != 0 {
 		t.Fatalf("mutation attempts=%d", f.transitionAttempts)
+	}
+}
+
+// LandComment carries the landing audit trail (pushed fix-turn commit SHAs and
+// the last failed gate on a deferred refusal). Its body is composed host-side,
+// but it is still bounded here, at the only place that posts it.
+
+func TestLandCommentPostsAHostGeneratedBodyWithoutTransitioning(t *testing.T) {
+	f := newHandoffFixture(t)
+	session := mergingSession(t, f, map[string]string{"Merging": "In Review"})
+	if err := session.LandComment(context.Background(), "bounded comment"); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.comments) != 1 || f.comments[0] != "bounded comment" || f.transitionAttempts != 0 {
+		t.Fatalf("comments=%v transitions=%d", f.comments, f.transitionAttempts)
+	}
+}
+
+func TestLandCommentRejectsBodiesOutsideTheValidatedBound(t *testing.T) {
+	for name, body := range map[string]string{
+		"empty":     "   ",
+		"too large": strings.Repeat("a", maxHandoffCommentBytes+1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newHandoffFixture(t)
+			session := mergingSession(t, f, map[string]string{"Merging": "In Review"})
+			err := session.LandComment(context.Background(), body)
+			if err == nil {
+				t.Fatal("an unbounded audit comment was accepted")
+			}
+			assertCategory(t, err, "handoff_request")
+			if f.commentAttempts != 0 {
+				t.Fatalf("a rejected body still reached Linear: attempts=%d", f.commentAttempts)
+			}
+		})
+	}
+}
+
+func TestLandCommentPropagatesAMutationFailure(t *testing.T) {
+	f := newHandoffFixture(t)
+	f.failComment = true
+	session := mergingSession(t, f, map[string]string{"Merging": "In Review"})
+	err := session.LandComment(context.Background(), "bounded comment")
+	if err == nil {
+		t.Fatal("a refused comment mutation was reported as success")
+	}
+	assertCategory(t, err, "handoff_response")
+	if len(f.comments) != 0 {
+		t.Fatalf("comments=%v", f.comments)
 	}
 }
 
@@ -487,6 +591,40 @@ func TestHandoffRejectsCrossScopeComment(t *testing.T) {
 				t.Fatal("cross-scope comment accepted")
 			}
 		})
+	}
+}
+
+// Enabled, SetLogger, and MatchesSecret are the handoff's wiring surface: a
+// launcher reads them before any session tool call happens, so no lifecycle
+// test reaches them.
+func TestHandoffWiringReportsCapabilityLoggerAndSecretMatcher(t *testing.T) {
+	f := newHandoffFixture(t)
+	h := NewHandoff(f.settings)
+	if !h.Enabled() {
+		t.Fatal("a configured handoff state must enable the Linear session capability")
+	}
+	disabled := NewHandoff(func() config.Settings {
+		s := f.settings()
+		s.Tracker.HandoffState = ""
+		return s
+	})
+	if disabled.Enabled() {
+		t.Fatal("no handoff state and no follow-up creation must leave the capability off")
+	}
+	logger := slog.New(slog.NewJSONHandler(&bytes.Buffer{}, nil))
+	h.SetLogger(logger)
+	h.SetLogger(nil) // A nil logger must not drop the operator handler.
+	session, err := h.Prepare(context.Background(), domain.Issue{ID: "active"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if session.logger != logger {
+		t.Fatal("the prepared session did not inherit the operator log handler")
+	}
+	// The launcher filters inherited values containing the credential without
+	// ever holding the credential itself.
+	if !session.MatchesSecret("LINEAR_TOKEN=test-token") || session.MatchesSecret("LINEAR_TOKEN=other") {
+		t.Fatal("secret matcher did not bound the configured credential")
 	}
 }
 
