@@ -754,6 +754,142 @@ func (g originGit) Run(ctx context.Context, dir string, args, env []string) (str
 	return g.fakeGit.Run(ctx, dir, args, env)
 }
 
+// failingGit fails exactly the one git invocation whose full argument list
+// matches failArgs, and otherwise delegates to fakeGit's defaults. It lets a
+// single table of Publish refusal causes pin an exact message per underlying
+// git failure without a bespoke fake type per case.
+type failingGit struct {
+	*fakeGit
+	failArgs []string
+}
+
+func (g *failingGit) Run(ctx context.Context, dir string, args, env []string) (string, error) {
+	if len(args) == len(g.failArgs) {
+		match := true
+		for i, a := range g.failArgs {
+			if args[i] != a {
+				match = false
+				break
+			}
+		}
+		if match {
+			return "", errors.New("boom")
+		}
+	}
+	return g.fakeGit.Run(ctx, dir, args, env)
+}
+
+// TestPublishRefusalCausesAreDistinctAgentActionableMessages pins each of
+// Publish's causes to its own message, so the capability layer's passthrough
+// (PMR-132) is meaningful and a future edit cannot silently collapse two
+// causes onto the same text.
+func TestPublishRefusalCausesAreDistinctAgentActionableMessages(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		base     *fakeGit
+		wrap     func(*fakeGit) gitRunner
+		prExists bool
+		want     string
+	}{
+		{
+			name: "origin mismatch",
+			base: &fakeGit{},
+			wrap: func(g *fakeGit) gitRunner { return originGit{fakeGit: g, origin: "git@github.com:someone/other.git"} },
+			want: "github publish worktree origin does not match the configured repository",
+		},
+		{
+			name: "dirty worktree",
+			base: &fakeGit{dirty: true},
+			want: "github publish requires a clean worktree",
+		},
+		{
+			name: "no committed HEAD",
+			base: &fakeGit{},
+			wrap: func(g *fakeGit) gitRunner { return &failingGit{fakeGit: g, failArgs: []string{"rev-parse", "HEAD"}} },
+			want: "github publish requires a committed HEAD",
+		},
+		{
+			name: "no committed changes",
+			base: &fakeGit{noChange: true},
+			want: "github publish requires committed changes",
+		},
+		{
+			name: "HEAD not based on the configured base branch",
+			base: &fakeGit{},
+			wrap: func(g *fakeGit) gitRunner {
+				return &failingGit{fakeGit: g, failArgs: []string{"merge-base", "--is-ancestor", "base", "head"}}
+			},
+			want: "github publish HEAD is not based on the configured base branch",
+		},
+		{
+			name: "non-fast-forward remote branch",
+			base: &fakeGit{},
+			wrap: func(g *fakeGit) gitRunner {
+				return &failingGit{fakeGit: g, failArgs: []string{"merge-base", "--is-ancestor", "sha1", "head"}}
+			},
+			prExists: true,
+			want:     "github publish remote branch symphony/pmr-27 has commits this worktree no longer contains; merge origin/main instead of rebasing",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			api, linear := newAPI(t), &fakeLinear{}
+			api.prExists = test.prExists
+			_, session := testSession(t, api, test.base, linear, nil)
+			if test.wrap != nil {
+				session.manager.git = test.wrap(test.base)
+			}
+			_, err := session.Publish(context.Background(), testInput())
+			if err == nil {
+				t.Fatal("unsafe publish succeeded")
+			}
+			if err.Error() != test.want {
+				t.Fatalf("publish refusal = %q, want %q", err.Error(), test.want)
+			}
+		})
+	}
+	seen := map[string]bool{}
+	for _, test := range []string{
+		"github publish worktree origin does not match the configured repository",
+		"github publish requires a clean worktree",
+		"github publish requires a committed HEAD",
+		"github publish requires committed changes",
+		"github publish HEAD is not based on the configured base branch",
+		"github publish remote branch symphony/pmr-27 has commits this worktree no longer contains; merge origin/main instead of rebasing",
+	} {
+		if seen[test] {
+			t.Fatalf("duplicate publish refusal message: %q", test)
+		}
+		seen[test] = true
+	}
+}
+
+// TestPublishRefusesNonFastForwardRemoteBranchBeforeAnyPush asserts the
+// stale-remote-branch check runs, and refuses, strictly before the push is
+// attempted: retrying a non-fast-forward push can never succeed, so the
+// worktree must never be left mid-push on this path (PMR-132, absorbing
+// PMR-137 proposal 2).
+func TestPublishRefusesNonFastForwardRemoteBranchBeforeAnyPush(t *testing.T) {
+	api, linear := newAPI(t), &fakeLinear{}
+	api.prExists = true
+	base := &fakeGit{}
+	git := &failingGit{fakeGit: base, failArgs: []string{"merge-base", "--is-ancestor", "sha1", "head"}}
+	_, session := testSession(t, api, base, linear, nil)
+	session.manager.git = git
+	if _, err := session.Publish(context.Background(), testInput()); err == nil || !strings.Contains(err.Error(), "merge origin/main instead of rebasing") {
+		t.Fatalf("non-fast-forward publish error=%v", err)
+	}
+	if api.created != 0 || len(linear.links) != 0 {
+		t.Fatalf("non-fast-forward publish mutated GitHub or Linear: created=%d links=%v", api.created, linear.links)
+	}
+	git.mu.Lock()
+	defer git.mu.Unlock()
+	for _, call := range git.calls {
+		if call[0] == "push" {
+			t.Fatalf("non-fast-forward publish attempted the push: %v", call)
+		}
+	}
+}
+
 func TestRepositoryOriginAcceptsOnlyCanonicalCredentialFreeGitHubForms(t *testing.T) {
 	for _, remote := range []string{
 		"https://github.com/owner/repo.git",

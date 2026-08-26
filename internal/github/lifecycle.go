@@ -387,6 +387,19 @@ func (s *Session) Publish(ctx context.Context, input PublishInput) (Result, erro
 	if _, err := s.manager.git.Run(ctx, s.workspace, []string{"merge-base", "--is-ancestor", base, head}, nil); err != nil {
 		return Result{}, errors.New("github publish HEAD is not based on the configured base branch")
 	}
+	existing, found, err := s.manager.findPull(ctx, s.settings, s.branch)
+	if err != nil {
+		return Result{}, err
+	}
+	if found && existing.Head.SHA != "" && existing.Head.SHA != head {
+		// A published pull request's remote head that HEAD no longer descends
+		// from means this worktree rebased instead of merging: the push below
+		// would be a non-fast-forward that can never succeed by retrying, so
+		// name the fixable cause now rather than let the push fail opaquely.
+		if _, err := s.manager.git.Run(ctx, s.workspace, []string{"merge-base", "--is-ancestor", existing.Head.SHA, head}, nil); err != nil {
+			return Result{}, errors.New("github publish remote branch " + s.branch + " has commits this worktree no longer contains; merge origin/" + s.settings.BaseBranch + " instead of rebasing")
+		}
+	}
 	auth := base64.StdEncoding.EncodeToString([]byte("x-access-token:" + s.settings.Token))
 	env := []string{"GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=http.https://github.com/.extraheader", "GIT_CONFIG_VALUE_0=AUTHORIZATION: basic " + auth}
 	remote := "https://github.com/" + s.settings.Owner + "/" + s.settings.Repository + ".git"
