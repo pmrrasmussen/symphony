@@ -34,6 +34,8 @@ type handoffFixture struct {
 	commentTeam         string
 	readAttempts        int
 	failRead            bool
+	failReadBody        string
+	graphqlErrorRead    bool
 	changeOnRead        int
 	changedStateID      string
 	changedStateName    string
@@ -83,6 +85,11 @@ func (f *handoffFixture) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		f.readAttempts++
 		if f.failRead {
 			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(f.failReadBody))
+			return
+		}
+		if f.graphqlErrorRead {
+			writeJSON(f.t, w, map[string]any{"errors": []map[string]any{{"message": "private agent payload test-token"}}})
 			return
 		}
 		if f.changeOnRead == f.readAttempts {
@@ -226,6 +233,55 @@ func TestEnsureActivePropagatesAScopedReadFailure(t *testing.T) {
 		t.Fatal("an unreadable issue was cleared to perform an irreversible mutation")
 	}
 	assertCategory(t, err, "tracker_status")
+}
+
+// TestEnsureActiveAndLinkAndHandoffErrorsCarryNoProviderWireContent guards the
+// sanitization github.Session.Publish and, downstream, the capability layer
+// rely on when they forward EnsureActive's and LinkAndHandoff's err.Error()
+// straight to the agent (PMR-149): whatever text a malicious or misbehaving
+// Linear response plants in the wire payload -- an HTTP error body or a
+// GraphQL errors entry -- must never appear in the resulting message.
+func TestEnsureActiveAndLinkAndHandoffErrorsCarryNoProviderWireContent(t *testing.T) {
+	const secret = "wire-secret-should-never-reach-the-agent"
+
+	t.Run("EnsureActive non-2xx response body", func(t *testing.T) {
+		f := newHandoffFixture(t)
+		session := f.session(t, nil)
+		f.failRead, f.failReadBody = true, secret
+		err := session.EnsureActive(context.Background())
+		if err == nil || strings.Contains(err.Error(), secret) {
+			t.Fatalf("EnsureActive leaked provider response body: %v", err)
+		}
+		if err.Error() != "linear tracker_status: Linear returned HTTP status 503" {
+			t.Fatalf("EnsureActive error = %q", err.Error())
+		}
+	})
+
+	t.Run("EnsureActive GraphQL errors payload", func(t *testing.T) {
+		f := newHandoffFixture(t)
+		session := f.session(t, nil)
+		f.graphqlErrorRead = true
+		err := session.EnsureActive(context.Background())
+		if err == nil || strings.Contains(err.Error(), "private agent payload") {
+			t.Fatalf("EnsureActive leaked a GraphQL errors payload: %v", err)
+		}
+		if err.Error() != "linear tracker_response: Linear returned GraphQL errors" {
+			t.Fatalf("EnsureActive error = %q", err.Error())
+		}
+	})
+
+	t.Run("LinkAndHandoff ambiguous comment mutation", func(t *testing.T) {
+		f := newHandoffFixture(t)
+		f.ambiguousComment = true
+		session := f.session(t, nil)
+		err := session.LinkAndHandoff(context.Background(), "https://github.com/owner/repo/pull/7")
+		if err == nil || strings.Contains(err.Error(), "private agent payload") {
+			t.Fatalf("LinkAndHandoff leaked provider response text: %v", err)
+		}
+		if err.Error() != "linear tracker_status: Linear returned HTTP status 500" {
+			t.Fatalf("LinkAndHandoff error = %q", err.Error())
+		}
+	})
 }
 
 // The following tests exercise the PMR-37 github_land_pr Linear surface:

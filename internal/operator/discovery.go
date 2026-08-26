@@ -107,9 +107,11 @@ type EffectiveConfig struct {
 	CodexCommand         string         `json:"codex_command,omitempty"`
 	CodexApprovalPolicy  string         `json:"codex_approval_policy,omitempty"`
 	CodexThreadSandbox   string         `json:"codex_thread_sandbox,omitempty"`
+	ClaudeCommand        string         `json:"claude_command,omitempty"`
+	ClaudeModel          string         `json:"claude_model,omitempty"`
 	TurnTimeout          time.Duration  `json:"turn_timeout"`
-	ReadTimeout          time.Duration  `json:"read_timeout"`
-	StartTimeout         time.Duration  `json:"start_timeout"`
+	ReadTimeout          time.Duration  `json:"read_timeout,omitempty"`
+	StartTimeout         time.Duration  `json:"start_timeout,omitempty"`
 	StallTimeout         time.Duration  `json:"stall_timeout"`
 	GitHubOwner          string         `json:"github_owner,omitempty"`
 	GitHubRepository     string         `json:"github_repository,omitempty"`
@@ -465,6 +467,7 @@ func inspectWorkflow(instance *Instance, environment map[string]string) []string
 		return nil
 	}
 	settings := workflow.Config
+	launch := settings.AgentLaunch()
 	instance.Config = &EffectiveConfig{
 		TrackerKind: settings.Tracker.Kind, ProjectSelector: providerString(settings.Tracker.Provider, "project_slug_id"),
 		ActiveStates: append([]string(nil), settings.Tracker.ActiveStates...), HandoffState: settings.Tracker.HandoffState,
@@ -472,13 +475,21 @@ func inspectWorkflow(instance *Instance, environment map[string]string) []string
 		PollInterval: settings.Polling.Interval, MaxConcurrentAgents: settings.Agent.MaxConcurrent,
 		MaxConcurrentByState: copyLimits(settings.Agent.ByState), MaxTurns: settings.Agent.MaxTurns,
 		WorkspaceRoot: settings.Workspace.Root, WorkspaceSource: settings.Workspace.SourceRoot,
-		AgentBackend: settings.AgentLaunch().Backend,
-		CodexCommand: settings.Codex.Command, TurnTimeout: settings.Codex.TurnTimeout, ReadTimeout: settings.Codex.ReadTimeout,
-		CodexApprovalPolicy: settings.Codex.ApprovalPolicy, CodexThreadSandbox: settings.Codex.ThreadSandbox,
-		StartTimeout: settings.Codex.StartTimeout, StallTimeout: settings.Codex.StallTimeout,
+		AgentBackend: launch.Backend, TurnTimeout: launch.TurnTimeout, StallTimeout: launch.StallTimeout,
 		GitHubOwner: settings.GitHub.Owner, GitHubRepository: settings.GitHub.Repository, GitHubBaseBranch: settings.GitHub.BaseBranch,
 		GitHubMergeMethod: settings.GitHub.MergeMethod, GitHubRequiredChecks: append([]string(nil), settings.GitHub.RequiredChecks...),
 		Credentials: credentialPresence(workflow.Raw, instance.Paths.Workflow, environment),
+	}
+	switch launch.Backend {
+	case config.ClaudeAgentBackend:
+		instance.Config.ClaudeCommand = launch.Command
+		instance.Config.ClaudeModel = launch.Model
+	default:
+		instance.Config.CodexCommand = launch.Command
+		instance.Config.CodexApprovalPolicy = launch.ApprovalPolicy
+		instance.Config.CodexThreadSandbox = launch.ThreadSandbox
+		instance.Config.ReadTimeout = launch.ReadTimeout
+		instance.Config.StartTimeout = launch.StartTimeout
 	}
 	for _, check := range preflight.RunWithEnvironment(context.Background(), instance.Paths.Workflow, instance.Paths.LogsRoot, instance.Paths.StatusFile, environment).Checks {
 		if check.Status == preflight.StatusPassed {

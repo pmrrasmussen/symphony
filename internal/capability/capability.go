@@ -53,10 +53,13 @@ type Result struct {
 	Reason   string
 }
 
-// Failure is a non-terminal refusal. Message is returned to the agent verbatim
-// and must stay generic: no provider error, issue data, or credential-derived
-// value belongs in it. Outcome is the item outcome to record when the refusal
-// happens after the call was already reported as started.
+// Failure is a non-terminal refusal. Message is returned to the agent
+// verbatim and may vary per cause -- providers deliberately compose dynamic,
+// actionable text into it -- but every string that reaches it must be
+// host-authored: never raw provider error text, wire-decoded response
+// content, issue data, or a credential-derived value. Outcome is the item
+// outcome to record when the refusal happens after the call was already
+// reported as started.
 type Failure struct {
 	Message string
 	Outcome string

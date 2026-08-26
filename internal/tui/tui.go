@@ -831,7 +831,10 @@ func (m Model) writeConfig(b *strings.Builder, instance operator.Instance) {
 	if len(config.MaxConcurrentByState) > 0 {
 		fmt.Fprintf(b, "State capacity: %s\n", rateLimitsInt(config.MaxConcurrentByState))
 	}
-	fmt.Fprintf(b, "\n%s: %s\nTimeouts: turn %s; read %s; start %s; stall %s\nSandbox policy: approval %s; thread %s\n", backendLabel(config.AgentBackend), empty(config.CodexCommand), config.TurnTimeout, config.ReadTimeout, config.StartTimeout, config.StallTimeout, empty(config.CodexApprovalPolicy), empty(config.CodexThreadSandbox))
+	fmt.Fprintf(b, "\n%s:\n", backendLabel(config.AgentBackend))
+	for _, row := range backendConfigRows(config) {
+		fmt.Fprintf(b, "%s: %s\n", row[0], row[1])
+	}
 	fmt.Fprintf(b, "\nGitHub: %s/%s base %s; merge %s\nRequired checks: %s\n", empty(config.GitHubOwner), empty(config.GitHubRepository), empty(config.GitHubBaseBranch), empty(config.GitHubMergeMethod), comma(config.GitHubRequiredChecks))
 	fmt.Fprintf(b, "Credentials: Linear %s; GitHub %s\n", configured(config.Credentials.Tracker.Configured), configured(config.Credentials.GitHub.Configured))
 }

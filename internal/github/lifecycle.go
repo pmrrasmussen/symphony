@@ -392,6 +392,16 @@ func (s *Session) Publish(ctx context.Context, input PublishInput) (Result, erro
 		return Result{}, err
 	}
 	if found && existing.Head.SHA != "" && existing.Head.SHA != head {
+		if _, err := s.manager.git.Run(ctx, s.workspace, []string{"cat-file", "-e", existing.Head.SHA + "^{commit}"}, nil); err != nil {
+			// The remote head commit was never fetched into this worktree (for
+			// example, a human pushed a suggested change through GitHub's UI),
+			// so the ancestry check below cannot run and would fail
+			// indistinguishably from a rebase. Naming the rebase cause without
+			// having established it would hand the agent an instruction that
+			// cannot resolve the divergence, so this case is refused with a
+			// cause that stops at what is actually known instead.
+			return Result{}, errors.New("github publish remote branch " + s.branch + " has a head commit this worktree has not fetched, so the cause of the divergence cannot be established here")
+		}
 		// A published pull request's remote head that HEAD no longer descends
 		// from means this worktree rebased instead of merging: the push below
 		// would be a non-fast-forward that can never succeed by retrying, so
@@ -404,7 +414,14 @@ func (s *Session) Publish(ctx context.Context, input PublishInput) (Result, erro
 	env := []string{"GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=http.https://github.com/.extraheader", "GIT_CONFIG_VALUE_0=AUTHORIZATION: basic " + auth}
 	remote := "https://github.com/" + s.settings.Owner + "/" + s.settings.Repository + ".git"
 	if _, err := s.manager.git.Run(ctx, s.workspace, []string{"push", remote, "HEAD:refs/heads/" + s.branch}, env); err != nil {
-		return Result{}, err
+		// execGit.Run discards the underlying git output, so this is never
+		// provider text; it is host-authored precisely because the generic
+		// "git operation failed" this replaces gave the agent nothing to act
+		// on. Every cause diagnosable ahead of the push (dirty worktree, stale
+		// base, non-fast-forward) was already refused above, so what reaches
+		// here is the remainder: a transient or remote-side rejection retrying
+		// may clear, or a repository push restriction retrying will not.
+		return Result{}, errors.New("github publish could not push branch " + s.branch + " to the configured repository; retry once, and if it persists check the repository's push permissions and branch protection rules")
 	}
 	s.manager.logger.Info("GitHub issue branch published", "issue_id", s.issue.ID, "issue_identifier", s.issue.Identifier, "repository", s.settings.Owner+"/"+s.settings.Repository, "branch", s.branch)
 	body := canonicalBody(input, s.issue.URL)
@@ -1002,6 +1019,12 @@ func (m *Manager) findPull(ctx context.Context, s config.GitHub, branch string) 
 // exists, reopens an issue-bound pull request that was closed without being
 // merged, and updates the body only when the canonical structured fields
 // changed. A pull request already merged is irrecoverable and rejected.
+//
+// It re-runs findPull itself rather than reusing Publish's pre-push lookup:
+// the push in between is a network round trip during which the pull request
+// can be merged, and a merge in that window must be caught here or Publish
+// would PATCH an already-merged pull request's body and hand it off as a
+// normal publish.
 func (m *Manager) publishPullRequest(ctx context.Context, s config.GitHub, branch string, issue domain.Issue, body string) (pull, bool, error) {
 	existing, found, err := m.findPull(ctx, s, branch)
 	if err != nil {
