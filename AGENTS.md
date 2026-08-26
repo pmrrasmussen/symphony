@@ -26,7 +26,9 @@ handoff, rework, landing, and completion instructions. Read it, and
 - `internal/mcpbridge` — the in-process loopback MCP endpoint that serves that registry to an MCP-capable agent process: one listener, per-session bearer tokens, one invocation in flight per session, and drain-before-finalize revocation. Wired into the Claude backend and reachable: a Claude workflow may bind Symphony's session capabilities.
 - `internal/codex` — the Codex app-server JSON-RPC backend and dynamic tool wiring.
 - `internal/claude` — the Claude Code CLI backend: the fixed, non-configurable launch contract (tool surface, permission mode, settings sources, sandbox, MCP configuration) re-applied and re-verified on every turn, the per-turn capability-endpoint registration retired before the next turn is minted, the launch-time cross-check that the rendered prompt's capability promises match what this session advertises, and the narrow `--print` stream decode.
-- `internal/workspace` — local Git worktree lifecycle, ownership, and recovery.
+- `internal/workspace` — local Git worktree lifecycle, ownership, and recovery,
+  and the `WORKFLOW.md` hook runner: a hook is a child like an agent backend, so
+  it runs under the same filtered environment with no session matcher.
 - `internal/domain` — the shared, provider-agnostic issue/agent/workspace types.
 - `internal/observability` — structured log redaction and level policy.
 - `internal/preflight` — the `--dry-run` side-effect-free validation path.

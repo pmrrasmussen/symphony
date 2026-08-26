@@ -4,14 +4,17 @@
 // It is the one implementation of the policy config.ReservedSecretEnvNames
 // describes, and it lives outside both backends because that policy is a
 // property of the trust boundary rather than of any one child. Every child that
-// inherits the daemon's environment -- the Codex app-server, each Claude turn --
-// reaches it through Filter, so a filter cannot hold for one child and not
-// another. That was not a hypothetical: PMR-94 was Claude children inheriting
-// the provider secrets Codex children stripped, from two implementations that
-// each carried a comment asserting the other matched it.
+// inherits the daemon's environment -- the Codex app-server, each Claude turn,
+// each WORKFLOW.md workspace hook -- reaches it through Filter, so a filter
+// cannot hold for one child and not another. That was not a hypothetical twice
+// over: PMR-94 was Claude children inheriting the provider secrets Codex
+// children stripped, from two implementations that each carried a comment
+// asserting the other matched it, and PMR-113 was hooks inheriting the daemon's
+// environment whole because a doctrine written about agent backends never named
+// the third child.
 //
 // It depends only on internal/config, so a caller with no session and no
-// capability registry -- a workspace hook, for instance -- can use it.
+// capability registry -- a workspace hook -- can use it.
 package hostenv
 
 import (

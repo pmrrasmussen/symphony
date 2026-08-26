@@ -62,12 +62,15 @@ under `codex`, so it configures nothing and reaches neither rule.
 
 The initial implementation is intentionally for a trusted local machine.
 `WORKFLOW.md` is repository-owned, versioned policy and its hooks are trusted
-shell code.  The agent can make changes and execute commands according to the
+shell code -- trusted to run, which is not the same as trusted with the host's
+credentials: a hook runs inside the agent's worktree and is filtered like any
+other child, as described under the host credential filter below.  The agent can
+make changes and execute commands according to the
 policy its backend runs under -- for Codex the configured approval and sandbox
 policy, for Claude the fixed launch contract described below; this service does
 not provide Docker, VM, SSH, distributed execution, or a database.  Linear
-credentials stay in the host process and are removed from the agent child's
-environment.
+credentials stay in the host process and are removed from the environment of
+every process Symphony spawns.
 
 On macOS, one repository may have one independently configured LaunchAgent.
 The LaunchAgent is machine-local instance configuration, not repository policy:
@@ -237,8 +240,10 @@ operation, all built from a fixed, narrow decode of protocol fields that
 never includes tool arguments, command bodies, outputs, or raw payloads. See
 [observability.md](observability.md).
 
-No host credential reaches an agent child as an environment variable, under
-either backend. One filter, described once, is applied by both launchers, and it
+No host credential reaches a child Symphony spawns as an environment variable.
+There are three kinds of child, not two: the Codex app-server, each Claude turn,
+and each `WORKFLOW.md` workspace hook. One filter, described once, is applied by
+all of them, and it
 has four parts. First, a fixed set of reserved variable names -- the documented
 names Symphony's own tracker and forge credentials are read from -- is removed
 whatever the workflow configures, so it still applies to a workflow that
@@ -270,16 +275,36 @@ other source. Everything else is inherited on purpose: both CLIs authenticate
 through the operator's own stored login, which lives in the home directory they
 read.
 
+A workspace hook is a child on the same terms. Its script is repository-owned
+policy and is trusted as such, but `cmd.Dir` is the agent's own worktree, so a
+hook that runs `make setup`, `./scripts/...`, or `npm run ...` executes code the
+agent wrote and committed, outside the agent sandbox -- and `before_run` and
+`after_run` bracket every turn on that worktree, so this is the ordinary
+lifecycle rather than operator error. A hook therefore gets the filter too; it
+has no session, so it passes no `SecretMatcher` and gets the three parts derived
+from settings alone, forgoing only a credential held by a live provider under a
+name and value no configuration mentions. Symphony adds `SYMPHONY_ISSUE_ID` and
+`SYMPHONY_ISSUE_IDENTIFIER` after filtering and blocks both names on the way in,
+so it is their only source. Hooks run under `sh -c` rather than `sh -lc`: a
+login shell sources the operator's profile, a second uncontrolled input to a
+process running in an agent-writable directory, and it is not the form
+`--dry-run` validates the script with (`sh -n -c`). A hook resolves commands
+from the daemon's own `PATH` -- under a LaunchAgent, the one written into the
+plist -- rather than from a profile.
+
 `internal/config`'s `ReservedSecretEnvNames` owns the reserved names and this
 description; `internal/hostenv`'s `Filter` is the one implementation, applied by
 every launcher, so the four parts cannot hold for one child and not another --
-which is what they did not, before `Filter` existed. `internal/capability`'s
+which is what they did not, before `Filter` existed. They did not hold for hooks
+either until PMR-113, for the same reason in a different place: the doctrine
+enumerated the agent backends, so the third child was never weighed against it.
+`internal/capability`'s
 `SecretMatcher` builds the fourth part from the same bindings that decide which
 capabilities a session gets, so the providers a session can reach and the
 credentials it strips cannot diverge; it is the one part a caller may omit,
 because a process spawned outside any session has no bindings to build it from.
-Each part is proven once over `Filter`, and each launcher is proven to reach it
-with everything it must contribute.
+Each part is proven once over `Filter`, and each launcher -- both backends and
+the hook path -- is proven to reach it with everything it must contribute.
 
 When `workspace.source_root` is configured, `LocalWorkspaceExecutor` creates a
 detached Git worktree for each issue. Before creating a new workspace, it
