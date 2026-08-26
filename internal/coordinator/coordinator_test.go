@@ -1811,7 +1811,12 @@ func TestLaunchReservationPreventsOversubscriptionBeforeSessionStart(t *testing.
 	<-ws.after
 }
 
-func TestRetryAtCapacityRequeuesWithBoundedBackoff(t *testing.T) {
+// TestRetryAtCapacityRequeuesOnFixedCadence covers runRetry's contended-slot
+// branch for retryAgent: losing the race for an orchestrator slot is capacity
+// contention, not a dispatch failure, so it must keep the attempt fixed and
+// retry on agentSlotRetryDelay's fixed poll-interval cadence rather than
+// attempt+1 and the escalating failure backoff.
+func TestRetryAtCapacityRequeuesOnFixedCadence(t *testing.T) {
 	w := testSettings(t)
 	w.Config.Agent.MaxRetryBackoff = 15 * time.Second
 	retrying := testIssue()
@@ -1839,11 +1844,11 @@ func TestRetryAtCapacityRequeuesWithBoundedBackoff(t *testing.T) {
 	c.mu.Lock()
 	retry := c.retries[retrying.ID]
 	c.mu.Unlock()
-	if retry.reason != "no available orchestrator slots" || retry.attempt != 2 {
-		t.Fatalf("retry=%+v", retry)
+	if retry.reason != "agent_slot_unavailable" || retry.attempt != 1 {
+		t.Fatalf("retry=%+v, want attempt unchanged and reason agent_slot_unavailable", retry)
 	}
-	if len(timer.delays) != 2 || timer.delays[1] != 15*time.Second {
-		t.Fatalf("retry delays=%v, want capped 15s second retry", timer.delays)
+	if len(timer.delays) != 2 || timer.delays[1] != w.Config.Polling.Interval {
+		t.Fatalf("retry delays=%v, want second retry at the poll interval (not the 15s failure backoff)", timer.delays)
 	}
 	if err := c.Shutdown(context.Background()); err != nil {
 		t.Fatal(err)
@@ -1851,12 +1856,13 @@ func TestRetryAtCapacityRequeuesWithBoundedBackoff(t *testing.T) {
 	<-ws.after
 }
 
-// TestRetryAtCapacityAbandonsAtMaxAttempts covers the gap the ceiling
-// originally missed: a slot that stays contended escalates the same attempt
-// counter as a dispatch failure (runRetry's "no available orchestrator
-// slots" branch), so it must give up at agent.max_attempts too, rather than
-// requeuing forever behind a slot that is never freed.
-func TestRetryAtCapacityAbandonsAtMaxAttempts(t *testing.T) {
+// TestRetryAtCapacityNeverAbandons pins the invariant review settled
+// empirically on this repository: PMR-100 completed successfully on attempt
+// 11 after eleven straight lost slot races, never once having failed a
+// dispatch. A contended orchestrator slot must never consume
+// agent.max_attempts, however many times the slot is lost, or a healthy but
+// busy queue would abandon issues that were never broken.
+func TestRetryAtCapacityNeverAbandons(t *testing.T) {
 	w := testSettings(t)
 	w.Config.Agent.MaxAttempts = 2
 	w.Config.Agent.MaxRetryBackoff = 15 * time.Second
@@ -1882,26 +1888,27 @@ func TestRetryAtCapacityAbandonsAtMaxAttempts(t *testing.T) {
 		t.Fatal("running issue was not admitted")
 	}
 	<-agent.started
-	timer.fire(0)
-	record := waitForSubstring(t, &log, `"msg":"dispatch abandoned after max attempts"`, time.Second)
+
+	const lostRaces = 5 // well past max_attempts=2, which a contended slot must never consume
+	for i := 0; i < lostRaces; i++ {
+		timer.fire(i)
+	}
 
 	c.mu.Lock()
 	claimed := c.claimed[retrying.ID]
-	_, stillRetrying := c.retries[retrying.ID]
+	retry, stillRetrying := c.retries[retrying.ID]
 	c.mu.Unlock()
-	if claimed {
-		t.Fatal("retrying issue kept its claim past max_attempts")
+	if !claimed || !stillRetrying {
+		t.Fatal("contended slot abandoned the retry before a real dispatch failure ever occurred")
 	}
-	if stillRetrying {
-		t.Fatal("slot contention rearmed a retry past max_attempts")
+	if retry.attempt != 1 {
+		t.Fatalf("attempt=%d, want unchanged across %d lost slot races", retry.attempt, lostRaces)
 	}
-	if len(timer.delays) != 1 {
-		t.Fatalf("delays=%v, want no further retry armed", timer.delays)
+	if retry.reason != "agent_slot_unavailable" {
+		t.Fatalf("reason=%q, want agent_slot_unavailable", retry.reason)
 	}
-	for _, want := range []string{`"reason":"no available orchestrator slots"`, `"attempt":2`, `"max_attempts":2`} {
-		if !strings.Contains(record, want) {
-			t.Fatalf("abandonment record missing %s: %s", want, record)
-		}
+	if strings.Contains(log.String(), `"msg":"dispatch abandoned after max attempts"`) {
+		t.Fatalf("contended slot armed an abandonment record: %s", log.String())
 	}
 	if err := c.Shutdown(context.Background()); err != nil {
 		t.Fatal(err)

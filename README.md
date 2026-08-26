@@ -111,7 +111,11 @@ needs a person rather than another retry. That also means abandonment is not
 quarantine: an issue nobody acts on keeps starting new bounded episodes at the
 poll interval, so `dispatch_abandoned` is a record to alert on rather than one
 to let accumulate. A non-terminal landing wait is exempt, since it is not an
-agent failure (see below).
+agent failure (see below), and so is losing the race for a contended
+orchestrator slot: that is capacity contention rather than a dispatch
+failure, so it leaves the attempt where it was and retries on a fixed,
+poll-interval cadence instead of consuming `max_attempts` or the escalating
+failure backoff.
 
 See `WORKFLOW.md`'s prompt body for the full per-state start, implementation,
 validation, review handoff, rework, landing, and completion playbook, and
