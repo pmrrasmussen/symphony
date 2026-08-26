@@ -5,10 +5,11 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
-	"time"
+	"sync/atomic"
 
-	"github.com/pmrrasmussen/symphony/internal/domain"
+	"github.com/pmrrasmussen/symphony/internal/capability"
 )
 
 // The JSON-RPC error codes this endpoint can produce. They are the protocol's
@@ -161,96 +162,87 @@ func toolList(g *Registration) []map[string]any {
 	return tools
 }
 
-// callTool runs one tools/call against this registration's registry, writing the
-// MCP result through respond and emitting any terminal outcome the capability
-// produced.
-//
-// Both happen before the deferred endCall releases the invocation slot, and that
-// ordering is load-bearing. A Revoke waiting in drain() wakes the moment the
-// slot is released and retires the registration; anything emitted after that is
-// dropped. A turn cancelled while a landing is in flight is exactly the case
-// this transport is built for -- the child is killed, the landing completes,
-// reports waiting or merged, and that event is what schedules the delayed retry
-// or ends the run. Releasing the slot first would destroy it, and the provider's
-// own finalizer would then also do nothing, because it sees the waiting outcome
-// the lost event was reporting.
-//
-// respond runs first so the model still receives the result of the call that
-// ended its turn, as it does on the Codex transport.
-//
-// Every decision about what a capability is, whether it accepts these
-// arguments, and what it refuses belongs to the registry. This function owns
-// only the transport, the single-invocation gate, and the context the invocation
+// callTool runs one tools/call against this registration's registry through the
+// shared capability dispatch, which owns the whole lookup-to-terminal-event
+// sequence for both of Symphony's agent transports. What this endpoint keeps is
+// what is genuinely its own: the MCP request and result envelopes, the
+// advertisement gate, the single-invocation gate, and the context an invocation
 // runs under.
 //
-// It emits no item events, and that is a deliberate trade with a known cost. A
-// call the agent CLI makes is already reported in the CLI's own stream as a
-// tool_use/tool_result pair named mcp__symphony__<tool>, which the backend pairs
-// and classifies, so emitting here would double-count it. A call the child makes
-// by other means -- its shell holds the endpoint token, and loopback is inside
-// its sandbox -- appears in no stream and therefore in no item record at all.
-// The advertisement gate below is what bounds that: such a call can only reach a
-// capability the model was already permitted to call, so it grants no authority,
-// but it does go unrecorded. That is also why the registry's Lifecycle flag is
-// not consulted: this transport has no lifecycle record to suppress.
+// Both the result and any terminal event the capability produced are delivered
+// before the deferred endCall releases the invocation slot, and that ordering is
+// load-bearing. A Revoke waiting in drain() wakes the moment the slot is
+// released and retires the registration; anything emitted after that is dropped.
+// A turn cancelled while a landing is in flight is exactly the case this
+// transport is built for -- the child is killed, the landing completes, reports
+// waiting or merged, and that event is what schedules the delayed retry or ends
+// the run. Releasing the slot first would destroy it, and the provider's own
+// finalizer would then also do nothing, because it sees the waiting outcome the
+// lost event was reporting. Dispatch responds before it emits and runs the
+// release last, which is why the gate is handed to it as Enter rather than taken
+// around it.
 //
-// Nothing decoded from the wire is echoed anywhere -- no log line, no event -- so
-// the registry-owned Definition().Name that internal/codex carries forward has
-// no consumer here. Any log or event ever added to this function must take the
-// name from the resolved capability's own definition, never from the decoded
-// request.
+// Item records. A capability whose Lifecycle reports it as observable is
+// reported here as a dynamicToolCall pair, exactly as it is on the Codex
+// transport (PMR-100). For a call the agent CLI made that is a second record of
+// the same work -- the CLI's own stream already carries a tool_use/tool_result
+// pair named mcp__symphony__<tool>, which the Claude backend pairs and
+// classifies as an mcpToolCall -- but the two are distinct item types with
+// distinct IDs, and only this one times the provider round trip itself rather
+// than the CLI's view of the call. It is also the only record a call the child
+// makes by other means produces at all: its shell holds the endpoint token and
+// loopback is inside its sandbox, and such a call appears in no CLI stream.
+//
+// Nothing decoded from the wire is echoed into those records. The name is used
+// only to select a capability -- Dispatch reports the resolved capability's own
+// registry-owned Definition().Name -- and the call ID is minted here rather than
+// taken from the request's JSON-RPC ID, which is a value the untrusted child
+// chose. Any log or event ever added to this file must take the same care.
 func (g *Registration) callTool(params json.RawMessage, respond func(map[string]any)) {
 	var call struct {
 		Name      string          `json:"name"`
 		Arguments json.RawMessage `json:"arguments"`
 	}
 	if err := json.Unmarshal(params, &call); err != nil {
-		respond(unsupportedTool())
+		respond(toolResult(capability.Outcome{Refusal: capability.Unsupported()}))
 		return
 	}
-	bound, ok := g.capabilities.Lookup(call.Name)
-	if !ok || !g.advertises(bound.Definition().Name) {
-		// Refused as a tool result, not a JSON-RPC error: an unknown name is
-		// something the model chose and can correct, and the refusal reveals
-		// nothing about what is configured -- an unadvertised capability is
-		// indistinguishable from one that does not exist.
-		respond(unsupportedTool())
-		return
-	}
-	invoke, failure := bound.Prepare(arguments(call.Arguments))
-	if failure != nil {
-		// A rejected argument list precedes the call, so it is not reported as
-		// one, and it does not claim the invocation slot.
-		respond(toolFailure(failure.Message))
-		return
-	}
-	if err := g.beginCall(); err != nil {
-		respond(toolFailure(gateRefusal(err)))
-		return
-	}
-	defer g.endCall()
 	// The session context, never the request's: see Register.
-	result, failure := invoke(g.sessionCtx)
-	if failure != nil {
-		respond(toolFailure(failure.Message))
-		return
-	}
-	payload, err := json.Marshal(result.Payload)
-	if err != nil {
-		respond(unsupportedTool())
-		return
-	}
-	respond(map[string]any{"content": text(string(payload)), "isError": !result.Success})
-	if result.Terminal != "" {
-		// A capability may settle the whole run. Reason is a fixed, bounded
-		// string owned by the provider.
-		g.emit(domain.Event{Kind: result.Terminal, At: time.Now(), Message: result.Reason})
-	}
+	capability.Dispatch(g.sessionCtx, g.capabilities, capability.Transport{
+		CallID:  nextCallID(),
+		Respond: func(outcome capability.Outcome) { respond(toolResult(outcome)) },
+		Emit:    g.emit,
+		Allow:   g.advertises,
+		Enter:   g.enterCall,
+	}, call.Name, arguments(call.Arguments))
 }
+
+// enterCall claims the single invocation slot for one dispatched call and
+// returns the release that runs once that call has been answered and its
+// terminal event emitted.
+func (g *Registration) enterCall() (func(), *capability.Failure) {
+	if err := g.beginCall(); err != nil {
+		return nil, &capability.Failure{Message: gateRefusal(err)}
+	}
+	return g.endCall, nil
+}
+
+// nextCallID mints the identity one dispatched call is reported under. It is
+// host-side and process-wide: an ID taken from the request's JSON-RPC envelope
+// would be a value the child chose reaching an event, and a per-registration
+// counter would repeat itself every turn, so a stale outstanding operation could
+// be cleared by the next turn's first call.
+func nextCallID() string {
+	return "mcp-call-" + strconv.FormatUint(callSequence.Add(1), 10)
+}
+
+var callSequence atomic.Uint64
 
 // advertises reports whether a resolved capability is one this registration
 // advertises, which over this transport is the same question as whether the
-// agent is allowed to call it.
+// agent is allowed to call it. It is the Allow gate the shared dispatch consults
+// after a name resolves and before any provider work, and a name it refuses is
+// answered exactly as an unknown one is.
 //
 // The registry's own Lookup deliberately ignores advertisement, because on the
 // Codex transport advertisement is only a filter over what the model is told
@@ -303,19 +295,18 @@ func gateRefusal(err error) string {
 	return "Symphony tools are no longer available for this session."
 }
 
-// unsupportedTool is the refusal for an unknown capability and for a call this
-// endpoint cannot even shape a result for. It matches the registry's own
-// unsupported-capability wording, so an agent cannot distinguish an unknown name
-// from a capability that refused to decode its arguments.
-func unsupportedTool() map[string]any {
-	return toolFailure("Unsupported client-side tool.")
-}
-
-// toolFailure is a normal, successful MCP response carrying an error result: the
-// model can read the refusal and keep working in the same turn. A JSON-RPC error
-// would instead be a client-level transport failure.
-func toolFailure(message string) map[string]any {
-	return map[string]any{"content": text(message), "isError": true}
+// toolResult frames one dispatched outcome in the MCP tool-result envelope.
+//
+// A refusal is a normal, successful MCP response carrying an error result: the
+// model can read it and keep working in the same turn, where a JSON-RPC error
+// would instead be a client-level transport failure. The refusal text is the
+// registry's own, so an unknown name, an unadvertised capability, and a call
+// this endpoint could not shape a result for stay indistinguishable.
+func toolResult(outcome capability.Outcome) map[string]any {
+	if outcome.Refusal != nil {
+		return map[string]any{"content": text(outcome.Refusal.Message), "isError": true}
+	}
+	return map[string]any{"content": text(string(outcome.Payload)), "isError": !outcome.Success}
 }
 
 func text(value string) []any {

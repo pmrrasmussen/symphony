@@ -588,14 +588,40 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{}}'
 		t.Fatal(err)
 	}
 	seenCompleted := false
+	reported := map[string][]domain.Event{}
 	for event := range events {
 		if event.Kind == domain.EventBlocked {
 			t.Fatalf("tool rejection blocked a non-interactive turn: %+v", event)
+		}
+		if event.ItemType == "dynamicToolCall" {
+			reported[event.ToolName] = append(reported[event.ToolName], event)
 		}
 		seenCompleted = seenCompleted || event.Kind == domain.EventCompleted
 	}
 	if !seenCompleted {
 		t.Fatal("tool rejection did not allow turn completion")
+	}
+	// The item records this transport hands to the shared dispatch, asserted
+	// where a real capability is actually invoked over the app-server protocol.
+	// Only the two calls whose arguments validated reached an invocation; every
+	// other call above was refused before it, and a refusal that precedes a call
+	// is never reported as one.
+	for name := range reported {
+		if name != "github_pr_context" && name != "github_land_pr" {
+			t.Fatalf("a call that never reached an invocation was reported as %q: %+v", name, reported[name])
+		}
+	}
+	for _, name := range []string{"github_pr_context", "github_land_pr"} {
+		pair := reported[name]
+		if len(pair) != 2 {
+			t.Fatalf("%s produced %d item records, want a started/finished pair: %+v", name, len(pair), pair)
+		}
+		if pair[0].Outcome != domain.ItemStarted || pair[1].Outcome != domain.ItemFailed {
+			t.Fatalf("%s outcomes = %q and %q, want started then failed", name, pair[0].Outcome, pair[1].Outcome)
+		}
+		if pair[0].ItemID == "" || pair[0].ItemID != pair[1].ItemID {
+			t.Fatalf("%s reported IDs %q and %q, so no consumer can match them", name, pair[0].ItemID, pair[1].ItemID)
+		}
 	}
 }
 
