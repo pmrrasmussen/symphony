@@ -75,13 +75,20 @@ agent:
   # session keeps the backend it started on. Only the selected backend's launch
   # block below has to be complete.
   backend: codex
-  # Four-agent operation: implementation/rework work can scale across the
-  # available global capacity while max_concurrent_agents_by_state keeps
-  # landing serialized at exactly one Merging agent.
+  # Four-agent operation, gated on refresh_base_ref (PMR-141) landing: each of
+  # up to four concurrent implementation/rework agents can clear its own stale
+  # origin/main when a concurrent peer's merge lands mid-run, instead of
+  # failing a stale-base publish. max_concurrent_agents_by_state keeps landing
+  # serialized at exactly one Merging agent regardless.
   max_concurrent_agents: 4
   max_concurrent_agents_by_state:
     Merging: 1
-  max_turns: 20
+  # Lowered from 20 (PMR-134): a dogfood session showed no run that published
+  # used more than 5 turns -- including landing and Rework runs -- while
+  # doomed runs burned the full 20-turn budget without publishing. 8 leaves
+  # headroom above every observed success without paying for as long a death
+  # spiral.
+  max_turns: 8
   # The one bound on the number of *runs*. max_turns bounds the turns inside a
   # run and max_retry_backoff_ms bounds the delay between runs; neither stops an
   # issue that fails the same way every time -- a corrupted worktree, a
@@ -127,7 +134,12 @@ codex:
   turn_sandbox_policy:
     type: workspaceWrite
     networkAccess: true
-  turn_timeout_ms: 3600000
+  # Lowered from one hour (PMR-134): a dogfood session's longest turn in any
+  # run that published was under 13 minutes; 900000 (15 min) covers that with
+  # headroom while cutting off a runaway turn that would otherwise run to
+  # completion (one observed turn ran 1,033,186 ms and reported 10.4M input
+  # tokens).
+  turn_timeout_ms: 900000
   # read_timeout_ms bounds every steady-state JSON-RPC round trip; keep it small
   # so a hung session is detected mid-turn.
   read_timeout_ms: 5000
@@ -191,7 +203,7 @@ codex:
 #   command: claude
 #   # Optional. Omit it to let the CLI select its own model.
 #   model: sonnet
-#   turn_timeout_ms: 3600000
+#   turn_timeout_ms: 900000
 #   # There is no read_timeout_ms or start_timeout_ms counterpart: one turn is
 #   # one process, so there is no steady-state round trip to bound.
 #   stall_timeout_ms: 300000

@@ -69,13 +69,21 @@ workspace:
 hooks:
   timeout_ms: 60000
 agent:
-  # Four-agent operation: implementation/rework work can scale across the
-  # available global capacity while max_concurrent_agents_by_state keeps
-  # landing serialized at exactly one Merging agent.
+  # Four-agent operation, gated on refresh_base_ref (PMR-141) landing (PR #98,
+  # merged 2026-08-26): each of up to four concurrent implementation/rework
+  # agents can now clear its own stale origin/main when a concurrent peer's
+  # merge lands mid-run, instead of failing a stale-base publish.
+  # max_concurrent_agents_by_state keeps landing serialized at exactly one
+  # Merging agent regardless.
   max_concurrent_agents: 4
   max_concurrent_agents_by_state:
     Merging: 1
-  max_turns: 20
+  # Lowered from 20 (PMR-134): across the 2026-08-26 dogfood session
+  # (.symphony/logs/symphony.jsonl), no run that published used more than 5
+  # turns -- including landing (always 1) and Rework runs -- while doomed runs
+  # burned the full 20-turn budget without publishing. 8 leaves headroom above
+  # every observed success without paying for as long a death spiral.
+  max_turns: 8
   # Bounds the number of runs, which max_turns (turns inside a run) and
   # max_retry_backoff_ms (the delay between runs) do not: after this many
   # dispatches of the same issue fail, Symphony logs one error-level
@@ -96,7 +104,11 @@ codex:
   turn_sandbox_policy:
     type: workspaceWrite
     networkAccess: true
-  turn_timeout_ms: 3600000
+  # Lowered from one hour (PMR-134): the longest turn in any run that
+  # published across the 2026-08-26 dogfood session was 756,699 ms (~12.6
+  # min); 900000 (15 min) covers that with headroom while cutting off a
+  # runaway turn like the 1,033,186 ms/10.4M-token one PMR-100 saw.
+  turn_timeout_ms: 900000
   # read_timeout_ms bounds every steady-state JSON-RPC round trip; keep it small
   # so a hung session is detected mid-turn.
   read_timeout_ms: 5000
