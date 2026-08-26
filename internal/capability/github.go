@@ -70,7 +70,12 @@ func (c publishCapability) Prepare(arguments json.RawMessage) (Invocation, *Fail
 	return func(ctx context.Context) (Result, *Failure) {
 		result, err := c.session.Publish(ctx, input)
 		if err != nil {
-			return Result{}, &Failure{Message: "GitHub pull request publication was rejected.", Outcome: domain.ItemFailed}
+			// Every reason Publish returns is a fixed, repository-config-derived,
+			// secret-free string (unclean worktree, stale base, non-fast-forward
+			// remote, and so on), so it is passed straight through: the agent can
+			// act on it and retry, instead of looping on a refusal it has no way
+			// to diagnose (PMR-132).
+			return Result{}, &Failure{Message: "GitHub publish needs a fix: " + err.Error() + ".", Outcome: domain.ItemFailed}
 		}
 		// The payload shape is built explicitly rather than marshaled from the
 		// provider result, so the field names an agent sees stay pinned here.
@@ -101,7 +106,10 @@ func (c contextCapability) Prepare(arguments json.RawMessage) (Invocation, *Fail
 	return func(ctx context.Context) (Result, *Failure) {
 		result, err := c.session.Context(ctx)
 		if err != nil {
-			return Result{}, &Failure{Message: "GitHub pull request context request was rejected.", Outcome: domain.ItemFailed}
+			// Every reason Context returns is a fixed, secret-free string (most
+			// commonly "no pull request has been published for this issue yet"),
+			// so it is passed straight through rather than discarded (PMR-132).
+			return Result{}, &Failure{Message: "GitHub pull request context was rejected: " + err.Error() + ".", Outcome: domain.ItemFailed}
 		}
 		return Result{Success: true, Payload: result}, nil
 	}, nil
@@ -142,7 +150,10 @@ func (c landCapability) Prepare(arguments json.RawMessage) (Invocation, *Failure
 			if errors.As(err, &gate) && gate.Retryable {
 				return Result{}, &Failure{Message: "GitHub landing needs a fix: " + gate.Reason + ".", Outcome: domain.ItemFailed}
 			}
-			return Result{}, &Failure{Message: "GitHub pull request landing was rejected.", Outcome: domain.ItemFailed}
+			// A non-retryable gate and every other Land error are also fixed,
+			// secret-free strings (see githubhost.Session.Land), so the terminal
+			// reason is passed through too instead of being discarded (PMR-132).
+			return Result{}, &Failure{Message: "GitHub pull request landing was rejected: " + err.Error() + ".", Outcome: domain.ItemFailed}
 		}
 		// A settled landing decision ends the run: no further model turn or tool
 		// call can advance it, so it is reported as a terminal outcome instead of
