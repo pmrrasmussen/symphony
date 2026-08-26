@@ -781,7 +781,7 @@ func (m Model) writeStatus(b *strings.Builder, instance operator.Instance, now t
 	if !snapshot.UpdatedAt.IsZero() {
 		fmt.Fprintf(b, "; snapshot %s ago", formatDuration(now.Sub(snapshot.UpdatedAt)))
 	}
-	fmt.Fprintf(b, "\nClaims: %d; active: %d; retries: %d\n", snapshot.Coordinator.Claimed, len(snapshot.Coordinator.Running), len(snapshot.Coordinator.Retrying))
+	fmt.Fprintf(b, "\nClaims: %d; active: %d; retries: %d; waiting: %d\n", snapshot.Coordinator.Claimed, len(snapshot.Coordinator.Running), len(snapshot.Coordinator.Retrying), len(snapshot.Coordinator.Waiting))
 	for _, run := range snapshot.Coordinator.Running {
 		fmt.Fprintf(b, "\n%s (%s)  run %s; activity %s ago; turns %d", run.IssueIdentifier, run.IssueState, formatDuration(now.Sub(run.StartedAt)), formatDuration(now.Sub(run.LastActivityAt)), run.TurnCount)
 		if instance.Config != nil {
@@ -798,6 +798,9 @@ func (m Model) writeStatus(b *strings.Builder, instance operator.Instance, now t
 	}
 	for _, retry := range snapshot.Coordinator.Retrying {
 		fmt.Fprintf(b, "\nRetry %s: %s/%s attempt %d, due %s\n", retry.IssueIdentifier, retry.Kind, retry.Reason, retry.Attempt, formatTimeOrAge(now, retry.Due))
+	}
+	for _, wait := range snapshot.Coordinator.Waiting {
+		fmt.Fprintf(b, "\nWaiting %s (%s): eligible, no capacity; waiting %s\n", wait.IssueIdentifier, wait.IssueState, formatDuration(now.Sub(wait.Since)))
 	}
 	m.writeRecentLog(b, instance)
 }

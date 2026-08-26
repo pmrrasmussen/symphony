@@ -30,6 +30,7 @@ func TestWriteSerializesOnlyTheVersionedSafeSnapshot(t *testing.T) {
 			Usage:                domain.Usage{InputTokens: 3, OutputTokens: 5, TotalTokens: 8},
 			OutstandingOperation: &coordinator.OutstandingOperationSnapshot{Type: "dynamicToolCall", Name: "github_publish_pr", StartedAt: started, AgeMS: 60000},
 		}},
+		Waiting: []coordinator.WaitingSnapshot{{IssueIdentifier: "PMR-77", IssueState: "Merging", Since: started, WaitingMS: 60000}},
 	}
 	if err := publisher.Write(Running, snapshot); err != nil {
 		t.Fatal(err)
@@ -44,6 +45,9 @@ func TestWriteSerializesOnlyTheVersionedSafeSnapshot(t *testing.T) {
 	}
 	if got.SchemaVersion != SchemaVersion || got.PID != 42 || got.State != Running || got.Coordinator.Running[0].IssueState != "In Progress" || got.Coordinator.Running[0].OutstandingOperation.Name != "github_publish_pr" {
 		t.Fatalf("snapshot=%+v", got)
+	}
+	if len(got.Coordinator.Waiting) != 1 || got.Coordinator.Waiting[0].IssueIdentifier != "PMR-77" || got.Coordinator.Waiting[0].IssueState != "Merging" {
+		t.Fatalf("snapshot missing waiting entry=%+v", got.Coordinator)
 	}
 	for _, prohibited := range []string{"description", "prompt", "workspace", "arguments", "api_key", "credential"} {
 		if strings.Contains(strings.ToLower(string(contents)), prohibited) {

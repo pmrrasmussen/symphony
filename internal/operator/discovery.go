@@ -141,6 +141,7 @@ type RuntimeSnapshot struct {
 	Claimed  int               `json:"claimed"`
 	Running  []RunningSnapshot `json:"running"`
 	Retrying []RetrySnapshot   `json:"retrying"`
+	Waiting  []WaitingSnapshot `json:"waiting"`
 	Stopping bool              `json:"stopping"`
 }
 
@@ -175,6 +176,15 @@ type RetrySnapshot struct {
 	Kind            string    `json:"kind"`
 	Reason          string    `json:"reason"`
 	Due             time.Time `json:"due_at"`
+}
+
+// WaitingSnapshot is an eligible issue that has reserved neither a slot nor a
+// retry timer, mirroring coordinator.WaitingSnapshot.
+type WaitingSnapshot struct {
+	IssueIdentifier string    `json:"issue_identifier"`
+	IssueState      string    `json:"issue_state"`
+	Since           time.Time `json:"since"`
+	WaitingMS       int64     `json:"waiting_ms"`
 }
 
 // LogEvent exposes the fixed structured-log envelope, not arbitrary log
