@@ -69,16 +69,30 @@ type Manager struct {
 	git      gitRunner
 	logger   *slog.Logger
 	mu       sync.Mutex
-	linked   map[string]*link
+	// linked holds, by issue ID, every pull request this manager still has a
+	// reason to request. Symphony runs for weeks, so the table is deliberately
+	// bounded by a defined end of life rather than by process lifetime
+	// (PMR-112): a link leaves it as soon as polling can learn nothing further
+	// -- the pull request was observed merged (and reconciled) or closed without
+	// merge, or Forget reported the issue terminal. Nothing else evicts. An
+	// open, unsettled pull request keeps being polled however old its link is,
+	// because evicting one on age would silently stop reconciling a merge that
+	// happens later.
+	linked map[string]*link
 }
 
 type link struct {
-	issueID, identifier  string
-	prNumber             int
-	prURL                string
-	settings             config.GitHub
-	linear               linearLifecycle
-	completed, closedLog bool
+	issueID, identifier string
+	prNumber            int
+	prURL               string
+	settings            config.GitHub
+	linear              linearLifecycle
+	// settled marks the end of this link's life: the pull request reached a
+	// terminal observation, so Poll sweeps the link out and no later tick
+	// requests it again. It is also the exactly-once completion guard, because
+	// the merged branch sets it only after ReconcileMerged returned: a
+	// reconciliation that failed leaves the link live and is retried next tick.
+	settled bool
 }
 
 type linearLifecycle interface {
@@ -1346,16 +1360,40 @@ func (m *Manager) request(ctx context.Context, s config.GitHub, method, path str
 	return nil
 }
 
+// track begins polling the pull request just published for an issue. It is
+// idempotent for a live link -- republication reuses the same deterministic
+// pull request, so the first link already describes it -- and deliberately not
+// idempotent for a settled one: an issue whose link settled (a closed-unmerged
+// pull request this publication just reopened) or was forgotten is tracked
+// afresh rather than left pointing at a link Poll is about to sweep.
 func (m *Manager) track(issue domain.Issue, pr pull, settings config.GitHub, handoff linearLifecycle) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if existing := m.linked[issue.ID]; existing != nil {
+	if existing := m.linked[issue.ID]; existing != nil && !existing.settled {
 		return
 	}
 	m.linked[issue.ID] = &link{issueID: issue.ID, identifier: issue.Identifier, prNumber: pr.Number, prURL: pr.URL, settings: settings, linear: handoff}
 }
 
-// Poll observes only PRs created/reused by this manager. It never merges.
+// Forget drops the linked pull request for an issue that reached a terminal
+// tracker state and will never be dispatched again. It is the host's explicit
+// end-of-life signal for a link whose pull request is still open: Symphony
+// never evicts one on age, because a merge that lands later must still
+// reconcile. Unknown issue IDs are ignored, and a later republication for the
+// same issue re-tracks it.
+func (m *Manager) Forget(issueID string) {
+	m.mu.Lock()
+	forgotten := m.linked[issueID]
+	delete(m.linked, issueID)
+	m.mu.Unlock()
+	if forgotten != nil {
+		m.logger.Info("GitHub pull request polling stopped for terminal issue", "issue_id", forgotten.issueID, "issue_identifier", forgotten.identifier, "pr_number", forgotten.prNumber)
+	}
+}
+
+// Poll observes only PRs created/reused by this manager. It never merges. The
+// walk ends by sweeping out every link that settled during it, so a terminal
+// pull request is observed once more and then never requested again.
 func (m *Manager) Poll(ctx context.Context) {
 	m.mu.Lock()
 	links := make([]*link, 0, len(m.linked))
@@ -1366,11 +1404,26 @@ func (m *Manager) Poll(ctx context.Context) {
 	for _, linked := range links {
 		m.pollOne(ctx, linked)
 	}
+	m.sweep(links)
+}
+
+// sweep removes the links that settled during one walk. It matches on pointer
+// identity rather than issue ID, so a republication that re-tracked the same
+// issue mid-walk keeps its fresh link instead of losing it to the settled one
+// this walk observed.
+func (m *Manager) sweep(links []*link) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, linked := range links {
+		if linked.settled && m.linked[linked.issueID] == linked {
+			delete(m.linked, linked.issueID)
+		}
+	}
 }
 
 func (m *Manager) pollOne(ctx context.Context, linked *link) {
 	m.mu.Lock()
-	if linked.completed {
+	if linked.settled {
 		m.mu.Unlock()
 		return
 	}
@@ -1391,7 +1444,7 @@ func (m *Manager) pollOne(ctx context.Context, linked *link) {
 			return
 		}
 		m.mu.Lock()
-		linked.completed = true
+		linked.settled = true
 		m.mu.Unlock()
 		if changed {
 			m.logger.Info("GitHub merge completed Linear issue", "issue_id", linked.issueID, "issue_identifier", linked.identifier, "pr_number", linked.prNumber)
@@ -1399,13 +1452,17 @@ func (m *Manager) pollOne(ctx context.Context, linked *link) {
 		return
 	}
 	if strings.EqualFold(pr.State, "closed") {
+		// Closed without merge is terminal for polling too: a pull request
+		// Symphony will not reopen on its own cannot reach merged through any
+		// path Symphony still drives. Rework republishes, which reopens it and
+		// re-tracks the issue afresh; a human who instead reopens and merges it
+		// out of band leaves the issue in review for a human to finish on the
+		// board, which is the hand this warning already puts it in. The warning
+		// therefore fires exactly once without a log-suppression flag.
 		m.mu.Lock()
-		first := !linked.closedLog
-		linked.closedLog = true
+		linked.settled = true
 		m.mu.Unlock()
-		if first {
-			m.logger.Warn("GitHub pull request closed without merge; Linear issue remains in review", "issue_id", linked.issueID, "issue_identifier", linked.identifier, "pr_number", linked.prNumber)
-		}
+		m.logger.Warn("GitHub pull request closed without merge; Linear issue remains in review", "issue_id", linked.issueID, "issue_identifier", linked.identifier, "pr_number", linked.prNumber)
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/pmrrasmussen/symphony/internal/config"
+	"github.com/pmrrasmussen/symphony/internal/domain"
 	githubhost "github.com/pmrrasmussen/symphony/internal/github"
 	"github.com/pmrrasmussen/symphony/internal/observability"
 	"github.com/pmrrasmussen/symphony/internal/operator"
@@ -180,6 +181,14 @@ func TestWireGivesTheHostTheGitHubManagerItsBackendsUse(t *testing.T) {
 	}
 	if endpoint == nil {
 		t.Fatal("wire returned no capability endpoint, so a capability-bearing backend would have no transport to serve one over")
+	}
+	// The same one manager is what run() hands the scheduler as its
+	// IssueForgetter, which is the only thing that ever ends polling for a pull
+	// request that is still open on an issue a human finished (PMR-112). A
+	// manager that stopped satisfying that contract would leave the wiring
+	// silently absent, so assert the contract here rather than at the call.
+	if _, ok := any(polled).(domain.IssueForgetter); !ok {
+		t.Fatal("the polled GitHub manager cannot be wired as the scheduler's issue forgetter, so terminal issues would be polled for the life of the process")
 	}
 	bound := 0
 	for name, backend := range backends {

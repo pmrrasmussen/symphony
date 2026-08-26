@@ -201,6 +201,19 @@ type LandingVerifier interface {
 	VerifyLanded(ctx context.Context, issue Issue, commit string) (bool, error)
 }
 
+// IssueForgetter releases the in-process state a host integration still holds
+// for an issue that reached a terminal tracker state and will never be
+// dispatched again. It is the explicit end-of-life signal the GitHub
+// linked-pull-request poller needs: without one, a process that runs for weeks
+// keeps requesting the pull request of every issue it ever published and keeps
+// that issue's credential snapshot and tracker session resident (PMR-112). It
+// is deliberately a notification and not a question -- there is nothing for the
+// scheduler to do about a failure -- so implementations must be idempotent,
+// non-blocking, and safe for an issue ID they never saw.
+type IssueForgetter interface {
+	Forget(issueID string)
+}
+
 type WorkspaceExecutor interface {
 	Prepare(context.Context, Issue) (Workspace, error)
 	BeforeRun(context.Context, Workspace, Issue) error

@@ -155,6 +155,18 @@ operation. Closed-unmerged PRs only produce an operator warning. The
 linked-pair and completion guard are process-local, while retries reconcile
 durable GitHub PRs and Linear comments.
 
+That linked-pair table is bounded by a defined end of life rather than by
+process lifetime, because Symphony runs for weeks (PMR-112). A pair leaves it
+on the very poll that can learn nothing further from it — the PR was observed
+merged and reconciled, or closed without merge — which is also why the
+closed-unmerged warning is logged exactly once without a suppression flag. A
+pair whose PR is still open leaves only when the scheduler reports its issue
+terminal: reaching a terminal tracker state is the one signal that no merge is
+still coming, so nothing is evicted on age, which would silently stop
+reconciling a merge that lands later. A reconciliation that failed keeps its
+pair for the next tick, and an issue that publishes again after its pair was
+dropped is tracked afresh.
+
 An additional optional landing capability (PMR-37) is gated by
 `github.merge_state`: a session bound to an issue currently in that exact
 Linear state receives a zero-argument `github_land_pr` tool. Unlike the rest

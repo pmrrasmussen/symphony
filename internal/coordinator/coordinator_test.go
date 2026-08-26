@@ -1569,6 +1569,67 @@ func TestCompletedEventAfterReconciliationCancellationDoesNotComplete(t *testing
 	}
 }
 
+// stubForgetter records the issues the coordinator reported as finished. It
+// stands in for the host GitHub manager's linked-pull-request table, which is
+// the thing that would otherwise poll a Done issue for the life of the process
+// (PMR-112).
+type stubForgetter struct {
+	mu        sync.Mutex
+	forgotten []string
+}
+
+func (s *stubForgetter) Forget(issueID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.forgotten = append(s.forgotten, issueID)
+}
+
+func (s *stubForgetter) issues() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.forgotten...)
+}
+
+func TestTerminalIssueIsForgottenByTheHostIntegration(t *testing.T) {
+	w := testSettings(t)
+	issue := testIssue()
+	tracker := &fakeTracker{issue: issue}
+	terminal := issue
+	terminal.State = "Done"
+	terminal.Dispatchable = false
+	tracker.setFresh(terminal)
+	agent := &fakeAgent{events: completedEvents}
+	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{}, 1), cleaned: make(chan struct{}, 1)}
+	c := testCoordinator(w.Config, tracker, agent, ws)
+	forgetter := &stubForgetter{}
+	c.SetIssueForgetter(forgetter)
+
+	c.Tick(context.Background())
+	<-ws.cleaned
+	if got := forgetter.issues(); len(got) != 1 || got[0] != issue.ID {
+		t.Fatalf("terminal issue releases=%v, want exactly %q", got, issue.ID)
+	}
+}
+
+// A run that ends with its issue still active must not release anything: the
+// pull request that issue published is exactly the one the poll loop still has
+// a merge to observe on.
+func TestActiveIssueIsNotForgotten(t *testing.T) {
+	w := testSettings(t)
+	issue := testIssue()
+	agent := &fakeAgent{events: completedEvents}
+	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{}, 1)}
+	c := testCoordinator(w.Config, &fakeTracker{issue: issue}, agent, ws)
+	forgetter := &stubForgetter{}
+	c.SetIssueForgetter(forgetter)
+
+	c.Tick(context.Background())
+	<-ws.after
+	if got := forgetter.issues(); len(got) != 0 {
+		t.Fatalf("still-active issue released=%v, want none", got)
+	}
+}
+
 func TestCompletionRevalidatesTerminalIssueBeforeMarker(t *testing.T) {
 	w := testSettings(t)
 	issue := testIssue()
