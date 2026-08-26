@@ -178,11 +178,15 @@ type RetrySnapshot struct {
 	Due             time.Time `json:"due_at"`
 }
 
-// WaitingSnapshot is an eligible issue that has reserved neither a slot nor a
-// retry timer, mirroring coordinator.WaitingSnapshot.
+// WaitingSnapshot is an issue that has reserved neither a slot nor a retry
+// timer, mirroring coordinator.WaitingSnapshot. Reason is "at_capacity" or
+// "blocked_by_relation" (PMR-146/PMR-152); BlockedBy carries only the open
+// blockers' identifiers and is populated for "blocked_by_relation".
 type WaitingSnapshot struct {
 	IssueIdentifier string    `json:"issue_identifier"`
 	IssueState      string    `json:"issue_state"`
+	Reason          string    `json:"reason"`
+	BlockedBy       []string  `json:"blocked_by,omitempty"`
 	Since           time.Time `json:"since"`
 	WaitingMS       int64     `json:"waiting_ms"`
 }

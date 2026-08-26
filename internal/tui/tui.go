@@ -800,6 +800,10 @@ func (m Model) writeStatus(b *strings.Builder, instance operator.Instance, now t
 		fmt.Fprintf(b, "\nRetry %s: %s/%s attempt %d, due %s\n", retry.IssueIdentifier, retry.Kind, retry.Reason, retry.Attempt, formatTimeOrAge(now, retry.Due))
 	}
 	for _, wait := range snapshot.Coordinator.Waiting {
+		if wait.Reason == "blocked_by_relation" {
+			fmt.Fprintf(b, "\nWaiting %s (%s): blocked by %s; waiting %s\n", wait.IssueIdentifier, wait.IssueState, strings.Join(wait.BlockedBy, ","), formatDuration(now.Sub(wait.Since)))
+			continue
+		}
 		fmt.Fprintf(b, "\nWaiting %s (%s): eligible, no capacity; waiting %s\n", wait.IssueIdentifier, wait.IssueState, formatDuration(now.Sub(wait.Since)))
 	}
 	m.writeRecentLog(b, instance)
