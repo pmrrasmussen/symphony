@@ -1851,6 +1851,64 @@ func TestRetryAtCapacityRequeuesWithBoundedBackoff(t *testing.T) {
 	<-ws.after
 }
 
+// TestRetryAtCapacityAbandonsAtMaxAttempts covers the gap the ceiling
+// originally missed: a slot that stays contended escalates the same attempt
+// counter as a dispatch failure (runRetry's "no available orchestrator
+// slots" branch), so it must give up at agent.max_attempts too, rather than
+// requeuing forever behind a slot that is never freed.
+func TestRetryAtCapacityAbandonsAtMaxAttempts(t *testing.T) {
+	w := testSettings(t)
+	w.Config.Agent.MaxAttempts = 2
+	w.Config.Agent.MaxRetryBackoff = 15 * time.Second
+	retrying := testIssue()
+	retrying.ID, retrying.Identifier = "retrying", "ENG-2"
+	running := testIssue()
+	running.ID, running.Identifier = "running", "ENG-3"
+	tracker := &issueMapTracker{issues: map[string]domain.Issue{retrying.ID: retrying, running.ID: running}}
+	block := make(chan domain.Event)
+	agent := &fakeAgent{events: func() <-chan domain.Event { return block }, started: make(chan struct{}, 1)}
+	ws := &fakeWorkspace{after: make(chan struct{}, 1)}
+	var log syncBuffer
+	c := New(tracker, agent, ws, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&log, nil)))
+	c.clock = fakeClock{now: time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)}
+	timer := &fakeTimer{}
+	c.timer = timer
+
+	if !c.claim(retrying, w.Config) {
+		t.Fatal("retrying issue was not claimed")
+	}
+	c.scheduleRetry(context.Background(), retrying, domain.Workspace{}, 1, retryAgent, "test", time.Second)
+	if !c.claim(running, w.Config) || !c.launch(context.Background(), running, 0) {
+		t.Fatal("running issue was not admitted")
+	}
+	<-agent.started
+	timer.fire(0)
+	record := waitForSubstring(t, &log, `"msg":"dispatch abandoned after max attempts"`, time.Second)
+
+	c.mu.Lock()
+	claimed := c.claimed[retrying.ID]
+	_, stillRetrying := c.retries[retrying.ID]
+	c.mu.Unlock()
+	if claimed {
+		t.Fatal("retrying issue kept its claim past max_attempts")
+	}
+	if stillRetrying {
+		t.Fatal("slot contention rearmed a retry past max_attempts")
+	}
+	if len(timer.delays) != 1 {
+		t.Fatalf("delays=%v, want no further retry armed", timer.delays)
+	}
+	for _, want := range []string{`"reason":"no available orchestrator slots"`, `"attempt":2`, `"max_attempts":2`} {
+		if !strings.Contains(record, want) {
+			t.Fatalf("abandonment record missing %s: %s", want, record)
+		}
+	}
+	if err := c.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	<-ws.after
+}
+
 func TestRetryRefreshFailureIncrementsAttemptAndRetries(t *testing.T) {
 	w := testSettings(t)
 	w.Config.Agent.MaxRetryBackoff = 15 * time.Second
@@ -1874,6 +1932,86 @@ func TestRetryRefreshFailureIncrementsAttemptAndRetries(t *testing.T) {
 	}
 	if len(timer.delays) != 2 || timer.delays[1] != 15*time.Second {
 		t.Fatalf("retry delays=%v, want capped 15s refresh retry", timer.delays)
+	}
+	if err := c.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestRetryRefreshFailureAbandonsAtMaxAttempts covers runRetry's other
+// host-side escalation: a tracker that keeps failing GetIssues on every
+// retry raises the same attempt counter as a dispatch failure, so a
+// retryAgent episode must give up at agent.max_attempts instead of retrying
+// a broken tracker connection forever.
+func TestRetryRefreshFailureAbandonsAtMaxAttempts(t *testing.T) {
+	w := testSettings(t)
+	w.Config.Agent.MaxAttempts = 2
+	w.Config.Agent.MaxRetryBackoff = 15 * time.Second
+	issue := testIssue()
+	tracker := &issueMapTracker{issues: map[string]domain.Issue{issue.ID: issue}, getErr: errors.New("temporary tracker failure")}
+	var log syncBuffer
+	c := New(tracker, &fakeAgent{}, &fakeWorkspace{}, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&log, nil)))
+	c.clock = fakeClock{now: time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)}
+	timer := &fakeTimer{}
+	c.timer = timer
+
+	if !c.claim(issue, w.Config) {
+		t.Fatal("issue was not claimed")
+	}
+	c.scheduleRetry(context.Background(), issue, domain.Workspace{}, 1, retryAgent, "test", time.Second)
+	timer.fire(0)
+	waitForRelease(t, c, issue.ID)
+
+	c.mu.Lock()
+	_, stillRetrying := c.retries[issue.ID]
+	c.mu.Unlock()
+	if stillRetrying {
+		t.Fatal("retry refresh failure rearmed a retry past max_attempts")
+	}
+	if len(timer.delays) != 1 {
+		t.Fatalf("delays=%v, want no further retry armed", timer.delays)
+	}
+	record := waitForSubstring(t, &log, `"msg":"dispatch abandoned after max attempts"`, time.Second)
+	for _, want := range []string{`"reason":"retry_refresh"`, `"attempt":2`, `"max_attempts":2`} {
+		if !strings.Contains(record, want) {
+			t.Fatalf("abandonment record missing %s: %s", want, record)
+		}
+	}
+	if err := c.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestLandingRetryRefreshFailureIgnoresMaxAttempts pins the same exemption
+// TestLandingWaitRedispatchesPastMaxAttempts pins for the wait itself: a
+// landing retry that fails to refresh its issue is still not an agent
+// failure, so it must keep redispatching past agent.max_attempts rather than
+// being abandoned by the ceiling that only retryAgent consumes.
+func TestLandingRetryRefreshFailureIgnoresMaxAttempts(t *testing.T) {
+	w := testSettings(t)
+	w.Config.Agent.MaxAttempts = 1
+	w.Config.Agent.MaxRetryBackoff = 15 * time.Second
+	issue := testIssue()
+	tracker := &issueMapTracker{issues: map[string]domain.Issue{issue.ID: issue}, getErr: errors.New("temporary tracker failure")}
+	c := testCoordinator(w.Config, tracker, &fakeAgent{}, &fakeWorkspace{})
+	timer := &fakeTimer{}
+	c.timer = timer
+
+	if !c.claim(issue, w.Config) {
+		t.Fatal("issue was not claimed")
+	}
+	c.scheduleRetry(context.Background(), issue, domain.Workspace{}, 3, retryLanding, "landing_waiting", time.Second)
+	timer.fire(0)
+
+	c.mu.Lock()
+	retry, ok := c.retries[issue.ID]
+	claimed := c.claimed[issue.ID]
+	c.mu.Unlock()
+	if !claimed {
+		t.Fatal("landing retry refresh failure dropped its claim below max_attempts=1")
+	}
+	if !ok || retry.kind != retryLanding || retry.reason != "retry_refresh" || retry.attempt != 4 {
+		t.Fatalf("retry=%+v ok=%v, want a further landing retry past the ceiling", retry, ok)
 	}
 	if err := c.Shutdown(context.Background()); err != nil {
 		t.Fatal(err)

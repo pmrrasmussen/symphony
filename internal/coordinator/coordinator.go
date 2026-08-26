@@ -1401,15 +1401,28 @@ func (c *Coordinator) finishFailure(ctx context.Context, i domain.Issue, attempt
 	if err != nil && reason != "prompt_render" && reason != "agent_event" {
 		attrs = append(attrs, "error", err)
 	}
-	// config rejects a non-positive max_attempts, so the guard only covers a
-	// hand-built Settings: those keep the pre-PMR-111 unbounded ladder rather
-	// than having a zero ceiling abandon every first failure.
-	if s.Agent.MaxAttempts > 0 && next >= s.Agent.MaxAttempts {
-		c.abandonDispatch(i, s.Agent.MaxAttempts, attrs)
+	if c.attemptsExhausted(i, retryAgent, next, s, attrs) {
 		return
 	}
 	c.log.Warn("agent run retry scheduled", attrs...)
 	c.scheduleRetry(ctx, i, domain.Workspace{}, next, retryAgent, reason, backoff(next, s.Agent.MaxRetryBackoff))
+}
+
+// attemptsExhausted reports whether next has reached agent.max_attempts for a
+// retryAgent episode, abandoning the dispatch (and releasing its claim) if so.
+// Only retryAgent consumes the ceiling: a retryLanding redispatch — whether
+// from finishLandingWait or the slot-contention/refresh escalations in
+// runRetry — is exempt regardless of how high its attempt counter climbs (see
+// abandonDispatch). config rejects a non-positive max_attempts, so the
+// MaxAttempts <= 0 case only covers a hand-built Settings, which keeps the
+// pre-PMR-111 unbounded ladder rather than having a zero ceiling abandon every
+// first failure.
+func (c *Coordinator) attemptsExhausted(i domain.Issue, kind retryKind, next int, s config.Settings, attrs []any) bool {
+	if kind != retryAgent || s.Agent.MaxAttempts <= 0 || next < s.Agent.MaxAttempts {
+		return false
+	}
+	c.abandonDispatch(i, s.Agent.MaxAttempts, attrs)
+	return true
 }
 
 // abandonDispatch ends one dispatch episode that reached agent.max_attempts
@@ -1417,10 +1430,11 @@ func (c *Coordinator) finishFailure(ctx context.Context, i domain.Issue, attempt
 // attempt N ends the (N+1)th launch of the episode, so a boundary that fails
 // every time dispatches exactly max_attempts times and arms no further retry.
 // The two host-side escalations in runRetry (a contended orchestrator slot, a
-// failed retry refresh) raise that same counter without dispatching. Neither
-// abandons on its own — waiting for a slot is backpressure, not a failure — but
-// both consume the budget, so an episode delayed that way gives up after fewer
-// launches instead of resetting the ceiling it never reached.
+// failed retry refresh) raise that same counter without dispatching, and check
+// it through attemptsExhausted exactly like a dispatch failure does: neither
+// abandons on its own — waiting for a slot is backpressure, not a failure —
+// but both consume the budget, so an episode delayed that way gives up after
+// fewer launches instead of resetting the ceiling it never reached.
 //
 // What it does NOT do is as deliberate as what it does:
 //
@@ -1557,6 +1571,10 @@ func (c *Coordinator) runRetry(id string, generation uint64) {
 	if err != nil {
 		c.log.Warn("retry issue refresh failed", "issue_id", id, "reason", retry.reason, "error", err)
 		attempt := retry.attempt + 1
+		attrs := []any{"issue_id", retry.issue.ID, "issue_identifier", retry.issue.Identifier, "reason", "retry_refresh", "attempt", attempt}
+		if c.attemptsExhausted(retry.issue, retry.kind, attempt, c.settings(), attrs) {
+			return
+		}
 		c.scheduleRetry(ctx, retry.issue, retry.workspace, attempt, retry.kind, "retry_refresh", backoff(attempt, c.settings().Agent.MaxRetryBackoff))
 		return
 	}
@@ -1591,6 +1609,10 @@ func (c *Coordinator) runRetry(id string, generation uint64) {
 		return
 	}
 	attempt := retry.attempt + 1
+	attrs := []any{"issue_id", issue.ID, "issue_identifier", issue.Identifier, "reason", "no available orchestrator slots", "attempt", attempt}
+	if c.attemptsExhausted(issue, retry.kind, attempt, s, attrs) {
+		return
+	}
 	c.scheduleRetry(ctx, issue, retry.workspace, attempt, retry.kind, "no available orchestrator slots", backoff(attempt, s.Agent.MaxRetryBackoff))
 }
 
