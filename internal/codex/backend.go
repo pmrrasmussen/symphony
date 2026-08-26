@@ -23,6 +23,7 @@ import (
 	"github.com/pmrrasmussen/symphony/internal/hostenv"
 	"github.com/pmrrasmussen/symphony/internal/linear"
 	"github.com/pmrrasmussen/symphony/internal/observability"
+	"github.com/pmrrasmussen/symphony/internal/procgroup"
 )
 
 type Backend struct {
@@ -98,13 +99,6 @@ func NewWithProviders(settings func() config.Settings, handoff *linear.Handoff, 
 	b.handoff = handoff
 	b.github = github
 	return b
-}
-
-// NewWithLinearHandoff enables the sole supported client-side tool. The
-// Linear adapter owns its configuration and HTTP transport; Codex sees only a
-// session-bound capability once the policy has been validated.
-func NewWithLinearHandoff(settings func() config.Settings, secretNames ...string) *Backend {
-	return NewWithProviders(settings, linear.NewHandoff(settings), nil, secretNames...)
 }
 
 // GitHubManager reports the manager this backend was given. The host reads its
@@ -300,7 +294,7 @@ func start(ctx context.Context, r domain.AgentRequest, environment []string, cap
 	cmd.Stdout = outWriter
 	cmd.Stderr = stderrWriter
 	c := &client{cmd: cmd, in: in, workspace: r.Workspace, approval: r.ApprovalPolicy, policy: r.TurnSandboxPolicy, readTimeout: r.ReadTimeout, startTimeout: r.StartTimeout, turnTimeout: r.TurnTimeout, ctx: ctx, capabilities: capabilities, pending: map[int]chan callResult{}, done: make(chan struct{}), exited: make(chan struct{})}
-	cmd.Cancel = func() error { return c.killProcessGroup() }
+	cmd.Cancel = func() error { return procgroup.Kill(c.cmd) }
 	if err := cmd.Start(); err != nil {
 		_ = out.Close()
 		_ = outWriter.Close()
@@ -328,7 +322,7 @@ func start(ctx context.Context, r domain.AgentRequest, environment []string, cap
 		waitErr := cmd.Wait()
 		// The leader can exit while descendants still hold inherited pipes.
 		// Terminating the group makes both reader completions deterministic.
-		_ = c.killProcessGroup()
+		_ = procgroup.Kill(c.cmd)
 		stdoutErr := <-stdoutDone
 		stderrErr := <-stderrDone
 		switch {
@@ -758,7 +752,7 @@ func (c *client) emit(e domain.Event) {
 	ch := c.active
 	if ch != nil {
 		if !c.activeReady {
-			if terminal(e.Kind) && c.pendingTerminal == nil {
+			if e.Kind.Terminal() && c.pendingTerminal == nil {
 				copy := e
 				c.pendingTerminal = &copy
 			} else if c.pendingTerminal == nil && len(c.pendingEvents) < cap(ch)-2 {
@@ -767,7 +761,7 @@ func (c *client) emit(e domain.Event) {
 			c.mu.Unlock()
 			return
 		}
-		if terminal(e.Kind) {
+		if e.Kind.Terminal() {
 			// Non-terminal sends reserve one slot, so terminal delivery cannot
 			// block even when the consumer falls behind.
 			ch <- e
@@ -827,18 +821,8 @@ func (c *client) abort(err error) {
 func (c *client) kill() {
 	c.killOnce.Do(func() {
 		_ = c.in.Close()
-		_ = c.killProcessGroup()
+		_ = procgroup.Kill(c.cmd)
 	})
-}
-func (c *client) killProcessGroup() error {
-	if c.cmd == nil || c.cmd.Process == nil {
-		return nil
-	}
-	err := syscall.Kill(-c.cmd.Process.Pid, syscall.SIGKILL)
-	if errors.Is(err, syscall.ESRCH) {
-		return nil
-	}
-	return err
 }
 func (c *client) removePending(id int) {
 	c.mu.Lock()
@@ -890,10 +874,6 @@ func drain(r io.Reader, report func(string)) error {
 			return nil
 		}
 	}
-}
-func terminal(kind domain.EventKind) bool {
-	return kind == domain.EventBlocked || kind == domain.EventCompleted || kind == domain.EventFailed ||
-		kind == domain.EventLandingWaiting || kind == domain.EventLandingResolved
 }
 func nestedString(m map[string]any, a, b string) (string, bool) {
 	x, ok := m[a].(map[string]any)

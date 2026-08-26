@@ -492,7 +492,7 @@ func ineligibleReason(i domain.Issue, s config.Settings) string {
 		return "missing_identity"
 	case !active(i, s):
 		return "not_active"
-	case terminal(i, s):
+	case issueTerminal(i, s):
 		return "terminal"
 	case !routable(i, s):
 		return "not_routable"
@@ -511,7 +511,7 @@ func (c *Coordinator) admissionRejectReason(i domain.Issue, s config.Settings) s
 		return "stopping"
 	case c.claimed[i.ID]:
 		return "already_claimed"
-	case !c.capacityAvailableLocked(norm(i.State), s):
+	case !c.capacityAvailableLocked(config.Norm(i.State), s):
 		return "at_capacity"
 	default:
 		return ""
@@ -523,8 +523,8 @@ func (c *Coordinator) admissionRejectReason(i domain.Issue, s config.Settings) s
 // is attributable at poll time. It is a no-op when no handoff state is
 // configured or the issue is not in it.
 func (c *Coordinator) noteHandoffObservation(issue domain.Issue, s config.Settings, now time.Time) {
-	handoff := norm(s.Tracker.HandoffState)
-	if handoff == "" || issue.ID == "" || norm(issue.State) != handoff {
+	handoff := config.Norm(s.Tracker.HandoffState)
+	if handoff == "" || issue.ID == "" || config.Norm(issue.State) != handoff {
 		return
 	}
 	c.mu.Lock()
@@ -542,7 +542,7 @@ func (c *Coordinator) noteHandoffObservation(issue domain.Issue, s config.Settin
 // mutates the tracker — re-asserting a reverted handoff is a documented
 // follow-up.
 func (c *Coordinator) notePostHandoffStateChange(i domain.Issue, s config.Settings, now time.Time) {
-	if norm(s.Tracker.HandoffState) == "" || i.ID == "" {
+	if config.Norm(s.Tracker.HandoffState) == "" || i.ID == "" {
 		return
 	}
 	c.mu.Lock()
@@ -551,16 +551,16 @@ func (c *Coordinator) notePostHandoffStateChange(i domain.Issue, s config.Settin
 		delete(c.handoffs, i.ID)
 	}
 	c.mu.Unlock()
-	if !ok || norm(i.State) == observation.state {
+	if !ok || config.Norm(i.State) == observation.state {
 		return
 	}
-	operation := postHandoffOperation(norm(i.State), s)
+	operation := postHandoffOperation(config.Norm(i.State), s)
 	attrs := []any{
 		"operation", operation,
 		"issue_id", i.ID,
 		"issue_identifier", i.Identifier,
 		"from_state", observation.state,
-		"to_state", norm(i.State),
+		"to_state", config.Norm(i.State),
 		"since_handoff_ms", now.Sub(observation.at).Milliseconds(),
 	}
 	if operation == observability.OperationExternalReversion {
@@ -583,7 +583,7 @@ func (c *Coordinator) notePostHandoffStateChange(i domain.Issue, s config.Settin
 // hide exactly the fault this record exists to surface.
 func postHandoffOperation(to string, s config.Settings) observability.Operation {
 	switch {
-	case to != "" && to == norm(s.GitHub.MergeState):
+	case to != "" && to == config.Norm(s.GitHub.MergeState):
 		return observability.OperationReviewApproved
 	case reworkDecision(to, s):
 		return observability.OperationReworkRequested
@@ -608,7 +608,7 @@ func postHandoffOperation(to string, s config.Settings) observability.Operation 
 // warning. The merge state is excluded here too, so this predicate is correct
 // on its own rather than relying on postHandoffOperation's case order.
 func reworkDecision(state string, s config.Settings) bool {
-	if state == "" || state == norm(s.GitHub.MergeState) {
+	if state == "" || state == config.Norm(s.GitHub.MergeState) {
 		return false
 	}
 	candidates := reworkCandidates(s)
@@ -623,14 +623,14 @@ func reworkCandidates(s config.Settings) []string {
 	if len(s.Tracker.HostTransitions.Start) == 0 {
 		return nil
 	}
-	accounted := map[string]bool{norm(s.GitHub.MergeState): true}
+	accounted := map[string]bool{config.Norm(s.GitHub.MergeState): true}
 	for source, target := range s.Tracker.HostTransitions.Start {
-		accounted[norm(source)] = true
-		accounted[norm(target)] = true
+		accounted[config.Norm(source)] = true
+		accounted[config.Norm(target)] = true
 	}
 	candidates := make([]string, 0, len(s.Tracker.ActiveStates))
 	for _, state := range s.Tracker.ActiveStates {
-		name := norm(state)
+		name := config.Norm(state)
 		if name == "" || accounted[name] {
 			continue
 		}
@@ -693,7 +693,7 @@ func (c *Coordinator) reconcile(ctx context.Context) error {
 		reason := stopReason("")
 		if !found || !eligible(fresh, s) {
 			reason = stopIneligible
-			if found && terminal(fresh, s) {
+			if found && issueTerminal(fresh, s) {
 				reason = stopTerminal
 			}
 		}
@@ -768,17 +768,17 @@ func (c *Coordinator) outstandingAttrs(r *running, now, last time.Time) []any {
 
 func (c *Coordinator) claim(i domain.Issue, s config.Settings) bool {
 	c.mu.Lock()
-	if c.stopping || c.claimed[i.ID] || !c.capacityAvailableLocked(norm(i.State), s) {
+	if c.stopping || c.claimed[i.ID] || !c.capacityAvailableLocked(config.Norm(i.State), s) {
 		c.mu.Unlock()
 		return false
 	}
 	c.claimed[i.ID] = true
-	c.claimState[i.ID] = norm(i.State)
+	c.claimState[i.ID] = config.Norm(i.State)
 	// A claimed issue is being actively worked; any prior handoff memory is
 	// stale (the poll loop already reported an external revert before this).
 	delete(c.handoffs, i.ID)
 	c.mu.Unlock()
-	c.log.Debug("issue claimed", "issue_id", i.ID, "issue_identifier", i.Identifier, "state", norm(i.State))
+	c.log.Debug("issue claimed", "issue_id", i.ID, "issue_identifier", i.Identifier, "state", config.Norm(i.State))
 	return true
 }
 
@@ -928,7 +928,7 @@ func (c *Coordinator) launch(parent context.Context, i domain.Issue, attempt int
 //     causes a double dispatch — the session starts regardless, and the poll
 //     loop retries or reconciles the tracker state on a later tick.
 func (c *Coordinator) transitionToStarted(ctx context.Context, i domain.Issue, s config.Settings) string {
-	target, ok := s.Tracker.HostTransitions.Start[norm(i.State)]
+	target, ok := s.Tracker.HostTransitions.Start[config.Norm(i.State)]
 	if !ok || strings.TrimSpace(target) == "" {
 		return ""
 	}
@@ -936,10 +936,10 @@ func (c *Coordinator) transitionToStarted(ctx context.Context, i domain.Issue, s
 		return target
 	}
 	if err := c.tracker.Transition(ctx, i, target); err != nil {
-		c.log.Warn("dispatch start transition failed", "operation", observability.OperationStartTransition, "issue_id", i.ID, "issue_identifier", i.Identifier, "from_state", norm(i.State), "to_state", norm(target), "error", err)
+		c.log.Warn("dispatch start transition failed", "operation", observability.OperationStartTransition, "issue_id", i.ID, "issue_identifier", i.Identifier, "from_state", config.Norm(i.State), "to_state", config.Norm(target), "error", err)
 		return ""
 	}
-	c.log.Info("issue moved to started state", "operation", observability.OperationStartTransition, "issue_id", i.ID, "issue_identifier", i.Identifier, "from_state", norm(i.State), "to_state", norm(target))
+	c.log.Info("issue moved to started state", "operation", observability.OperationStartTransition, "issue_id", i.ID, "issue_identifier", i.Identifier, "from_state", config.Norm(i.State), "to_state", config.Norm(target))
 	return target
 }
 
@@ -965,7 +965,7 @@ func (c *Coordinator) runTurns(ctx context.Context, r *running, events <-chan do
 		turnCount := r.run.TurnCount
 		c.mu.Unlock()
 		if !eligible(current, settings) {
-			if terminal(current, settings) {
+			if issueTerminal(current, settings) {
 				c.cleanupWorkspace(ctx, current)
 			}
 			return true, current, nil
@@ -1540,7 +1540,7 @@ func (c *Coordinator) runRetry(id string, generation uint64) {
 	s := c.settings()
 	issue := fresh[0]
 	if !eligible(issue, s) {
-		if terminal(issue, s) {
+		if issueTerminal(issue, s) {
 			c.cleanupWorkspace(ctx, issue)
 		}
 		c.release(id)
@@ -1633,10 +1633,10 @@ func (c *Coordinator) unreserve(id string) {
 }
 
 func (c *Coordinator) reserveLocked(i domain.Issue, s config.Settings) bool {
-	if _, admitted := c.admitted[i.ID]; !c.claimed[i.ID] || admitted || !c.capacityAvailableLocked(norm(i.State), s) {
+	if _, admitted := c.admitted[i.ID]; !c.claimed[i.ID] || admitted || !c.capacityAvailableLocked(config.Norm(i.State), s) {
 		return false
 	}
-	state := norm(i.State)
+	state := config.Norm(i.State)
 	c.admitted[i.ID] = state
 	c.claimState[i.ID] = state
 	return true
@@ -1666,7 +1666,7 @@ func (c *Coordinator) refreshRunIssue(r *running, fresh domain.Issue) {
 		return
 	}
 	r.issue = fresh
-	state := norm(fresh.State)
+	state := config.Norm(fresh.State)
 	c.claimState[fresh.ID] = state
 	if _, admitted := c.admitted[fresh.ID]; admitted {
 		c.admitted[fresh.ID] = state
@@ -1697,15 +1697,19 @@ func cancellationReason(stopped stopReason, ctx context.Context) stopReason {
 
 func active(i domain.Issue, s config.Settings) bool {
 	for _, x := range s.Tracker.ActiveStates {
-		if norm(i.State) == norm(x) {
+		if config.Norm(i.State) == config.Norm(x) {
 			return true
 		}
 	}
 	return false
 }
-func terminal(i domain.Issue, s config.Settings) bool {
+
+// issueTerminal reports whether the issue's tracker state is one of the
+// configured terminal states -- unrelated to domain.EventKind.Terminal, which
+// answers the same question for an agent session's event stream.
+func issueTerminal(i domain.Issue, s config.Settings) bool {
 	for _, x := range s.Tracker.TerminalStates {
-		if norm(i.State) == norm(x) {
+		if config.Norm(i.State) == config.Norm(x) {
 			return true
 		}
 	}
@@ -1717,7 +1721,7 @@ func routable(i domain.Issue, s config.Settings) bool {
 	}
 	have := map[string]bool{}
 	for _, x := range i.Labels {
-		have[norm(x)] = true
+		have[config.Norm(x)] = true
 	}
 	for _, x := range s.Tracker.RequiredLabels {
 		if x == "" || !have[x] {
@@ -1727,9 +1731,8 @@ func routable(i domain.Issue, s config.Settings) bool {
 	return true
 }
 func eligible(i domain.Issue, s config.Settings) bool {
-	return i.ID != "" && i.Identifier != "" && i.Title != "" && active(i, s) && !terminal(i, s) && routable(i, s)
+	return i.ID != "" && i.Identifier != "" && i.Title != "" && active(i, s) && !issueTerminal(i, s) && routable(i, s)
 }
-func norm(v string) string { return strings.ToLower(strings.TrimSpace(v)) }
 func sortIssues(v []domain.Issue) {
 	sort.SliceStable(v, func(i, j int) bool {
 		a, b := v[i], v[j]

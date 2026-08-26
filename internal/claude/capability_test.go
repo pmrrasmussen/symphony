@@ -535,7 +535,7 @@ func TestThePreviousTurnsRegistrationIsDeadBeforeTheNextTurnRuns(t *testing.T) {
 	// Reading only as far as the terminal event is what the coordinator does, and
 	// it is what leaves turn one's goroutine still running.
 	for event := range events {
-		if terminal(event.Kind) {
+		if event.Kind.Terminal() {
 			break
 		}
 	}
@@ -1060,7 +1060,7 @@ func TestTheNextTurnCannotStartUntilThePreviousRegistrationIsFullyRetired(t *tes
 		t.Fatal(err)
 	}
 	for event := range events {
-		if terminal(event.Kind) {
+		if event.Kind.Terminal() {
 			break
 		}
 	}

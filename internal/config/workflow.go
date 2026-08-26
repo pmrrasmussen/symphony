@@ -827,7 +827,7 @@ func environmentReferenceName(value string) (string, bool) {
 		return "", false
 	}
 	name := strings.TrimPrefix(value, "$")
-	return name, validEnvironmentName(name)
+	return name, ValidEnvironmentName(name)
 }
 
 func isLocalConfigHost(host string) bool {
@@ -1167,6 +1167,11 @@ func stateInList(state string, states []string) bool {
 	return false
 }
 
+// Norm lowercases and trims a tracker-supplied name -- state, label, or
+// similar -- so callers comparing one against a configured value do not have
+// to agree on case or surrounding whitespace themselves.
+func Norm(value string) string { return strings.ToLower(strings.TrimSpace(value)) }
+
 // Render renders a prompt for one run. The first run has a nil attempt;
 // retries and continuations receive the spec's 1-based attempt number.
 func (s Settings) Render(issue any, attempt int) (string, error) {
@@ -1401,14 +1406,6 @@ func (s *Store) Current() Workflow {
 	return cloneWorkflow(s.current)
 }
 
-// Reload builds and validates a complete candidate before publishing it. Its
-// digest includes referenced environment values and files, so fixing an input
-// retries a previously rejected WORKFLOW.md without requiring an edit.
-func (s *Store) Reload() error {
-	_, err := s.ReloadIfChanged()
-	return err
-}
-
 // ReloadIfChanged reports whether a new valid snapshot was published. A
 // repeated rejected input is suppressed, while changes to its referenced
 // environment values or files cause it to be validated again.
@@ -1440,8 +1437,8 @@ func (s *Store) ReloadIfChanged() (bool, error) {
 }
 
 func cloneWorkflow(w Workflow) Workflow {
-	w.Raw = cloneMap(w.Raw)
-	w.Config.Tracker.Provider = cloneMap(w.Config.Tracker.Provider)
+	w.Raw = CloneMap(w.Raw)
+	w.Config.Tracker.Provider = CloneMap(w.Config.Tracker.Provider)
 	w.Config.Tracker.RequiredLabels = append([]string(nil), w.Config.Tracker.RequiredLabels...)
 	w.Config.Tracker.ActiveStates = append([]string(nil), w.Config.Tracker.ActiveStates...)
 	w.Config.Tracker.TerminalStates = append([]string(nil), w.Config.Tracker.TerminalStates...)
@@ -1471,7 +1468,9 @@ func cloneStringMap(source map[string]string) map[string]string {
 	return copy
 }
 
-func cloneMap(source map[string]any) map[string]any {
+// CloneMap deep-copies a decoded configuration map so a caller holding one
+// cannot mutate the snapshot another caller reads.
+func CloneMap(source map[string]any) map[string]any {
 	if source == nil {
 		return nil
 	}
@@ -1485,7 +1484,7 @@ func cloneMap(source map[string]any) map[string]any {
 func cloneValue(value any) any {
 	switch typed := value.(type) {
 	case map[string]any:
-		return cloneMap(typed)
+		return CloneMap(typed)
 	case []any:
 		copy := make([]any, len(typed))
 		for index, value := range typed {
@@ -2012,7 +2011,7 @@ func (s *sourceSnapshot) expand(value, field string) (string, error) {
 		return value, nil
 	}
 	name := strings.TrimPrefix(value, "$")
-	if !validEnvironmentName(name) {
+	if !ValidEnvironmentName(name) {
 		return "", fmt.Errorf("invalid configuration: %s must use exact $VARNAME environment syntax", field)
 	}
 	resolved := s.environment[name]
@@ -2020,7 +2019,10 @@ func (s *sourceSnapshot) expand(value, field string) (string, error) {
 	return resolved, nil
 }
 
-func validEnvironmentName(name string) bool {
+// ValidEnvironmentName reports whether name is a legal $VARNAME reference: a
+// non-empty run of letters, digits, and underscores that does not start with a
+// digit.
+func ValidEnvironmentName(name string) bool {
 	if name == "" {
 		return false
 	}

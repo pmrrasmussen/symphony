@@ -898,7 +898,7 @@ func liveTurn(t *testing.T, backend *Backend, sessionID string) *turn {
 func terminalEvents(events []domain.Event) []domain.Event {
 	var out []domain.Event
 	for _, event := range events {
-		if terminal(event.Kind) {
+		if event.Kind.Terminal() {
 			out = append(out, event)
 		}
 	}

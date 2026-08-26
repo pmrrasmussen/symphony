@@ -2457,7 +2457,7 @@ func TestPostHandoffStateChangeIsClassified(t *testing.T) {
 				!strings.Contains(output, `"operation":"`+tc.operation+`"`) ||
 				!strings.Contains(output, `"level":"`+tc.level+`"`) ||
 				!strings.Contains(output, `"from_state":"in review"`) ||
-				!strings.Contains(output, `"to_state":"`+norm(tc.state)+`"`) ||
+				!strings.Contains(output, `"to_state":"`+config.Norm(tc.state)+`"`) ||
 				!strings.Contains(output, `"issue_identifier":"ENG-1"`) {
 				t.Fatalf("post-handoff change to %s was not classified as %s: %s", tc.state, tc.operation, output)
 			}
