@@ -593,16 +593,78 @@ func waitForRunning(t *testing.T, c *Coordinator, identifier string) {
 	}
 }
 
+// TestRunningSnapshotUsageIsLiveAndSurvivesFailure pins the running-entry
+// usage field to reporting real figures while a session is still actively
+// spending tokens, not only after it produces a result: a cost field that
+// always reads zero mid-run is worse than absent, because it looks
+// authoritative. The run here ends in EventFailed rather than EventCompleted
+// -- the shape of a turn killed by turn_timeout_ms, which never gets a result
+// event -- so the usage already recorded before that failure has to be the
+// evidence that survives, not a per-run total computed only on success.
+func TestRunningSnapshotUsageIsLiveAndSurvivesFailure(t *testing.T) {
+	w := testSettings(t)
+	issue := testIssue()
+	tracker := &fakeTracker{issue: issue}
+	ch := make(chan domain.Event)
+	agent := &fakeAgent{events: func() <-chan domain.Event { return ch }, started: make(chan struct{}, 1)}
+	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{}, 1)}
+	var logs bytes.Buffer
+	c := New(tracker, agent, ws, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&logs, nil)))
+	c.clock = fakeClock{now: time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)}
+
+	c.Tick(context.Background())
+	<-agent.started
+	waitForRunning(t, c, issue.Identifier)
+
+	ch <- domain.Event{Kind: domain.EventUsage, At: time.Now(), Usage: domain.Usage{InputTokens: 7000, OutputTokens: 300, TotalTokens: 7300}}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		var live domain.Usage
+		for _, r := range c.Snapshot().Running {
+			if r.IssueIdentifier == issue.Identifier {
+				live = r.Usage
+			}
+		}
+		if live.TotalTokens != 0 {
+			if live.InputTokens != 7000 || live.OutputTokens != 300 || live.TotalTokens != 7300 {
+				t.Fatalf("in-flight usage=%+v", live)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("running entry never reported non-zero in-flight usage")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	// The turn ends without a result -- exactly what a turn_timeout_ms kill
+	// produces -- so the only trace of what it spent is the usage already
+	// logged above, not a completion-time summary.
+	ch <- domain.Event{Kind: domain.EventFailed, At: time.Now(), Message: "claude turn timeout"}
+	<-ws.after
+	if err := c.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	output := logs.String()
+	for _, field := range []string{`"input_tokens":7000`, `"output_tokens":300`, `"total_tokens":7300`} {
+		if !strings.Contains(output, field) {
+			t.Fatalf("usage did not survive the timeout failure in the log: missing %s: %s", field, output)
+		}
+	}
+}
+
 func TestRenderExplainsHostAndManualDeliveryModes(t *testing.T) {
 	settings := config.Settings{Prompt: "Work on {{.issue.identifier}}"}
 	issue := domain.Issue{Identifier: "PMR-40"}
-	manual, err := render(settings, issue, 0, config.DefaultAgentBackend)
+	manual, _, err := render(settings, issue, 0, config.DefaultAgentBackend)
 	if err != nil || !strings.Contains(manual, "Delivery mode: manual") || !strings.Contains(manual, "Do not run gh, git push") {
 		t.Fatalf("manual prompt=%q err=%v", manual, err)
 	}
 	settings.GitHub.Enabled = true
 	settings.Tracker.HandoffState = "In Review"
-	host, err := render(settings, issue, 0, config.DefaultAgentBackend)
+	host, _, err := render(settings, issue, 0, config.DefaultAgentBackend)
 	if err != nil || !strings.Contains(host, "Delivery mode: host-side publish") || !strings.Contains(host, "github_publish_pr with why, what_changed, and on_call") || !strings.Contains(host, "github_pr_context") {
 		t.Fatalf("host prompt=%q err=%v", host, err)
 	}
@@ -610,9 +672,12 @@ func TestRenderExplainsHostAndManualDeliveryModes(t *testing.T) {
 	// will actually serve. render is the only caller of DeliveryInstructions, so
 	// this is where a dropped backend argument becomes observable: it would leave
 	// the prompt naming Codex tool names for a Claude session.
-	claude, err := render(settings, issue, 0, config.ClaudeAgentBackend)
+	claude, deliveryBytes, err := render(settings, issue, 0, config.ClaudeAgentBackend)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if deliveryBytes <= 0 || deliveryBytes >= len(claude) {
+		t.Fatalf("delivery instruction byte count=%d prompt bytes=%d", deliveryBytes, len(claude))
 	}
 	if !strings.Contains(claude, config.MCPToolPrefix+"github_publish_pr with why, what_changed, and on_call") {
 		t.Fatalf("claude prompt did not name the MCP publish tool: %q", claude)

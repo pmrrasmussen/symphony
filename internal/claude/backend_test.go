@@ -545,6 +545,45 @@ func TestUsageAccumulatesAcrossTurns(t *testing.T) {
 	}
 }
 
+// assistantUsageLine is one Anthropic API call inside a turn's agentic loop --
+// the closing result line reports the turn's total only once the turn ends, so
+// this is the CLI's only in-flight signal of what a running turn has spent.
+func assistantUsageLine(input, output, cacheCreate, cacheRead int) string {
+	return `{"type":"assistant","message":{"content":[],"usage":{"input_tokens":` + strconv.Itoa(input) +
+		`,"output_tokens":` + strconv.Itoa(output) +
+		`,"cache_creation_input_tokens":` + strconv.Itoa(cacheCreate) +
+		`,"cache_read_input_tokens":` + strconv.Itoa(cacheRead) + `}}}`
+}
+
+// TestUsageIsLiveAndSurvivesATimeout is the fix for the field that always read
+// zero for a session actively spending tokens: usage must be observable while a
+// turn is in flight, not only once it produces a result, and it must be the
+// last thing reported even when the turn never gets that far because
+// turn_timeout_ms killed it first (PMR-131's failure mode).
+func TestUsageIsLiveAndSurvivesATimeout(t *testing.T) {
+	dir := t.TempDir()
+	script := writeFakeClaude(t, dir, "cat <<'EOF'\n"+
+		initLine(dir, allCodingTools)+"\n"+
+		assistantUsageLine(2, 11, 5325, 3289)+"\n"+
+		"EOF\nsleep 120\n")
+	r := request(t, dir, script)
+	r.TurnTimeout = 300 * time.Millisecond
+	backend := New(settingsFunc())
+	_, events, err := backend.Start(context.Background(), r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	collected := drain(t, events)
+	usage := usageOf(t, collected)
+	if usage.InputTokens != 2+5325+3289 || usage.OutputTokens != 11 {
+		t.Fatalf("live usage=%+v", usage)
+	}
+	failure := lastKind(t, collected)
+	if failure.Kind != domain.EventFailed || !strings.Contains(failure.Message, "timeout") {
+		t.Fatalf("terminal event=%+v", failure)
+	}
+}
+
 // TestHostSecretsNeverReachTheChild covers the filters that need no bound
 // provider: every reserved name, the configured names, and the configured
 // values, because an inherited variable under any other name can still carry a

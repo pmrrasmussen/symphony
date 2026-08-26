@@ -45,6 +45,13 @@ type assistantMessage struct {
 			ID   string `json:"id"`
 			Name string `json:"name"`
 		} `json:"content"`
+		// Usage is the Anthropic Messages API usage for this one underlying API
+		// call. A turn's agentic loop can make several of these before the CLI's
+		// closing result line, which is the only place usage was previously
+		// read, so reading it there alone leaves a turn that is actively
+		// spending tokens reporting zero until it ends -- or, if it is killed by
+		// the turn timeout, reporting nothing at all.
+		Usage usage `json:"usage"`
 	} `json:"message"`
 }
 

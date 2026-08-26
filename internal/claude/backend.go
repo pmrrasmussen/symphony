@@ -845,6 +845,11 @@ func (t *turn) stream(s *session, r domain.AgentRequest, turnNumber int) {
 	lines := newLineReader(t.stdout)
 	var initVerified bool
 	var readErr error
+	// turnUsage sums the Anthropic API usage of every assistant message seen so
+	// far in this turn, so a live total can be emitted before the turn's
+	// closing result line arrives -- or survive a turn that never gets one,
+	// because the timeout above killed it first.
+	var turnUsage domain.Usage
 	for {
 		line, skipped, err := lines.next()
 		if err != nil {
@@ -912,6 +917,13 @@ func (t *turn) stream(s *session, r domain.AgentRequest, turnNumber int) {
 					ToolName: observability.Text(content.Name),
 					Outcome:  domain.ItemStarted,
 				})
+			}
+			if call := message.Message.Usage.totals(); call != (domain.Usage{}) {
+				turnUsage = add(turnUsage, call)
+				s.mu.Lock()
+				live := add(s.usage, turnUsage)
+				s.mu.Unlock()
+				emit(domain.Event{Kind: domain.EventUsage, At: time.Now(), Usage: live})
 			}
 		case "user":
 			var message userMessage
