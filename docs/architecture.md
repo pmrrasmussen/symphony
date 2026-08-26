@@ -271,11 +271,15 @@ through the operator's own stored login, which lives in the home directory they
 read.
 
 `internal/config`'s `ReservedSecretEnvNames` owns the reserved names and this
-description; the other three parts are derived and applied by the launchers, and
-`internal/capability`'s `SecretMatcher` builds the fourth from the same bindings
-that decide which capabilities a session gets, so the providers a session can
-reach and the credentials it strips cannot diverge. Each part is proven
-separately per backend.
+description; `internal/hostenv`'s `Filter` is the one implementation, applied by
+every launcher, so the four parts cannot hold for one child and not another --
+which is what they did not, before `Filter` existed. `internal/capability`'s
+`SecretMatcher` builds the fourth part from the same bindings that decide which
+capabilities a session gets, so the providers a session can reach and the
+credentials it strips cannot diverge; it is the one part a caller may omit,
+because a process spawned outside any session has no bindings to build it from.
+Each part is proven once over `Filter`, and each launcher is proven to reach it
+with everything it must contribute.
 
 When `workspace.source_root` is configured, `LocalWorkspaceExecutor` creates a
 detached Git worktree for each issue. Before creating a new workspace, it

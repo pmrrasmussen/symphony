@@ -658,8 +658,8 @@ func decodeGitHub(raw map[string]any, objectValid bool, base string, sources *so
 // It lives beside HostSecretEnvNames and HostSecretValues, and beside the
 // loader that derives both, because all of them are one policy -- see
 // ReservedSecretEnvNames -- and that policy is a property of the trust boundary,
-// not of either backend. Both launchers read it from here, so a name added or
-// removed cannot apply to one backend and not the other.
+// not of any one child. One function reads it, hostenv.Filter, so a name added
+// or removed cannot apply to one child Symphony spawns and not another.
 var reservedSecretEnvNames = []string{
 	"LINEAR_API_KEY",
 	"SYMPHONY_LINEAR_API_KEY_FILE",
@@ -669,14 +669,16 @@ var reservedSecretEnvNames = []string{
 }
 
 // ReservedSecretEnvNames returns the names no agent child may inherit under any
-// configuration. A copy is returned because a launcher appends its own
-// configured names to the result.
+// configuration. A copy is returned because its one caller blocks names of its
+// own alongside these.
 //
 // This comment is also the one description of how host credentials are kept out
-// of an agent child. Both backends implement exactly this, and neither documents
-// it separately.
+// of a process Symphony spawns. hostenv.Filter is the one implementation of it,
+// and nothing else documents it separately: the description lives here, beside
+// the names and the loader that derives the rest, and the loop lives there,
+// where every launcher can reach it without depending on a session.
 //
-// A launcher filters the inherited environment through four filters, and each
+// A caller filters the inherited environment through four filters, and each
 // one exists because the others cannot cover it:
 //
 //  1. ReservedSecretEnvNames removes these five documented names, whatever the
@@ -684,12 +686,13 @@ var reservedSecretEnvNames = []string{
 //     with no credential reference at all -- one whose tracker key is passed in
 //     some other way, so filters 2 and 3 are both empty -- and it covers the two
 //     documented *_FILE names even when nothing references them.
-//  2. Settings.HostSecretEnvNames removes the variables this workflow actually
-//     references. Filter 1 cannot: those names are repository-chosen. It is
-//     also the only filter of any kind that covers a repository-chosen
-//     credential *file path*: for the api_key_file and token_file forms the
-//     variable holds a path, not the credential, so filter 3 never matches it
-//     and filter 1 does not know its name (PMR-80).
+//  2. Settings.HostSecretEnvNames, plus whatever names the caller blocks of
+//     its own, removes the variables this workflow actually references. Filter
+//     1 cannot: those names are repository-chosen. It is also the only filter
+//     of any kind that covers a repository-chosen credential *file path*: for
+//     the api_key_file and token_file forms the variable holds a path, not the
+//     credential, so filter 3 never matches it and filter 1 does not know its
+//     name (PMR-80).
 //  3. Settings.HostSecretValues removes any variable whose value *contains* a
 //     configured credential, under any name. Neither name filter can: an
 //     inherited variable Symphony has never heard of can still carry the
@@ -714,18 +717,24 @@ var reservedSecretEnvNames = []string{
 //     Both sides of that divergence are covered rather than one: a bound
 //     githubhost.Manager is asked too, and it reads its callback live, so the
 //     rotated value is stripped alongside the frozen one. See SecretMatcher for
-//     why the Linear side has no such pair.
+//     why the Linear side has no such pair. It is the one filter a caller may
+//     omit, because it is the one that needs a session: a process Symphony
+//     spawns outside any session has no bindings to build a matcher from and
+//     passes none.
 //
-// A credential the launcher deliberately hands over -- the Claude backend's
+// A credential the caller deliberately hands over -- the Claude backend's
 // capability endpoint token -- is appended after filtering, so no filter can
-// strip it and no inherited value can pre-empt it.
+// strip it and no inherited value can pre-empt it. That is the caller's own
+// business, not the filter's.
 //
 // Everything else is inherited on purpose: both CLIs authenticate through the
 // operator's own login, which lives in the home directory they read.
 //
-// Each numbered filter is proven per backend, because a hole would be silent:
-// see TestNoHostCredentialReachesTheChildEnvironment in internal/codex and
-// TestHostSecretsNeverReachTheChild plus
+// Each numbered filter is proven once over hostenv.Filter, in
+// TestFilterAppliesEveryPartOfTheHostCredentialFilter, and each launcher is
+// proven to reach it with the whole of what it must contribute, because a hole
+// would be silent either way: see TestNoHostCredentialReachesTheChildEnvironment
+// in internal/codex and TestHostSecretsNeverReachTheChild plus
 // TestStartBindsTheHostProvidersAndTheirSecrets in internal/claude. Filter 1's
 // names are also the names internal/service writes into the LaunchAgent plist;
 // TestReservedNamesCoverTheServiceCredentialVariables holds those two lists

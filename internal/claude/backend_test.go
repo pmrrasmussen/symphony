@@ -535,8 +535,9 @@ func TestHostSecretsNeverReachTheChild(t *testing.T) {
 
 	settings := func() config.Settings {
 		return config.Settings{
-			// The padded name is the parity case with internal/codex, which
-			// applies the same trimming to the same settings-derived names.
+			// The padded and blank names are hostenv.Filter's, and are here
+			// because this test launches the real backend: what matters is that
+			// the launcher reaches the filter that handles them.
 			HostSecretEnvNames: []string{"HOST_CONFIGURED_NAME", "  HOST_PADDED_NAME  ", "   "},
 			HostSecretValues:   []string{"configured-value-secret"},
 		}
@@ -1070,37 +1071,5 @@ func TestTwoRefusedInitLinesReportOneFailure(t *testing.T) {
 	}
 	if terminals[0].Kind != domain.EventFailed || !strings.Contains(terminals[0].Message, "permission mode") {
 		t.Fatalf("terminal event=%+v", terminals[0])
-	}
-}
-
-// TestAMalformedEntryIsDroppedAndOnlyValuesReachTheMatcher is the counterpart to
-// internal/codex's test of the same name: neither case is reachable through
-// os.Environ(), which is why both loops take an explicit entry list. The name
-// half matters beyond tidiness -- a matcher fed a whole entry would strip any
-// variable whose *name* happened to contain a credential-shaped string.
-func TestAMalformedEntryIsDroppedAndOnlyValuesReachTheMatcher(t *testing.T) {
-	var offered []string
-	kept := filterEntries(
-		[]string{"MALFORMED_NO_EQUALS", "PMR94_KEEP=ordinary", "PMR94_SECRET=carries-the-token"},
-		map[string]bool{},
-		nil,
-		func(candidate string) bool {
-			offered = append(offered, candidate)
-			return strings.Contains(candidate, "the-token")
-		},
-	)
-	if slices.Contains(kept, "MALFORMED_NO_EQUALS") {
-		t.Fatalf("an entry carrying no \"=\" was forwarded to the child: %v", kept)
-	}
-	if slices.Contains(kept, "PMR94_SECRET=carries-the-token") {
-		t.Fatalf("a matched value survived: %v", kept)
-	}
-	if !slices.Contains(kept, "PMR94_KEEP=ordinary") {
-		t.Fatalf("an ordinary variable was dropped: %v", kept)
-	}
-	for _, candidate := range offered {
-		if strings.Contains(candidate, "PMR94_") || candidate == "MALFORMED_NO_EQUALS" {
-			t.Fatalf("the matcher was offered a name or a whole entry: %q", candidate)
-		}
 	}
 }
