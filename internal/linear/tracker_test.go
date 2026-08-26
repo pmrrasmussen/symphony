@@ -619,6 +619,12 @@ func TestAssigneeMeAndFixedPolicy(t *testing.T) {
 	if viewerCalls != 1 || !issues[0].Dispatchable || issues[1].Dispatchable {
 		t.Fatalf("viewerCalls=%d issues=%#v", viewerCalls, issues)
 	}
+	// AssigneeMismatch must be computed against the resolved viewer ID, not the
+	// literal "me" policy string, or every issue -- including the one that
+	// actually is the viewer's -- would be misreported as a mismatch.
+	if issues[0].AssigneeMismatch || !issues[1].AssigneeMismatch {
+		t.Fatalf("AssigneeMismatch not resolved against viewer ID: %#v", issues)
+	}
 	issues, err = newTestTracker(server.URL, "other-id").ListCandidates(context.Background(), []string{"Todo"})
 	if err != nil {
 		t.Fatal(err)

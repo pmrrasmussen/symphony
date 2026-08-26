@@ -226,6 +226,19 @@ type Coordinator struct {
 	// subsequent poll-cadence wait. Cleared with the claim alongside
 	// landingWaits (PMR-116).
 	landingEscalated map[string]bool
+	// waiting records an eligible issue that could not reserve an orchestrator
+	// slot this poll and was never claimed, so no retry timer exists to
+	// remember it (PMR-139): a candidate rejected only for capacity is
+	// re-evaluated fresh from ListCandidates on the next poll, with nothing else
+	// tracking it in the interim. It is keyed by issue ID and cleared the moment
+	// the issue is no longer seen at capacity -- admitted, turned ineligible, or
+	// dropped from the tracker's candidate list.
+	waiting map[string]waitingState
+	// waitingEscalated marks, per waiting issue, that the "still waiting for
+	// capacity" Warn has already fired once, mirroring landingEscalated: a
+	// queue that stays contended keeps logging Info every poll transition, not
+	// a Warn every poll.
+	waitingEscalated map[string]bool
 	nextRetry        uint64
 	stopping         bool
 	ctx              context.Context
@@ -240,6 +253,15 @@ type Coordinator struct {
 type handoffObservation struct {
 	state string
 	at    time.Time
+}
+
+// waitingState is the coordinator's memory of one eligible issue that has not
+// yet reserved an orchestrator slot. It stores the issue itself, exactly as
+// retryState does, only so Snapshot can report its current identifier and
+// state -- since is the timestamp of the first poll it was seen unadmitted.
+type waitingState struct {
+	issue domain.Issue
+	since time.Time
 }
 
 type running struct {
@@ -293,6 +315,7 @@ func New(t domain.Tracker, a domain.AgentBackend, w domain.WorkspaceExecutor, se
 		claimState: map[string]string{}, admitted: map[string]string{}, retries: map[string]retryState{},
 		handoffs: map[string]handoffObservation{}, landingWaits: map[string]int{},
 		landingEscalated: map[string]bool{},
+		waiting:          map[string]waitingState{}, waitingEscalated: map[string]bool{},
 	}
 }
 
@@ -308,6 +331,12 @@ type Snapshot struct {
 	Claimed  int               `json:"claimed"`
 	Running  []RunningSnapshot `json:"running"`
 	Retrying []RetrySnapshot   `json:"retrying"`
+	// Waiting lists an eligible issue that has reserved neither an
+	// orchestrator slot nor (unlike Retrying) a retry timer: a candidate the
+	// poll rejected only for capacity, re-checked fresh on every poll (PMR-139).
+	// It never overlaps Running or Retrying -- a claimed issue is removed here
+	// the moment it is claimed.
+	Waiting  []WaitingSnapshot `json:"waiting"`
 	Stopping bool              `json:"stopping"`
 }
 
@@ -340,6 +369,17 @@ type RetrySnapshot struct {
 	Due         time.Time `json:"due_at"`
 }
 
+// WaitingSnapshot is one issue eligible for dispatch but not yet admitted.
+// WaitingMS is how long it has gone unadmitted, in milliseconds, computed at
+// snapshot time rather than stored as a duration so JSON does not have to
+// carry Go's duration encoding.
+type WaitingSnapshot struct {
+	IssueIdentifier string    `json:"issue_identifier"`
+	IssueState      string    `json:"issue_state"`
+	Since           time.Time `json:"since"`
+	WaitingMS       int64     `json:"waiting_ms"`
+}
+
 // OutstandingOperationSnapshot identifies the one safe app-server operation
 // that has started but not finished. It intentionally excludes arguments,
 // command bodies, outputs, and the protocol item's opaque identifier.
@@ -356,7 +396,7 @@ func (c *Coordinator) Snapshot() Snapshot {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	now := c.clock.Now()
-	snapshot := Snapshot{Claimed: len(c.claimed), Running: make([]RunningSnapshot, 0, len(c.running)), Retrying: make([]RetrySnapshot, 0, len(c.retries)), Stopping: c.stopping}
+	snapshot := Snapshot{Claimed: len(c.claimed), Running: make([]RunningSnapshot, 0, len(c.running)), Retrying: make([]RetrySnapshot, 0, len(c.retries)), Waiting: make([]WaitingSnapshot, 0, len(c.waiting)), Stopping: c.stopping}
 	for _, run := range c.running {
 		item := snapshotOutstanding(run.outstanding, now)
 		snapshot.Running = append(snapshot.Running, RunningSnapshot{IssueIdentifier: run.issue.Identifier, IssueState: run.issue.State, SessionID: run.session.ID, ThreadID: run.session.ThreadID, TurnID: run.session.TurnID, Attempt: run.run.Attempt, TurnCount: run.run.TurnCount, StartedAt: run.run.StartedAt, LastEventAt: run.last, Usage: run.run.Usage, RateLimit: copyRateLimit(run.rateLimit), OutstandingOperation: item})
@@ -364,9 +404,19 @@ func (c *Coordinator) Snapshot() Snapshot {
 	for _, retry := range c.retries {
 		snapshot.Retrying = append(snapshot.Retrying, RetrySnapshot{IssueIdentifier: retry.issue.Identifier, Attempt: retry.attempt, Kind: string(retry.kind), Reason: retry.reason, WaitAttempt: c.landingWaits[retry.issue.ID], Due: retry.due})
 	}
+	for _, wait := range c.waiting {
+		age := now.Sub(wait.since).Milliseconds()
+		if age < 0 {
+			age = 0
+		}
+		snapshot.Waiting = append(snapshot.Waiting, WaitingSnapshot{IssueIdentifier: wait.issue.Identifier, IssueState: wait.issue.State, Since: wait.since, WaitingMS: age})
+	}
 	sort.Slice(snapshot.Running, func(i, j int) bool { return snapshot.Running[i].IssueIdentifier < snapshot.Running[j].IssueIdentifier })
 	sort.Slice(snapshot.Retrying, func(i, j int) bool {
 		return snapshot.Retrying[i].IssueIdentifier < snapshot.Retrying[j].IssueIdentifier
+	})
+	sort.Slice(snapshot.Waiting, func(i, j int) bool {
+		return snapshot.Waiting[i].IssueIdentifier < snapshot.Waiting[j].IssueIdentifier
 	})
 	return snapshot
 }
@@ -440,6 +490,10 @@ func (c *Coordinator) Shutdown(ctx context.Context) error {
 		delete(c.landingWaits, id)
 		delete(c.landingEscalated, id)
 	}
+	for id := range c.waiting {
+		delete(c.waiting, id)
+		delete(c.waitingEscalated, id)
+	}
 	c.mu.Unlock()
 	c.cancelAll(ctx, runs)
 	done := make(chan struct{})
@@ -476,6 +530,7 @@ func (c *Coordinator) tick(ctx context.Context) error {
 	}
 	sortIssues(issues)
 	summary := pollSummary{candidates: len(issues), rejected: map[string]int64{}}
+	waiting := map[string]domain.Issue{}
 	for _, i := range issues {
 		if ctx.Err() != nil || c.isStopping() {
 			c.logPollSummary(summary)
@@ -502,6 +557,9 @@ func (c *Coordinator) tick(ctx context.Context) error {
 		if reason := c.admissionRejectReason(i, s); reason != "" {
 			summary.rejected[reason]++
 			c.log.Debug("poll candidate rejected", "issue_identifier", i.Identifier, "reason", reason)
+			if reason == "at_capacity" {
+				waiting[i.ID] = i
+			}
 			continue
 		}
 		if !c.claim(i, s) {
@@ -517,6 +575,7 @@ func (c *Coordinator) tick(ctx context.Context) error {
 			summary.rejected["launch_reservation_lost"]++
 		}
 	}
+	c.updateWaiting(waiting, now, s)
 	c.logPollSummary(summary)
 	return nil
 }
@@ -538,11 +597,100 @@ func (c *Coordinator) logPollSummary(summary pollSummary) {
 	c.log.Debug("poll summary", attrs...)
 }
 
+// waitingEscalationFloor is the lower bound on how long an eligible issue can
+// sit unadmitted for capacity before the wait is escalated to Warn. The
+// effective threshold is max(this, waitingEscalationMultiplier*poll interval),
+// mirroring handoffObservationFloor, so a fast-polling instance does not warn
+// after a couple of missed cycles and a slow-polling one is not held to an
+// unreasonably short deadline.
+const waitingEscalationFloor = 5 * time.Minute
+
+// waitingEscalationMultiplier is how many poll intervals an issue may go
+// unadmitted before waitingEscalationFloor's alternative kicks in. It is
+// deliberately generous: losing one or two admission races to fresher
+// candidates (PMR-129) is the queue working as designed, not a stuck issue.
+const waitingEscalationMultiplier = 10
+
+// updateWaiting reconciles the coordinator's memory of eligible issues
+// rejected only for capacity ("at_capacity") this poll against the previous
+// poll's memory, and reports every genuinely new entry once by logging its
+// identifier and state -- the one thing pollSummary is not allowed to carry.
+// An issue absent from seen this poll is no longer waiting for whatever
+// reason (admitted, turned ineligible, or dropped from the tracker's
+// candidate list) and its memory is dropped here, so the waiting set can only
+// ever describe issues this exact poll actually re-observed at capacity.
+func (c *Coordinator) updateWaiting(seen map[string]domain.Issue, now time.Time, s config.Settings) {
+	c.mu.Lock()
+	for id := range c.waiting {
+		if _, ok := seen[id]; !ok {
+			delete(c.waiting, id)
+			delete(c.waitingEscalated, id)
+		}
+	}
+	var newlyWaiting []domain.Issue
+	for id, issue := range seen {
+		entry, already := c.waiting[id]
+		if !already {
+			entry = waitingState{issue: issue, since: now}
+			newlyWaiting = append(newlyWaiting, issue)
+		} else {
+			entry.issue = issue
+		}
+		c.waiting[id] = entry
+	}
+	c.mu.Unlock()
+	for _, issue := range newlyWaiting {
+		c.log.Info("issue eligible but waiting for capacity", "issue_id", issue.ID, "issue_identifier", issue.Identifier, "issue_state", config.Norm(issue.State))
+	}
+	c.escalateStuckWaits(now, s)
+}
+
+// escalateStuckWaits raises a one-time Warn for any issue that has sat in the
+// waiting set past waitingEscalationFloor's effective threshold, exactly the
+// way finishLandingWait escalates a landing wait past
+// landingWaitEscalated. Below the threshold the Info logged by updateWaiting
+// on entry is enough; at and above it a wait that is still recurring is no
+// longer distinguishable, on the timeline alone, from a queue that will never
+// clear.
+func (c *Coordinator) escalateStuckWaits(now time.Time, s config.Settings) {
+	threshold := waitingEscalationFloor
+	if window := waitingEscalationMultiplier * s.Polling.Interval; window > threshold {
+		threshold = window
+	}
+	c.mu.Lock()
+	var escalated []domain.Issue
+	for id, entry := range c.waiting {
+		if c.waitingEscalated[id] || now.Sub(entry.since) < threshold {
+			continue
+		}
+		c.waitingEscalated[id] = true
+		escalated = append(escalated, entry.issue)
+	}
+	c.mu.Unlock()
+	for _, issue := range escalated {
+		c.log.Warn("issue still waiting for capacity", "issue_id", issue.ID, "issue_identifier", issue.Identifier, "issue_state", config.Norm(issue.State))
+	}
+}
+
 // ineligibleReason mirrors eligible's own checks so a rejected candidate's
 // debug record explains exactly which one failed. blocked_by_relation is
 // split out from the generic not_routable so a Todo issue held by an open
 // blocker (PMR-146) is distinguishable, at the poll log, from one rejected
 // for an assignee mismatch or a missing required label.
+//
+// The assignee check is ordered ahead of the blocker check because
+// dispatchable() in internal/linear/tracker.go decides Dispatchable in that
+// same order: an assignee-policy mismatch fails an issue regardless of its
+// blockers, so an issue carrying both must not be misreported as
+// blocked_by_relation, which would name a resolvable blocker as the cause of
+// something an operator resolving it would never fix.
+//
+// The check reads i.AssigneeMismatch rather than re-reading
+// config.Tracker.Provider["assignee"] itself, because that config value can be
+// "me" -- a policy dispatchable() only compares after resolving it to the
+// acting viewer's ID over the network. Re-deriving the comparison here from
+// the unresolved string would assert a mismatch whenever the policy is "me",
+// regardless of the issue's actual assignee.
 func ineligibleReason(i domain.Issue, s config.Settings) string {
 	switch {
 	case i.ID == "" || i.Identifier == "" || i.Title == "":
@@ -551,6 +699,8 @@ func ineligibleReason(i domain.Issue, s config.Settings) string {
 		return "not_active"
 	case issueTerminal(i, s):
 		return "terminal"
+	case !i.Dispatchable && i.AssigneeMismatch:
+		return "not_routable"
 	case !i.Dispatchable && len(openBlockers(i)) > 0:
 		return "blocked_by_relation"
 	case !routable(i, s):

@@ -59,6 +59,7 @@ func TestStatusViewRendersOnlySafeRuntimeFields(t *testing.T) {
 					OutstandingOperation: &operator.OutstandingOperation{Type: "mcpToolCall", Name: "github_pr_context", AgeMS: 3000},
 				}},
 				Retrying: []operator.RetrySnapshot{{IssueIdentifier: "PMR-76", Attempt: 2, Kind: "retry", Reason: "timeout", Due: now.Add(time.Minute)}},
+				Waiting:  []operator.WaitingSnapshot{{IssueIdentifier: "PMR-77", IssueState: "Merging", Since: now.Add(-10 * time.Minute), WaitingMS: 600000}},
 			},
 		},
 		RecentLog: []operator.LogEvent{{Time: now, Level: "INFO", Message: "issue claimed"}},
@@ -66,7 +67,7 @@ func TestStatusViewRendersOnlySafeRuntimeFields(t *testing.T) {
 	model := New([]operator.Instance{instance}, now)
 	model, _ = model.Update("enter")
 	view := model.View(now)
-	for _, want := range []string{"PMR-75 (In Progress)", "turns 4/20", "tokens: input 12, output 3, total 15", "waiting: mcpToolCall github_pr_context", "Retry PMR-76", "Recent redacted lifecycle activity", "issue claimed"} {
+	for _, want := range []string{"PMR-75 (In Progress)", "turns 4/20", "tokens: input 12, output 3, total 15", "waiting: mcpToolCall github_pr_context", "Retry PMR-76", "Waiting PMR-77 (Merging)", "Recent redacted lifecycle activity", "issue claimed"} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("status view missing %q:\n%s", want, view)
 		}

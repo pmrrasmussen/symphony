@@ -153,6 +153,39 @@ func TestIneligibleReasonCategorizesEachRejection(t *testing.T) {
 			s:      config.Settings{Tracker: config.Tracker{ActiveStates: []string{"Todo"}}},
 			reason: "",
 		},
+		// dispatchable() (internal/linear/tracker.go) checks the assignee-policy
+		// mismatch before it checks blockers, so an issue carrying both must
+		// report the assignee cause here too, not blocked_by_relation: naming
+		// the blocker would send an operator to resolve a relation that was
+		// never why the issue was refused.
+		{
+			name: "assignee mismatch outranks an open blocker",
+			issue: domain.Issue{
+				ID: "a", Identifier: "X-1", Title: "t", State: "Todo", Dispatchable: false, AssigneeID: "someone-else",
+				AssigneeMismatch: true,
+				BlockedBy:        []domain.Blocker{{ID: "b", Identifier: "X-0", State: "In Progress", Dispatchable: false}},
+			},
+			s: config.Settings{
+				Tracker: config.Tracker{ActiveStates: []string{"Todo"}, Provider: map[string]any{"assignee": "required-assignee"}},
+			},
+			reason: "not_routable",
+		},
+		// AssigneeMismatch is populated by the tracker from its own resolved
+		// policy value (internal/linear/tracker.go), never re-derived here from
+		// the raw, possibly-"me" config string, so a false AssigneeMismatch
+		// correctly falls through to the real cause instead of masking it.
+		{
+			name: "open blocker reported when assignee actually matches a resolved me policy",
+			issue: domain.Issue{
+				ID: "a", Identifier: "X-1", Title: "t", State: "Todo", Dispatchable: false, AssigneeID: "viewer-id",
+				AssigneeMismatch: false,
+				BlockedBy:        []domain.Blocker{{ID: "b", Identifier: "X-0", State: "In Progress", Dispatchable: false}},
+			},
+			s: config.Settings{
+				Tracker: config.Tracker{ActiveStates: []string{"Todo"}, Provider: map[string]any{"assignee": "me"}},
+			},
+			reason: "blocked_by_relation",
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -252,6 +285,150 @@ func TestPollRejectionNamesTheBlockingIssue(t *testing.T) {
 	}
 	if !strings.Contains(output, `"issue_identifier":"ENG-1"`) || !strings.Contains(output, `"reason":"blocked_by_relation"`) || !strings.Contains(output, `"blocked_by":"ENG-0"`) {
 		t.Fatalf("per-issue rejection record missing the blocking issue: %s", output)
+	}
+}
+
+// TestWaitingIssueAppearsInSnapshotUntilAdmitted guards the PMR-139 operator
+// visibility requirement: an eligible issue rejected only for capacity earns
+// no claim and no retry timer, so the poll's own waiting memory is the only
+// place it can be observed. It must appear there with its identifier and
+// state while capacity stays full, and disappear the moment it is admitted.
+func TestWaitingIssueAppearsInSnapshotUntilAdmitted(t *testing.T) {
+	w := testSettings(t)
+	w.Config.Agent.MaxConcurrent = 1
+	occupying := testIssue()
+	occupying.ID, occupying.Identifier = "occupying", "ENG-OCCUPY"
+	waitingIssue := testIssue()
+	waitingIssue.ID, waitingIssue.Identifier = "queued", "ENG-QUEUED"
+	tracker := &issueMapTracker{candidates: []domain.Issue{waitingIssue}, issues: map[string]domain.Issue{occupying.ID: occupying, waitingIssue.ID: waitingIssue}}
+	block := make(chan domain.Event)
+	agent := &fakeAgent{events: func() <-chan domain.Event { return block }, started: make(chan struct{}, 1)}
+	ws := &fakeWorkspace{after: make(chan struct{}, 1)}
+	c := testCoordinator(w.Config, tracker, agent, ws)
+
+	// Occupy the only slot directly, exactly as other coordinator tests seed
+	// running/claimed/retrying state, so the poll observes real contention
+	// without needing a second live run.
+	c.mu.Lock()
+	c.claimed[occupying.ID] = true
+	c.admitted[occupying.ID] = config.Norm(occupying.State)
+	c.mu.Unlock()
+
+	c.Tick(context.Background())
+	snapshot := c.Snapshot()
+	if len(snapshot.Waiting) != 1 {
+		t.Fatalf("waiting=%+v, want exactly the queued issue", snapshot.Waiting)
+	}
+	if got := snapshot.Waiting[0]; got.IssueIdentifier != "ENG-QUEUED" || got.IssueState != "Todo" || got.WaitingMS < 0 {
+		t.Fatalf("waiting entry=%+v", got)
+	}
+
+	// Free the slot and re-poll: the queued issue must be admitted and drop out
+	// of Waiting, exactly as an issue newly claimed always has.
+	c.mu.Lock()
+	delete(c.claimed, occupying.ID)
+	delete(c.admitted, occupying.ID)
+	c.mu.Unlock()
+	c.Tick(context.Background())
+	<-agent.started
+
+	snapshot = c.Snapshot()
+	if len(snapshot.Waiting) != 0 {
+		t.Fatalf("waiting=%+v, want empty once admitted", snapshot.Waiting)
+	}
+	if len(snapshot.Running) != 1 || snapshot.Running[0].IssueIdentifier != "ENG-QUEUED" {
+		t.Fatalf("running=%+v, want the formerly queued issue", snapshot.Running)
+	}
+	if err := c.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	<-ws.after
+}
+
+// TestWaitingListNeverDuplicatesARunningOrRetryingIssue guards the PMR-139
+// acceptance criterion that the waiting list never grows a second entry for
+// an issue already visible in Running or Retrying: admissionRejectReason
+// reports already_claimed for a claimed issue before it ever reaches the
+// at_capacity check that populates Waiting.
+func TestWaitingListNeverDuplicatesARunningOrRetryingIssue(t *testing.T) {
+	w := testSettings(t)
+	w.Config.Agent.MaxConcurrent = 1
+	runningIssue := testIssue()
+	runningIssue.ID, runningIssue.Identifier = "running", "ENG-RUNNING"
+	retrying := testIssue()
+	retrying.ID, retrying.Identifier = "retrying", "ENG-RETRYING"
+	queued := testIssue()
+	queued.ID, queued.Identifier = "queued", "ENG-QUEUED"
+	tracker := &issueMapTracker{candidates: []domain.Issue{runningIssue, retrying, queued}, issues: map[string]domain.Issue{runningIssue.ID: runningIssue, retrying.ID: retrying, queued.ID: queued}}
+	c := testCoordinator(w.Config, tracker, &fakeAgent{}, &fakeWorkspace{})
+	timer := &fakeTimer{}
+	c.timer = timer
+
+	c.mu.Lock()
+	c.claimed[runningIssue.ID] = true
+	c.admitted[runningIssue.ID] = config.Norm(runningIssue.State)
+	c.running[runningIssue.ID] = &running{issue: runningIssue, session: domain.AgentSession{ID: "s"}, last: time.Now(), cancel: func() {}}
+	// A retry timer holds only the duplicate-prevention claim, never an
+	// orchestrator slot (PMR-78/PMR-129), so it is seeded directly here rather
+	// than through claim(), which would itself require the capacity this test
+	// deliberately keeps fully occupied by runningIssue.
+	c.claimed[retrying.ID] = true
+	c.mu.Unlock()
+	c.scheduleRetry(context.Background(), retrying, domain.Workspace{}, 1, retryAgent, "test", time.Minute)
+
+	c.Tick(context.Background())
+	snapshot := c.Snapshot()
+	if len(snapshot.Running) != 1 || snapshot.Running[0].IssueIdentifier != "ENG-RUNNING" {
+		t.Fatalf("running=%+v, want the seeded running issue", snapshot.Running)
+	}
+	if len(snapshot.Retrying) != 1 || snapshot.Retrying[0].IssueIdentifier != "ENG-RETRYING" {
+		t.Fatalf("retrying=%+v", snapshot.Retrying)
+	}
+	if len(snapshot.Waiting) != 1 || snapshot.Waiting[0].IssueIdentifier != "ENG-QUEUED" {
+		t.Fatalf("waiting=%+v, want only the queued issue -- running and retrying must never duplicate into it", snapshot.Waiting)
+	}
+	if err := c.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestPollSummaryNeverCarriesIssueIdentifiers guards the privacy property
+// pollSummary documents on itself: adding Waiting to the snapshot must not
+// leak an identifier into the aggregate debug line the way the per-issue
+// "poll candidate rejected" record deliberately does.
+func TestPollSummaryNeverCarriesIssueIdentifiers(t *testing.T) {
+	w := testSettings(t)
+	w.Config.Agent.MaxConcurrent = 1
+	occupying := testIssue()
+	occupying.ID, occupying.Identifier = "occupying", "ENG-OCCUPY"
+	queued := testIssue()
+	queued.ID, queued.Identifier = "queued", "ENG-QUEUED"
+	tracker := &issueMapTracker{candidates: []domain.Issue{queued}, issues: map[string]domain.Issue{occupying.ID: occupying, queued.ID: queued}}
+	var logs bytes.Buffer
+	c := New(tracker, &fakeAgent{}, &fakeWorkspace{}, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	c.mu.Lock()
+	c.claimed[occupying.ID] = true
+	c.admitted[occupying.ID] = config.Norm(occupying.State)
+	c.mu.Unlock()
+
+	c.Tick(context.Background())
+
+	var summaryLine string
+	for _, line := range strings.Split(logs.String(), "\n") {
+		if strings.Contains(line, `"msg":"poll summary"`) {
+			summaryLine = line
+		}
+	}
+	if summaryLine == "" {
+		t.Fatalf("poll summary line missing: %s", logs.String())
+	}
+	if !strings.Contains(summaryLine, `"at_capacity":1`) {
+		t.Fatalf("poll summary missing the at_capacity rejection: %s", summaryLine)
+	}
+	for _, prohibited := range []string{"ENG-QUEUED", "ENG-OCCUPY", "issue_identifier", "issue_id"} {
+		if strings.Contains(summaryLine, prohibited) {
+			t.Fatalf("poll summary leaked an issue identifier: %s", summaryLine)
+		}
 	}
 }
 
