@@ -278,11 +278,11 @@ func TestRequestErrorsAreClassifiedEndToEnd(t *testing.T) {
 
 	t.Run("client timeout", func(t *testing.T) {
 		block := make(chan struct{})
-		defer close(block)
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			<-block
 		}))
 		defer server.Close()
+		defer close(block)
 		tracker := newTestTracker(server.URL, "")
 		tracker.client.Timeout = 50 * time.Millisecond
 
