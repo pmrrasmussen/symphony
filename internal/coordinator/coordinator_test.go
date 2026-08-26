@@ -279,6 +279,10 @@ func TestCleanupStatusClassifiesWorkspaceOutcome(t *testing.T) {
 		{name: "committed", err: fmt.Errorf("refusing to remove Git workspace whose HEAD %s differs from recorded base commit %s", "abc", "def"), want: "committed"},
 		{name: "unverifiable landing stays committed", err: fmt.Errorf("refusing to remove Git workspace whose HEAD %s differs from recorded base commit %s; merged landing could not be verified", "abc", "def"), want: "committed"},
 		{name: "blocked", err: errors.New("refusing to remove workspace without durable ownership state"), want: "blocked"},
+		// A killed subprocess or another failure that never reached a refusal
+		// decision is not a verified refusal, so it must not be reported as
+		// blocked (PMR-130): it names no committed or dirty work to protect.
+		{name: "failed before it could classify anything", err: errors.New("validate recorded source repository: classify workspace source repository: git rev-parse --path-format=absolute --show-toplevel: signal: killed: ; manual recovery is required"), want: "failed"},
 		// A refused cleanup never reports a removal outcome, even if one leaks in.
 		{name: "landed outcome never masks a refusal", outcome: domain.CleanupLanded, err: errors.New("refusing to remove Git workspace with uncommitted or untracked changes"), want: "dirty"},
 	}
@@ -769,6 +773,15 @@ type fakeWorkspace struct {
 	after          chan struct{}
 	prepareStarted chan struct{}
 	prepareGate    <-chan struct{}
+	// cleanupStarted and cleanupGate let a test pause the first Cleanup call
+	// until it has arranged a race against it (a concurrent stopRun, or a
+	// second Cleanup call), and cleanupErr makes that first call fail so the
+	// test can observe how the failure is reported. Every later call proceeds
+	// immediately and succeeds, standing in for reconciliation's own
+	// authoritative retry.
+	cleanupStarted chan struct{}
+	cleanupGate    <-chan struct{}
+	cleanupErr     error
 }
 
 func (f *fakeWorkspace) Prepare(ctx context.Context, _ domain.Issue) (domain.Workspace, error) {
@@ -795,11 +808,29 @@ func (f *fakeWorkspace) AfterRun(context.Context, domain.Workspace, domain.Issue
 		f.after <- struct{}{}
 	}
 }
-func (f *fakeWorkspace) Cleanup(context.Context, domain.Issue) (domain.CleanupOutcome, error) {
+func (f *fakeWorkspace) Cleanup(ctx context.Context, _ domain.Issue) (domain.CleanupOutcome, error) {
 	f.mu.Lock()
 	f.cleanups++
+	first := f.cleanups == 1
 	cleaned := f.cleaned
+	started := f.cleanupStarted
+	gate := f.cleanupGate
+	err := f.cleanupErr
 	f.mu.Unlock()
+	if first {
+		if started != nil {
+			started <- struct{}{}
+		}
+		if gate != nil {
+			<-gate
+		}
+		if err != nil {
+			return domain.CleanupClean, err
+		}
+		if ctx.Err() != nil {
+			return domain.CleanupClean, ctx.Err()
+		}
+	}
 	if cleaned != nil {
 		cleaned <- struct{}{}
 	}
@@ -1074,6 +1105,133 @@ func TestLandingResolvedEndsRunWithoutAnotherTurn(t *testing.T) {
 	}
 	if !strings.Contains(records, `"status":"succeeded"`) {
 		t.Fatalf("terminal landing did not finish the run successfully: %s", records)
+	}
+}
+
+// cleanupLogLines returns every "workspace cleanup" record in a JSONL log, in
+// order, so a test can assert on each attempt's level and status without a
+// substring match spuriously matching across lines.
+func cleanupLogLines(records string) []string {
+	var lines []string
+	for _, line := range strings.Split(strings.TrimSpace(records), "\n") {
+		if strings.Contains(line, `"msg":"workspace cleanup"`) {
+			lines = append(lines, line)
+		}
+	}
+	return lines
+}
+
+// TestRunEndCleanupSurvivesConcurrentReconciliationCancellation covers
+// PMR-130's first cause: a resolved landing's own workspace cleanup raced
+// reconciliation, which observed the same terminal issue and called stopRun
+// concurrently. stopRun cancels the run's own context, and cleanupWorkspace
+// used to inherit it, turning a healthy landing's git invocation into a
+// killed subprocess reported as an operator-actionable "blocked". The
+// run-end cleanup call must hold a context detached from that cancellation so
+// a race with reconciliation cannot fail it.
+func TestRunEndCleanupSurvivesConcurrentReconciliationCancellation(t *testing.T) {
+	w := testSettings(t)
+	issue := testIssue()
+	terminal := issue
+	terminal.State = "Done"
+	terminal.Dispatchable = false
+	tracker := &fakeTracker{issue: issue}
+	tracker.setFresh(terminal)
+	var log syncBuffer
+	agent := &fakeAgent{events: completedEvents}
+	gate := make(chan struct{})
+	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{}, 1), cleanupStarted: make(chan struct{}, 1), cleanupGate: gate}
+	c := New(tracker, agent, ws, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&log, nil)))
+	c.clock = fakeClock{now: time.Date(2026, 8, 26, 7, 37, 0, 0, time.UTC)}
+	c.timer = &fakeTimer{}
+
+	c.Tick(context.Background())
+	<-ws.cleanupStarted // the run's own cleanup is now blocked mid-attempt
+
+	if !c.stopRun(issue.ID, stopTerminal) {
+		t.Fatal("reconciliation could not stop a run whose own cleanup is still in flight")
+	}
+	close(gate) // let the blocked attempt observe whatever context it was actually given
+
+	<-ws.after
+	waitForRelease(t, c, issue.ID)
+
+	if _, _, cleanups, _ := ws.counts(); cleanups != 1 {
+		t.Fatalf("cleanups=%d, want exactly the one run-end attempt", cleanups)
+	}
+	lines := cleanupLogLines(log.String())
+	if len(lines) != 1 {
+		t.Fatalf("workspace cleanup records=%v, want exactly one", lines)
+	}
+	if strings.Contains(lines[0], `"level":"WARN"`) || strings.Contains(lines[0], `"status":"blocked"`) {
+		t.Fatalf("run-end cleanup observed the concurrent cancellation it must be detached from: %s", lines[0])
+	}
+	if !strings.Contains(lines[0], `"status":"clean"`) {
+		t.Fatalf("run-end cleanup did not report a successful removal: %s", lines[0])
+	}
+}
+
+// TestRunEndCleanupFailureIsNotActionableWhenReconciliationSucceeds covers
+// PMR-130's reporting fix directly: even when the run-end cleanup attempt
+// fails for a reason that has nothing to do with context cancellation (here,
+// a stand-in for the read-after-write race PMR-112's landing hit against
+// GitHub), reconciliation's own concurrent, authoritative attempt succeeding
+// right after it means the first failure named no real call to action and
+// must not be logged at WARN.
+func TestRunEndCleanupFailureIsNotActionableWhenReconciliationSucceeds(t *testing.T) {
+	w := testSettings(t)
+	issue := testIssue()
+	terminal := issue
+	terminal.State = "Done"
+	terminal.Dispatchable = false
+	tracker := &fakeTracker{issue: issue}
+	tracker.setFresh(terminal)
+	var log syncBuffer
+	agent := &fakeAgent{events: completedEvents}
+	gate := make(chan struct{})
+	ws := &fakeWorkspace{
+		shouldRun:      true,
+		after:          make(chan struct{}, 1),
+		cleanupStarted: make(chan struct{}, 1),
+		cleanupGate:    gate,
+		cleanupErr:     errors.New("refusing to remove Git workspace whose HEAD c6e8a98 differs from recorded base commit 54bccf5; merged landing could not be verified"),
+	}
+	c := New(tracker, agent, ws, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&log, nil)))
+	c.clock = fakeClock{now: time.Date(2026, 8, 26, 7, 41, 0, 0, time.UTC)}
+	c.timer = &fakeTimer{}
+
+	c.Tick(context.Background())
+	<-ws.cleanupStarted // the run's own cleanup is now blocked before it fails
+
+	// Reconciliation independently reaches the same terminal issue while the
+	// run-end attempt is still in flight, stops the run, and runs its own
+	// cleanup on a live context -- the authoritative retry.
+	c.Tick(context.Background())
+	close(gate) // only now let the blocked, doomed first attempt fail
+
+	<-ws.after
+	waitForRelease(t, c, issue.ID)
+
+	if _, _, cleanups, _ := ws.counts(); cleanups != 2 {
+		t.Fatalf("cleanups=%d, want the run-end attempt and reconciliation's authoritative retry", cleanups)
+	}
+	lines := cleanupLogLines(log.String())
+	if len(lines) != 2 {
+		t.Fatalf("workspace cleanup records=%v, want exactly two", lines)
+	}
+	for _, line := range lines {
+		if strings.Contains(line, `"level":"WARN"`) {
+			t.Fatalf("a superseded first attempt must never be reported as an operator call to action: %s", line)
+		}
+	}
+	// Reconciliation's own cleanup runs synchronously within the second Tick
+	// call and so is logged first; the run-end attempt was still blocked on
+	// the gate at that point and only logs once it is released afterward.
+	if !strings.Contains(lines[0], `"status":"clean"`) {
+		t.Fatalf("reconciliation's retry record=%s, want a successful removal", lines[0])
+	}
+	if !strings.Contains(lines[1], `"status":"committed"`) {
+		t.Fatalf("run-end cleanup record=%s, want the classified committed refusal", lines[1])
 	}
 }
 
