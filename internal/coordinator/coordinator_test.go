@@ -1986,7 +1986,9 @@ func TestRetryRefreshFailureAbandonsAtMaxAttempts(t *testing.T) {
 // TestLandingWaitRedispatchesPastMaxAttempts pins for the wait itself: a
 // landing retry that fails to refresh its issue is still not an agent
 // failure, so it must keep redispatching past agent.max_attempts rather than
-// being abandoned by the ceiling that only retryAgent consumes.
+// being abandoned by the ceiling that only retryAgent consumes — and, like the
+// slot-contention escalation in runRetry, it must not inflate the attempt
+// that feeds the rendered prompt either.
 func TestLandingRetryRefreshFailureIgnoresMaxAttempts(t *testing.T) {
 	w := testSettings(t)
 	w.Config.Agent.MaxAttempts = 1
@@ -2010,8 +2012,8 @@ func TestLandingRetryRefreshFailureIgnoresMaxAttempts(t *testing.T) {
 	if !claimed {
 		t.Fatal("landing retry refresh failure dropped its claim below max_attempts=1")
 	}
-	if !ok || retry.kind != retryLanding || retry.reason != "retry_refresh" || retry.attempt != 4 {
-		t.Fatalf("retry=%+v ok=%v, want a further landing retry past the ceiling", retry, ok)
+	if !ok || retry.kind != retryLanding || retry.reason != "retry_refresh" || retry.attempt != 3 {
+		t.Fatalf("retry=%+v ok=%v, want a further landing retry past the ceiling with its attempt unchanged", retry, ok)
 	}
 	if err := c.Shutdown(context.Background()); err != nil {
 		t.Fatal(err)

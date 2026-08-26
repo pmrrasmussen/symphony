@@ -1412,8 +1412,8 @@ func (c *Coordinator) finishFailure(ctx context.Context, i domain.Issue, attempt
 // retryAgent episode, abandoning the dispatch (and releasing its claim) if so.
 // Only retryAgent consumes the ceiling: a retryLanding redispatch — whether
 // from finishLandingWait or the slot-contention/refresh escalations in
-// runRetry — is exempt regardless of how high its attempt counter climbs (see
-// abandonDispatch). config rejects a non-positive max_attempts, so the
+// runRetry — never even raises its attempt counter, let alone reaches here
+// (see abandonDispatch). config rejects a non-positive max_attempts, so the
 // MaxAttempts <= 0 case only covers a hand-built Settings, which keeps the
 // pre-PMR-111 unbounded ladder rather than having a zero ceiling abandon every
 // first failure.
@@ -1430,11 +1430,14 @@ func (c *Coordinator) attemptsExhausted(i domain.Issue, kind retryKind, next int
 // attempt N ends the (N+1)th launch of the episode, so a boundary that fails
 // every time dispatches exactly max_attempts times and arms no further retry.
 // The two host-side escalations in runRetry (a contended orchestrator slot, a
-// failed retry refresh) raise that same counter without dispatching, and check
-// it through attemptsExhausted exactly like a dispatch failure does: neither
-// abandons on its own — waiting for a slot is backpressure, not a failure —
-// but both consume the budget, so an episode delayed that way gives up after
-// fewer launches instead of resetting the ceiling it never reached.
+// failed retry refresh), for a retryAgent episode, raise that same counter
+// without dispatching, and check it through attemptsExhausted exactly like a
+// dispatch failure does: neither abandons on its own — waiting for a slot is
+// backpressure, not a failure — but both consume the budget, so an episode
+// delayed that way gives up after fewer launches instead of resetting the
+// ceiling it never reached. For a retryLanding episode, both escalations keep
+// the attempt unchanged instead (see runRetry), since it feeds the rendered
+// prompt and a wait must not inflate it.
 //
 // What it does NOT do is as deliberate as what it does:
 //
@@ -1567,22 +1570,32 @@ func (c *Coordinator) runRetry(id string, generation uint64) {
 		c.release(id)
 		return
 	}
+	s := c.settings()
 	fresh, err := c.tracker.GetIssues(ctx, []string{id})
 	if err != nil {
 		c.log.Warn("retry issue refresh failed", "issue_id", id, "reason", retry.reason, "error", err)
-		attempt := retry.attempt + 1
-		attrs := []any{"issue_id", retry.issue.ID, "issue_identifier", retry.issue.Identifier, "reason", "retry_refresh", "attempt", attempt}
-		if c.attemptsExhausted(retry.issue, retry.kind, attempt, c.settings(), attrs) {
+		if retry.kind == retryLanding {
+			// A stale tracker read is no more an agent failure than the wait
+			// itself: keep the attempt (it feeds the rendered prompt) and the
+			// landing cadence, exactly like the slot-contention branch below.
+			c.mu.Lock()
+			waits := c.landingWaits[id]
+			c.mu.Unlock()
+			c.scheduleRetry(ctx, retry.issue, retry.workspace, retry.attempt, retryLanding, "retry_refresh", landingRetryDelay(s, waits))
 			return
 		}
-		c.scheduleRetry(ctx, retry.issue, retry.workspace, attempt, retry.kind, "retry_refresh", backoff(attempt, c.settings().Agent.MaxRetryBackoff))
+		attempt := retry.attempt + 1
+		attrs := []any{"issue_id", retry.issue.ID, "issue_identifier", retry.issue.Identifier, "reason", "retry_refresh", "attempt", attempt}
+		if c.attemptsExhausted(retry.issue, retry.kind, attempt, s, attrs) {
+			return
+		}
+		c.scheduleRetry(ctx, retry.issue, retry.workspace, attempt, retry.kind, "retry_refresh", backoff(attempt, s.Agent.MaxRetryBackoff))
 		return
 	}
 	if len(fresh) != 1 || fresh[0].ID != id {
 		c.release(id)
 		return
 	}
-	s := c.settings()
 	issue := fresh[0]
 	if !eligible(issue, s) {
 		if terminal(issue, s) {
