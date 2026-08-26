@@ -190,6 +190,14 @@ state.
   `scripts/check all` once shared behavior changes.
 - Create a clean local commit once validation passes; do not leave
   uncommitted or untracked changes in the worktree.
+- A Claude session's sandbox grants `network.allowLocalBinding`, so a test
+  suite that binds a loopback listener (`httptest`, `mcpbridge`) is expected
+  to run in-session. If a command still fails with `bind: operation not
+  permitted` despite that grant, do not treat it as a regression: it is a
+  sandbox limitation Symphony's own diagnostics already flag, not evidence
+  about the change. Say so explicitly in the pull request's On Call section
+  and rely on CI's required checks to validate that suite instead of
+  retrying the command.
 
 ## Review handoff
 - Follow the delivery-mode instructions Symphony supplies below (host-side

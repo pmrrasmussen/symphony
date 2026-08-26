@@ -51,11 +51,41 @@ type assistantMessage struct {
 type userMessage struct {
 	Message struct {
 		Content []struct {
-			Type      string `json:"type"`
-			ToolUseID string `json:"tool_use_id"`
-			IsError   bool   `json:"is_error"`
+			Type      string          `json:"type"`
+			ToolUseID string          `json:"tool_use_id"`
+			IsError   bool            `json:"is_error"`
+			Content   json.RawMessage `json:"content"`
 		} `json:"content"`
 	} `json:"message"`
+}
+
+// sandboxBindDeniedMarker is the exact substring Go's net package produces
+// when the sandbox refuses a loopback bind ("listen tcp 127.0.0.1:0: bind:
+// operation not permitted"), which is what blocks every repository test
+// suite that stands up an httptest server or an mcpbridge listener.
+const sandboxBindDeniedMarker = "bind: operation not permitted"
+
+// toolResultDeniedLoopbackBind reports whether a failed tool result's content
+// contains the fixed sandbox-denial marker, without ever forwarding that
+// content itself into an event: only this boolean crosses the boundary, so a
+// tool result full of arbitrary or sensitive output is still never decoded
+// into a log.
+func toolResultDeniedLoopbackBind(raw json.RawMessage) bool {
+	var text string
+	if err := json.Unmarshal(raw, &text); err == nil {
+		return strings.Contains(text, sandboxBindDeniedMarker)
+	}
+	var blocks []struct {
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(raw, &blocks); err == nil {
+		for _, block := range blocks {
+			if strings.Contains(block.Text, sandboxBindDeniedMarker) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // resultEvent ends a turn. There is no turn_success or error_reason field: the

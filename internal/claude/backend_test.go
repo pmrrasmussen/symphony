@@ -192,6 +192,47 @@ func TestStartRunsATurnAndNormalizesItsLifecycle(t *testing.T) {
 	}
 }
 
+// TestASandboxDeniedLoopbackBindIsReportedAsADiagnostic covers the failure mode
+// this backend cannot otherwise distinguish from a real test regression: a
+// failed Bash call whose own output shows the sandbox refused a loopback
+// bind. Without this, an operator reading only item outcomes sees the same
+// "Bash failed" either way.
+func TestASandboxDeniedLoopbackBindIsReportedAsADiagnostic(t *testing.T) {
+	for name, resultContent := range map[string]string{
+		"a plain string result": `"listen tcp 127.0.0.1:0: bind: operation not permitted\n"`,
+		"a text content block":  `[{"type":"text","text":"panic: listen tcp6 [::1]:0: bind: operation not permitted"}]`,
+		"an unrelated failure":  `"exit status 1: FAIL github.com/example/pkg"`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			script := writeFakeClaude(t, dir, "cat <<'EOF'\n"+
+				initLine(dir, allCodingTools)+"\n"+
+				`{"type":"assistant","message":{"content":[{"type":"tool_use","id":"call-1","name":"Bash"}]}}`+"\n"+
+				`{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"call-1","is_error":true,"content":`+resultContent+`}]}}`+"\n"+
+				resultLine(false, "")+"\n"+
+				"EOF\n")
+
+			backend := New(settingsFunc())
+			_, events, err := backend.Start(context.Background(), request(t, dir, script))
+			if err != nil {
+				t.Fatal(err)
+			}
+			collected := drain(t, events)
+
+			var diagnosed bool
+			for _, event := range collected {
+				if event.Kind == domain.EventDiagnostic && strings.Contains(event.Message, "loopback bind") {
+					diagnosed = true
+				}
+			}
+			wantDiagnosed := name != "an unrelated failure"
+			if diagnosed != wantDiagnosed {
+				t.Fatalf("diagnosed=%v, want %v (%v)", diagnosed, wantDiagnosed, kinds(collected))
+			}
+		})
+	}
+}
+
 // TestTheLaunchContractIsFixedAndReappliedOnEveryTurn is the core boundary test.
 // The CLI restores none of the policy flags on resume, so a contract applied only
 // on the first turn would silently vanish for every turn after it.
@@ -273,6 +314,11 @@ func assertFixedPolicy(t *testing.T, args []string, r domain.AgentRequest) {
 	}
 	if !rendered.Sandbox.Enabled || !rendered.Sandbox.FailIfUnavailable || rendered.Sandbox.AllowUnsandboxedCommands {
 		t.Fatalf("sandbox=%+v", rendered.Sandbox)
+	}
+	// AllowLocalBinding is the separate grant, alongside "*" egress, that lets a
+	// session bind the loopback listeners its own test suites need.
+	if !rendered.Sandbox.Network.AllowLocalBinding {
+		t.Fatalf("network=%+v, want AllowLocalBinding", rendered.Sandbox.Network)
 	}
 	// Writes are bounded to the worktree plus exactly the Git metadata roots the
 	// workspace layer granted -- no wider.

@@ -78,6 +78,13 @@ type filesystemPolicy struct {
 
 type networkPolicy struct {
 	AllowedDomains []string `json:"allowedDomains"`
+	// AllowLocalBinding grants bind(2) on loopback in addition to the outbound
+	// connect that AllowedDomains alone covers. The two are separate grants in
+	// the CLI's sandbox: without this, "*" egress still leaves net.Listen on
+	// 127.0.0.1 failing with "bind: operation not permitted", which is what
+	// blocks every repository test suite that stands up an httptest server or
+	// an mcpbridge listener.
+	AllowLocalBinding bool `json:"allowLocalBinding"`
 }
 
 type permissionsPolicy struct {
@@ -89,8 +96,10 @@ type permissionsPolicy struct {
 // buildPolicy bounds Bash writes to the worktree plus the two narrow Git
 // metadata roots Symphony grants for a local commit -- the same grant the Codex
 // profile makes -- and leaves outbound network unrestricted, matching the Codex
-// profile's deliberate networkAccess: true. Reads are not confined, exactly as
-// for Codex.
+// profile's deliberate networkAccess: true. It also grants AllowLocalBinding,
+// without which a session cannot bind the loopback listeners several of this
+// repository's own test suites require to run at all. Reads are not confined,
+// exactly as for Codex.
 //
 // allowed is the session's whole tool surface, capability tools included, and it
 // is passed in rather than read from codingTools so the payload cannot describe
@@ -111,11 +120,12 @@ func buildPolicy(r domain.AgentRequest, allowed []string) (policy, error) {
 			FailIfUnavailable:        true,
 			AllowUnsandboxedCommands: false,
 			Filesystem:               filesystemPolicy{AllowWrite: roots},
-			// "*" is unrestricted egress. Repository test suites bind loopback
-			// listeners and fetch modules, which is why the Codex profile grants
-			// the same; a narrower list belongs to whoever owns that policy, not
-			// to this launcher.
-			Network: networkPolicy{AllowedDomains: []string{"*"}},
+			// "*" is unrestricted egress, matching the Codex profile's
+			// networkAccess: true. AllowLocalBinding is the separate grant
+			// repository test suites need to bind loopback listeners; a
+			// narrower policy belongs to whoever owns that policy, not to this
+			// launcher.
+			Network: networkPolicy{AllowedDomains: []string{"*"}, AllowLocalBinding: true},
 		},
 		Permissions: permissionsPolicy{
 			DefaultMode: permissionMode,
