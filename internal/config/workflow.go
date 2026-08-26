@@ -149,8 +149,18 @@ type Hooks struct {
 }
 type Agent struct {
 	MaxConcurrent, MaxTurns int
-	MaxRetryBackoff         time.Duration
-	ByState                 map[string]int
+	// MaxAttempts bounds how many times one dispatch episode may launch the
+	// same issue. MaxTurns bounds the turns inside a run and MaxRetryBackoff
+	// bounds the delay between runs; neither bounds the number of runs, so
+	// before PMR-111 an issue that failed deterministically (a corrupted
+	// worktree, an always-failing before_run hook, a template error, an
+	// unreachable agent binary) re-dispatched at the backoff ceiling for the
+	// daemon's lifetime while holding its claim. Reaching this ceiling
+	// abandons the dispatch: the coordinator logs one error-level record,
+	// drops the claim, and leaves the tracker state alone.
+	MaxAttempts     int
+	MaxRetryBackoff time.Duration
+	ByState         map[string]int
 	// Backend names the agent runtime new sessions are started on. It is
 	// validated against agentBackends, so an unknown value fails the whole
 	// candidate rather than silently falling back to a default.
@@ -401,6 +411,10 @@ func decode(raw map[string]any, base, path, logRoot string, sources *sourceSnaps
 	if err != nil {
 		return Settings{}, err
 	}
+	maxAttempts, err := integer(agent, "max_attempts", 5)
+	if err != nil {
+		return Settings{}, err
+	}
 	maxRetryBackoff, err := durationMS(agent, "max_retry_backoff_ms", 300_000)
 	if err != nil {
 		return Settings{}, err
@@ -492,7 +506,7 @@ func decode(raw map[string]any, base, path, logRoot string, sources *sourceSnaps
 		Workspace: Workspace{Root: workspaceRoot, SourceRoot: sourceRoot},
 		Hooks:     Hooks{AfterCreate: afterCreate, BeforeRun: beforeRun, AfterRun: afterRun, BeforeRemove: beforeRemove, Timeout: hookTimeout},
 		Claude:    claudeSettings,
-		Agent:     Agent{Backend: backend, MaxConcurrent: maxConcurrent, MaxTurns: maxTurns, MaxRetryBackoff: maxRetryBackoff, ByState: byState},
+		Agent:     Agent{Backend: backend, MaxConcurrent: maxConcurrent, MaxTurns: maxTurns, MaxAttempts: maxAttempts, MaxRetryBackoff: maxRetryBackoff, ByState: byState},
 		Codex:     Codex{Command: command, ApprovalPolicy: approvalPolicy, ThreadSandbox: threadSandbox, TurnSandboxPolicy: turnSandboxPolicy, TurnTimeout: turnTimeout, ReadTimeout: readTimeout, StartTimeout: startTimeout, StallTimeout: stallTimeout},
 		GitHub:    githubSettings,
 		// Keep only the names of environment variables that carry host
@@ -508,7 +522,7 @@ func decode(raw map[string]any, base, path, logRoot string, sources *sourceSnaps
 	if len(s.Tracker.ActiveStates) == 0 || len(s.Tracker.TerminalStates) == 0 {
 		return s, errors.New("invalid configuration: tracker active_states and terminal_states are required")
 	}
-	if s.Polling.Interval <= 0 || s.Hooks.Timeout <= 0 || s.Agent.MaxConcurrent <= 0 || s.Agent.MaxTurns <= 0 || s.Agent.MaxRetryBackoff <= 0 {
+	if s.Polling.Interval <= 0 || s.Hooks.Timeout <= 0 || s.Agent.MaxConcurrent <= 0 || s.Agent.MaxTurns <= 0 || s.Agent.MaxAttempts <= 0 || s.Agent.MaxRetryBackoff <= 0 {
 		return s, errors.New("invalid configuration: non-positive duration or agent limit")
 	}
 	// Only the selected backend's launch contract has to be complete: a workflow

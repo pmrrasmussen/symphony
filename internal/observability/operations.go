@@ -1,10 +1,11 @@
 package observability
 
-// Operation is the bounded vocabulary for the `operation` field of a tracker
-// state-change log record. It is a closed set on purpose: every record that
-// names a lifecycle edge — one Symphony performed, or one it merely observed —
-// uses a constant from this file, so an operator (or a log query) can rely on
-// the field's values instead of matching free-form strings that drift per call
+// Operation is the bounded vocabulary for the `operation` field of a lifecycle
+// log record. It is a closed set on purpose: every record that names a
+// lifecycle decision — a tracker edge Symphony performed, one it merely
+// observed, or a scheduling decision an operator has to be able to find — uses
+// a constant from this file, so an operator (or a log query) can rely on the
+// field's values instead of matching free-form strings that drift per call
 // site. Values are lowercase snake_case and are treated as a stable log
 // contract: rename one only alongside the documentation in
 // docs/observability.md.
@@ -33,6 +34,13 @@ const (
 	// OperationReviewCompleted is the terminal edge for review work GitHub
 	// reports as already delivered.
 	OperationReviewCompleted Operation = "review_completed"
+	// OperationDispatchAbandoned is the one operation here that names no
+	// tracker edge: it reports that the coordinator hit agent.max_attempts for
+	// one issue and gave up on that dispatch episode rather than retrying
+	// forever (PMR-111). It deliberately leaves the tracker state alone, so
+	// "the issue was abandoned, and the board still says otherwise" is exactly
+	// what an operator has to be able to query for.
+	OperationDispatchAbandoned Operation = "dispatch_abandoned"
 
 	// The three operations below describe state changes Symphony did NOT
 	// perform: the handoff state is human-controlled, so every change out of it
@@ -67,6 +75,7 @@ var known = map[Operation]bool{
 	OperationLandingCompleted:  true,
 	OperationMergeReconciled:   true,
 	OperationReviewCompleted:   true,
+	OperationDispatchAbandoned: true,
 	OperationReviewApproved:    true,
 	OperationReworkRequested:   true,
 	OperationExternalReversion: true,

@@ -1391,7 +1391,9 @@ func (c *Coordinator) finishFailure(ctx context.Context, i domain.Issue, attempt
 		c.release(i.ID)
 		return
 	}
-	attrs := []any{"issue_id", i.ID, "issue_identifier", i.Identifier, "reason", reason, "attempt", attempt + 1}
+	s := c.settings()
+	next := attempt + 1
+	attrs := []any{"issue_id", i.ID, "issue_identifier", i.Identifier, "reason", reason, "attempt", next}
 	var blocked blockedError
 	if errors.As(err, &blocked) {
 		attrs = append(attrs, "blocker", blocked.category)
@@ -1399,8 +1401,50 @@ func (c *Coordinator) finishFailure(ctx context.Context, i domain.Issue, attempt
 	if err != nil && reason != "prompt_render" && reason != "agent_event" {
 		attrs = append(attrs, "error", err)
 	}
+	// config rejects a non-positive max_attempts, so the guard only covers a
+	// hand-built Settings: those keep the pre-PMR-111 unbounded ladder rather
+	// than having a zero ceiling abandon every first failure.
+	if s.Agent.MaxAttempts > 0 && next >= s.Agent.MaxAttempts {
+		c.abandonDispatch(i, s.Agent.MaxAttempts, attrs)
+		return
+	}
 	c.log.Warn("agent run retry scheduled", attrs...)
-	c.scheduleRetry(ctx, i, domain.Workspace{}, attempt+1, retryAgent, reason, backoff(attempt+1, c.settings().Agent.MaxRetryBackoff))
+	c.scheduleRetry(ctx, i, domain.Workspace{}, next, retryAgent, reason, backoff(next, s.Agent.MaxRetryBackoff))
+}
+
+// abandonDispatch ends one dispatch episode that reached agent.max_attempts
+// (PMR-111). The escalated attempt counter is the ceiling's unit: a failure at
+// attempt N ends the (N+1)th launch of the episode, so a boundary that fails
+// every time dispatches exactly max_attempts times and arms no further retry.
+// The two host-side escalations in runRetry (a contended orchestrator slot, a
+// failed retry refresh) raise that same counter without dispatching. Neither
+// abandons on its own — waiting for a slot is backpressure, not a failure — but
+// both consume the budget, so an episode delayed that way gives up after fewer
+// launches instead of resetting the ceiling it never reached.
+//
+// What it does NOT do is as deliberate as what it does:
+//
+//   - It does not touch the tracker. The issue stays where a human left it and
+//     stays re-poll-able, so a later poll starts a fresh, equally bounded
+//     episode rather than an in-process loop nothing can kill. That makes this
+//     record load-bearing: it is the only trace of the give-up, and it is at
+//     error level because abandonment bounds one episode rather than
+//     quarantining the issue — with nobody acting on it, new episodes keep
+//     starting at the poll interval.
+//   - It does not comment either, and that is the same decision rather than an
+//     omission. The coordinator holds only domain.Tracker (candidates, refresh,
+//     and the one start edge), and an abandoned dispatch has often failed before
+//     any session existed (workspace_prepare, before_run, prompt_render), so
+//     there is no HandoffSession whose LandComment shape could be reused —
+//     only a new host tracker-write path, for a record that would repeat on
+//     every episode.
+//   - It does not apply to a landing wait. finishLandingWait keeps its own
+//     unbounded redispatch on purpose (see landingRetryDelay): a wait is not an
+//     agent failure, does not escalate the attempt, and never reaches here.
+func (c *Coordinator) abandonDispatch(i domain.Issue, maxAttempts int, attrs []any) {
+	attrs = append(attrs, "operation", observability.OperationDispatchAbandoned, "max_attempts", maxAttempts)
+	c.log.Error("dispatch abandoned after max attempts", attrs...)
+	c.release(i.ID)
 }
 
 // finishLandingWait ends a run whose landing capability reported a

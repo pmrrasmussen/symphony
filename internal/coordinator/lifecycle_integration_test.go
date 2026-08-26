@@ -302,7 +302,7 @@ func lifecycleSettings(root, afterRun string) config.Settings {
 		Polling:   config.Polling{Interval: time.Hour},
 		Workspace: config.Workspace{Root: root},
 		Hooks:     config.Hooks{AfterRun: afterRun, Timeout: time.Second},
-		Agent:     config.Agent{MaxConcurrent: 1, MaxTurns: 1, MaxRetryBackoff: time.Second},
+		Agent:     config.Agent{MaxConcurrent: 1, MaxTurns: 1, MaxAttempts: 5, MaxRetryBackoff: time.Second},
 		Codex:     config.Codex{Command: "test", TurnTimeout: time.Second, ReadTimeout: time.Second},
 		Prompt:    "Work on {{.issue.identifier}}",
 	}
