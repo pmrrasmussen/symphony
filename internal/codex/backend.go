@@ -20,6 +20,7 @@ import (
 	"github.com/pmrrasmussen/symphony/internal/config"
 	"github.com/pmrrasmussen/symphony/internal/domain"
 	githubhost "github.com/pmrrasmussen/symphony/internal/github"
+	"github.com/pmrrasmussen/symphony/internal/hostenv"
 	"github.com/pmrrasmussen/symphony/internal/linear"
 	"github.com/pmrrasmussen/symphony/internal/observability"
 )
@@ -63,9 +64,11 @@ type Backend struct {
 // here.
 const finalizeBudget = 5 * time.Second
 
+// New builds a Codex backend. secretNames are extra environment variable names
+// this child may not inherit, on top of everything hostenv.Filter blocks for
+// every child Symphony spawns.
 func New(secretNames ...string) *Backend {
-	names := append(config.ReservedSecretEnvNames(), secretNames...)
-	return &Backend{sessions: map[string]*client{}, secretNames: uniquePaths(names)}
+	return &Backend{sessions: map[string]*client{}, secretNames: uniquePaths(secretNames)}
 }
 
 // NewWithProviders binds already-built host providers to this backend instead
@@ -131,20 +134,17 @@ func (b *Backend) Start(ctx context.Context, r domain.AgentRequest) (domain.Agen
 		githubSession = b.github.PrepareWithSettings(settings.GitHub, r.Issue, r.Workspace, handoff)
 	}
 	r.TurnSandboxPolicy = localCommitSandbox(r)
-	// uniquePaths is applied to the combined slice, not just the constructor's
-	// half: it trims and drops empties, which is what internal/claude's
-	// filteredEnv does to the same settings-derived names. Without it a
-	// hand-assembled Settings could carry " NAME " here and have it blocked on
-	// one backend and inherited on the other.
-	secretNames := uniquePaths(append(append([]string(nil), b.secretNames...), settings.HostSecretEnvNames...))
 	// The registry is per session and holds these same provider session
 	// pointers, because every per-run idempotency latch lives in them. The
 	// secret matcher is derived from the same bindings, so the providers this
 	// session can reach and the credentials it strips cannot disagree.
 	bindings := capability.Bindings{Settings: settings, Issue: r.Issue, Handoff: handoff, GitHub: githubSession}
-	secretMatcher := withSecretValues(capability.SecretMatcher(bindings, b.github), settings.HostSecretValues)
 	capabilities := capability.Build(bindings)
-	c, err := start(ctx, r, secretNames, secretMatcher, capabilities)
+	// The child environment is filtered by hostenv, which every child Symphony
+	// spawns shares: this backend adds no name of its own beyond the ones its
+	// constructor was given, and nothing at all after filtering.
+	environment := hostenv.Filter(os.Environ(), b.secretNames, settings, capability.SecretMatcher(bindings, b.github))
+	c, err := start(ctx, r, environment, capabilities)
 	if err != nil {
 		return domain.AgentSession{}, nil, err
 	}
@@ -268,14 +268,20 @@ type rpc struct {
 	} `json:"error"`
 }
 
-func start(ctx context.Context, r domain.AgentRequest, secrets []string, secretMatcher func(string) bool, capabilities *capability.Registry) (*client, error) {
+// start spawns the app-server with an already-filtered environment. It takes
+// the entries rather than the inputs to hostenv.Filter because the filter's
+// inputs are the session's -- the settings snapshot Start froze and the matcher
+// built from its bindings -- and because a nil slice here would hand the child
+// the daemon's complete environment, which is exactly what the filter exists to
+// prevent.
+func start(ctx context.Context, r domain.AgentRequest, environment []string, capabilities *capability.Registry) (*client, error) {
 	command := strings.TrimSpace(r.Command)
 	if command == "" {
 		command = "codex app-server"
 	}
 	cmd := exec.CommandContext(ctx, "bash", "-lc", command)
 	cmd.Dir = r.Workspace
-	cmd.Env = filteredEnv(secrets, secretMatcher)
+	cmd.Env = environment
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	in, err := cmd.StdinPipe()
 	if err != nil {
@@ -391,59 +397,6 @@ func uniquePaths(paths []string) []string {
 		}
 	}
 	return out
-}
-
-// filteredEnv applies the host credential filter to this child's environment:
-// the reserved and configured names in names, and the configured and
-// provider-held values in secretMatcher. config.ReservedSecretEnvNames
-// documents all four filters and why each is needed; internal/claude applies
-// the same four and adds nothing but the capability endpoint token.
-func filteredEnv(names []string, secretMatcher func(string) bool) []string {
-	return filterEntries(os.Environ(), names, secretMatcher)
-}
-
-// filterEntries is filteredEnv over an explicit entry list, which is the only
-// way a test can present an entry os.Environ() cannot be made to hold.
-//
-// An entry carrying no "=" is dropped rather than forwarded, and only the value
-// is ever offered to the matcher. Both are what internal/claude does with the
-// same entry: a malformed entry conveys nothing to a child, and running a whole
-// entry through the matcher would let a variable's own *name* trip a credential
-// match and silently strip an unrelated variable.
-func filterEntries(entries, names []string, secretMatcher func(string) bool) []string {
-	blocked := map[string]bool{}
-	for _, n := range names {
-		blocked[n] = true
-	}
-	out := []string{}
-	for _, entry := range entries {
-		name, value, found := strings.Cut(entry, "=")
-		if !found || blocked[name] {
-			continue
-		}
-		if secretMatcher != nil && secretMatcher(value) {
-			continue
-		}
-		out = append(out, entry)
-	}
-	return out
-}
-
-func withSecretValues(matcher func(string) bool, values []string) func(string) bool {
-	if len(values) == 0 {
-		return matcher
-	}
-	return func(candidate string) bool {
-		if matcher != nil && matcher(candidate) {
-			return true
-		}
-		for _, value := range values {
-			if value != "" && strings.Contains(candidate, value) {
-				return true
-			}
-		}
-		return false
-	}
 }
 
 // call applies the steady-state read timeout to a single JSON-RPC round trip.

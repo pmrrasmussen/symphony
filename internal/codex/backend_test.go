@@ -23,6 +23,7 @@ import (
 	"github.com/pmrrasmussen/symphony/internal/config"
 	"github.com/pmrrasmussen/symphony/internal/domain"
 	githubhost "github.com/pmrrasmussen/symphony/internal/github"
+	"github.com/pmrrasmussen/symphony/internal/hostenv"
 	"github.com/pmrrasmussen/symphony/internal/linear"
 	"github.com/pmrrasmussen/symphony/internal/observability"
 )
@@ -85,7 +86,10 @@ func TestStartDrainsStderrBeforeProcessFinalization(t *testing.T) {
 	script := writeAppServer(t, dir, `
 printf '%s\n' 'token=do-not-log-this' >&2
 `)
-	c, err := start(context.Background(), request(dir, script), nil, nil, nil)
+	// This test is about stderr, not the environment, so it hands the child the
+	// filter's own no-op result rather than nil: a nil Env would inherit the
+	// test process's environment whole, which is never what a real launch does.
+	c, err := start(context.Background(), request(dir, script), hostenv.Filter(os.Environ(), nil, config.Settings{}, nil), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1108,24 +1112,6 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{}}'
 	}
 }
 
-func TestFilteredEnvRemovesConfiguredSecretByNameAndValue(t *testing.T) {
-	t.Setenv("PMR5_TOKEN_BY_NAME", "visible-if-broken")
-	t.Setenv("PMR5_TOKEN_BY_VALUE", "linear-secret")
-	t.Setenv("PMR5_TOKEN_WITH_PREFIX", "Bearer linear-secret")
-	t.Setenv("PMR5_TOKEN_WITH_SUFFIX", "linear-secret:suffix")
-	t.Setenv("SYMPHONY_LINEAR_API_KEY_FILE", "/private/linear-key")
-	t.Setenv("SYMPHONY_GITHUB_TOKEN_FILE", "/private/github-key")
-	blockedNames := []string{"PMR5_TOKEN_BY_NAME", "SYMPHONY_LINEAR_API_KEY_FILE", "SYMPHONY_GITHUB_TOKEN_FILE"}
-	for _, value := range filteredEnv(blockedNames, func(candidate string) bool { return strings.Contains(candidate, "linear-secret") }) {
-		if strings.HasPrefix(value, "PMR5_TOKEN_BY_NAME=") || strings.HasPrefix(value, "PMR5_TOKEN_BY_VALUE=") || strings.HasPrefix(value, "SYMPHONY_LINEAR_API_KEY_FILE=") || strings.HasPrefix(value, "SYMPHONY_GITHUB_TOKEN_FILE=") {
-			t.Fatalf("child environment retained a configured credential variable: %q", value)
-		}
-		if strings.HasPrefix(value, "PMR5_TOKEN_WITH_PREFIX=") || strings.HasPrefix(value, "PMR5_TOKEN_WITH_SUFFIX=") {
-			t.Fatalf("child environment retained embedded Linear secret: %q", value)
-		}
-	}
-}
-
 type nopWriteCloser struct{ io.Writer }
 
 func (nopWriteCloser) Close() error { return nil }
@@ -1215,7 +1201,7 @@ func redactedDiagnostic(event domain.Event) bool {
 // TestFileFormCredentialPathIsRemovedByName pins the name-based half of the
 // environment blocklist. For the api_key_file form the canonical WORKFLOW.md
 // actually uses, the variable holds a *path* rather than the secret, so
-// withSecretValues never matches it and settings.HostSecretEnvNames is the only
+// no value filter ever matches it and settings.HostSecretEnvNames is the only
 // control keeping it out of the child. That control is load-bearing now that
 // the turn policy grants network access: reads outside the workspace are not
 // sandboxed, so a worker that learned this path could read the credential and
@@ -1465,9 +1451,10 @@ func TestNoHostCredentialReachesTheChildEnvironment(t *testing.T) {
 		},
 		GitHub: config.GitHub{Enabled: true, Owner: "owner", Repository: "repo", BaseBranch: "main",
 			Token: "provider-forge-token", Endpoint: tracker.URL, MergeState: "Merging", MergeMethod: "merge"},
-		// The padded name is the parity case: internal/claude's filteredEnv trims
-		// and skips empties, and this backend must not be looser about the same
-		// hand-assembled Settings that filter 4 exists for.
+		// The padded and blank names are hostenv.Filter's, and are here because
+		// this test launches the real backend: a Settings that never went
+		// through config.Load can carry either, and the launcher must reach the
+		// filter that handles them.
 		HostSecretEnvNames: []string{"PMR94_CONFIGURED_NAME", "  PMR94_PADDED_NAME  ", "   "},
 		HostSecretValues:   []string{"configured-secret-value"},
 	}
@@ -1606,38 +1593,39 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{}}'
 	}
 }
 
-// TestAMalformedEntryIsDroppedAndOnlyValuesReachTheMatcher pins the two smaller
-// halves of backend parity with internal/claude, which has the same test over
-// its own filterEntries. Neither case is reachable through os.Environ(), which
-// is why the loop takes an explicit entry list.
-//
-// The name half matters beyond tidiness: a matcher fed a whole entry would strip
-// any variable whose *name* happened to contain a credential-shaped string,
-// silently removing something the child needs.
-func TestAMalformedEntryIsDroppedAndOnlyValuesReachTheMatcher(t *testing.T) {
-	var offered []string
-	kept := filterEntries(
-		[]string{"MALFORMED_NO_EQUALS", "PMR94_KEEP=ordinary", "PMR94_SECRET=carries-the-token"},
-		nil,
-		func(candidate string) bool {
-			offered = append(offered, candidate)
-			return strings.Contains(candidate, "the-token")
-		},
-	)
-	if slices.Contains(kept, "MALFORMED_NO_EQUALS") {
-		t.Fatalf("an entry carrying no \"=\" was forwarded to the child: %v", kept)
-	}
-	if slices.Contains(kept, "PMR94_SECRET=carries-the-token") {
-		t.Fatalf("a matched value survived: %v", kept)
-	}
-	if !slices.Contains(kept, "PMR94_KEEP=ordinary") {
-		t.Fatalf("an ordinary variable was dropped: %v", kept)
-	}
-	// Only values, never names or whole entries: "MALFORMED_NO_EQUALS" must not
-	// appear, and neither must "PMR94_SECRET=carries-the-token".
-	for _, candidate := range offered {
-		if strings.Contains(candidate, "PMR94_") || candidate == "MALFORMED_NO_EQUALS" {
-			t.Fatalf("the matcher was offered a name or a whole entry: %q", candidate)
+// TestTheConstructorsExtraSecretNamesAreBlocked is this backend's whole share of
+// the environment filter now that hostenv.Filter owns the loop: the names New
+// was given are the only input Start contributes that no other caller does, and
+// nothing is added after filtering. Everything the filter itself does is proven
+// once, in internal/hostenv.
+func TestTheConstructorsExtraSecretNamesAreBlocked(t *testing.T) {
+	t.Setenv("PMR99_CONSTRUCTOR_NAME", "constructor-secret")
+	t.Setenv("PMR99_KEPT", "ordinary-value")
+	dir := t.TempDir()
+	environment := filepath.Join(dir, "environment")
+	script := writeAppServer(t, dir, `
+env > `+environment+`
+IFS= read -r line
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'
+IFS= read -r line
+IFS= read -r line
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thread-1"}}}'
+IFS= read -r line
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn-1"}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{}}'
+`)
+	b := New("PMR99_CONSTRUCTOR_NAME")
+	if _, events, err := b.Start(context.Background(), request(dir, script)); err != nil {
+		t.Fatal(err)
+	} else {
+		for range events {
 		}
+	}
+	child := readChildEnvironment(t, environment)
+	if strings.Contains(child, "constructor-secret") {
+		t.Fatal("a name this backend's constructor was given reached the child")
+	}
+	if !strings.Contains(child, "ordinary-value") {
+		t.Fatal("the host credential filter removed unrelated variables")
 	}
 }
