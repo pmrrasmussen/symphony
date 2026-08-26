@@ -671,20 +671,21 @@ func normalizeIssue(record linearIssue, assignee string) (domain.Issue, error) {
 	}
 	blockersComplete := record.InverseRelations.PageInfo != nil && !record.InverseRelations.PageInfo.HasNextPage
 	return domain.Issue{
-		ID:           id,
-		Identifier:   identifier,
-		Title:        title,
-		Description:  record.Description,
-		Priority:     optionalInt(record.Priority),
-		State:        state,
-		BranchName:   nullableString(record.BranchName),
-		URL:          nullableString(record.URL),
-		AssigneeID:   assigneeID,
-		Labels:       labels,
-		BlockedBy:    blockers,
-		Dispatchable: dispatchable(state, assigneeID, assignee, blockers, blockersComplete),
-		CreatedAt:    optionalTime(record.CreatedAt),
-		UpdatedAt:    optionalTime(record.UpdatedAt),
+		ID:               id,
+		Identifier:       identifier,
+		Title:            title,
+		Description:      record.Description,
+		Priority:         optionalInt(record.Priority),
+		State:            state,
+		BranchName:       nullableString(record.BranchName),
+		URL:              nullableString(record.URL),
+		AssigneeID:       assigneeID,
+		Labels:           labels,
+		BlockedBy:        blockers,
+		Dispatchable:     dispatchable(state, assigneeID, assignee, blockers, blockersComplete),
+		AssigneeMismatch: assignee != "" && assigneeID != assignee,
+		CreatedAt:        optionalTime(record.CreatedAt),
+		UpdatedAt:        optionalTime(record.UpdatedAt),
 	}, nil
 }
 

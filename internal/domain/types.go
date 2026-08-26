@@ -27,7 +27,14 @@ type Issue struct {
 	Labels                                                                 []string
 	BlockedBy                                                              []Blocker
 	Dispatchable                                                           bool
-	CreatedAt, UpdatedAt                                                   *time.Time
+	// AssigneeMismatch reports whether the tracker's resolved assignee policy
+	// (config.Tracker.Provider["assignee"], with a "me" value already resolved
+	// to the acting viewer's ID) does not match AssigneeID. It lets a caller
+	// identify an assignee-policy rejection specifically without re-reading the
+	// unresolved config value itself, which cannot distinguish "me" from a
+	// genuine mismatch without the same network resolution Dispatchable used.
+	AssigneeMismatch     bool
+	CreatedAt, UpdatedAt *time.Time
 }
 type Usage struct {
 	InputTokens  int64 `json:"input_tokens"`

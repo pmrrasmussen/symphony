@@ -684,6 +684,13 @@ func (c *Coordinator) escalateStuckWaits(now time.Time, s config.Settings) {
 // blockers, so an issue carrying both must not be misreported as
 // blocked_by_relation, which would name a resolvable blocker as the cause of
 // something an operator resolving it would never fix.
+//
+// The check reads i.AssigneeMismatch rather than re-reading
+// config.Tracker.Provider["assignee"] itself, because that config value can be
+// "me" -- a policy dispatchable() only compares after resolving it to the
+// acting viewer's ID over the network. Re-deriving the comparison here from
+// the unresolved string would assert a mismatch whenever the policy is "me",
+// regardless of the issue's actual assignee.
 func ineligibleReason(i domain.Issue, s config.Settings) string {
 	switch {
 	case i.ID == "" || i.Identifier == "" || i.Title == "":
@@ -692,7 +699,7 @@ func ineligibleReason(i domain.Issue, s config.Settings) string {
 		return "not_active"
 	case issueTerminal(i, s):
 		return "terminal"
-	case !i.Dispatchable && assigneeMismatch(i, s):
+	case !i.Dispatchable && i.AssigneeMismatch:
 		return "not_routable"
 	case !i.Dispatchable && len(openBlockers(i)) > 0:
 		return "blocked_by_relation"
@@ -701,17 +708,6 @@ func ineligibleReason(i domain.Issue, s config.Settings) string {
 	default:
 		return ""
 	}
-}
-
-// assigneeMismatch reports whether the issue's own assignee is the reason
-// dispatchable() (internal/linear/tracker.go) refused it, using the same
-// tracker.provider.assignee policy value dispatchable() itself reads. An
-// unconfigured policy never mismatches, matching dispatchable()'s own
-// unconditional pass in that case.
-func assigneeMismatch(i domain.Issue, s config.Settings) bool {
-	configured, _ := s.Tracker.Provider["assignee"].(string)
-	configured = strings.TrimSpace(configured)
-	return configured != "" && i.AssigneeID != configured
 }
 
 // openBlockers is the subset of the issue's blockers that are not yet

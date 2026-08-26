@@ -162,12 +162,29 @@ func TestIneligibleReasonCategorizesEachRejection(t *testing.T) {
 			name: "assignee mismatch outranks an open blocker",
 			issue: domain.Issue{
 				ID: "a", Identifier: "X-1", Title: "t", State: "Todo", Dispatchable: false, AssigneeID: "someone-else",
-				BlockedBy: []domain.Blocker{{ID: "b", Identifier: "X-0", State: "In Progress", Dispatchable: false}},
+				AssigneeMismatch: true,
+				BlockedBy:        []domain.Blocker{{ID: "b", Identifier: "X-0", State: "In Progress", Dispatchable: false}},
 			},
 			s: config.Settings{
 				Tracker: config.Tracker{ActiveStates: []string{"Todo"}, Provider: map[string]any{"assignee": "required-assignee"}},
 			},
 			reason: "not_routable",
+		},
+		// AssigneeMismatch is populated by the tracker from its own resolved
+		// policy value (internal/linear/tracker.go), never re-derived here from
+		// the raw, possibly-"me" config string, so a false AssigneeMismatch
+		// correctly falls through to the real cause instead of masking it.
+		{
+			name: "open blocker reported when assignee actually matches a resolved me policy",
+			issue: domain.Issue{
+				ID: "a", Identifier: "X-1", Title: "t", State: "Todo", Dispatchable: false, AssigneeID: "viewer-id",
+				AssigneeMismatch: false,
+				BlockedBy:        []domain.Blocker{{ID: "b", Identifier: "X-0", State: "In Progress", Dispatchable: false}},
+			},
+			s: config.Settings{
+				Tracker: config.Tracker{ActiveStates: []string{"Todo"}, Provider: map[string]any{"assignee": "me"}},
+			},
+			reason: "blocked_by_relation",
 		},
 	}
 	for _, test := range tests {
