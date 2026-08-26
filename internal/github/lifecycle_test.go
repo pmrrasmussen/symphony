@@ -469,6 +469,64 @@ func TestRefreshBaseRefFailureIsARefusalNotAFatalError(t *testing.T) {
 	}
 }
 
+// overlapTrackingGit records the highest number of concurrent "fetch"
+// invocations it ever observed, holding each one open briefly so two
+// goroutines calling it at once are actually likely to overlap absent
+// serialization.
+type overlapTrackingGit struct {
+	mu        sync.Mutex
+	active    int
+	maxActive int
+}
+
+func (g *overlapTrackingGit) Run(_ context.Context, _ string, args, _ []string) (string, error) {
+	if args[0] != "fetch" {
+		return "base", nil
+	}
+	g.mu.Lock()
+	g.active++
+	if g.active > g.maxActive {
+		g.maxActive = g.active
+	}
+	g.mu.Unlock()
+	time.Sleep(20 * time.Millisecond)
+	g.mu.Lock()
+	g.active--
+	g.mu.Unlock()
+	return "", nil
+}
+
+// TestRefreshBaseRefSerializesConcurrentFetches asserts two sessions sharing
+// one Manager never fetch the shared refs/remotes/origin/<base> at the same
+// time: at raised agent.max_concurrent_agents, unserialized concurrent
+// fetches would race the same repository-wide ref and its packed-refs
+// (PMR-141).
+func TestRefreshBaseRefSerializesConcurrentFetches(t *testing.T) {
+	git := &overlapTrackingGit{}
+	settings := config.GitHub{Enabled: true, Owner: "owner", Repository: "repo", BaseBranch: "main", Token: "private-token"}
+	m := New(func() config.Settings { return config.Settings{GitHub: settings} }, slog.Default())
+	m.git = git
+	s1 := &Session{manager: m, settings: settings, issue: domain.Issue{ID: "issue-27", Identifier: "PMR-27"}, workspace: t.TempDir(), branch: "symphony/pmr-27"}
+	s2 := &Session{manager: m, settings: settings, issue: domain.Issue{ID: "issue-28", Identifier: "PMR-28"}, workspace: t.TempDir(), branch: "symphony/pmr-28"}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	for _, s := range []*Session{s1, s2} {
+		s := s
+		go func() {
+			defer wg.Done()
+			if _, err := s.RefreshBaseRef(context.Background()); err != nil {
+				t.Errorf("RefreshBaseRef returned %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if git.maxActive != 1 {
+		t.Fatalf("max concurrent fetches = %d, want 1 (unserialized)", git.maxActive)
+	}
+}
+
 // testLandingSession builds a Session configured for github_land_pr: the
 // fixture's pull request head SHA is set to "head" so it matches fakeGit's
 // default HEAD, meaning no push is exercised unless a test overrides it.
