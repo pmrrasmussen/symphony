@@ -574,6 +574,7 @@ type fakeTracker struct {
 	getErr        error
 	transitions   []trackerTransition
 	transitionErr error
+	getIssuesErr  error
 }
 
 // trackerTransition records one host-side dispatch transition request so tests
@@ -589,6 +590,9 @@ func (f *fakeTracker) GetIssues(context.Context, []string) ([]domain.Issue, erro
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.gets++
+	if f.getIssuesErr != nil {
+		return nil, f.getIssuesErr
+	}
 	if f.getErr != nil {
 		return nil, f.getErr
 	}
@@ -1946,6 +1950,51 @@ func TestReconciliationCancellationDoesNotRetry(t *testing.T) {
 	if starts != 1 || cancels != 1 {
 		t.Fatalf("starts=%d cancels=%d", starts, cancels)
 	}
+}
+
+// TestReconcileRefreshFailureLogsWarnOnlyWhenNotCancelled pins the PMR-128
+// fix that a run-scoped refresh racing its own context's cancellation is
+// routine, not an operator-facing problem: reconcile still surfaces a live
+// tracker failure at Warn, but a failure discovered after ctx is already done
+// logs at Debug instead.
+func TestReconcileRefreshFailureLogsWarnOnlyWhenNotCancelled(t *testing.T) {
+	w := testSettings(t)
+	issue := testIssue()
+	refreshErr := errors.New("linear tracker_transport: Linear request failed")
+
+	t.Run("live context", func(t *testing.T) {
+		var logs bytes.Buffer
+		tracker := &fakeTracker{issue: issue, getIssuesErr: refreshErr}
+		c := New(tracker, &fakeAgent{}, &fakeWorkspace{}, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&logs, nil)))
+		c.mu.Lock()
+		c.running[issue.ID] = &running{issue: issue}
+		c.mu.Unlock()
+
+		if err := c.reconcile(context.Background()); err == nil {
+			t.Fatal("expected reconcile to surface the refresh failure")
+		}
+		if !strings.Contains(logs.String(), "running issue refresh failed") {
+			t.Fatalf("missing warn log: %s", logs.String())
+		}
+	})
+
+	t.Run("cancelled context", func(t *testing.T) {
+		var logs bytes.Buffer
+		tracker := &fakeTracker{issue: issue, getIssuesErr: refreshErr}
+		c := New(tracker, &fakeAgent{}, &fakeWorkspace{}, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&logs, nil)))
+		c.mu.Lock()
+		c.running[issue.ID] = &running{issue: issue}
+		c.mu.Unlock()
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		if err := c.reconcile(ctx); err == nil {
+			t.Fatal("expected reconcile to surface the refresh failure")
+		}
+		if strings.Contains(logs.String(), "running issue refresh failed") {
+			t.Fatalf("cancelled refresh produced a log record at the default (Info+) level: %s", logs.String())
+		}
+	})
 }
 
 func TestCompletedEventAfterReconciliationCancellationDoesNotComplete(t *testing.T) {

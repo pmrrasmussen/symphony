@@ -687,6 +687,18 @@ func (c *Coordinator) sweepHandoffObservations(now time.Time, s config.Settings)
 	c.mu.Unlock()
 }
 
+// logIssueRefreshFailure warns on a tracker refresh failure, unless the ctx
+// used for that refresh has already ended. A cancelled ctx there is routine
+// -- the run or retry timer it belonged to raced the in-flight request to
+// completion -- and not a Linear problem worth an operator's attention.
+func (c *Coordinator) logIssueRefreshFailure(ctx context.Context, msg string, args ...any) {
+	if ctx.Err() != nil {
+		c.log.Debug(msg, args...)
+		return
+	}
+	c.log.Warn(msg, args...)
+}
+
 func (c *Coordinator) reconcile(ctx context.Context) error {
 	type runRef struct {
 		r     *running
@@ -707,7 +719,7 @@ func (c *Coordinator) reconcile(ctx context.Context) error {
 	}
 	issues, err := c.tracker.GetIssues(ctx, ids)
 	if err != nil {
-		c.log.Warn("running issue refresh failed", "error", err)
+		c.logIssueRefreshFailure(ctx, "running issue refresh failed", "error", err)
 		return err
 	}
 	byID := map[string]domain.Issue{}
@@ -1704,7 +1716,7 @@ func (c *Coordinator) runRetry(id string, generation uint64) {
 	s := c.settings()
 	fresh, err := c.tracker.GetIssues(ctx, []string{id})
 	if err != nil {
-		c.log.Warn("retry issue refresh failed", "issue_id", id, "reason", retry.reason, "error", err)
+		c.logIssueRefreshFailure(ctx, "retry issue refresh failed", "issue_id", id, "reason", retry.reason, "error", err)
 		if retry.kind == retryLanding {
 			// A stale tracker read is no more an agent failure than the wait
 			// itself: keep the attempt (it feeds the rendered prompt) and the
