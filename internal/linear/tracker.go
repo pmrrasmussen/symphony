@@ -204,7 +204,7 @@ func (t *Tracker) GetIssues(ctx context.Context, ids []string) ([]domain.Issue, 
 		if err != nil {
 			return nil, err // Do not return a partial refresh.
 		}
-		issues, err := normalizeIssues(page.Nodes, assignee, s.Tracker.TerminalStates, true)
+		issues, err := normalizeIssues(page.Nodes, assignee, true)
 		if err != nil {
 			return nil, err // Do not hide malformed requested records.
 		}
@@ -352,7 +352,7 @@ func (t *Tracker) listByStates(ctx context.Context, states []string) ([]domain.I
 			}
 			return nil, err // Atomic: never expose a partial poll.
 		}
-		issues, err := normalizeIssues(page.Nodes, assignee, s.Tracker.TerminalStates, false)
+		issues, err := normalizeIssues(page.Nodes, assignee, false)
 		if err != nil {
 			return nil, err
 		}
@@ -606,6 +606,7 @@ type linearIssue struct {
 				Identifier string `json:"identifier"`
 				State      struct {
 					Name string `json:"name"`
+					Type string `json:"type"`
 				} `json:"state"`
 			} `json:"issue"`
 		} `json:"nodes"`
@@ -617,10 +618,10 @@ type linearIssue struct {
 	UpdatedAt json.RawMessage `json:"updatedAt"`
 }
 
-func normalizeIssues(records []linearIssue, assignee string, terminalStates []string, strict bool) ([]domain.Issue, error) {
+func normalizeIssues(records []linearIssue, assignee string, strict bool) ([]domain.Issue, error) {
 	out := make([]domain.Issue, 0, len(records))
 	for _, record := range records {
-		issue, err := normalizeIssue(record, assignee, terminalStates)
+		issue, err := normalizeIssue(record, assignee)
 		if err != nil {
 			if strict {
 				return nil, trackerError("tracker_response", "Linear returned a malformed requested issue")
@@ -633,7 +634,7 @@ func normalizeIssues(records []linearIssue, assignee string, terminalStates []st
 	return out, nil
 }
 
-func normalizeIssue(record linearIssue, assignee string, terminalStates []string) (domain.Issue, error) {
+func normalizeIssue(record linearIssue, assignee string) (domain.Issue, error) {
 	id, identifier, title, state := strings.TrimSpace(record.ID), strings.TrimSpace(record.Identifier), strings.TrimSpace(record.Title), strings.TrimSpace(record.State.Name)
 	if id == "" || identifier == "" || title == "" || state == "" {
 		return domain.Issue{}, errors.New("missing required field")
@@ -654,10 +655,13 @@ func normalizeIssue(record linearIssue, assignee string, terminalStates []string
 		if config.Norm(relation.Type) != "blocks" {
 			continue
 		}
+		stateType := nullableString(relation.Issue.State.Type)
 		blockers = append(blockers, domain.Blocker{
-			ID:         nullableString(relation.Issue.ID),
-			Identifier: nullableString(relation.Issue.Identifier),
-			State:      nullableString(relation.Issue.State.Name),
+			ID:           nullableString(relation.Issue.ID),
+			Identifier:   nullableString(relation.Issue.Identifier),
+			State:        nullableString(relation.Issue.State.Name),
+			StateType:    stateType,
+			Dispatchable: resolvedBlockerStateTypes[config.Norm(stateType)],
 		})
 	}
 
@@ -678,13 +682,27 @@ func normalizeIssue(record linearIssue, assignee string, terminalStates []string
 		AssigneeID:   assigneeID,
 		Labels:       labels,
 		BlockedBy:    blockers,
-		Dispatchable: dispatchable(state, assigneeID, assignee, blockers, blockersComplete, terminalStates),
+		Dispatchable: dispatchable(state, assigneeID, assignee, blockers, blockersComplete),
 		CreatedAt:    optionalTime(record.CreatedAt),
 		UpdatedAt:    optionalTime(record.UpdatedAt),
 	}, nil
 }
 
-func dispatchable(state, actualAssignee, configuredAssignee string, blockers []domain.Blocker, blockersComplete bool, terminalStates []string) bool {
+// resolvedBlockerStateTypes are the Linear workflow-state types a blocker can
+// never leave, so an issue parked in one of them is as settled as one in a
+// configured terminal state. Deciding by this classification rather than by
+// matching State's display name against tracker.terminal_states means a
+// resolved status the workflow config does not happen to name -- Duplicate
+// today, whatever a team adds next -- still satisfies the blocker instead of
+// freezing the blocked issue silently forever.
+var resolvedBlockerStateTypes = map[string]bool{
+	"completed": true,
+	"canceled":  true,
+	"cancelled": true,
+	"duplicate": true,
+}
+
+func dispatchable(state, actualAssignee, configuredAssignee string, blockers []domain.Blocker, blockersComplete bool) bool {
 	if configuredAssignee != "" && actualAssignee != configuredAssignee {
 		return false
 	}
@@ -698,12 +716,8 @@ func dispatchable(state, actualAssignee, configuredAssignee string, blockers []d
 	if !blockersComplete {
 		return false
 	}
-	terminal := map[string]bool{}
-	for _, name := range terminalStates {
-		terminal[config.Norm(name)] = true
-	}
 	for _, blocker := range blockers {
-		if blocker.State == "" || !terminal[config.Norm(blocker.State)] {
+		if !blocker.Dispatchable {
 			return false
 		}
 	}
@@ -776,7 +790,7 @@ func isLocalHTTPHost(host string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
-const issueFields = `id identifier title description priority state { name } branchName url assignee { id } labels { nodes { name } } inverseRelations(first: $relationFirst) { nodes { type issue { id identifier state { name } } } pageInfo { hasNextPage } } createdAt updatedAt`
+const issueFields = `id identifier title description priority state { name } branchName url assignee { id } labels { nodes { name } } inverseRelations(first: $relationFirst) { nodes { type issue { id identifier state { name type } } } pageInfo { hasNextPage } } createdAt updatedAt`
 
 const queryByStates = `query SymphonyLinearPoll($projectSlug: String!, $stateNames: [String!]!, $first: Int!, $relationFirst: Int!, $after: String) { issues(filter: {project: {slugId: {eq: $projectSlug}}, state: {name: {in: $stateNames}}}, first: $first, after: $after) { nodes { ` + issueFields + ` } pageInfo { hasNextPage endCursor } } }`
 const queryByIDs = `query SymphonyLinearIssuesByID($ids: [ID!]!, $projectSlug: String!, $first: Int!, $relationFirst: Int!) { issues(filter: {id: {in: $ids}, project: {slugId: {eq: $projectSlug}}}, first: $first) { nodes { ` + issueFields + ` } } }`

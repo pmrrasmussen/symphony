@@ -47,13 +47,21 @@ additional provider ID is needed. Required `id`, `identifier`, `title`, and
 malformed records, while refresh reads fail. Labels are lowercase, blank labels
 are dropped, and duplicate labels are removed. Invalid optional timestamps and
 priority values normalize to null. `inverseRelations` with type `blocks` become
-best-effort `blocked_by` records. The bounded relation query includes page info;
-a `Todo` issue is conservatively non-dispatchable if all blocker relations were
-not returned.
+best-effort `blocked_by` records, each carrying Linear's workflow-state `type`
+for the blocker's own state alongside its display name. The bounded relation
+query includes page info; a `Todo` issue is conservatively non-dispatchable if
+all blocker relations were not returned.
 
 An issue is dispatchable only when it matches the optional assignee policy and,
-while in `Todo`, has no blocker outside the workflow's terminal states. A
-non-terminal blocker for an in-progress issue does not make it disappear from
+while in `Todo`, has no open blocker. A blocker is satisfied by its Linear
+workflow-state *type* -- `completed`, `canceled`/`cancelled`, or `duplicate` --
+never by matching its display name against `tracker.terminal_states`. Deciding
+by type means a resolved status the workflow config does not happen to name
+(for example a team's `Duplicate` state, which Linear supplies by default and
+is not itself in `terminal_states`) still satisfies the blocker, instead of
+freezing the blocked issue non-dispatchable forever. `terminal_states` governs
+only the issue's own terminal-state check, not its blockers'. A non-terminal
+blocker for an in-progress issue does not make it disappear from
 reconciliation.
 
 Errors are redacted `linear.Error` values. Categories are

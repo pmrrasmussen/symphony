@@ -481,7 +481,11 @@ func (c *Coordinator) tick(ctx context.Context) error {
 		c.notePostHandoffStateChange(i, s, now)
 		if reason := ineligibleReason(i, s); reason != "" {
 			summary.rejected[reason]++
-			c.log.Debug("poll candidate rejected", "issue_identifier", i.Identifier, "reason", reason)
+			attrs := []any{"issue_identifier", i.Identifier, "reason", reason}
+			if reason == "blocked_by_relation" {
+				attrs = append(attrs, "blocked_by", blockerIdentifiers(openBlockers(i)))
+			}
+			c.log.Debug("poll candidate rejected", attrs...)
 			continue
 		}
 		summary.eligible++
@@ -525,7 +529,10 @@ func (c *Coordinator) logPollSummary(summary pollSummary) {
 }
 
 // ineligibleReason mirrors eligible's own checks so a rejected candidate's
-// debug record explains exactly which one failed.
+// debug record explains exactly which one failed. blocked_by_relation is
+// split out from the generic not_routable so a Todo issue held by an open
+// blocker (PMR-146) is distinguishable, at the poll log, from one rejected
+// for an assignee mismatch or a missing required label.
 func ineligibleReason(i domain.Issue, s config.Settings) string {
 	switch {
 	case i.ID == "" || i.Identifier == "" || i.Title == "":
@@ -534,11 +541,41 @@ func ineligibleReason(i domain.Issue, s config.Settings) string {
 		return "not_active"
 	case issueTerminal(i, s):
 		return "terminal"
+	case !i.Dispatchable && len(openBlockers(i)) > 0:
+		return "blocked_by_relation"
 	case !routable(i, s):
 		return "not_routable"
 	default:
 		return ""
 	}
+}
+
+// openBlockers is the subset of the issue's blockers that are not yet
+// resolved -- the ones actually responsible for a Dispatchable=false Todo
+// issue -- so a poll rejection can name the blocker instead of only refusing
+// the candidate.
+func openBlockers(i domain.Issue) []domain.Blocker {
+	var open []domain.Blocker
+	for _, b := range i.BlockedBy {
+		if !b.Dispatchable {
+			open = append(open, b)
+		}
+	}
+	return open
+}
+
+// blockerIdentifiers renders a safe, content-free log value from a blocker
+// list: tracker issue identifiers only, never titles or descriptions, joined
+// into a plain string so the observability logger's attribute allowlist (which
+// omits unrecognized non-scalar kinds) does not drop it.
+func blockerIdentifiers(blockers []domain.Blocker) string {
+	identifiers := make([]string, 0, len(blockers))
+	for _, b := range blockers {
+		if b.Identifier != "" {
+			identifiers = append(identifiers, b.Identifier)
+		}
+	}
+	return strings.Join(identifiers, ",")
 }
 
 // admissionRejectReason peeks at claim's own admission checks purely to

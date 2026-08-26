@@ -8,7 +8,17 @@ import (
 
 type Blocker struct {
 	ID, Identifier, State string
-	Dispatchable          bool
+	// StateType is Linear's workflow-state type for State (for example
+	// "completed", "canceled", or "duplicate"). Dispatchability is decided by
+	// this classification rather than by State's display name, so a resolved
+	// status a workflow's terminal_states does not happen to name still
+	// satisfies the blocker.
+	StateType string
+	// Dispatchable reports whether this blocker is itself resolved, i.e. no
+	// longer an open dependency of the issue it blocks. It lets a caller
+	// identify which specific blocker is holding an otherwise-eligible issue
+	// non-dispatchable without re-deriving Linear's state-type classification.
+	Dispatchable bool
 }
 type Issue struct {
 	ID, Identifier, Title, Description, State, BranchName, URL, AssigneeID string
