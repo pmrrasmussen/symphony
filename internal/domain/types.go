@@ -63,13 +63,22 @@ const (
 	// its terminal state. It ends the logical run immediately so no later turn
 	// or landing tool call is possible for it (PMR-78).
 	EventLandingResolved EventKind = "landing_resolved"
+	// EventRateLimited reports a definitive backend rate-limit rejection: the
+	// account's quota for the reported window is closed, not a model or
+	// provider failure this issue's work caused. It is terminal for the
+	// logical run -- continuing to retry a turn against a limit already known
+	// to be closed only spends launches the coordinator cannot make progress
+	// with (PMR-131). RateLimitStatus and RetryAfter carry the backend's own
+	// classification and reset time so the scheduler can name the outcome and
+	// schedule the next attempt without parsing Message.
+	EventRateLimited EventKind = "rate_limited"
 )
 
 // Terminal reports whether an event of this kind ends the logical run: no
 // later event follows it on the same stream.
 func (k EventKind) Terminal() bool {
 	switch k {
-	case EventCompleted, EventFailed, EventBlocked, EventLandingWaiting, EventLandingResolved:
+	case EventCompleted, EventFailed, EventBlocked, EventLandingWaiting, EventLandingResolved, EventRateLimited:
 		return true
 	}
 	return false
@@ -102,6 +111,17 @@ type Event struct {
 	ItemID, ItemType, ToolName string
 	Outcome                    string
 	DurationMs                 int64
+	// RateLimitStatus is the backend's own rate-limit classification (for
+	// example Claude's "allowed_warning" or "rejected"), set on an
+	// EventDiagnostic or EventRateLimited record so the scheduler can log and
+	// classify it without parsing formatted Message text. Empty for every
+	// other event.
+	RateLimitStatus string
+	// RetryAfter is the backend-reported delay before a rate-limited run
+	// should be retried, set alongside an EventRateLimited record when the
+	// backend gave a reset time. Zero when it did not; the scheduler falls
+	// back to its own floor in that case (PMR-131).
+	RetryAfter time.Duration
 }
 type RunStatus string
 

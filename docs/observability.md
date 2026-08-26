@@ -94,13 +94,17 @@ before the coordinator gives up on that episode — Symphony logs a single
 template, its own agent, its own turn budget — never the shared environment
 dispatching it.
 
-Five reasons never appear on that abandonment record, because none of them is
+Six reasons never appear on that abandonment record, because none of them is
 evidence the issue itself is unworkable (`systemicFailureReasons` in
 `internal/coordinator/coordinator.go`):
 
 * `agent_event` — a run that ended on `domain.EventFailed` carrying model or
-  provider text the coordinator cannot itself classify, most commonly a Claude
-  quota rejection (PMR-131).
+  provider text the coordinator cannot itself classify.
+* `agent_rate_limited` — a Claude quota rejection (PMR-131; see "Rate limit
+  status" under "The Claude backend" below). Unlike the other five reasons
+  here, its retry is not scheduled from the ordinary backoff ladder either:
+  `finishFailure` takes the delay from the rejection's own reset time, or a
+  floor well above `agent.max_retry_backoff_ms` when the CLI reported none.
 * `issue_refresh` — a tracker error from the post-turn `GetIssues` refresh
   that follows a turn the agent completed successfully (PMR-115; confirmed
   live as a 30s Linear client timeout). This is tracker infrastructure, not
@@ -122,9 +126,10 @@ evidence the issue itself is unworkable (`systemicFailureReasons` in
   emits one of those before it closes its channel, so this is never a
   repository- or issue-specific outcome, only ever a host bug.
 
-Each of these five keeps climbing the ordinary backoff ladder without ever
-arming the ceiling, so a transient, account-wide condition cannot abandon an
-otherwise-healthy issue. Every classified `reason` — armed or exempt alike, on
+Each of these six is exempt from the ceiling, so a transient, account-wide
+condition cannot abandon an otherwise-healthy issue; five of them (every
+reason but `agent_rate_limited`) also keep climbing the ordinary backoff
+ladder while they do. Every classified `reason` — armed or exempt alike, on
 the `"msg":"agent run retry scheduled"` warning that precedes abandonment as
 well as on the abandonment record itself — also carries the underlying
 `error`, redacted and bounded the same way as any other `error`-keyed
@@ -287,6 +292,29 @@ CLI's `--print` stream is not the app-server protocol.
   log; the result's own text does not. When a turn ends without any result
   event, the tail of the child's stderr is reported as a diagnostic, truncated
   to the shared redaction bound.
+* **Rate limit status** (PMR-131/PMR-126) — the CLI's own `rate_limit_event`
+  reports a string `status` (`allowed`, `allowed_warning`, or `rejected`),
+  not the app-server's numeric snapshot, so it is never logged as
+  `"msg":"agent rate limit"` under `EventRateLimit`'s empty-snapshot rule
+  above; that numeric path only ever applies to Codex. `allowed` is the
+  default, healthy state and reaches no event or log record at all.
+  `allowed_warning` reaches a non-terminal diagnostic logged as
+  `"msg":"agent rate limit"` at **warn**, carrying `status` — distinct from
+  `"msg":"agent stderr"`, which stays reserved for child output that
+  genuinely could not be decoded. `rejected` is definitive: the account's
+  quota for the reported window is closed, so the backend ends the turn
+  there rather than waiting for the result event the CLI still sends a
+  moment later, and reports it as its own terminal event logged as
+  `"msg":"agent rate limit rejected"` at **warn**, carrying `status` and
+  `retry_after_ms`. The coordinator names the retry reason
+  `agent_rate_limited` (distinct from the unclassified `agent_event`
+  fallback) in `"msg":"agent run retry scheduled"`, exempts it from
+  `agent.max_attempts` the same way `issue_refresh` and `stream_closed` are
+  (see `systemicFailureReasons` in `internal/coordinator/coordinator.go`),
+  and schedules the next attempt from the CLI's own reset time when it
+  reported one, falling back to ten times `agent.max_retry_backoff_ms`
+  otherwise — never the ordinary escalating ladder, which caps in minutes
+  and is far too short for an account-wide window that can run for hours.
 
 ## Following the log
 

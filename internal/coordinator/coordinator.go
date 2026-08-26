@@ -103,6 +103,16 @@ type blockedError struct{ category string }
 
 func (e blockedError) Error() string { return "agent blocked: " + e.category }
 
+// rateLimitedError reports a definitive Claude quota rejection (PMR-131). It
+// carries the backend's own reset time, when one was reported, so
+// finishFailure can schedule the next attempt from it instead of the
+// ordinary attempt-keyed backoff ladder -- a rejection says nothing about
+// this issue's work, and the account-wide window it names routinely
+// outlasts agent.max_retry_backoff_ms by hours.
+type rateLimitedError struct{ retryAfter time.Duration }
+
+func (e rateLimitedError) Error() string { return "agent rate limited" }
+
 // errStreamClosed means consume's event channel closed without ever
 // delivering a terminal event. Every backend emits EventFailed or
 // EventCompleted before it closes its channel (see claude/backend.go and
@@ -1098,6 +1108,10 @@ func agentFailureReason(err error) string {
 	if errors.As(err, &blocked) {
 		return "agent_blocked"
 	}
+	var limited rateLimitedError
+	if errors.As(err, &limited) {
+		return "agent_rate_limited"
+	}
 	var exhausted turnLimitError
 	if errors.As(err, &exhausted) {
 		return "turn_limit_exhausted"
@@ -1217,6 +1231,8 @@ func (c *Coordinator) consume(ctx context.Context, r *running, events <-chan dom
 			switch e.Kind {
 			case domain.EventBlocked:
 				return false, blockedError{category: blockerCategory(e.Message)}
+			case domain.EventRateLimited:
+				return false, rateLimitedError{retryAfter: e.RetryAfter}
 			case domain.EventFailed:
 				return false, fmt.Errorf("agent failed: %s", e.Message)
 			case domain.EventLandingWaiting:
@@ -1301,8 +1317,20 @@ func (c *Coordinator) logEvent(r *running, event domain.Event) {
 		attrs = append(attrs, "rate_limit", rateLimit)
 		c.log.Info("agent rate limit", attrs...)
 	case domain.EventDiagnostic:
+		if event.RateLimitStatus != "" {
+			// A non-allowed, non-terminal rate-limit status (today, Claude's
+			// "allowed_warning") is a decoded protocol event, not undecodable
+			// child output, so it gets its own name and status attribute
+			// rather than "agent stderr" (PMR-126).
+			attrs = append(attrs, "status", event.RateLimitStatus)
+			c.log.Warn("agent rate limit", attrs...)
+			return
+		}
 		attrs = append(attrs, "stderr", observability.Text(event.Message))
 		c.log.Warn("agent stderr", attrs...)
+	case domain.EventRateLimited:
+		attrs = append(attrs, "status", event.RateLimitStatus, "retry_after_ms", event.RetryAfter.Milliseconds())
+		c.log.Warn("agent rate limit rejected", attrs...)
 	case domain.EventLandingWaiting:
 		// The reason is the github package's own fixed waiting string, so it is
 		// safe to log; it is still redacted defensively like every other text.
@@ -1589,7 +1617,34 @@ func (c *Coordinator) finishFailure(ctx context.Context, i domain.Issue, attempt
 		return
 	}
 	c.log.Warn("agent run retry scheduled", attrs...)
-	c.scheduleRetry(ctx, i, domain.Workspace{}, next, retryAgent, reason, backoff(next, s.Agent.MaxRetryBackoff))
+	delay := backoff(next, s.Agent.MaxRetryBackoff)
+	var limited rateLimitedError
+	if errors.As(err, &limited) {
+		// A backend-reported reset time always wins over the ordinary
+		// attempt-keyed ladder: retrying against a limit already known to be
+		// closed is wasted regardless of how many attempts have accumulated,
+		// and the ladder's own cap (max_retry_backoff_ms) is far too short
+		// for a multi-hour quota window (PMR-131).
+		delay = rateLimitRetryDelay(limited.retryAfter, s.Agent.MaxRetryBackoff)
+	}
+	c.scheduleRetry(ctx, i, domain.Workspace{}, next, retryAgent, reason, delay)
+}
+
+// rateLimitRetryDelay bounds the wait before a retryAgent episode ended by a
+// Claude quota rejection is retried. It defers entirely to the backend's own
+// reset time when one was reported: a five-hour window's remainder is
+// routinely far longer than agent.max_retry_backoff_ms, and honoring the
+// ordinary ladder instead is the bug this exists to fix (PMR-131: 203
+// launches rejected across six issues at a five-minute cadence, against a
+// limit with hours left to run). When Claude reports no reset at all, the
+// floor is ten times the ordinary ceiling -- still bounded, but far enough
+// above max_retry_backoff_ms that this path can never collapse back onto the
+// ladder it exists to replace.
+func rateLimitRetryDelay(retryAfter, maxRetryBackoff time.Duration) time.Duration {
+	if retryAfter > 0 {
+		return retryAfter
+	}
+	return 10 * maxRetryBackoff
 }
 
 // systemicFailureReasons are the reasons -- from agentFailureReason or raised
@@ -1597,13 +1652,18 @@ func (c *Coordinator) finishFailure(ctx context.Context, i domain.Issue, attempt
 // host, or a shared backend, crosses -- never evidence that this issue's
 // work is unworkable -- so none of them arms attemptsExhausted's ceiling:
 //
-//   - "agent_event": the ceiling's original exemption (PMR-111/PMR-131). It
-//     is agentFailureReason's fallback for domain.EventFailed carrying
-//     model or provider text the coordinator cannot itself name -- most
-//     commonly, today, a Claude quota rejection that ends a run in under a
-//     second. Observed: 203 such rejections across six healthy issues in
-//     one 2.5-hour window, an account-wide condition that would have
-//     abandoned every one of them.
+//   - "agent_event": the ceiling's original exemption (PMR-111). It is
+//     agentFailureReason's fallback for domain.EventFailed carrying model
+//     or provider text the coordinator cannot itself name.
+//   - "agent_rate_limited": a Claude quota rejection (PMR-131), named by its
+//     own reason rather than falling through to "agent_event" as it did
+//     before this reason existed. Observed live: 203 such rejections across
+//     six healthy issues in one 2.5-hour window, an account-wide condition
+//     that would have abandoned every one of them under the ceiling -- and
+//     finishFailure schedules its retry from the backend's own reset time
+//     rather than the ordinary ladder (see rateLimitRetryDelay), so the
+//     exemption here is what stops the ceiling from cutting that wait short
+//     with an abandonment instead.
 //   - "issue_refresh": a tracker error from runTurns' post-turn GetIssues
 //     refresh (PMR-115, confirmed live: a 30s Linear client timeout
 //     following a turn the agent completed successfully). That is Linear
@@ -1641,18 +1701,19 @@ func (c *Coordinator) finishFailure(ctx context.Context, i domain.Issue, attempt
 // "agent_blocked" are left to arm the ceiling -- each is evidence about
 // *this* issue's run (it exhausted its turns; its own agent reported a
 // blocker), the same way "prompt_render" is evidence about this issue's own
-// WORKFLOW.md template. None of the five reasons above says anything about
+// WORKFLOW.md template. None of the six reasons above says anything about
 // the issue at all; each says something about the shared environment
 // dispatching it. This map is not exhaustive for finishFailure's other
 // direct reasons ("workspace_prepare", "before_run", "prompt_render",
 // "session_start", "stalled") -- those are deliberately absent because they
 // are issue-attributable, not systemic.
 var systemicFailureReasons = map[string]bool{
-	"agent_event":      true,
-	"issue_refresh":    true,
-	"retry_refresh":    true,
-	"session_continue": true,
-	"stream_closed":    true,
+	"agent_event":        true,
+	"agent_rate_limited": true,
+	"issue_refresh":      true,
+	"retry_refresh":      true,
+	"session_continue":   true,
+	"stream_closed":      true,
 }
 
 // attemptsExhausted reports whether next has reached agent.max_attempts for a
