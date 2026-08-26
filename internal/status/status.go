@@ -163,12 +163,29 @@ func secureDirectory(path string) error {
 // Run publishes immediately and then at a fixed cadence until ctx is done.
 // Errors are reported through report and never returned to, or block, the
 // coordinator's scheduling path.
+//
+// A write failure is usually structural -- an owner-only directory
+// requirement violated by the operator, say -- so it recurs unchanged on
+// every subsequent tick. report is therefore called once per distinct error,
+// not once per tick: a fixed condition would otherwise repeat identically for
+// the rest of the process's life, at DefaultInterval, forever. Recovery, or a
+// change in the failure itself, is reported again.
 func (p *Publisher) Run(ctx context.Context, interval time.Duration, source func() coordinator.Snapshot, report func(error)) {
 	if interval <= 0 {
 		interval = DefaultInterval
 	}
+	var lastReported string
 	publish := func() {
-		if err := p.Write(Running, source()); err != nil && report != nil {
+		err := p.Write(Running, source())
+		if err == nil {
+			lastReported = ""
+			return
+		}
+		if report == nil {
+			return
+		}
+		if message := err.Error(); message != lastReported {
+			lastReported = message
 			report(err)
 		}
 	}

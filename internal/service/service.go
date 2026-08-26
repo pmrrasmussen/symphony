@@ -225,7 +225,7 @@ func prepare(ctx context.Context, options Options, validate bool) (desired, Runn
 		if err != nil {
 			return desired{}, nil, err
 		}
-		result := preflight.RunWithEnvironment(ctx, workflow, logsRoot, environment)
+		result := preflight.RunWithEnvironment(ctx, workflow, logsRoot, statusFile, environment)
 		if !result.OK() {
 			return desired{}, nil, fmt.Errorf("service preflight failed: %s", failedChecks(result))
 		}
