@@ -1474,34 +1474,68 @@ func (c *Coordinator) finishFailure(ctx context.Context, i domain.Issue, attempt
 	c.scheduleRetry(ctx, i, domain.Workspace{}, next, retryAgent, reason, backoff(next, s.Agent.MaxRetryBackoff))
 }
 
+// systemicAgentFailureReasons are the agentFailureReason outputs that name a
+// boundary the coordinator's own host, or a shared backend, crosses -- never
+// evidence that this issue's work is unworkable -- so none of them arms
+// attemptsExhausted's ceiling:
+//
+//   - "agent_event": the ceiling's original exemption (PMR-111/PMR-131). It
+//     is agentFailureReason's fallback for domain.EventFailed carrying
+//     model or provider text the coordinator cannot itself name -- most
+//     commonly, today, a Claude quota rejection that ends a run in under a
+//     second. Observed: 203 such rejections across six healthy issues in
+//     one 2.5-hour window, an account-wide condition that would have
+//     abandoned every one of them.
+//   - "issue_refresh": a tracker error from runTurns' post-turn GetIssues
+//     refresh (PMR-115, confirmed live: a 30s Linear client timeout
+//     following a turn the agent completed successfully). That is Linear
+//     infrastructure, not this issue: with this codebase's default
+//     max_attempts=5 and its escalating backoff, a two-and-a-half-minute
+//     Linear outage would otherwise abandon every issue currently running,
+//     since they all fail the same way at the same time. Once PMR-128
+//     gives tracker errors a real Retryable signal, this can narrow to
+//     "arm the ceiling only when the wrapped error is not Retryable"
+//     instead of staying a blanket exemption -- but that is future work,
+//     not a precondition for this one.
+//   - "session_continue": Symphony's own backend adapter (agent.Continue)
+//     failing to resume a session. A broken `claude` binary or lapsed
+//     backend auth fails every running issue's next turn the same way, at
+//     the same time -- the same account-wide shape as the quota rejection
+//     above, just raised by Symphony's own code instead of the model's.
+//   - "stream_closed": the host's own event plumbing failing to deliver a
+//     verdict (see errStreamClosed). By construction every backend emits
+//     a terminal event before its channel closes, so this can never be a
+//     repository- or issue-specific outcome -- only ever a host bug, and a
+//     host bug affects whichever issues happen to be running when it
+//     fires, not the one that happened to surface it first.
+//
+// Of agentFailureReason's outputs, only "turn_limit_exhausted" and
+// "agent_blocked" are left to arm the ceiling -- each is evidence about
+// *this* issue's run (it exhausted its turns; its own agent reported a
+// blocker), the same way "prompt_render" is evidence about this issue's own
+// WORKFLOW.md template. None of the four reasons above says anything about
+// the issue at all; each says something about the shared environment
+// dispatching it.
+var systemicAgentFailureReasons = map[string]bool{
+	"agent_event":      true,
+	"issue_refresh":    true,
+	"session_continue": true,
+	"stream_closed":    true,
+}
+
 // attemptsExhausted reports whether next has reached agent.max_attempts for a
 // retryAgent episode, abandoning the dispatch (and releasing its claim) if so.
 // Only retryAgent consumes the ceiling, and only on a genuine, classified
-// dispatch failure: a retryLanding redispatch — whether from
-// finishLandingWait or either escalation in runRetry — never raises its
-// attempt counter, and neither does a retryAgent episode that merely lost an
-// orchestrator slot race (see agentSlotRetryDelay). config rejects a
-// non-positive max_attempts, so the MaxAttempts <= 0 case only covers a
-// hand-built Settings, which keeps the pre-PMR-111 unbounded ladder rather
-// than having a zero ceiling abandon every first failure.
-//
-// reason == "agent_event" is agentFailureReason's fallback for
-// domain.EventFailed carrying model or provider text the coordinator cannot
-// itself name -- most commonly, today, a Claude quota rejection that ends a
-// run in under a second (PMR-131). It still climbs the ordinary escalating
-// backoff ladder like any other failure, but it never arms the ceiling:
-// abandoning an issue on a cause the coordinator cannot name would turn a
-// transient, account-wide condition into permanent abandonment of otherwise-
-// healthy issues (observed: 203 such rejections across six healthy issues in
-// one 2.5-hour window). PMR-115 gave three other former "agent_event" causes
-// -- a closed event stream, a failed post-turn tracker refresh, and a failed
-// session continuation -- their own classified reasons (stream_closed,
-// issue_refresh, session_continue), and per this same comment's original
-// intent, each one now consumes the ceiling like any other classified
-// dispatch failure: only genuine unclassified model/provider text stays
-// exempt.
+// dispatch failure that is not systemic (see systemicAgentFailureReasons): a
+// retryLanding redispatch — whether from finishLandingWait or either
+// escalation in runRetry — never raises its attempt counter, and neither does
+// a retryAgent episode that merely lost an orchestrator slot race (see
+// agentSlotRetryDelay). config rejects a non-positive max_attempts, so the
+// MaxAttempts <= 0 case only covers a hand-built Settings, which keeps the
+// pre-PMR-111 unbounded ladder rather than having a zero ceiling abandon
+// every first failure.
 func (c *Coordinator) attemptsExhausted(i domain.Issue, kind retryKind, reason string, next int, s config.Settings, attrs []any) bool {
-	if kind != retryAgent || reason == "agent_event" || s.Agent.MaxAttempts <= 0 || next < s.Agent.MaxAttempts {
+	if kind != retryAgent || systemicAgentFailureReasons[reason] || s.Agent.MaxAttempts <= 0 || next < s.Agent.MaxAttempts {
 		return false
 	}
 	c.abandonDispatch(i, s.Agent.MaxAttempts, attrs)

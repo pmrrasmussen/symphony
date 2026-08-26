@@ -1284,8 +1284,10 @@ func TestPermanentDispatchFailureStopsAtMaxAttempts(t *testing.T) {
 // the ceiling was built for, so it must keep climbing the ordinary
 // escalating backoff ladder without ever arming abandonment, however many
 // times it repeats -- unlike workspace_prepare, before_run, prompt_render,
-// session_start, and (since PMR-115) stream_closed, issue_refresh, and
-// session_continue, which are classified and still consume the ceiling.
+// and session_start, which are issue-attributable and still consume the
+// ceiling. See systemicAgentFailureReasons for the three PMR-115 added
+// alongside it (stream_closed, issue_refresh, session_continue) and why none
+// of them consumes the ceiling either.
 func TestUnclassifiedAgentEventNeverAbandonsIssue(t *testing.T) {
 	w := testSettings(t)
 	w.Config.Agent.MaxAttempts = 2
@@ -1328,6 +1330,151 @@ func TestUnclassifiedAgentEventNeverAbandonsIssue(t *testing.T) {
 	}
 	if strings.Contains(log.String(), `"msg":"dispatch abandoned after max attempts"`) {
 		t.Fatalf("an unclassified agent_event armed an abandonment record: %s", log.String())
+	}
+	if err := c.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestClosedEventStreamNeverAbandonsIssue pins the review-round-4 decision in
+// systemicAgentFailureReasons for "stream_closed": by construction (see
+// errStreamClosed) it is never a repository- or issue-specific outcome, only
+// ever a host bug in the coordinator's own event plumbing, so -- like
+// agent_event -- it must keep climbing the ordinary escalating backoff
+// ladder without ever arming abandonment, however many times it repeats. It
+// drives finishFailure directly, the same way TestRetryAtCapacityNeverAbandons
+// drives scheduleRetry directly, rather than replaying a full dispatch for
+// every repeat: the reason and the ceiling interaction are what is under
+// test, not the dispatch machinery TestClosedEventStreamSchedulesDeterministicAgentRetry
+// already covers for a single occurrence.
+func TestClosedEventStreamNeverAbandonsIssue(t *testing.T) {
+	w := testSettings(t)
+	w.Config.Agent.MaxAttempts = 2
+	issue := testIssue()
+	var log syncBuffer
+	c := New(&fakeTracker{issue: issue}, &fakeAgent{}, &fakeWorkspace{}, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&log, nil)))
+	c.timer = &fakeTimer{}
+	if !c.claim(issue, w.Config) {
+		t.Fatal("issue was not claimed")
+	}
+
+	attempt := 0
+	const repeats = 6 // well past max_attempts=2, which a host-generated cause must never consume
+	for i := 0; i < repeats; i++ {
+		c.finishFailure(context.Background(), issue, attempt, agentFailureReason(errStreamClosed), errStreamClosed)
+		c.mu.Lock()
+		retry, stillRetrying := c.retries[issue.ID]
+		c.mu.Unlock()
+		if !stillRetrying {
+			t.Fatalf("stream_closed abandoned the issue on repeat %d", i)
+		}
+		if retry.reason != "stream_closed" {
+			t.Fatalf("reason=%q, want stream_closed", retry.reason)
+		}
+		attempt = retry.attempt
+	}
+
+	if attempt <= w.Config.Agent.MaxAttempts {
+		t.Fatalf("attempt=%d, want it to keep climbing the ordinary ladder past max_attempts", attempt)
+	}
+	if strings.Contains(log.String(), `"msg":"dispatch abandoned after max attempts"`) {
+		t.Fatalf("a closed event stream armed an abandonment record: %s", log.String())
+	}
+	if err := c.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestPostTurnRefreshFailureNeverAbandonsIssue is the ceiling-interaction
+// test review round 4 asked for: PMR-115's confirmed-live failure mode -- a
+// Linear timeout on the post-turn GetIssues refresh -- is this codebase's
+// shared tracker infrastructure, not this issue, so repeating it past
+// agent.max_attempts must keep retrying rather than abandon the issue (see
+// systemicAgentFailureReasons). It drives finishFailure directly rather than
+// replaying a full dispatch (see TestClosedEventStreamNeverAbandonsIssue):
+// a permanently failing tracker would also fail runRetry's own pre-dispatch
+// refresh, reclassifying every retry after the first as "retry_refresh" (a
+// separate, already-covered ceiling interaction -- TestRetryRefreshFailureAbandonsAtMaxAttempts,
+// PMR-128) instead of exercising "issue_refresh" a second time.
+func TestPostTurnRefreshFailureNeverAbandonsIssue(t *testing.T) {
+	w := testSettings(t)
+	w.Config.Agent.MaxAttempts = 2
+	issue := testIssue()
+	var log syncBuffer
+	c := New(&fakeTracker{issue: issue}, &fakeAgent{}, &fakeWorkspace{}, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&log, nil)))
+	c.timer = &fakeTimer{}
+	if !c.claim(issue, w.Config) {
+		t.Fatal("issue was not claimed")
+	}
+
+	refreshErr := issueRefreshError{err: errors.New("linear tracker_request: Linear request failed")}
+	attempt := 0
+	const repeats = 6 // well past max_attempts=2, which a Linear-infrastructure cause must never consume
+	for i := 0; i < repeats; i++ {
+		c.finishFailure(context.Background(), issue, attempt, agentFailureReason(refreshErr), refreshErr)
+		c.mu.Lock()
+		retry, stillRetrying := c.retries[issue.ID]
+		c.mu.Unlock()
+		if !stillRetrying {
+			t.Fatalf("issue_refresh abandoned the issue on repeat %d", i)
+		}
+		if retry.reason != "issue_refresh" {
+			t.Fatalf("reason=%q, want issue_refresh", retry.reason)
+		}
+		attempt = retry.attempt
+	}
+
+	if attempt <= w.Config.Agent.MaxAttempts {
+		t.Fatalf("attempt=%d, want it to keep climbing the ordinary ladder past max_attempts", attempt)
+	}
+	if strings.Contains(log.String(), `"msg":"dispatch abandoned after max attempts"`) {
+		t.Fatalf("issue_refresh armed an abandonment record: %s", log.String())
+	}
+	if err := c.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestContinuationFailureNeverAbandonsIssue pins the same decision for
+// "session_continue": it is Symphony's own backend adapter (agent.Continue)
+// failing to resume a session, so a broken `claude` binary or lapsed backend
+// auth would fail every running issue's next turn identically -- the same
+// account-wide shape as the quota rejection that motivates agent_event's
+// exemption, just raised by Symphony's own code instead of the model's (see
+// systemicAgentFailureReasons).
+func TestContinuationFailureNeverAbandonsIssue(t *testing.T) {
+	w := testSettings(t)
+	w.Config.Agent.MaxAttempts = 2
+	issue := testIssue()
+	var log syncBuffer
+	c := New(&fakeTracker{issue: issue}, &fakeAgent{}, &fakeWorkspace{}, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&log, nil)))
+	c.timer = &fakeTimer{}
+	if !c.claim(issue, w.Config) {
+		t.Fatal("issue was not claimed")
+	}
+
+	continueErr := sessionContinueError{err: errors.New("continuation unavailable")}
+	attempt := 0
+	const repeats = 6 // well past max_attempts=2, which a backend-adapter cause must never consume
+	for i := 0; i < repeats; i++ {
+		c.finishFailure(context.Background(), issue, attempt, agentFailureReason(continueErr), continueErr)
+		c.mu.Lock()
+		retry, stillRetrying := c.retries[issue.ID]
+		c.mu.Unlock()
+		if !stillRetrying {
+			t.Fatalf("session_continue abandoned the issue on repeat %d", i)
+		}
+		if retry.reason != "session_continue" {
+			t.Fatalf("reason=%q, want session_continue", retry.reason)
+		}
+		attempt = retry.attempt
+	}
+
+	if attempt <= w.Config.Agent.MaxAttempts {
+		t.Fatalf("attempt=%d, want it to keep climbing the ordinary ladder past max_attempts", attempt)
+	}
+	if strings.Contains(log.String(), `"msg":"dispatch abandoned after max attempts"`) {
+		t.Fatalf("session_continue armed an abandonment record: %s", log.String())
 	}
 	if err := c.Shutdown(context.Background()); err != nil {
 		t.Fatal(err)
