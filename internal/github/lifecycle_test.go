@@ -25,6 +25,11 @@ type fakeGit struct {
 	failFetch bool
 	calls     [][]string
 	envs      [][]string
+
+	// onPush lets a test simulate provider-side state changing during the
+	// push's network round trip -- for example a pull request merging while
+	// Publish is still pushing the branch (PMR-149).
+	onPush func()
 }
 
 func (g *fakeGit) Run(_ context.Context, _ string, args, env []string) (string, error) {
@@ -51,7 +56,12 @@ func (g *fakeGit) Run(_ context.Context, _ string, args, env []string) (string, 
 			return "head", nil
 		}
 		return "base", nil
-	case "merge-base", "push":
+	case "merge-base":
+		return "", nil
+	case "push":
+		if g.onPush != nil {
+			g.onPush()
+		}
 		return "", nil
 	}
 	return "", nil
@@ -60,6 +70,7 @@ func (g *fakeGit) Run(_ context.Context, _ string, args, env []string) (string, 
 type fakeLinear struct {
 	mu        sync.Mutex
 	activeErr error
+	linkErr   error
 	links     []string
 	completed int
 
@@ -90,6 +101,9 @@ func (l *fakeLinear) EnsureActive(context.Context) error { return l.activeErr }
 func (l *fakeLinear) LinkAndHandoff(_ context.Context, url string) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if l.linkErr != nil {
+		return l.linkErr
+	}
 	for _, existing := range l.links {
 		if existing == url {
 			return nil
@@ -172,6 +186,15 @@ type apiFixture struct {
 	mu     sync.Mutex
 
 	auth []string
+
+	// failMethod/failPath/failStatus/failBody let a test make exactly one
+	// endpoint respond with an arbitrary status and body instead of its usual
+	// handling, so a guard test can plant provider wire content in that body
+	// and assert it never reaches an agent-visible error message (PMR-149).
+	failMethod string
+	failPath   string
+	failStatus int
+	failBody   string
 
 	// Pull request state. prExists lets a test seed a pull request without
 	// going through Publish, so mismatched/closed/merged reuse can be tested
@@ -277,6 +300,11 @@ func (f *apiFixture) serve(w http.ResponseWriter, r *http.Request) {
 	defer f.mu.Unlock()
 	f.auth = append(f.auth, r.Header.Get("Authorization"))
 	w.Header().Set("Content-Type", "application/json")
+	if f.failStatus != 0 && r.Method == f.failMethod && r.URL.Path == f.failPath {
+		w.WriteHeader(f.failStatus)
+		_, _ = w.Write([]byte(f.failBody))
+		return
+	}
 	switch {
 	case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/pulls":
 		if r.URL.Query().Get("head") != "owner:symphony/pmr-27" || r.URL.Query().Get("base") != "main" {
@@ -830,6 +858,23 @@ func TestPublishRefusalCausesAreDistinctAgentActionableMessages(t *testing.T) {
 			prExists: true,
 			want:     "github publish remote branch symphony/pmr-27 has commits this worktree no longer contains; merge origin/main instead of rebasing",
 		},
+		{
+			name: "remote head not fetched",
+			base: &fakeGit{},
+			wrap: func(g *fakeGit) gitRunner {
+				return &failingGit{fakeGit: g, failArgs: []string{"cat-file", "-e", "sha1^{commit}"}}
+			},
+			prExists: true,
+			want:     "github publish remote branch symphony/pmr-27 has a head commit this worktree has not fetched, so the cause of the divergence cannot be established here",
+		},
+		{
+			name: "push failure",
+			base: &fakeGit{},
+			wrap: func(g *fakeGit) gitRunner {
+				return &failingGit{fakeGit: g, failArgs: []string{"push", "https://github.com/owner/repo.git", "HEAD:refs/heads/symphony/pmr-27"}}
+			},
+			want: "github publish could not push branch symphony/pmr-27 to the configured repository; retry once, and if it persists check the repository's push permissions and branch protection rules",
+		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			api, linear := newAPI(t), &fakeLinear{}
@@ -855,12 +900,79 @@ func TestPublishRefusalCausesAreDistinctAgentActionableMessages(t *testing.T) {
 		"github publish requires committed changes",
 		"github publish HEAD is not based on the configured base branch",
 		"github publish remote branch symphony/pmr-27 has commits this worktree no longer contains; merge origin/main instead of rebasing",
+		"github publish remote branch symphony/pmr-27 has a head commit this worktree has not fetched, so the cause of the divergence cannot be established here",
+		"github publish could not push branch symphony/pmr-27 to the configured repository; retry once, and if it persists check the repository's push permissions and branch protection rules",
 	} {
 		if seen[test] {
 			t.Fatalf("duplicate publish refusal message: %q", test)
 		}
 		seen[test] = true
 	}
+}
+
+// TestPublishForwardedFailuresAtEveryCallSiteCarryNoProviderOrWireDecodedText
+// guards the forwarding surface PMR-132 widened: the capability layer now
+// forwards err.Error() for every error Publish can return, not only the local
+// gate checks pinned above, so a failure at EnsureActive, findPull,
+// publishPullRequest, or LinkAndHandoff must still reach the agent as a
+// bounded message free of provider or wire-decoded text (PMR-149). findPull
+// and publishPullRequest are exercised directly against a fixture that plants
+// a secret in the response body; EnsureActive and LinkAndHandoff are Linear
+// operations behind an interface, so this only pins that Publish forwards
+// their result verbatim -- internal/linear's own tests are what establish
+// that the real implementation never returns wire-decoded text there.
+func TestPublishForwardedFailuresAtEveryCallSiteCarryNoProviderOrWireDecodedText(t *testing.T) {
+	const secret = "wire-secret-should-never-reach-the-agent"
+
+	t.Run("EnsureActive", func(t *testing.T) {
+		api, git := newAPI(t), &fakeGit{}
+		linear := &fakeLinear{activeErr: errors.New(secret)}
+		_, session := testSession(t, api, git, linear, nil)
+		if _, err := session.Publish(context.Background(), testInput()); err == nil || err.Error() != secret {
+			t.Fatalf("EnsureActive failure not forwarded verbatim: %v", err)
+		}
+		if api.created != 0 {
+			t.Fatalf("EnsureActive failure still created a pull request: created=%d", api.created)
+		}
+	})
+
+	t.Run("findPull", func(t *testing.T) {
+		api, git, linear := newAPI(t), &fakeGit{}, &fakeLinear{}
+		api.failMethod, api.failPath, api.failStatus, api.failBody = http.MethodGet, "/repos/owner/repo/pulls", http.StatusInternalServerError, secret
+		_, session := testSession(t, api, git, linear, nil)
+		_, err := session.Publish(context.Background(), testInput())
+		if err == nil || strings.Contains(err.Error(), secret) {
+			t.Fatalf("findPull failure leaked provider text: %v", err)
+		}
+		if err.Error() != "github request failed with status 500" {
+			t.Fatalf("findPull failure message = %q", err.Error())
+		}
+	})
+
+	t.Run("publishPullRequest", func(t *testing.T) {
+		api, git, linear := newAPI(t), &fakeGit{}, &fakeLinear{}
+		api.failMethod, api.failPath, api.failStatus, api.failBody = http.MethodPost, "/repos/owner/repo/pulls", http.StatusInternalServerError, secret
+		_, session := testSession(t, api, git, linear, nil)
+		_, err := session.Publish(context.Background(), testInput())
+		if err == nil || strings.Contains(err.Error(), secret) {
+			t.Fatalf("publishPullRequest failure leaked provider text: %v", err)
+		}
+		if err.Error() != "github request failed with status 500" {
+			t.Fatalf("publishPullRequest failure message = %q", err.Error())
+		}
+		if api.created != 0 {
+			t.Fatalf("publishPullRequest failure still created a pull request: created=%d", api.created)
+		}
+	})
+
+	t.Run("LinkAndHandoff", func(t *testing.T) {
+		api, git := newAPI(t), &fakeGit{}
+		linear := &fakeLinear{linkErr: errors.New(secret)}
+		_, session := testSession(t, api, git, linear, nil)
+		if _, err := session.Publish(context.Background(), testInput()); err == nil || err.Error() != secret {
+			t.Fatalf("LinkAndHandoff failure not forwarded verbatim: %v", err)
+		}
+	})
 }
 
 // TestPublishRefusesNonFastForwardRemoteBranchBeforeAnyPush asserts the
@@ -926,6 +1038,29 @@ func TestPublishRejectsMergedPullRequestAsIrrecoverable(t *testing.T) {
 	}
 	if api.created != 0 || len(api.patches) != 0 || len(linear.links) != 0 {
 		t.Fatalf("merged pull request was mutated: created=%d patches=%v links=%v", api.created, api.patches, linear.links)
+	}
+}
+
+// TestPublishRefusesPullRequestMergedDuringThePushWindow pins the case PMR-149
+// item 4 identified: the push is a network round trip during which the pull
+// request's state can change, so Publish must re-check that state after the
+// push rather than reuse its pre-push lookup, or a pull request merged while
+// the push was in flight gets PATCHed and handed off as a normal publish.
+func TestPublishRefusesPullRequestMergedDuringThePushWindow(t *testing.T) {
+	api, git, linear := newAPI(t), &fakeGit{}, &fakeLinear{}
+	api.prExists, api.prState, api.prBody = true, "open", "old body"
+	git.onPush = func() {
+		api.mu.Lock()
+		defer api.mu.Unlock()
+		api.prMerged = true
+		api.prState = "closed"
+	}
+	_, session := testSession(t, api, git, linear, nil)
+	if _, err := session.Publish(context.Background(), testInput()); err == nil || !strings.Contains(err.Error(), "already merged") {
+		t.Fatalf("merge-during-push error=%v", err)
+	}
+	if len(api.patches) != 0 || len(linear.links) != 0 {
+		t.Fatalf("pull request merged during the push window was mutated: patches=%v links=%v", api.patches, linear.links)
 	}
 }
 
