@@ -83,8 +83,25 @@ operator mitigation is to disable the tracker's native PR-to-status automation
 re-asserting the handoff without overriding a legitimate human reactivation is
 a deferred follow-up.
 
-Every `operation` value — the performed edges above and these three observed
-ones — comes from one bounded vocabulary of fixed literals
+One `operation` value names no tracker edge at all. When a dispatch reaches
+`agent.max_attempts` — the ceiling on how many times one issue may be launched
+before the coordinator gives up on that episode — Symphony logs a single
+**error**-level `"msg":"dispatch abandoned after max attempts"` with
+`operation: dispatch_abandoned`, the issue, the classified failure `reason`
+(`workspace_prepare`, `before_run`, `prompt_render`, `session_start`,
+`stalled`, `agent_blocked`, `turn_limit_exhausted`, `agent_event`), the final
+`attempt`, and `max_attempts`. That record is deliberately the *whole* outcome:
+the claim and the retry timer are dropped, and the tracker is left exactly as
+it was. That is what
+makes the record load-bearing — the board will keep showing the issue as
+active work, so this is the only place the give-up is visible. A later poll may
+start a fresh, equally bounded episode; an issue that keeps producing this
+record needs a person, not another retry. Below the ceiling nothing changes:
+each earlier failure keeps its warn-level `"msg":"agent run retry scheduled"`.
+Landing waits never reach it, because a wait does not escalate the attempt.
+
+Every `operation` value — the performed edges above, these three observed ones,
+and `dispatch_abandoned` — comes from one bounded vocabulary of fixed literals
 (`internal/observability`), so a log query can rely on the field's values
 instead of matching per-call-site strings.
 
@@ -280,6 +297,13 @@ actionable `external_reversion`):
 ```sh
 tail -F .symphony/logs/symphony.jsonl \
   | jq 'select(.msg | test("human review state change|external tracker state change")) | {operation, from_state, to_state, issue_identifier, since_handoff_ms}'
+```
+
+Issues Symphony gave up dispatching, which no tracker state reflects:
+
+```sh
+tail -F .symphony/logs/symphony.jsonl \
+  | jq 'select(.operation == "dispatch_abandoned") | {issue_identifier, reason, attempt, max_attempts}'
 ```
 
 Workspace lifecycle final status (removal vs. kept for review):

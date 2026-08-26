@@ -94,6 +94,29 @@ concurrently (`agent.max_concurrent_agents: 4`). Landing remains serialized
 (`agent.max_concurrent_agents_by_state: {Merging: 1}`), while a delayed retry
 never occupies a concurrency slot as it waits.
 
+Dispatch itself is bounded by `agent.max_attempts` (default 5). `max_turns`
+bounds the turns inside one run and `max_retry_backoff_ms` bounds the delay
+between runs; `max_attempts` is the only bound on the *number* of runs, so an
+issue that fails the same way every time — a corrupted worktree, a `before_run`
+hook that always exits non-zero, a prompt template error, an unreachable agent
+binary — stops instead of re-dispatching at the backoff ceiling for the
+daemon's lifetime. On the last attempt Symphony abandons that dispatch: one
+error-level `dispatch abandoned after max attempts` record
+(`operation: dispatch_abandoned`) naming the classified failure reason and the
+attempt count, and the claim and retry timer dropped. It deliberately makes no
+tracker change — no transition and no comment — so the issue stays where a
+human left it and a later poll may start a fresh, equally bounded episode;
+that error record, not a silent state change, is the signal that the issue
+needs a person rather than another retry. That also means abandonment is not
+quarantine: an issue nobody acts on keeps starting new bounded episodes at the
+poll interval, so `dispatch_abandoned` is a record to alert on rather than one
+to let accumulate. A non-terminal landing wait is exempt, since it is not an
+agent failure (see below), and so is losing the race for a contended
+orchestrator slot: that is capacity contention rather than a dispatch
+failure, so it leaves the attempt where it was and retries on a fixed,
+poll-interval cadence instead of consuming `max_attempts` or the escalating
+failure backoff.
+
 See `WORKFLOW.md`'s prompt body for the full per-state start, implementation,
 validation, review handoff, rework, landing, and completion playbook, and
 [docs/architecture.md](docs/architecture.md) for the underlying trust model.
@@ -404,8 +427,10 @@ starts at `github.poll_interval_ms` and escalates with each consecutive wait
 toward `agent.max_retry_backoff_ms`, so a gate that never settles — including a
 `required_checks` name that matches no GitHub job — backs off to a slow poll
 with a climbing `wait_attempt` in the log and snapshot instead of respawning a
-session every interval. Symphony never gives up on it by itself: returning the
-issue to review remains the landing capability's own bounded fallback.
+session every interval. `agent.max_attempts` does not apply here either — the
+wait leaves the attempt where it was, so it can never reach that ceiling.
+Symphony never gives up on it by itself: returning the issue to review remains
+the landing capability's own bounded fallback.
 A terminal result (merged, already merged, or a completed reconciliation) ends
 the run the same way and closes `github_land_pr` for it, so a normal landing
 invokes the capability exactly once. With `github.update_stale_branch: true`, one

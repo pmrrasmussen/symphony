@@ -1193,7 +1193,7 @@ func TestReloadPublishesEveryDynamicSettingAsOneSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	updated := "---\ntracker: {kind: linear, provider: {api_key: ' second-key '}, required_labels: [Ready], active_states: [Backlog, Started], terminal_states: [Closed]}\npolling: {interval_ms: 200}\nworkspace: {root: work-two, source_root: " + secondSource + "}\nhooks: {after_create: two-create, before_run: two-before, after_run: two-after, before_remove: two-remove, timeout_ms: 201}\nagent: {backend: codex, max_concurrent_agents: 3, max_turns: 4, max_retry_backoff_ms: 202, max_concurrent_agents_by_state: {Started: 2}}\ncodex: {command: codex-two, approval_policy: on-request, thread_sandbox: danger-full-access, turn_sandbox_policy: {type: dangerFullAccess}, turn_timeout_ms: 203, read_timeout_ms: 204, start_timeout_ms: 206, stall_timeout_ms: 205}\n---\nsecond"
+	updated := "---\ntracker: {kind: linear, provider: {api_key: ' second-key '}, required_labels: [Ready], active_states: [Backlog, Started], terminal_states: [Closed]}\npolling: {interval_ms: 200}\nworkspace: {root: work-two, source_root: " + secondSource + "}\nhooks: {after_create: two-create, before_run: two-before, after_run: two-after, before_remove: two-remove, timeout_ms: 201}\nagent: {backend: codex, max_concurrent_agents: 3, max_turns: 4, max_attempts: 6, max_retry_backoff_ms: 202, max_concurrent_agents_by_state: {Started: 2}}\ncodex: {command: codex-two, approval_policy: on-request, thread_sandbox: danger-full-access, turn_sandbox_policy: {type: dangerFullAccess}, turn_timeout_ms: 203, read_timeout_ms: 204, start_timeout_ms: 206, stall_timeout_ms: 205}\n---\nsecond"
 	if err := os.WriteFile(workflow, []byte(updated), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -1212,7 +1212,7 @@ func TestReloadPublishesEveryDynamicSettingAsOneSnapshot(t *testing.T) {
 	if settings.Hooks != (Hooks{AfterCreate: "two-create", BeforeRun: "two-before", AfterRun: "two-after", BeforeRemove: "two-remove", Timeout: 201 * time.Millisecond}) {
 		t.Fatalf("hooks=%+v", settings.Hooks)
 	}
-	if settings.Agent.MaxConcurrent != 3 || settings.Agent.MaxTurns != 4 || settings.Agent.MaxRetryBackoff != 202*time.Millisecond || settings.Agent.ByState["started"] != 2 || settings.Agent.Backend != "codex" {
+	if settings.Agent.MaxConcurrent != 3 || settings.Agent.MaxTurns != 4 || settings.Agent.MaxAttempts != 6 || settings.Agent.MaxRetryBackoff != 202*time.Millisecond || settings.Agent.ByState["started"] != 2 || settings.Agent.Backend != "codex" {
 		t.Fatalf("agent=%+v", settings.Agent)
 	}
 	policy, ok := settings.Codex.TurnSandboxPolicy.(map[string]any)
@@ -1531,6 +1531,66 @@ func TestAgentBackendDefaultsToCodexAndFailsClosed(t *testing.T) {
 	t.Run("rejects a non-string", func(t *testing.T) {
 		if _, err := Load(write(t, "backend: 3"), "logs"); err == nil {
 			t.Fatal("a non-string backend was accepted")
+		}
+	})
+}
+
+// TestAgentMaxAttemptsDefaultsAndIsValidatedLikeTheOtherAgentLimits covers the
+// PMR-111 dispatch ceiling as a schema field: a workflow written before it
+// existed still loads with a usable bound, and a value that would restore the
+// unbounded retry loop (zero or negative) or is not an integer at all fails the
+// whole candidate instead of silently disabling the ceiling.
+func TestAgentMaxAttemptsDefaultsAndIsValidatedLikeTheOtherAgentLimits(t *testing.T) {
+	d := t.TempDir()
+	write := func(t *testing.T, agentBlock string) string {
+		t.Helper()
+		path := filepath.Join(d, strings.ReplaceAll(t.Name(), "/", "_")+".md")
+		body := "---\ntracker: {kind: linear, provider: {api_key: secret-key}, active_states: [Todo], terminal_states: [Done]}\npolling: {interval_ms: 100}\nworkspace: {root: work}\nhooks: {timeout_ms: 100}\nagent: {" + agentBlock + "}\ncodex: {command: codex app-server}\n---\nbody"
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+
+	t.Run("absent defaults to a bounded ceiling", func(t *testing.T) {
+		w, err := Load(write(t, "max_turns: 2"), "logs")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if w.Config.Agent.MaxAttempts != 5 {
+			t.Fatalf("max_attempts=%d, want the default 5", w.Config.Agent.MaxAttempts)
+		}
+	})
+
+	t.Run("an explicit value is loaded", func(t *testing.T) {
+		w, err := Load(write(t, "max_attempts: 2"), "logs")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if w.Config.Agent.MaxAttempts != 2 {
+			t.Fatalf("max_attempts=%d", w.Config.Agent.MaxAttempts)
+		}
+	})
+
+	for _, value := range []string{"0", "-1"} {
+		t.Run("rejects "+value, func(t *testing.T) {
+			_, err := Load(write(t, "max_attempts: "+value), "logs")
+			if err == nil {
+				t.Fatalf("max_attempts %s was accepted", value)
+			}
+			if !strings.Contains(err.Error(), "non-positive duration or agent limit") {
+				t.Fatalf("error=%v", err)
+			}
+		})
+	}
+
+	t.Run("rejects a non-integer", func(t *testing.T) {
+		_, err := Load(write(t, "max_attempts: many"), "logs")
+		if err == nil {
+			t.Fatal("a non-integer max_attempts was accepted")
+		}
+		if !strings.Contains(err.Error(), "max_attempts must be an integer") {
+			t.Fatalf("error=%v", err)
 		}
 	})
 }

@@ -82,6 +82,25 @@ agent:
   max_concurrent_agents_by_state:
     Merging: 1
   max_turns: 20
+  # The one bound on the number of *runs*. max_turns bounds the turns inside a
+  # run and max_retry_backoff_ms bounds the delay between runs; neither stops an
+  # issue that fails the same way every time -- a corrupted worktree, a
+  # before_run hook that always exits non-zero, a prompt template error, an
+  # unreachable agent binary -- from re-dispatching at the backoff ceiling for
+  # the daemon's lifetime while holding its claim.
+  #
+  # After this many failed dispatches of one issue Symphony abandons that
+  # dispatch: one error-level "dispatch abandoned after max attempts" record
+  # (operation: dispatch_abandoned) naming the classified reason, the claim and
+  # the retry timer dropped. The tracker is deliberately left alone -- no
+  # transition, no comment -- so the issue stays visible and a later poll may
+  # start a fresh, equally bounded episode; the error record is the signal that
+  # a human, not another retry, is what the issue needs.
+  #
+  # A non-terminal landing wait is exempt: it is not an agent failure, does not
+  # escalate the attempt, and keeps the bounded-delay redispatch described under
+  # github.poll_interval_ms below. Defaults to 5; must be a positive integer.
+  max_attempts: 5
 codex:
   command: codex app-server
   approval_policy: never

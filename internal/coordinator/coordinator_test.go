@@ -682,10 +682,14 @@ type fakeAgent struct {
 	started            chan struct{}
 	events             func() <-chan domain.Event
 	continuationEvents []func() <-chan domain.Event
-	continueErr        error
-	continueSessions   []domain.AgentSession
-	continuePrompts    []string
-	onContinue         func(int)
+	// startErr models a boundary that fails identically on every dispatch --
+	// an unreachable agent binary is the canonical one -- so a test can drive
+	// the retry ladder to its ceiling without any per-attempt bookkeeping.
+	startErr         error
+	continueErr      error
+	continueSessions []domain.AgentSession
+	continuePrompts  []string
+	onContinue       func(int)
 	// startRequests is every request the coordinator dispatched. The prompt and
 	// the backend on it are one decision made at the call site, and this is the
 	// only place a test can see the pair the router was actually handed.
@@ -697,9 +701,13 @@ func (f *fakeAgent) Start(_ context.Context, r domain.AgentRequest) (domain.Agen
 	f.starts++
 	f.startRequests = append(f.startRequests, r)
 	started := f.started
+	err := f.startErr
 	f.mu.Unlock()
 	if started != nil {
 		started <- struct{}{}
+	}
+	if err != nil {
+		return domain.AgentSession{}, nil, err
 	}
 	return domain.AgentSession{ID: "t-u", ThreadID: "t", TurnID: "u"}, f.events(), nil
 }
@@ -1196,6 +1204,175 @@ func TestCapacityBlockedLandingRetryKeepsItsCadence(t *testing.T) {
 	}
 	if starts, _, _ := agent.counts(); starts != 1 {
 		t.Fatalf("starts=%d, want no dispatch while the slot is taken", starts)
+	}
+	if err := c.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestPermanentDispatchFailureStopsAtMaxAttempts covers the PMR-111 defect: a
+// boundary that fails identically on every dispatch used to reschedule itself
+// forever at the backoff ceiling, holding its claim and leaving nothing in the
+// log but a warning that reads like progress. The ladder now stops at exactly
+// agent.max_attempts dispatches, arms no further timer, drops the claim, and
+// says so once at error level.
+func TestPermanentDispatchFailureStopsAtMaxAttempts(t *testing.T) {
+	w := testSettings(t)
+	w.Config.Agent.MaxAttempts = 3
+	w.Config.Agent.MaxRetryBackoff = time.Minute
+	issue := testIssue()
+	var log syncBuffer
+	agent := &fakeAgent{startErr: errors.New("agent binary not found")}
+	ws := &fakeWorkspace{after: make(chan struct{}, 4)}
+	c := New(&fakeTracker{issue: issue}, agent, ws, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&log, nil)))
+	c.clock = fakeClock{now: time.Date(2026, 8, 26, 9, 41, 0, 0, time.UTC)}
+	timer := &fakeTimer{signal: make(chan struct{}, 4)}
+	c.timer = timer
+
+	c.Tick(context.Background())
+	<-ws.after
+	<-timer.signal
+	// Two armed retries, and no more: the third dispatch reaches the ceiling.
+	timer.fire(0)
+	<-ws.after
+	<-timer.signal
+	timer.fire(1)
+	<-ws.after
+	waitForRelease(t, c, issue.ID)
+
+	if starts, _, _ := agent.counts(); starts != 3 {
+		t.Fatalf("starts=%d, want exactly max_attempts dispatches", starts)
+	}
+	if timer.scheduled() != 2 {
+		t.Fatalf("armed %d retries, want one fewer than max_attempts", timer.scheduled())
+	}
+	c.mu.Lock()
+	claimed, retries, admitted := c.claimed[issue.ID], len(c.retries), len(c.admitted)
+	c.mu.Unlock()
+	if claimed || retries != 0 || admitted != 0 {
+		t.Fatalf("claimed=%v retries=%d admitted=%d, want the abandoned dispatch to hold nothing", claimed, retries, admitted)
+	}
+	record := waitForSubstring(t, &log, `"msg":"dispatch abandoned after max attempts"`, time.Second)
+	for _, want := range []string{`"level":"ERROR"`, `"operation":"dispatch_abandoned"`, `"issue_identifier":"ENG-1"`, `"reason":"session_start"`, `"attempt":3`, `"max_attempts":3`} {
+		if !strings.Contains(record, want) {
+			t.Fatalf("abandonment record missing %s: %s", want, record)
+		}
+	}
+	records := log.String()
+	if count := strings.Count(records, `"msg":"dispatch abandoned after max attempts"`); count != 1 {
+		t.Fatalf("abandonment was logged %d times, want exactly one: %s", count, records)
+	}
+	// The two dispatches below the ceiling keep their ordinary retry warning,
+	// so the abandonment is the only new record on this path.
+	if count := strings.Count(records, `"msg":"agent run retry scheduled"`); count != 2 {
+		t.Fatalf("retry warnings=%d, want one per dispatch below the ceiling: %s", count, records)
+	}
+	if err := c.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestUnclassifiedAgentEventNeverAbandonsIssue covers the correction from
+// review round 3: agentFailureReason's fallback, "agent_event", means the
+// coordinator does not know why a run ended -- most commonly, in practice, a
+// Claude quota rejection that ends a run in under a second (PMR-131). That is
+// not the deterministic, classified failure the ceiling was built for, so it
+// must keep climbing the ordinary escalating backoff ladder without ever
+// arming abandonment, however many times it repeats -- unlike
+// workspace_prepare, before_run, prompt_render, or session_start, which stay
+// classified and still consume the ceiling.
+func TestUnclassifiedAgentEventNeverAbandonsIssue(t *testing.T) {
+	w := testSettings(t)
+	w.Config.Agent.MaxAttempts = 2
+	w.Config.Agent.MaxRetryBackoff = time.Minute
+	issue := testIssue()
+	var log syncBuffer
+	agent := &fakeAgent{events: closedEvents}
+	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{}, 8)}
+	c := New(&fakeTracker{issue: issue}, agent, ws, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&log, nil)))
+	c.clock = fakeClock{now: time.Date(2026, 8, 26, 9, 41, 0, 0, time.UTC)}
+	timer := &fakeTimer{signal: make(chan struct{}, 8)}
+	c.timer = timer
+
+	c.Tick(context.Background())
+	<-ws.after
+	<-timer.signal
+
+	const repeats = 6 // well past max_attempts=2, which an unclassified cause must never consume
+	for i := 0; i < repeats; i++ {
+		timer.fire(i)
+		<-ws.after
+		<-timer.signal
+	}
+
+	if starts, _, _ := agent.counts(); starts != repeats+1 {
+		t.Fatalf("starts=%d, want one dispatch per fire plus the initial one", starts)
+	}
+	c.mu.Lock()
+	claimed := c.claimed[issue.ID]
+	retry, stillRetrying := c.retries[issue.ID]
+	c.mu.Unlock()
+	if !claimed || !stillRetrying {
+		t.Fatal("an unclassified agent_event abandoned the issue before any classified failure occurred")
+	}
+	if retry.reason != "agent_event" {
+		t.Fatalf("reason=%q, want agent_event", retry.reason)
+	}
+	if retry.attempt <= w.Config.Agent.MaxAttempts {
+		t.Fatalf("attempt=%d, want it to keep climbing the ordinary ladder past max_attempts", retry.attempt)
+	}
+	if strings.Contains(log.String(), `"msg":"dispatch abandoned after max attempts"`) {
+		t.Fatalf("an unclassified agent_event armed an abandonment record: %s", log.String())
+	}
+	if err := c.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestLandingWaitRedispatchesPastMaxAttempts pins the exemption the ceiling
+// must not swallow: a non-terminal landing wait is not an agent failure, so it
+// keeps its unbounded redispatch and its unescalated attempt even after more
+// dispatches than agent.max_attempts. Bounding it here would give up on a
+// pull request whose checks are merely slow.
+func TestLandingWaitRedispatchesPastMaxAttempts(t *testing.T) {
+	w := testSettings(t)
+	w.Config.Agent.MaxTurns = 20
+	w.Config.Agent.MaxAttempts = 2
+	w.Config.Agent.MaxRetryBackoff = 10 * time.Minute
+	w.Config.GitHub.PollInterval = 30 * time.Second
+	issue := testIssue()
+	var log syncBuffer
+	agent := &fakeAgent{events: landingWaitingEvents}
+	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{}, 4)}
+	c := New(&fakeTracker{issue: issue}, agent, ws, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&log, nil)))
+	c.clock = fakeClock{now: time.Date(2026, 8, 26, 9, 41, 0, 0, time.UTC)}
+	timer := &fakeTimer{signal: make(chan struct{}, 4)}
+	c.timer = timer
+
+	c.Tick(context.Background())
+	<-ws.after
+	<-timer.signal
+	for fired := 0; fired < 2; fired++ {
+		timer.fire(fired)
+		<-ws.after
+		<-timer.signal
+	}
+
+	if starts, _, _ := agent.counts(); starts != 3 {
+		t.Fatalf("starts=%d, want landing to keep redispatching past max_attempts", starts)
+	}
+	c.mu.Lock()
+	retry, ok := c.retries[issue.ID]
+	claimed, waits := c.claimed[issue.ID], c.landingWaits[issue.ID]
+	c.mu.Unlock()
+	if !ok || retry.kind != retryLanding || retry.attempt != 0 {
+		t.Fatalf("retry=%+v ok=%v, want a further landing retry on the same attempt", retry, ok)
+	}
+	if !claimed || waits != 3 {
+		t.Fatalf("claimed=%v wait_attempt=%d, want the claim held and only the wait count climbing", claimed, waits)
+	}
+	if records := log.String(); strings.Contains(records, "dispatch_abandoned") {
+		t.Fatalf("a landing wait was abandoned at the agent ceiling: %s", records)
 	}
 	if err := c.Shutdown(context.Background()); err != nil {
 		t.Fatal(err)
@@ -1752,7 +1929,12 @@ func TestLaunchReservationPreventsOversubscriptionBeforeSessionStart(t *testing.
 	<-ws.after
 }
 
-func TestRetryAtCapacityRequeuesWithBoundedBackoff(t *testing.T) {
+// TestRetryAtCapacityRequeuesOnFixedCadence covers runRetry's contended-slot
+// branch for retryAgent: losing the race for an orchestrator slot is capacity
+// contention, not a dispatch failure, so it must keep the attempt fixed and
+// retry on agentSlotRetryDelay's fixed poll-interval cadence rather than
+// attempt+1 and the escalating failure backoff.
+func TestRetryAtCapacityRequeuesOnFixedCadence(t *testing.T) {
 	w := testSettings(t)
 	w.Config.Agent.MaxRetryBackoff = 15 * time.Second
 	retrying := testIssue()
@@ -1780,11 +1962,71 @@ func TestRetryAtCapacityRequeuesWithBoundedBackoff(t *testing.T) {
 	c.mu.Lock()
 	retry := c.retries[retrying.ID]
 	c.mu.Unlock()
-	if retry.reason != "no available orchestrator slots" || retry.attempt != 2 {
-		t.Fatalf("retry=%+v", retry)
+	if retry.reason != "agent_slot_unavailable" || retry.attempt != 1 {
+		t.Fatalf("retry=%+v, want attempt unchanged and reason agent_slot_unavailable", retry)
 	}
-	if len(timer.delays) != 2 || timer.delays[1] != 15*time.Second {
-		t.Fatalf("retry delays=%v, want capped 15s second retry", timer.delays)
+	if len(timer.delays) != 2 || timer.delays[1] != w.Config.Polling.Interval {
+		t.Fatalf("retry delays=%v, want second retry at the poll interval (not the 15s failure backoff)", timer.delays)
+	}
+	if err := c.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	<-ws.after
+}
+
+// TestRetryAtCapacityNeverAbandons pins the invariant review settled
+// empirically on this repository: PMR-100 completed successfully on attempt
+// 11 after eleven straight lost slot races, never once having failed a
+// dispatch. A contended orchestrator slot must never consume
+// agent.max_attempts, however many times the slot is lost, or a healthy but
+// busy queue would abandon issues that were never broken.
+func TestRetryAtCapacityNeverAbandons(t *testing.T) {
+	w := testSettings(t)
+	w.Config.Agent.MaxAttempts = 2
+	w.Config.Agent.MaxRetryBackoff = 15 * time.Second
+	retrying := testIssue()
+	retrying.ID, retrying.Identifier = "retrying", "ENG-2"
+	running := testIssue()
+	running.ID, running.Identifier = "running", "ENG-3"
+	tracker := &issueMapTracker{issues: map[string]domain.Issue{retrying.ID: retrying, running.ID: running}}
+	block := make(chan domain.Event)
+	agent := &fakeAgent{events: func() <-chan domain.Event { return block }, started: make(chan struct{}, 1)}
+	ws := &fakeWorkspace{after: make(chan struct{}, 1)}
+	var log syncBuffer
+	c := New(tracker, agent, ws, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&log, nil)))
+	c.clock = fakeClock{now: time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)}
+	timer := &fakeTimer{}
+	c.timer = timer
+
+	if !c.claim(retrying, w.Config) {
+		t.Fatal("retrying issue was not claimed")
+	}
+	c.scheduleRetry(context.Background(), retrying, domain.Workspace{}, 1, retryAgent, "test", time.Second)
+	if !c.claim(running, w.Config) || !c.launch(context.Background(), running, 0) {
+		t.Fatal("running issue was not admitted")
+	}
+	<-agent.started
+
+	const lostRaces = 5 // well past max_attempts=2, which a contended slot must never consume
+	for i := 0; i < lostRaces; i++ {
+		timer.fire(i)
+	}
+
+	c.mu.Lock()
+	claimed := c.claimed[retrying.ID]
+	retry, stillRetrying := c.retries[retrying.ID]
+	c.mu.Unlock()
+	if !claimed || !stillRetrying {
+		t.Fatal("contended slot abandoned the retry before a real dispatch failure ever occurred")
+	}
+	if retry.attempt != 1 {
+		t.Fatalf("attempt=%d, want unchanged across %d lost slot races", retry.attempt, lostRaces)
+	}
+	if retry.reason != "agent_slot_unavailable" {
+		t.Fatalf("reason=%q, want agent_slot_unavailable", retry.reason)
+	}
+	if strings.Contains(log.String(), `"msg":"dispatch abandoned after max attempts"`) {
+		t.Fatalf("contended slot armed an abandonment record: %s", log.String())
 	}
 	if err := c.Shutdown(context.Background()); err != nil {
 		t.Fatal(err)
@@ -1815,6 +2057,88 @@ func TestRetryRefreshFailureIncrementsAttemptAndRetries(t *testing.T) {
 	}
 	if len(timer.delays) != 2 || timer.delays[1] != 15*time.Second {
 		t.Fatalf("retry delays=%v, want capped 15s refresh retry", timer.delays)
+	}
+	if err := c.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestRetryRefreshFailureAbandonsAtMaxAttempts covers runRetry's other
+// host-side escalation: a tracker that keeps failing GetIssues on every
+// retry raises the same attempt counter as a dispatch failure, so a
+// retryAgent episode must give up at agent.max_attempts instead of retrying
+// a broken tracker connection forever.
+func TestRetryRefreshFailureAbandonsAtMaxAttempts(t *testing.T) {
+	w := testSettings(t)
+	w.Config.Agent.MaxAttempts = 2
+	w.Config.Agent.MaxRetryBackoff = 15 * time.Second
+	issue := testIssue()
+	tracker := &issueMapTracker{issues: map[string]domain.Issue{issue.ID: issue}, getErr: errors.New("temporary tracker failure")}
+	var log syncBuffer
+	c := New(tracker, &fakeAgent{}, &fakeWorkspace{}, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&log, nil)))
+	c.clock = fakeClock{now: time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)}
+	timer := &fakeTimer{}
+	c.timer = timer
+
+	if !c.claim(issue, w.Config) {
+		t.Fatal("issue was not claimed")
+	}
+	c.scheduleRetry(context.Background(), issue, domain.Workspace{}, 1, retryAgent, "test", time.Second)
+	timer.fire(0)
+	waitForRelease(t, c, issue.ID)
+
+	c.mu.Lock()
+	_, stillRetrying := c.retries[issue.ID]
+	c.mu.Unlock()
+	if stillRetrying {
+		t.Fatal("retry refresh failure rearmed a retry past max_attempts")
+	}
+	if len(timer.delays) != 1 {
+		t.Fatalf("delays=%v, want no further retry armed", timer.delays)
+	}
+	record := waitForSubstring(t, &log, `"msg":"dispatch abandoned after max attempts"`, time.Second)
+	for _, want := range []string{`"reason":"retry_refresh"`, `"attempt":2`, `"max_attempts":2`} {
+		if !strings.Contains(record, want) {
+			t.Fatalf("abandonment record missing %s: %s", want, record)
+		}
+	}
+	if err := c.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestLandingRetryRefreshFailureIgnoresMaxAttempts pins the same exemption
+// TestLandingWaitRedispatchesPastMaxAttempts pins for the wait itself: a
+// landing retry that fails to refresh its issue is still not an agent
+// failure, so it must keep redispatching past agent.max_attempts rather than
+// being abandoned by the ceiling that only retryAgent consumes — and, like the
+// slot-contention escalation in runRetry, it must not inflate the attempt
+// that feeds the rendered prompt either.
+func TestLandingRetryRefreshFailureIgnoresMaxAttempts(t *testing.T) {
+	w := testSettings(t)
+	w.Config.Agent.MaxAttempts = 1
+	w.Config.Agent.MaxRetryBackoff = 15 * time.Second
+	issue := testIssue()
+	tracker := &issueMapTracker{issues: map[string]domain.Issue{issue.ID: issue}, getErr: errors.New("temporary tracker failure")}
+	c := testCoordinator(w.Config, tracker, &fakeAgent{}, &fakeWorkspace{})
+	timer := &fakeTimer{}
+	c.timer = timer
+
+	if !c.claim(issue, w.Config) {
+		t.Fatal("issue was not claimed")
+	}
+	c.scheduleRetry(context.Background(), issue, domain.Workspace{}, 3, retryLanding, "landing_waiting", time.Second)
+	timer.fire(0)
+
+	c.mu.Lock()
+	retry, ok := c.retries[issue.ID]
+	claimed := c.claimed[issue.ID]
+	c.mu.Unlock()
+	if !claimed {
+		t.Fatal("landing retry refresh failure dropped its claim below max_attempts=1")
+	}
+	if !ok || retry.kind != retryLanding || retry.reason != "retry_refresh" || retry.attempt != 3 {
+		t.Fatalf("retry=%+v ok=%v, want a further landing retry past the ceiling with its attempt unchanged", retry, ok)
 	}
 	if err := c.Shutdown(context.Background()); err != nil {
 		t.Fatal(err)

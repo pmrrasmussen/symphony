@@ -76,6 +76,13 @@ agent:
   max_concurrent_agents_by_state:
     Merging: 1
   max_turns: 20
+  # Bounds the number of runs, which max_turns (turns inside a run) and
+  # max_retry_backoff_ms (the delay between runs) do not: after this many
+  # dispatches of the same issue fail, Symphony logs one error-level
+  # dispatch_abandoned record and drops the claim instead of retrying at the
+  # backoff ceiling for the rest of the daemon's life. A landing wait is not a
+  # failure and is exempt.
+  max_attempts: 5
 codex:
   command: codex app-server
   approval_policy: never

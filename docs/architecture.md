@@ -114,6 +114,14 @@ concurrent `Merging` landing session even when overall capacity allows more).
 A queued retry timer never occupies this capacity -- only a live session or a
 launch already in flight does -- so one landing session and one unrelated
 implementation session can run concurrently when global capacity permits.
+Retries themselves are bounded by `agent.max_attempts`: after that many failed
+dispatches of one issue the coordinator abandons the episode, logging one
+error-level record with `operation: dispatch_abandoned` and releasing the
+claim, so a boundary that fails deterministically cannot occupy a claim and
+re-dispatch at the backoff ceiling for the daemon's lifetime. The tracker is
+untouched by that give-up, which is why the record is the operator's only
+signal; a landing wait does not escalate the attempt and so never reaches the
+ceiling.
 
 The optional `create_followup_issue` capability follows the same model: it is
 disabled unless `tracker.provider.followup_issue_creation` is configured and
@@ -530,8 +538,9 @@ continue on the same live Codex session, with a scheduler-controlled one-second
 delay between turns, until `agent.max_turns`. Reaching that boundary while the
 issue is still active is an explicit blocked/exhausted result, not successful
 completion. The coordinator logs `turn_limit_exhausted` and schedules its
-normal backoff retry, leaving the workspace eligible so a resolved external
-condition or a Linear update can be dispatched safely. A run that ends on a
+normal backoff retry -- up to `agent.max_attempts` dispatches -- leaving the
+workspace eligible so a resolved external condition or a Linear update can be
+dispatched safely. A run that ends on a
 host gate no model turn can advance -- today only a landing wait -- is
 deliberately not that failure path: it finishes as a `waiting` run and gets a
 delayed, non-escalating `landing` retry instead of consuming turns and an
