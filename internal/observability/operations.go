@@ -60,6 +60,12 @@ const (
 	// issue back into a pre-review implementation state. It is the only one of
 	// the three logged at warn level.
 	OperationExternalReversion Operation = "external_reversion"
+	// OperationSourceIntegrityAlert is the PMR-65 defense-in-depth backstop: a
+	// run left the source repository's branches or primary working tree index
+	// changed even though the narrowed sandbox grant is supposed to make that
+	// impossible. It is the highest-signal record workspace.Local can produce
+	// and is always logged at error level.
+	OperationSourceIntegrityAlert Operation = "source_integrity_alert"
 )
 
 // known is the closed set above, checkable at log time. safeAttr writes an
@@ -68,15 +74,16 @@ const (
 // by comment, so a value converted from arbitrary text (which would otherwise
 // bypass Text's scrubbing and truncation) can never reach a log record.
 var known = map[Operation]bool{
-	OperationStartTransition:   true,
-	OperationTransition:        true,
-	OperationHandoff:           true,
-	OperationLandingRefused:    true,
-	OperationLandingCompleted:  true,
-	OperationMergeReconciled:   true,
-	OperationReviewCompleted:   true,
-	OperationDispatchAbandoned: true,
-	OperationReviewApproved:    true,
-	OperationReworkRequested:   true,
-	OperationExternalReversion: true,
+	OperationStartTransition:      true,
+	OperationTransition:           true,
+	OperationHandoff:              true,
+	OperationLandingRefused:       true,
+	OperationLandingCompleted:     true,
+	OperationMergeReconciled:      true,
+	OperationReviewCompleted:      true,
+	OperationDispatchAbandoned:    true,
+	OperationReviewApproved:       true,
+	OperationReworkRequested:      true,
+	OperationExternalReversion:    true,
+	OperationSourceIntegrityAlert: true,
 }
