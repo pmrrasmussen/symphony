@@ -224,6 +224,91 @@ func TestListTerminalReturnsTerminalProjectIssues(t *testing.T) {
 	}
 }
 
+// TestClassifyRequestErrorDistinguishesCancellationTimeoutAndTransport pins
+// classifyRequestError's decision directly, without opening a socket, so it
+// stays runnable in environments (including this one) that cannot bind a
+// loopback listener. TestRequestErrorsAreClassifiedEndToEnd below exercises
+// the same three cases through a real client.Do.
+func TestClassifyRequestErrorDistinguishesCancellationTimeoutAndTransport(t *testing.T) {
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := classifyRequestError(canceledCtx, errors.New("connection reset by peer"))
+	assertCategory(t, err, "tracker_canceled")
+	var trackerErr *Error
+	if errors.As(err, &trackerErr) && trackerErr.Retryable {
+		t.Fatalf("cancelled request marked retryable: %#v", trackerErr)
+	}
+
+	err = classifyRequestError(context.Background(), fakeTimeoutError{})
+	assertCategory(t, err, "tracker_timeout")
+	if !errors.As(err, &trackerErr) || !trackerErr.Retryable {
+		t.Fatalf("timeout error not retryable: %#v", trackerErr)
+	}
+
+	err = classifyRequestError(context.Background(), errors.New("dial tcp: connection refused"))
+	assertCategory(t, err, "tracker_transport")
+	if !errors.As(err, &trackerErr) || !trackerErr.Retryable {
+		t.Fatalf("transport error not retryable: %#v", trackerErr)
+	}
+}
+
+type fakeTimeoutError struct{}
+
+func (fakeTimeoutError) Error() string   { return "i/o timeout" }
+func (fakeTimeoutError) Timeout() bool   { return true }
+func (fakeTimeoutError) Temporary() bool { return true }
+
+// TestRequestErrorsAreClassifiedEndToEnd exercises the same three cases as
+// TestClassifyRequestErrorDistinguishesCancellationTimeoutAndTransport, but
+// through a real client.Do, so a change to how http.Client surfaces these
+// failures (not just to classifyRequestError itself) is also caught.
+func TestRequestErrorsAreClassifiedEndToEnd(t *testing.T) {
+	t.Run("cancelled context", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			writeJSON(t, w, issuePage(nil, false, ""))
+		}))
+		defer server.Close()
+		tracker := newTestTracker(server.URL, "")
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		_, err := tracker.ListCandidates(ctx, []string{"Todo"})
+		assertCategory(t, err, "tracker_canceled")
+	})
+
+	t.Run("client timeout", func(t *testing.T) {
+		block := make(chan struct{})
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			<-block
+		}))
+		defer server.Close()
+		defer close(block)
+		tracker := newTestTracker(server.URL, "")
+		tracker.client.Timeout = 50 * time.Millisecond
+
+		_, err := tracker.ListCandidates(context.Background(), []string{"Todo"})
+		assertCategory(t, err, "tracker_timeout")
+		var trackerErr *Error
+		if !errors.As(err, &trackerErr) || !trackerErr.Retryable {
+			t.Fatalf("timeout error not retryable: %#v", trackerErr)
+		}
+	})
+
+	t.Run("connection failure", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+		addr := server.URL
+		server.Close() // nothing is listening at addr now
+
+		tracker := newTestTracker(addr, "")
+		_, err := tracker.ListCandidates(context.Background(), []string{"Todo"})
+		assertCategory(t, err, "tracker_transport")
+		var trackerErr *Error
+		if !errors.As(err, &trackerErr) || !trackerErr.Retryable {
+			t.Fatalf("transport error not retryable: %#v", trackerErr)
+		}
+	})
+}
+
 func TestRateLimitUsesLatestRedactedReset(t *testing.T) {
 	now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -19,7 +19,10 @@ registry, lock, or singleton path. The parent runtime directory is created mode
 either the previous complete JSON document or the next complete document,
 never a partial write. If the selected runtime directory already exists, it
 must already be owner-only; Symphony refuses to change permissions on an
-arbitrary existing parent directory.
+arbitrary existing parent directory. `--dry-run` checks this ahead of time as
+its `status_file` check, so a bad directory mode fails preflight instead of
+surfacing only as a repeating write-failure warning once the daemon is
+already running.
 
 The versioned document includes the process PID and start time, generation
 time, effective workflow and log paths, coordinator claim/running/retry state,
@@ -32,7 +35,10 @@ bodies, tool arguments and output, and raw Codex payloads.
 Symphony writes the snapshot on startup and every second while it runs, then
 writes a final `"state":"stopped"` record after graceful shutdown. Snapshot
 publication is observational: a filesystem failure is logged but never blocks
-or changes coordinator scheduling. A crash can leave a `"running"` record
+or changes coordinator scheduling. A write failure is logged once and then
+suppressed while it stays identical from tick to tick, rather than once per
+second for the rest of the process's life; it is logged again if the failure
+changes or the writes recover. A crash can leave a `"running"` record
 behind, so clients must treat it as a hint rather than liveness authority:
 compare `generated_at` with a freshness threshold and check the PID/service
 manager state (for example launchd) independently. The structured log at

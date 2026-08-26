@@ -94,8 +94,8 @@ before the coordinator gives up on that episode — Symphony logs a single
 template, its own agent, its own turn budget — never the shared environment
 dispatching it.
 
-Four reasons never appear on that abandonment record, because none of them is
-evidence the issue itself is unworkable (`systemicAgentFailureReasons` in
+Five reasons never appear on that abandonment record, because none of them is
+evidence the issue itself is unworkable (`systemicFailureReasons` in
 `internal/coordinator/coordinator.go`):
 
 * `agent_event` — a run that ended on `domain.EventFailed` carrying model or
@@ -107,6 +107,13 @@ evidence the issue itself is unworkable (`systemicAgentFailureReasons` in
   the issue: with an escalating backoff ladder, a Linear outage lasting a
   couple of minutes would otherwise abandon every issue running at the time,
   since they would all fail the post-turn refresh the same way at once.
+* `retry_refresh` — the same tracker error from the *pre-dispatch* `GetIssues`
+  refresh a queued retry runs before redispatching (PMR-142). It wraps the
+  same failure as `issue_refresh`, just observed at a different moment: an
+  issue that already failed once and is waiting to retry, rather than one
+  that just finished a turn. A sustained outage drives every retrying issue
+  through exactly this site, so leaving it off this exemption let the same
+  outage abandon issues at that moment while sparing ones still running.
 * `session_continue` — Symphony's own backend adapter (`agent.Continue`)
   failing to resume a session. A broken agent binary or lapsed backend auth
   fails every running issue's next turn identically.
@@ -115,7 +122,7 @@ evidence the issue itself is unworkable (`systemicAgentFailureReasons` in
   emits one of those before it closes its channel, so this is never a
   repository- or issue-specific outcome, only ever a host bug.
 
-Each of these four keeps climbing the ordinary backoff ladder without ever
+Each of these five keeps climbing the ordinary backoff ladder without ever
 arming the ceiling, so a transient, account-wide condition cannot abandon an
 otherwise-healthy issue. Every classified `reason` — armed or exempt alike, on
 the `"msg":"agent run retry scheduled"` warning that precedes abandonment as

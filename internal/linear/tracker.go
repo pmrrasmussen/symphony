@@ -59,6 +59,26 @@ func trackerError(category, message string) error {
 	return &Error{Category: category, Message: message}
 }
 
+// classifyRequestError distinguishes the three ways client.Do can fail so a
+// caller-cancelled refresh (routine whenever a run ends mid-request), a
+// client-side timeout, and every other transport failure are no longer the
+// same undiagnosable string with the same (wrong) non-retryable verdict. The
+// caller's ctx is checked first because the 30s http.Client.Timeout in
+// newHTTPClient fires through the same request context Go derives for the
+// deadline, so a fired client timeout and a cancelled caller context are only
+// distinguishable by asking whether the caller's own ctx is the one that gave
+// out.
+func classifyRequestError(ctx context.Context, err error) error {
+	if ctx.Err() != nil {
+		return &Error{Category: "tracker_canceled", Message: "Linear request was canceled"}
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return &Error{Category: "tracker_timeout", Message: "Linear request timed out", Retryable: true}
+	}
+	return &Error{Category: "tracker_transport", Message: "Linear request failed", Retryable: true}
+}
+
 type Tracker struct {
 	settings func() config.Settings
 	client   *http.Client
@@ -403,7 +423,7 @@ func (t *Tracker) cachedViewer(ctx context.Context, s config.Settings) (string, 
 	if ready != nil {
 		select {
 		case <-ctx.Done():
-			return "", trackerError("tracker_request", "Linear request failed")
+			return "", &Error{Category: "tracker_canceled", Message: "Linear request was canceled"}
 		case <-ready:
 		}
 		viewerID = resolution.viewerID
@@ -503,7 +523,7 @@ func requestWithSettingsAt(ctx context.Context, client *http.Client, s config.Se
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, trackerError("tracker_request", "Linear request failed")
+		return nil, classifyRequestError(ctx, err)
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseSize+1))

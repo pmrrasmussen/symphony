@@ -20,8 +20,8 @@ func TestDiscoverMultipleIndependentInstancesAndStaleSnapshot(t *testing.T) {
 	now := time.Date(2026, 8, 25, 12, 0, 0, 0, time.UTC)
 	first := fixtureWorkflow(t, dir, "first")
 	second := fixtureWorkflow(t, dir, "second")
-	firstStatus := filepath.Join(dir, "first-status.json")
-	secondStatus := filepath.Join(dir, "second-status.json")
+	firstStatus := filepath.Join(ownerOnlyDir(t, dir, "first-status"), "status.json")
+	secondStatus := filepath.Join(ownerOnlyDir(t, dir, "second-status"), "status.json")
 	write(t, firstStatus, `{"state":"running","updated_at":"2026-08-25T11:59:30Z"}`)
 	write(t, secondStatus, `{"state":"running","updated_at":"2026-08-25T11:50:00Z"}`)
 	writePlist(t, dir, labelPrefix+".zeta", first, filepath.Join(dir, "logs-first"), firstStatus)
@@ -85,7 +85,7 @@ func TestDiscoverKeepsMalformedAndMissingWorkflowCandidates(t *testing.T) {
 func TestDiscoverReportsDuplicateUnsafePathsAndMissingStatus(t *testing.T) {
 	dir := t.TempDir()
 	workflow := fixtureWorkflow(t, dir, "shared")
-	status := filepath.Join(dir, "status.json")
+	status := filepath.Join(ownerOnlyDir(t, dir, "status"), "status.json")
 	writePlist(t, dir, labelPrefix+".one", workflow, filepath.Join(dir, "logs"), status)
 	writePlist(t, dir, labelPrefix+".two", workflow, filepath.Join(dir, "logs"), status)
 
@@ -105,7 +105,7 @@ func TestDiscoverReportsDuplicateUnsafePathsAndMissingStatus(t *testing.T) {
 func TestSnapshotCannotMakeStoppedLaunchAgentRunning(t *testing.T) {
 	dir := t.TempDir()
 	workflow := fixtureWorkflow(t, dir, "stopped")
-	status := filepath.Join(dir, "status.json")
+	status := filepath.Join(ownerOnlyDir(t, dir, "status"), "status.json")
 	write(t, status, `{"state":"running","updated_at":"2026-08-25T11:59:30Z"}`)
 	writePlist(t, dir, labelPrefix+".stopped", workflow, filepath.Join(dir, "logs"), status)
 
@@ -145,7 +145,7 @@ func TestEffectiveConfigReportsResolvedAgentBackendAlongsideCodexKeys(t *testing
 	dir := t.TempDir()
 	now := time.Date(2026, 8, 25, 12, 0, 0, 0, time.UTC)
 	workflow := fixtureWorkflow(t, dir, "backend")
-	status := filepath.Join(dir, "backend-status.json")
+	status := filepath.Join(ownerOnlyDir(t, dir, "backend-status"), "status.json")
 	write(t, status, `{"state":"running","updated_at":"2026-08-25T11:59:30Z"}`)
 	writePlist(t, dir, labelPrefix, workflow, filepath.Join(dir, "logs"), status)
 
@@ -241,6 +241,20 @@ func TestDiscoverUsesLaunchAgentCredentialFileReferenceWithoutLeakingIt(t *testi
 	if strings.Contains(string(encoded), "daemon-secret-value") {
 		t.Fatalf("operator model exposed credential value: %s", encoded)
 	}
+}
+
+// ownerOnlyDir creates and returns a subdirectory of dir with mode 0700.
+// t.TempDir() itself is not owner-only: its numbered leaf is created with
+// os.Mkdir(dir, 0o777), which a typical umask reduces to 0755, not the
+// owner-only mode status.Publisher requires of a status file's parent
+// directory (see preflight's status_file check).
+func ownerOnlyDir(t *testing.T, dir, name string) string {
+	t.Helper()
+	path := filepath.Join(dir, name)
+	if err := os.Mkdir(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return path
 }
 
 func fixtureWorkflow(t *testing.T, dir, name string) string {

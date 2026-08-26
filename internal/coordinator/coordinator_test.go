@@ -574,6 +574,7 @@ type fakeTracker struct {
 	getErr        error
 	transitions   []trackerTransition
 	transitionErr error
+	getIssuesErr  error
 }
 
 // trackerTransition records one host-side dispatch transition request so tests
@@ -589,6 +590,9 @@ func (f *fakeTracker) GetIssues(context.Context, []string) ([]domain.Issue, erro
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.gets++
+	if f.getIssuesErr != nil {
+		return nil, f.getIssuesErr
+	}
 	if f.getErr != nil {
 		return nil, f.getErr
 	}
@@ -1285,7 +1289,7 @@ func TestPermanentDispatchFailureStopsAtMaxAttempts(t *testing.T) {
 // escalating backoff ladder without ever arming abandonment, however many
 // times it repeats -- unlike workspace_prepare, before_run, prompt_render,
 // and session_start, which are issue-attributable and still consume the
-// ceiling. See systemicAgentFailureReasons for the three PMR-115 added
+// ceiling. See systemicFailureReasons for the three PMR-115 added
 // alongside it (stream_closed, issue_refresh, session_continue) and why none
 // of them consumes the ceiling either.
 func TestUnclassifiedAgentEventNeverAbandonsIssue(t *testing.T) {
@@ -1337,7 +1341,7 @@ func TestUnclassifiedAgentEventNeverAbandonsIssue(t *testing.T) {
 }
 
 // TestClosedEventStreamNeverAbandonsIssue pins the review-round-4 decision in
-// systemicAgentFailureReasons for "stream_closed": by construction (see
+// systemicFailureReasons for "stream_closed": by construction (see
 // errStreamClosed) it is never a repository- or issue-specific outcome, only
 // ever a host bug in the coordinator's own event plumbing, so -- like
 // agent_event -- it must keep climbing the ordinary escalating backoff
@@ -1390,12 +1394,12 @@ func TestClosedEventStreamNeverAbandonsIssue(t *testing.T) {
 // Linear timeout on the post-turn GetIssues refresh -- is this codebase's
 // shared tracker infrastructure, not this issue, so repeating it past
 // agent.max_attempts must keep retrying rather than abandon the issue (see
-// systemicAgentFailureReasons). It drives finishFailure directly rather than
+// systemicFailureReasons). It drives finishFailure directly rather than
 // replaying a full dispatch (see TestClosedEventStreamNeverAbandonsIssue):
 // a permanently failing tracker would also fail runRetry's own pre-dispatch
 // refresh, reclassifying every retry after the first as "retry_refresh" (a
-// separate, already-covered ceiling interaction -- TestRetryRefreshFailureAbandonsAtMaxAttempts,
-// PMR-128) instead of exercising "issue_refresh" a second time.
+// separate, already-covered ceiling interaction -- TestRetryRefreshFailureNeverAbandonsIssue,
+// PMR-142) instead of exercising "issue_refresh" a second time.
 func TestPostTurnRefreshFailureNeverAbandonsIssue(t *testing.T) {
 	w := testSettings(t)
 	w.Config.Agent.MaxAttempts = 2
@@ -1441,7 +1445,7 @@ func TestPostTurnRefreshFailureNeverAbandonsIssue(t *testing.T) {
 // auth would fail every running issue's next turn identically -- the same
 // account-wide shape as the quota rejection that motivates agent_event's
 // exemption, just raised by Symphony's own code instead of the model's (see
-// systemicAgentFailureReasons).
+// systemicFailureReasons).
 func TestContinuationFailureNeverAbandonsIssue(t *testing.T) {
 	w := testSettings(t)
 	w.Config.Agent.MaxAttempts = 2
@@ -1948,6 +1952,51 @@ func TestReconciliationCancellationDoesNotRetry(t *testing.T) {
 	}
 }
 
+// TestReconcileRefreshFailureLogsWarnOnlyWhenNotCancelled pins the PMR-128
+// fix that a run-scoped refresh racing its own context's cancellation is
+// routine, not an operator-facing problem: reconcile still surfaces a live
+// tracker failure at Warn, but a failure discovered after ctx is already done
+// logs at Debug instead.
+func TestReconcileRefreshFailureLogsWarnOnlyWhenNotCancelled(t *testing.T) {
+	w := testSettings(t)
+	issue := testIssue()
+	refreshErr := errors.New("linear tracker_transport: Linear request failed")
+
+	t.Run("live context", func(t *testing.T) {
+		var logs bytes.Buffer
+		tracker := &fakeTracker{issue: issue, getIssuesErr: refreshErr}
+		c := New(tracker, &fakeAgent{}, &fakeWorkspace{}, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&logs, nil)))
+		c.mu.Lock()
+		c.running[issue.ID] = &running{issue: issue}
+		c.mu.Unlock()
+
+		if err := c.reconcile(context.Background()); err == nil {
+			t.Fatal("expected reconcile to surface the refresh failure")
+		}
+		if !strings.Contains(logs.String(), "running issue refresh failed") {
+			t.Fatalf("missing warn log: %s", logs.String())
+		}
+	})
+
+	t.Run("cancelled context", func(t *testing.T) {
+		var logs bytes.Buffer
+		tracker := &fakeTracker{issue: issue, getIssuesErr: refreshErr}
+		c := New(tracker, &fakeAgent{}, &fakeWorkspace{}, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&logs, nil)))
+		c.mu.Lock()
+		c.running[issue.ID] = &running{issue: issue}
+		c.mu.Unlock()
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		if err := c.reconcile(ctx); err == nil {
+			t.Fatal("expected reconcile to surface the refresh failure")
+		}
+		if strings.Contains(logs.String(), "running issue refresh failed") {
+			t.Fatalf("cancelled refresh produced a log record at the default (Info+) level: %s", logs.String())
+		}
+	})
+}
+
 func TestCompletedEventAfterReconciliationCancellationDoesNotComplete(t *testing.T) {
 	w := testSettings(t)
 	issue := testIssue()
@@ -2285,12 +2334,17 @@ func TestRetryRefreshFailureIncrementsAttemptAndRetries(t *testing.T) {
 	}
 }
 
-// TestRetryRefreshFailureAbandonsAtMaxAttempts covers runRetry's other
-// host-side escalation: a tracker that keeps failing GetIssues on every
-// retry raises the same attempt counter as a dispatch failure, so a
-// retryAgent episode must give up at agent.max_attempts instead of retrying
-// a broken tracker connection forever.
-func TestRetryRefreshFailureAbandonsAtMaxAttempts(t *testing.T) {
+// TestRetryRefreshFailureNeverAbandonsIssue pins the PMR-142 correction:
+// runRetry's pre-dispatch refresh wraps the same tracker.GetIssues failure
+// as the post-turn refresh covered by TestPostTurnRefreshFailureNeverAbandonsIssue
+// (see systemicFailureReasons), just observed at a different moment -- the
+// moment an issue is waiting to redispatch rather than the moment one just
+// finished a turn. A sustained Linear outage drives every retrying issue
+// through exactly this site, so it must keep climbing the ordinary
+// escalating backoff ladder past agent.max_attempts, the same as
+// "issue_refresh", instead of abandoning the issue on infrastructure that
+// says nothing about whether its work is workable.
+func TestRetryRefreshFailureNeverAbandonsIssue(t *testing.T) {
 	w := testSettings(t)
 	w.Config.Agent.MaxAttempts = 2
 	w.Config.Agent.MaxRetryBackoff = 15 * time.Second
@@ -2306,23 +2360,27 @@ func TestRetryRefreshFailureAbandonsAtMaxAttempts(t *testing.T) {
 		t.Fatal("issue was not claimed")
 	}
 	c.scheduleRetry(context.Background(), issue, domain.Workspace{}, 1, retryAgent, "test", time.Second)
-	timer.fire(0)
-	waitForRelease(t, c, issue.ID)
+
+	const repeats = 6 // well past max_attempts=2, which a Linear-infrastructure cause must never consume
+	for i := 0; i < repeats; i++ {
+		timer.fire(i)
+	}
 
 	c.mu.Lock()
-	_, stillRetrying := c.retries[issue.ID]
+	claimed := c.claimed[issue.ID]
+	retry, stillRetrying := c.retries[issue.ID]
 	c.mu.Unlock()
-	if stillRetrying {
-		t.Fatal("retry refresh failure rearmed a retry past max_attempts")
+	if !claimed || !stillRetrying {
+		t.Fatal("retry_refresh abandoned the issue before any classified failure occurred")
 	}
-	if len(timer.delays) != 1 {
-		t.Fatalf("delays=%v, want no further retry armed", timer.delays)
+	if retry.reason != "retry_refresh" {
+		t.Fatalf("reason=%q, want retry_refresh", retry.reason)
 	}
-	record := waitForSubstring(t, &log, `"msg":"dispatch abandoned after max attempts"`, time.Second)
-	for _, want := range []string{`"reason":"retry_refresh"`, `"attempt":2`, `"max_attempts":2`} {
-		if !strings.Contains(record, want) {
-			t.Fatalf("abandonment record missing %s: %s", want, record)
-		}
+	if retry.attempt <= w.Config.Agent.MaxAttempts {
+		t.Fatalf("attempt=%d, want it to keep climbing the ordinary ladder past max_attempts", retry.attempt)
+	}
+	if strings.Contains(log.String(), `"msg":"dispatch abandoned after max attempts"`) {
+		t.Fatalf("retry_refresh armed an abandonment record: %s", log.String())
 	}
 	if err := c.Shutdown(context.Background()); err != nil {
 		t.Fatal(err)

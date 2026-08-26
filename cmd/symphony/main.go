@@ -84,7 +84,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		workflowPath = flags.Arg(0)
 	}
 	if dry {
-		result := preflight.Run(context.Background(), workflowPath, logs)
+		result := preflight.Run(context.Background(), workflowPath, logs, statusFile)
 		encoder := json.NewEncoder(stdout)
 		encoder.SetIndent("", "  ")
 		if err := encoder.Encode(result); err != nil {

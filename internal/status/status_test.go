@@ -1,6 +1,7 @@
 package status
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -156,6 +157,43 @@ func TestWriteSecuresPathAndIndependentPublishers(t *testing.T) {
 				t.Fatalf("runtime directory mode=%#o want 0700", dirInfo.Mode().Perm())
 			}
 		}
+	}
+}
+
+// TestRunSuppressesRepeatedIdenticalWriteFailures pins the shape of PMR-125: a
+// structural failure like a non-owner-only status directory cannot self-heal,
+// so it must not report once per tick for as long as the daemon runs.
+func TestRunSuppressesRepeatedIdenticalWriteFailures(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows does not expose Unix permission semantics")
+	}
+	dir := filepath.Join(t.TempDir(), "runtime")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	publisher, err := New(filepath.Join(dir, "status.json"), Metadata{PID: 1, StartedAt: time.Now()})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var mu sync.Mutex
+	var reports []error
+	interval := 5 * time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), 20*interval)
+	defer cancel()
+	publisher.Run(ctx, interval, func() coordinator.Snapshot { return coordinator.Snapshot{} }, func(err error) {
+		mu.Lock()
+		defer mu.Unlock()
+		reports = append(reports, err)
+	})
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(reports) != 1 {
+		t.Fatalf("got %d reports for an unchanging failure across %d ticks, want 1: %v", len(reports), 20, reports)
+	}
+	if !strings.Contains(reports[0].Error(), "owner-only") {
+		t.Fatalf("report=%v, want owner-only directory refusal", reports[0])
 	}
 }
 
