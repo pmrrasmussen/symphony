@@ -142,6 +142,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	ws := workspace.New(settings)
+	ws.SetLogger(slog.New(log.Handler()))
 	backends, githubLifecycle, capabilityEndpoint, err := wire(settings, slog.New(log.Handler()))
 	if err != nil {
 		fmt.Fprintln(stderr, "symphony startup error:", err)
