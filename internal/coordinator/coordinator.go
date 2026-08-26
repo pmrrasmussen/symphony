@@ -1486,10 +1486,10 @@ func (c *Coordinator) finishFailure(ctx context.Context, i domain.Issue, attempt
 	c.scheduleRetry(ctx, i, domain.Workspace{}, next, retryAgent, reason, backoff(next, s.Agent.MaxRetryBackoff))
 }
 
-// systemicAgentFailureReasons are the agentFailureReason outputs that name a
-// boundary the coordinator's own host, or a shared backend, crosses -- never
-// evidence that this issue's work is unworkable -- so none of them arms
-// attemptsExhausted's ceiling:
+// systemicFailureReasons are the reasons -- from agentFailureReason or raised
+// directly at a call site -- that name a boundary the coordinator's own
+// host, or a shared backend, crosses -- never evidence that this issue's
+// work is unworkable -- so none of them arms attemptsExhausted's ceiling:
 //
 //   - "agent_event": the ceiling's original exemption (PMR-111/PMR-131). It
 //     is agentFailureReason's fallback for domain.EventFailed carrying
@@ -1504,11 +1504,16 @@ func (c *Coordinator) finishFailure(ctx context.Context, i domain.Issue, attempt
 //     infrastructure, not this issue: with this codebase's default
 //     max_attempts=5 and its escalating backoff, a two-and-a-half-minute
 //     Linear outage would otherwise abandon every issue currently running,
-//     since they all fail the same way at the same time. Once PMR-128
-//     gives tracker errors a real Retryable signal, this can narrow to
-//     "arm the ceiling only when the wrapped error is not Retryable"
-//     instead of staying a blanket exemption -- but that is future work,
-//     not a precondition for this one.
+//     since they all fail the same way at the same time.
+//   - "retry_refresh": the same tracker.GetIssues failure, observed instead
+//     at runRetry's pre-dispatch refresh (PMR-142). It is the same Linear
+//     infrastructure as "issue_refresh", just crossed at a different
+//     moment -- the moment an issue is waiting to redispatch rather than
+//     the moment one just finished a turn -- and a sustained outage drives
+//     every retrying issue through exactly this site, raising `attempt`
+//     each time. Governing it from the same map as "issue_refresh" is
+//     deliberate: the two must not be able to drift into opposite verdicts
+//     on identical evidence again.
 //   - "session_continue": Symphony's own backend adapter (agent.Continue)
 //     failing to resume a session. A broken `claude` binary or lapsed
 //     backend auth fails every running issue's next turn the same way, at
@@ -1521,16 +1526,25 @@ func (c *Coordinator) finishFailure(ctx context.Context, i domain.Issue, attempt
 //     host bug affects whichever issues happen to be running when it
 //     fires, not the one that happened to surface it first.
 //
+// Once PMR-128 gives tracker errors a real Retryable signal, "issue_refresh"
+// and "retry_refresh" can narrow together from a blanket exemption to "arm
+// the ceiling only when the wrapped error is not Retryable" -- but that is
+// future work, not a precondition for this one.
+//
 // Of agentFailureReason's outputs, only "turn_limit_exhausted" and
 // "agent_blocked" are left to arm the ceiling -- each is evidence about
 // *this* issue's run (it exhausted its turns; its own agent reported a
 // blocker), the same way "prompt_render" is evidence about this issue's own
-// WORKFLOW.md template. None of the four reasons above says anything about
+// WORKFLOW.md template. None of the five reasons above says anything about
 // the issue at all; each says something about the shared environment
-// dispatching it.
-var systemicAgentFailureReasons = map[string]bool{
+// dispatching it. This map is not exhaustive for finishFailure's other
+// direct reasons ("workspace_prepare", "before_run", "prompt_render",
+// "session_start", "stalled") -- those are deliberately absent because they
+// are issue-attributable, not systemic.
+var systemicFailureReasons = map[string]bool{
 	"agent_event":      true,
 	"issue_refresh":    true,
+	"retry_refresh":    true,
 	"session_continue": true,
 	"stream_closed":    true,
 }
@@ -1538,7 +1552,7 @@ var systemicAgentFailureReasons = map[string]bool{
 // attemptsExhausted reports whether next has reached agent.max_attempts for a
 // retryAgent episode, abandoning the dispatch (and releasing its claim) if so.
 // Only retryAgent consumes the ceiling, and only on a genuine, classified
-// dispatch failure that is not systemic (see systemicAgentFailureReasons): a
+// dispatch failure that is not systemic (see systemicFailureReasons): a
 // retryLanding redispatch — whether from finishLandingWait or either
 // escalation in runRetry — never raises its attempt counter, and neither does
 // a retryAgent episode that merely lost an orchestrator slot race (see
@@ -1547,7 +1561,7 @@ var systemicAgentFailureReasons = map[string]bool{
 // pre-PMR-111 unbounded ladder rather than having a zero ceiling abandon
 // every first failure.
 func (c *Coordinator) attemptsExhausted(i domain.Issue, kind retryKind, reason string, next int, s config.Settings, attrs []any) bool {
-	if kind != retryAgent || systemicAgentFailureReasons[reason] || s.Agent.MaxAttempts <= 0 || next < s.Agent.MaxAttempts {
+	if kind != retryAgent || systemicFailureReasons[reason] || s.Agent.MaxAttempts <= 0 || next < s.Agent.MaxAttempts {
 		return false
 	}
 	c.abandonDispatch(i, s.Agent.MaxAttempts, attrs)
@@ -1559,14 +1573,16 @@ func (c *Coordinator) attemptsExhausted(i domain.Issue, kind retryKind, reason s
 // attempt N ends the (N+1)th launch of the episode, so a boundary that fails
 // every time dispatches exactly max_attempts times and arms no further retry.
 // Of runRetry's two host-side escalations for a retryAgent episode, only the
-// failed retry refresh raises that counter and checks it through
-// attemptsExhausted, exactly like a dispatch failure does — a tracker that
-// will not answer is a real failure. The other, a contended orchestrator
-// slot, is not: it is capacity contention rather than a failure, so it keeps
-// the attempt fixed and never reaches here (see agentSlotRetryDelay), the
-// same way a retryLanding episode's own escalations do (see runRetry), since
-// the attempt feeds the rendered prompt and neither a wait nor contention
-// should inflate it.
+// failed retry refresh raises that counter and routes it through
+// attemptsExhausted at all -- but "retry_refresh" is itself one of
+// systemicFailureReasons' exemptions (PMR-142), so that check never actually
+// abandons the episode; the counter keeps climbing the ordinary backoff
+// ladder instead, the same way a classified "issue_refresh" failure does.
+// The other escalation, a contended orchestrator slot, never reaches here at
+// all: it is capacity contention rather than a failure, so it keeps the
+// attempt fixed (see agentSlotRetryDelay), the same way a retryLanding
+// episode's own escalations do (see runRetry), since the attempt feeds the
+// rendered prompt and neither a wait nor contention should inflate it.
 //
 // What it does NOT do is as deliberate as what it does:
 //
