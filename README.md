@@ -220,7 +220,12 @@ Host-owned Linear and GitHub secrets are absent from the Codex child
 configured name, by configured value, and by the credential the run's bound
 providers hold, so no host credential is handed to the worker as a variable, and
 all publishing authority stays with the host. The same filter applies to both
-backends; [docs/architecture.md](docs/architecture.md) describes it in full.
+backends and to `WORKFLOW.md` hooks, which run inside the issue worktree and can
+invoke what the agent committed there; a hook receives only
+`SYMPHONY_ISSUE_ID` and `SYMPHONY_ISSUE_IDENTIFIER` on top of the filtered
+environment, and runs under `sh -c`, so it resolves commands from the daemon's
+own `PATH` rather than the operator's login profile.
+[docs/architecture.md](docs/architecture.md) describes the filter in full.
 That guarantee covers the environment, not reachability and not files on disk.
 With both local reads and outbound network available to the worker, what
 protects host credentials from exfiltration is that no untrusted input reaches

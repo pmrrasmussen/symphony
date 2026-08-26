@@ -650,9 +650,9 @@ func decodeGitHub(raw map[string]any, objectValid bool, base string, sources *so
 }
 
 // reservedSecretEnvNames is the fixed half of the host credential filter: names
-// that never reach an agent child whatever a workflow says. They are the
-// documented variables Symphony's own tracker and forge credentials are read
-// from, and an agent reaches those providers through bounded capabilities,
+// that never reach a child Symphony spawns, whatever a workflow says. They are
+// the documented variables Symphony's own tracker and forge credentials are
+// read from, and an agent reaches those providers through bounded capabilities,
 // never directly.
 //
 // It lives beside HostSecretEnvNames and HostSecretValues, and beside the
@@ -668,15 +668,25 @@ var reservedSecretEnvNames = []string{
 	"SYMPHONY_GITHUB_TOKEN_FILE",
 }
 
-// ReservedSecretEnvNames returns the names no agent child may inherit under any
-// configuration. A copy is returned because its one caller blocks names of its
-// own alongside these.
+// ReservedSecretEnvNames returns the names no child Symphony spawns may inherit
+// under any configuration. A copy is returned because its one caller blocks
+// names of its own alongside these.
 //
 // This comment is also the one description of how host credentials are kept out
 // of a process Symphony spawns. hostenv.Filter is the one implementation of it,
 // and nothing else documents it separately: the description lives here, beside
 // the names and the loader that derives the rest, and the loop lives there,
 // where every launcher can reach it without depending on a session.
+//
+// "Child" here means every process Symphony starts, not only an agent backend.
+// There are three: the Codex app-server, each Claude turn, and a WORKFLOW.md
+// workspace hook (workspace.Local.hook -- after_create, before_run, after_run,
+// before_remove). The hook is the one that reads as an exception and is not:
+// its script is repository-owned policy, but it runs in the agent's own
+// worktree, so it can invoke anything the agent committed there, outside the
+// agent sandbox. It ran with the daemon's complete environment until PMR-113,
+// which is what a doctrine that enumerated only the backends could not make
+// visible. Adding a fourth kind of child means adding it here too.
 //
 // A caller filters the inherited environment through four filters, and each
 // one exists because the others cannot cover it:
@@ -719,8 +729,10 @@ var reservedSecretEnvNames = []string{
 //     rotated value is stripped alongside the frozen one. See SecretMatcher for
 //     why the Linear side has no such pair. It is the one filter a caller may
 //     omit, because it is the one that needs a session: a process Symphony
-//     spawns outside any session has no bindings to build a matcher from and
-//     passes none.
+//     spawns outside any session -- a workspace hook -- has no bindings to build
+//     a matcher from and passes none, so it gets filters 1 through 3 and forgoes
+//     only a credential held by a live provider under a name and value no
+//     configuration mentions.
 //
 // A credential the caller deliberately hands over -- the Claude backend's
 // capability endpoint token -- is appended after filtering, so no filter can
@@ -734,8 +746,9 @@ var reservedSecretEnvNames = []string{
 // TestFilterAppliesEveryPartOfTheHostCredentialFilter, and each launcher is
 // proven to reach it with the whole of what it must contribute, because a hole
 // would be silent either way: see TestNoHostCredentialReachesTheChildEnvironment
-// in internal/codex and TestHostSecretsNeverReachTheChild plus
-// TestStartBindsTheHostProvidersAndTheirSecrets in internal/claude. Filter 1's
+// in internal/codex, TestHostSecretsNeverReachTheChild plus
+// TestStartBindsTheHostProvidersAndTheirSecrets in internal/claude, and
+// TestNoHostCredentialReachesAHook in internal/workspace. Filter 1's
 // names are also the names internal/service writes into the LaunchAgent plist;
 // TestReservedNamesCoverTheServiceCredentialVariables holds those two lists
 // together.
