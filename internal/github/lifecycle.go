@@ -425,7 +425,7 @@ func (s *Session) Publish(ctx context.Context, input PublishInput) (Result, erro
 	}
 	s.manager.logger.Info("GitHub issue branch published", "issue_id", s.issue.ID, "issue_identifier", s.issue.Identifier, "repository", s.settings.Owner+"/"+s.settings.Repository, "branch", s.branch)
 	body := canonicalBody(input, s.issue.URL)
-	pr, updated, err := s.manager.publishPullRequest(ctx, s.settings, s.branch, s.issue, body, existing, found)
+	pr, updated, err := s.manager.publishPullRequest(ctx, s.settings, s.branch, s.issue, body)
 	if err != nil {
 		return Result{}, err
 	}
@@ -1019,11 +1019,17 @@ func (m *Manager) findPull(ctx context.Context, s config.GitHub, branch string) 
 // exists, reopens an issue-bound pull request that was closed without being
 // merged, and updates the body only when the canonical structured fields
 // changed. A pull request already merged is irrecoverable and rejected.
-// existing and found are the caller's own findPull result -- Publish already
-// looked the pull request up to run its pre-push divergence check, and
-// nothing between that lookup and this call can change the pull request's
-// state, so a second list-PR request would be redundant.
-func (m *Manager) publishPullRequest(ctx context.Context, s config.GitHub, branch string, issue domain.Issue, body string, existing pull, found bool) (pull, bool, error) {
+//
+// It re-runs findPull itself rather than reusing Publish's pre-push lookup:
+// the push in between is a network round trip during which the pull request
+// can be merged, and a merge in that window must be caught here or Publish
+// would PATCH an already-merged pull request's body and hand it off as a
+// normal publish.
+func (m *Manager) publishPullRequest(ctx context.Context, s config.GitHub, branch string, issue domain.Issue, body string) (pull, bool, error) {
+	existing, found, err := m.findPull(ctx, s, branch)
+	if err != nil {
+		return pull{}, false, err
+	}
 	if found {
 		if existing.Merged || existing.MergedAt != nil {
 			return pull{}, false, errors.New("github pull request for this issue was already merged and cannot be reused")

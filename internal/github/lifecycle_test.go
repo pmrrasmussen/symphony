@@ -25,6 +25,11 @@ type fakeGit struct {
 	failFetch bool
 	calls     [][]string
 	envs      [][]string
+
+	// onPush lets a test simulate provider-side state changing during the
+	// push's network round trip -- for example a pull request merging while
+	// Publish is still pushing the branch (PMR-149).
+	onPush func()
 }
 
 func (g *fakeGit) Run(_ context.Context, _ string, args, env []string) (string, error) {
@@ -51,7 +56,12 @@ func (g *fakeGit) Run(_ context.Context, _ string, args, env []string) (string, 
 			return "head", nil
 		}
 		return "base", nil
-	case "merge-base", "push":
+	case "merge-base":
+		return "", nil
+	case "push":
+		if g.onPush != nil {
+			g.onPush()
+		}
 		return "", nil
 	}
 	return "", nil
@@ -1028,6 +1038,29 @@ func TestPublishRejectsMergedPullRequestAsIrrecoverable(t *testing.T) {
 	}
 	if api.created != 0 || len(api.patches) != 0 || len(linear.links) != 0 {
 		t.Fatalf("merged pull request was mutated: created=%d patches=%v links=%v", api.created, api.patches, linear.links)
+	}
+}
+
+// TestPublishRefusesPullRequestMergedDuringThePushWindow pins the case PMR-149
+// item 4 identified: the push is a network round trip during which the pull
+// request's state can change, so Publish must re-check that state after the
+// push rather than reuse its pre-push lookup, or a pull request merged while
+// the push was in flight gets PATCHed and handed off as a normal publish.
+func TestPublishRefusesPullRequestMergedDuringThePushWindow(t *testing.T) {
+	api, git, linear := newAPI(t), &fakeGit{}, &fakeLinear{}
+	api.prExists, api.prState, api.prBody = true, "open", "old body"
+	git.onPush = func() {
+		api.mu.Lock()
+		defer api.mu.Unlock()
+		api.prMerged = true
+		api.prState = "closed"
+	}
+	_, session := testSession(t, api, git, linear, nil)
+	if _, err := session.Publish(context.Background(), testInput()); err == nil || !strings.Contains(err.Error(), "already merged") {
+		t.Fatalf("merge-during-push error=%v", err)
+	}
+	if len(api.patches) != 0 || len(linear.links) != 0 {
+		t.Fatalf("pull request merged during the push window was mutated: patches=%v links=%v", api.patches, linear.links)
 	}
 }
 
