@@ -79,7 +79,7 @@ func Migrate(ctx context.Context, options Options) (Migration, error) {
 	if candidate == nil {
 		// A rerun after a completed migration must stay a successful no-op,
 		// and migrate must never become an implicit first-time installer.
-		managed, err := findManaged(ctx, options, d)
+		managed, err := findManaged(ctx, options, d, false)
 		if err != nil {
 			return Migration{}, fmt.Errorf("no hand-authored Symphony LaunchAgent to migrate for %s: %w", d.Repository, err)
 		}

@@ -105,6 +105,16 @@ Normally none are necessary. They are useful for an explicitly named
 instance, a workflow outside the repository root, an alternative shared
 binary, or a deliberate credential-file override.
 
+`install` and `migrate` always resolve `--workflow` themselves (defaulting to
+the repository's `WORKFLOW.md`) because they decide what gets written to the
+plist. `status` and `restart` instead treat the *installed* instance as the
+authority: if `--workflow` is omitted, they use whatever workflow path that
+instance was actually installed with, so `symphony service status` works
+after `service install --workflow WORKFLOW.local.md` without repeating the
+flag. Passing `--workflow` to `status` or `restart` still selects/validates
+against that specific path, and a mismatch is reported by name rather than
+silently resolved.
+
 ## Credentials
 
 The workflow contains credential *references*, never secret values. Services

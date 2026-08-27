@@ -285,6 +285,108 @@ func TestInstallDoesNotChangeExistingLaunchAgentsPermissions(t *testing.T) {
 	}
 }
 
+// TestStatusFallsBackToInstalledWorkflowWhenNotSupplied guards PMR-144: a
+// service installed against a non-default --workflow must still be found by
+// a bare "symphony service status", using the workflow it was actually
+// installed with rather than misdiagnosing the mismatch as an unrelated
+// hand-authored LaunchAgent.
+func TestStatusFallsBackToInstalledWorkflowWhenNotSupplied(t *testing.T) {
+	dir, options, _ := serviceFixture(t)
+	alt := writeAlternateWorkflow(t, dir)
+	options.Workflow = alt
+	if _, _, err := Install(context.Background(), options); err != nil {
+		t.Fatal(err)
+	}
+	options.Workflow = ""
+	instance, err := Status(context.Background(), options)
+	if err != nil {
+		t.Fatalf("status with default --workflow after installing against %s: %v", alt, err)
+	}
+	if !instance.Managed {
+		t.Fatalf("instance not reported managed: %#v", instance)
+	}
+	if canonical(instance.Paths.Workflow) != canonical(alt) {
+		t.Fatalf("instance workflow = %s, want %s", instance.Paths.Workflow, alt)
+	}
+}
+
+// TestRestartFallsBackToInstalledWorkflowWhenNotSupplied is Restart's half of
+// PMR-144; see TestStatusFallsBackToInstalledWorkflowWhenNotSupplied.
+func TestRestartFallsBackToInstalledWorkflowWhenNotSupplied(t *testing.T) {
+	dir, options, runner := serviceFixture(t)
+	alt := writeAlternateWorkflow(t, dir)
+	options.Workflow = alt
+	installed, _, err := Install(context.Background(), options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	options.Workflow = ""
+	if _, err := Restart(context.Background(), options); err != nil {
+		t.Fatalf("restart with default --workflow after installing against %s: %v", alt, err)
+	}
+	found := false
+	for _, call := range runner.calls {
+		if strings.Contains(call, "launchctl kickstart") && strings.Contains(call, installed.Label) {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("restart did not kickstart %s: calls=%v", installed.Label, runner.calls)
+	}
+}
+
+// TestUninstallReportsWorkflowMismatchInsteadOfUnrelated documents that
+// uninstall, unlike status/restart, keeps requiring an explicit --workflow
+// to match the installed instance -- but the resulting error must name the
+// mismatch, never claim the plist it just found is unrelated.
+func TestUninstallReportsWorkflowMismatchInsteadOfUnrelated(t *testing.T) {
+	dir, options, _ := serviceFixture(t)
+	alt := writeAlternateWorkflow(t, dir)
+	options.Workflow = alt
+	if _, _, err := Install(context.Background(), options); err != nil {
+		t.Fatal(err)
+	}
+	options.Workflow = ""
+	_, err := Uninstall(context.Background(), options)
+	if err == nil {
+		t.Fatal("expected an error naming the workflow mismatch")
+	}
+	if strings.Contains(err.Error(), "unrelated") || strings.Contains(err.Error(), "migrate") {
+		t.Fatalf("err=%v should not blame an unrelated hand-authored LaunchAgent", err)
+	}
+	if !strings.Contains(err.Error(), "--workflow") || !strings.Contains(err.Error(), alt) {
+		t.Fatalf("err=%v should name --workflow and the installed workflow %s", err, alt)
+	}
+}
+
+// TestStatusReportsUnrelatedForHandAuthoredPlist keeps the "unrelated
+// LaunchAgent" / migrate diagnosis reserved for a plist that genuinely lacks
+// the managed marker, so PMR-144's fix does not paper over that case too.
+func TestStatusReportsUnrelatedForHandAuthoredPlist(t *testing.T) {
+	_, options, _ := serviceFixture(t)
+	target := filepath.Join(options.LaunchAgentsDir, "com.pmrrasmussen.symphony.owner-repository.plist")
+	if err := os.WriteFile(target, []byte("<?xml version=\"1.0\"?><plist version=\"1.0\"><dict><key>Label</key><string>com.pmrrasmussen.symphony.owner-repository</string><key>Program</key><string>/bin/sh</string></dict></plist>"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Status(context.Background(), options)
+	if err == nil || !strings.Contains(err.Error(), "unrelated LaunchAgent") || !strings.Contains(err.Error(), "migrate") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+// writeAlternateWorkflow writes a second, differently-named workflow file
+// next to the one serviceFixture already installs at WORKFLOW.md, so a test
+// can install against a non-default --workflow.
+func writeAlternateWorkflow(t *testing.T, dir string) string {
+	t.Helper()
+	alt := filepath.Join(dir, "WORKFLOW.local.md")
+	content := "---\ntracker: {kind: linear, provider: {project_slug_id: service, api_key_file: $SYMPHONY_LINEAR_API_KEY_FILE}, active_states: [Todo], terminal_states: [Done]}\nworkspace: {root: .symphony/workspaces, source_root: .}\ncodex: {command: go}\n---\nprompt"
+	if err := os.WriteFile(alt, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return alt
+}
+
 func TestRenderPlistEscapesSpecialPathCharacters(t *testing.T) {
 	d := desired{Instance: Instance{Label: "com.pmrrasmussen.symphony.example", Workflow: "/tmp/a & b/WORKFLOW.md"}, Repository: "/tmp/a & b", LogsRoot: "/tmp/a & b/.symphony/logs", StatusFile: "/tmp/a & b/.symphony/service/status.json", Stdout: "/tmp/a & b/.symphony/service/stdout.log", Stderr: "/tmp/a & b/.symphony/service/stderr.log"}
 	content := string(renderPlist(d, "/tmp/a & b/symphony", "info", map[string]string{"PATH": "/bin"}))
