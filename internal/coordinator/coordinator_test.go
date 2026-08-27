@@ -733,6 +733,22 @@ func waitForSubstring(t *testing.T, buf *syncBuffer, substr string, timeout time
 	}
 }
 
+// findLine returns the single log line within output containing marker, so a
+// test can pin an assertion to one record (for example the terminal summary)
+// rather than the whole buffered log, where an earlier, legitimately
+// different figure would otherwise make a Contains check pass or fail for the
+// wrong reason.
+func findLine(t *testing.T, output, marker string) string {
+	t.Helper()
+	for _, line := range strings.Split(strings.TrimRight(output, "\n"), "\n") {
+		if strings.Contains(line, marker) {
+			return line
+		}
+	}
+	t.Fatalf("no log line contains %q: %s", marker, output)
+	return ""
+}
+
 // waitForRunning blocks until identifier appears in c's running snapshot.
 // agent.started only confirms Start was called; the launch goroutine still
 // needs to record the session in c.running afterward, and a test that
@@ -815,6 +831,112 @@ func TestRunningSnapshotUsageIsLiveAndSurvivesFailure(t *testing.T) {
 		if !strings.Contains(output, field) {
 			t.Fatalf("usage did not survive the timeout failure in the log: missing %s: %s", field, output)
 		}
+	}
+}
+
+// TestUpdateUsageAuthoritativeReplacesInflatedProvisionalPeak pins the fix for
+// PMR-153: Claude's mid-turn provisional figure is this host's own running
+// sum of per-API-call deltas, not the CLI's turn total, so it can overshoot
+// the authoritative end-of-turn result for the very same turn. A
+// component-wise max() would let that overshoot latch permanently even after
+// the authoritative source corrects itself down; the recorded usage must end
+// at the authoritative figure instead.
+func TestUpdateUsageAuthoritativeReplacesInflatedProvisionalPeak(t *testing.T) {
+	w := testSettings(t)
+	issue := testIssue()
+	events := make(chan domain.Event, 4)
+	// A mid-turn provisional estimate, inflated above what the turn actually
+	// spends -- exactly the failure mode PMR-153 describes.
+	events <- domain.Event{Kind: domain.EventUsage, At: time.Now(), Usage: domain.Usage{InputTokens: 9000, OutputTokens: 9000, TotalTokens: 18000}}
+	// The CLI's own authoritative end-of-turn total for that same turn, lower
+	// than the provisional estimate above.
+	events <- domain.Event{Kind: domain.EventUsage, At: time.Now(), Usage: domain.Usage{InputTokens: 1000, OutputTokens: 500, TotalTokens: 1500}, UsageAuthoritative: true}
+	events <- domain.Event{Kind: domain.EventCompleted, At: time.Now()}
+	close(events)
+	agent := &fakeAgent{events: func() <-chan domain.Event { return events }}
+	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{})}
+	var logs bytes.Buffer
+	c := New(&fakeTracker{issue: issue}, agent, ws, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&logs, nil)))
+	c.Tick(context.Background())
+	<-ws.after
+	if err := c.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	output := logs.String()
+	summary := findLine(t, output, `"msg":"agent turn completed"`)
+	if strings.Contains(summary, `"total_tokens":18000`) {
+		t.Fatalf("authoritative usage did not replace the inflated provisional peak in the terminal summary: %s", summary)
+	}
+	for _, field := range []string{`"input_tokens":1000`, `"output_tokens":500`, `"total_tokens":1500`} {
+		if !strings.Contains(summary, field) {
+			t.Fatalf("terminal summary missing authoritative %s: %s", field, summary)
+		}
+	}
+}
+
+// TestUpdateUsageNonAuthoritativeNotificationsAccumulate pins the behavior
+// updateUsage's component-wise max() was written for: Codex's turn/completed
+// notifications are genuinely cumulative and monotonically increasing, so
+// repeated or successive notifications merge into a running total rather than
+// ever regressing (PMR-153).
+func TestUpdateUsageNonAuthoritativeNotificationsAccumulate(t *testing.T) {
+	w := testSettings(t)
+	issue := testIssue()
+	events := make(chan domain.Event, 4)
+	events <- domain.Event{Kind: domain.EventUsage, At: time.Now(), Usage: domain.Usage{InputTokens: 100, OutputTokens: 50, TotalTokens: 150}}
+	events <- domain.Event{Kind: domain.EventUsage, At: time.Now(), Usage: domain.Usage{InputTokens: 400, OutputTokens: 200, TotalTokens: 600}}
+	events <- domain.Event{Kind: domain.EventCompleted, At: time.Now()}
+	close(events)
+	agent := &fakeAgent{events: func() <-chan domain.Event { return events }}
+	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{})}
+	var logs bytes.Buffer
+	c := New(&fakeTracker{issue: issue}, agent, ws, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&logs, nil)))
+	c.Tick(context.Background())
+	<-ws.after
+	if err := c.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	summary := findLine(t, logs.String(), `"msg":"agent turn completed"`)
+	for _, field := range []string{`"input_tokens":400`, `"output_tokens":200`, `"total_tokens":600`} {
+		if !strings.Contains(summary, field) {
+			t.Fatalf("terminal summary missing accumulated %s: %s", field, summary)
+		}
+	}
+}
+
+// TestPromptRenderedDebugRecordCarriesByteCountsNotText pins the Debug-level
+// "prompt rendered" record (added for PMR-136) to actually being emitted with
+// its two byte-count fields, and to those fields surviving redaction as
+// plain numbers rather than being treated as opaque text: prompt_bytes and
+// delivery_instruction_bytes are ints, so safeAttr passes them through
+// unmodified and opaqueKey does not match either name. The rendered prompt
+// text itself must never appear in the log.
+func TestPromptRenderedDebugRecordCarriesByteCountsNotText(t *testing.T) {
+	w := testSettings(t)
+	issue := testIssue()
+	agent := &fakeAgent{events: closedEvents, started: make(chan struct{}, 1)}
+	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{}, 1)}
+	var logs bytes.Buffer
+	c := New(&fakeTracker{issue: issue}, agent, ws, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	c.Tick(context.Background())
+	<-ws.after
+	if err := c.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	line := findLine(t, logs.String(), `"msg":"prompt rendered"`)
+	if !strings.Contains(line, `"issue_identifier":"ENG-1"`) {
+		t.Fatalf("prompt rendered record missing issue_identifier: %s", line)
+	}
+	for _, field := range []string{`"prompt_bytes":`, `"delivery_instruction_bytes":`} {
+		if !strings.Contains(line, field) {
+			t.Fatalf("prompt rendered record missing %s: %s", field, line)
+		}
+	}
+	if strings.Contains(line, `"prompt_bytes":"`) || strings.Contains(line, `"delivery_instruction_bytes":"`) {
+		t.Fatalf("prompt rendered byte counts were redacted to strings instead of passing through as numbers: %s", line)
+	}
+	if strings.Contains(logs.String(), "Work on ENG-1") {
+		t.Fatalf("rendered prompt text leaked into the log: %s", logs.String())
 	}
 }
 

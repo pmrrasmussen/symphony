@@ -923,6 +923,10 @@ func (t *turn) stream(s *session, r domain.AgentRequest, turnNumber int) {
 				s.mu.Lock()
 				live := add(s.usage, turnUsage)
 				s.mu.Unlock()
+				// Provisional (UsageAuthoritative left false): this is this
+				// host's own running sum of per-API-call deltas, not the CLI's
+				// turn total, and it can overshoot the "result" line's figure
+				// for the same turn (PMR-153).
 				emit(domain.Event{Kind: domain.EventUsage, At: time.Now(), Usage: live})
 			}
 		case "user":
@@ -1015,7 +1019,11 @@ func (t *turn) stream(s *session, r domain.AgentRequest, turnNumber int) {
 			total := s.usage
 			s.mu.Unlock()
 			if total != (domain.Usage{}) {
-				emit(domain.Event{Kind: domain.EventUsage, At: time.Now(), Usage: total})
+				// Authoritative: this is the CLI's own turn total, added onto the
+				// prior settled figure, not this host's mid-turn estimate -- it
+				// must replace rather than merge with whatever the running total
+				// reported while the turn was still in flight (PMR-153).
+				emit(domain.Event{Kind: domain.EventUsage, At: time.Now(), Usage: total, UsageAuthoritative: true})
 			}
 			for _, denial := range event.PermissionDenials {
 				emit(domain.Event{Kind: domain.EventDiagnostic, At: time.Now(),
