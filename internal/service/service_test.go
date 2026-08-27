@@ -380,7 +380,7 @@ func TestStatusReportsUnrelatedForHandAuthoredPlist(t *testing.T) {
 func writeAlternateWorkflow(t *testing.T, dir string) string {
 	t.Helper()
 	alt := filepath.Join(dir, "WORKFLOW.local.md")
-	content := "---\ntracker: {kind: linear, provider: {project_slug_id: service, api_key_file: $SYMPHONY_LINEAR_API_KEY_FILE}, active_states: [Todo], terminal_states: [Done]}\nworkspace: {root: .symphony/workspaces, source_root: .}\ncodex: {command: go}\n---\nprompt"
+	content := "---\ntracker: {kind: linear, provider: {project_slug_id: service, api_key_file: $SYMPHONY_LINEAR_API_KEY_FILE}, active_states: [Todo], terminal_states: [Done]}\nworkspace: {root: .symphony/workspaces, source_root: .}\ncodex: {command: " + fakeAuthenticatedAgentCommand(t, dir) + "}\n---\nprompt"
 	if err := os.WriteFile(alt, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}
