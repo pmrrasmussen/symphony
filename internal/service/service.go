@@ -117,22 +117,27 @@ func Install(ctx context.Context, options Options) (Instance, bool, error) {
 	return d.Instance, true, nil
 }
 
-// Status finds exactly one managed service for this repository.
+// Status finds exactly one managed service for this repository. When
+// --workflow is not supplied, the installed instance's own recorded workflow
+// is authoritative, so status works regardless of which workflow file the
+// service was installed against.
 func Status(ctx context.Context, options Options) (operator.Instance, error) {
 	d, _, err := prepare(ctx, options, false)
 	if err != nil {
 		return operator.Instance{}, err
 	}
-	return findManaged(ctx, options, d)
+	return findManaged(ctx, options, d, options.Workflow == "")
 }
 
-// Restart kickstarts only this repository's managed instance.
+// Restart kickstarts only this repository's managed instance. As with
+// Status, an unsupplied --workflow defers to the workflow the instance was
+// actually installed with.
 func Restart(ctx context.Context, options Options) (Instance, error) {
 	d, runner, err := prepare(ctx, options, false)
 	if err != nil {
 		return Instance{}, err
 	}
-	selected, err := findManaged(ctx, options, d)
+	selected, err := findManaged(ctx, options, d, options.Workflow == "")
 	if err != nil {
 		return Instance{}, err
 	}
@@ -148,7 +153,7 @@ func Uninstall(ctx context.Context, options Options) (Instance, error) {
 	if err != nil {
 		return Instance{}, err
 	}
-	selected, err := findManaged(ctx, options, d)
+	selected, err := findManaged(ctx, options, d, false)
 	if err != nil {
 		return Instance{}, err
 	}
@@ -603,7 +608,22 @@ func rejectConflicts(ctx context.Context, options Options, d desired, ignorePlis
 	return nil
 }
 
-func findManaged(ctx context.Context, options Options, d desired) (operator.Instance, error) {
+// findManaged locates the single managed LaunchAgent for this repository's
+// instance label. Matching happens by label first: the label is derived from
+// the repository (and optional --name), never from the workflow path, so it
+// stays stable across which workflow file is currently resolved. A workflow
+// match is accepted too, so a hand-authored candidate that reuses this
+// repository's workflow path under a different label is still found for the
+// "unrelated" diagnosis below.
+//
+// A match whose recorded workflow differs from d.Workflow can only be a
+// label match (a workflow match is trivially equal by construction), so it
+// is never the "unrelated" case: the plist is this repository's own managed
+// instance, just installed against a different --workflow. fallbackToInstalled
+// lets Status and Restart treat that instance's own recorded workflow as
+// authoritative when the caller did not pass an explicit --workflow;
+// otherwise the mismatch is reported by name rather than papered over.
+func findManaged(ctx context.Context, options Options, d desired, fallbackToInstalled bool) (operator.Instance, error) {
 	instances, err := operator.Discover(ctx, operator.Options{LaunchAgentsDir: filepath.Dir(d.PlistPath)})
 	if err != nil {
 		return operator.Instance{}, err
@@ -621,8 +641,11 @@ func findManaged(ctx context.Context, options Options, d desired) (operator.Inst
 		return operator.Instance{}, fmt.Errorf("ambiguous Symphony services for %s; leave exactly one LaunchAgent for this repository in place, then run symphony service migrate to adopt it", d.Workflow)
 	}
 	instance := matches[0]
-	if !instance.Managed || canonical(instance.Paths.Workflow) != canonical(d.Workflow) {
+	if !instance.Managed {
 		return operator.Instance{}, fmt.Errorf("refusing to manage unrelated LaunchAgent %s; run symphony service migrate to adopt a compatible hand-authored Symphony LaunchAgent for this repository", instance.Paths.Plist)
+	}
+	if canonical(instance.Paths.Workflow) != canonical(d.Workflow) && !fallbackToInstalled {
+		return operator.Instance{}, fmt.Errorf("%s is installed for workflow %s, not %s; pass --workflow %s to manage the installed instance", instance.ID, instance.Paths.Workflow, d.Workflow, instance.Paths.Workflow)
 	}
 	if options.Name != "" && instance.ID != d.Label {
 		return operator.Instance{}, fmt.Errorf("configured service name %s does not match %s", d.Label, instance.ID)
