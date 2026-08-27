@@ -397,6 +397,42 @@ with the `repository`, the shortened `workspace_commit`, and, when verified,
 the `pr_number`. See [workspace ownership and
 recovery](completion-markers.md) for the full cleanup safety table.
 
+The `internal/github` package's own warn-level records name the operation that
+failed and carry the underlying cause as a bounded `error`
+(`internal/observability.Text`), the same way the records above do (PMR-154).
+GitHub's HTTP errors are fixed strings or interpolate only a numeric status
+code (`"github request failed with status %d"`) — a response body never
+reaches one of these `error` attributes:
+
+* `"msg":"GitHub landing verification failed"` — the read-only pull request
+  lookup `VerifyLanded` needs failed; `issue_id`/`issue_identifier`,
+  `repository`, `error`.
+* `"msg":"GitHub land Merging fallback transition failed"` and
+  `"msg":"GitHub land deferred Merging fallback transition failed"` — the
+  best-effort `Merging -> In Review` fallback transition failed after an
+  immediate or deferred landing refusal; `issue_id`/`issue_identifier` (the
+  immediate case also carries the hard-gate `reason`), `error`.
+* `"msg":"GitHub land refusal comment failed"`,
+  `"msg":"GitHub land push audit Linear comment failed"`, and
+  `"msg":"GitHub land push audit PR comment failed"` — a best-effort audit
+  comment (the refusal reason, or a fix turn's pushed commit) failed to post to
+  Linear or the pull request; `issue_id`/`issue_identifier` (the latter two
+  also carry `pr_number`), `error`.
+* `"msg":"GitHub pull request poll failed"` — the linked-PR poll's read of the
+  pull request failed; `issue_id`/`issue_identifier`, `pr_number`, `error`.
+  This fires again on the same link every `github.poll_interval_ms` until the
+  read succeeds or the issue is forgotten, so a permanently-failing poll (for
+  example a 404 on a deleted pull request) is not yet distinguished in the
+  record from a transient one and currently retries indefinitely.
+* `"msg":"GitHub merge Linear completion failed"` — the pull request merged
+  but reconciling the bound Linear issue to Done failed, so the link stays
+  live and is retried next poll; `issue_id`/`issue_identifier`, `pr_number`,
+  `error`.
+* `"msg":"GitHub pull request closed without merge; Linear issue remains in
+  review"` — a terminal state observation rather than a failed operation, so
+  it carries no `error`; `issue_id`/`issue_identifier`, `pr_number`, `pr_url`
+  identify which pull request a human needs to finish reconciling by hand.
+
 The `internal/workspace` package logs three more records, all through the same
 redaction boundary rather than to `os.Stderr` — the JSONL log is the operator's
 complete record of them:
