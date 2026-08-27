@@ -292,20 +292,26 @@ CLI's `--print` stream is not the app-server protocol.
   log; the result's own text does not. When a turn ends without any result
   event, the tail of the child's stderr is reported as a diagnostic, truncated
   to the shared redaction bound.
-* **Rate limit status** (PMR-131/PMR-126) — the CLI's own `rate_limit_event`
-  reports a string `status` (`allowed`, `allowed_warning`, or `rejected`),
-  not the app-server's numeric snapshot, so it is never logged as
-  `"msg":"agent rate limit"` under `EventRateLimit`'s empty-snapshot rule
-  above; that numeric path only ever applies to Codex. `allowed` is the
-  default, healthy state and reaches no event or log record at all.
+* **Rate limit status** (PMR-131/PMR-126/PMR-150) — the CLI's own
+  `rate_limit_event` reports a string `status`, which is normalized before it
+  leaves the Claude backend. The only values that can appear as log `status`
+  are `allowed`, `allowed_warning`, `rejected`, and `unrecognized`; an
+  unfamiliar CLI value is never echoed. The first three are the currently
+  recognized CLI statuses. It is not the app-server's numeric snapshot, so it
+  is never logged as `"msg":"agent rate limit"` under `EventRateLimit`'s
+  empty-snapshot rule above; that numeric path only ever applies to Codex.
+  `allowed` is the default, healthy state and reaches no event or log record
+  at all.
   `allowed_warning` reaches a non-terminal diagnostic logged as
-  `"msg":"agent rate limit"` at **warn**, carrying `status` — distinct from
+  `"msg":"agent rate limit"` at **warn**, carrying `operation: rate_limit`
+  and `status` — distinct from
   `"msg":"agent stderr"`, which stays reserved for child output that
   genuinely could not be decoded. `rejected` is definitive: the account's
   quota for the reported window is closed, so the backend ends the turn
   there rather than waiting for the result event the CLI still sends a
   moment later, and reports it as its own terminal event logged as
-  `"msg":"agent rate limit rejected"` at **warn**, carrying `status` and
+  `"msg":"agent rate limit rejected"` at **warn**, carrying
+  `operation: rate_limit`, `status`, and
   `retry_after_ms`. The coordinator names the retry reason
   `agent_rate_limited` (distinct from the unclassified `agent_event`
   fallback) in `"msg":"agent run retry scheduled"`, exempts it from

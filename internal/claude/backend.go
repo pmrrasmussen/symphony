@@ -972,7 +972,12 @@ func (t *turn) stream(s *session, r domain.AgentRequest, turnNumber int) {
 			// CLI's actionable status is a string under a different name, so
 			// an EventRateLimit here would be silently discarded and never
 			// reach a log.
+			// Keep the wire value local: it determines the backend's control
+			// flow below, but the scheduler and its logs receive only this fixed
+			// host-side vocabulary. A future CLI diagnostic must not widen the
+			// log contract by appearing in RateLimitStatus (PMR-150).
 			status := firstNonEmpty(event.RateLimitInfo.Status, "unspecified")
+			statusCategory := rateLimitStatusCategory(status)
 			rateLimitType := firstNonEmpty(event.RateLimitInfo.RateLimitType, "unspecified")
 			if status == "rejected" {
 				// A rejection is definitive: the account's quota for this
@@ -984,8 +989,8 @@ func (t *turn) stream(s *session, r domain.AgentRequest, turnNumber int) {
 				// (PMR-131).
 				t.sink.emitTerminal(domain.Event{
 					Kind: domain.EventRateLimited, At: time.Now(),
-					Message:         "claude reported a rate limit: rejected (" + observability.Text(rateLimitType) + ")",
-					RateLimitStatus: status,
+					Message:         "claude reported a rate limit: " + statusCategory + " (" + observability.Text(rateLimitType) + ")",
+					RateLimitStatus: statusCategory,
 					RetryAfter:      rateLimitRetryAfter(event.RateLimitInfo.ResetsAt, time.Now()),
 				})
 				t.kill()
@@ -997,8 +1002,8 @@ func (t *turn) stream(s *session, r domain.AgentRequest, turnNumber int) {
 				// status (today, "allowed_warning") is worth an operator's
 				// attention (PMR-126).
 				emit(domain.Event{Kind: domain.EventDiagnostic, At: time.Now(),
-					Message:         "claude reported a rate limit: " + observability.Text(status) + " (" + observability.Text(rateLimitType) + ")",
-					RateLimitStatus: status,
+					Message:         "claude reported a rate limit: " + statusCategory + " (" + observability.Text(rateLimitType) + ")",
+					RateLimitStatus: statusCategory,
 				})
 			}
 		case "result":
@@ -1099,6 +1104,30 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+const (
+	rateLimitStatusAllowed        = "allowed"
+	rateLimitStatusAllowedWarning = "allowed_warning"
+	rateLimitStatusRejected       = "rejected"
+	rateLimitStatusUnrecognized   = "unrecognized"
+)
+
+// rateLimitStatusCategory maps CLI-supplied status text onto the complete,
+// host-owned vocabulary that may cross the backend boundary. The raw status is
+// still used locally for the CLI's control-flow rules, but never reaches a
+// domain.Event or coordinator log.
+func rateLimitStatusCategory(status string) string {
+	switch status {
+	case rateLimitStatusAllowed:
+		return rateLimitStatusAllowed
+	case rateLimitStatusAllowedWarning:
+		return rateLimitStatusAllowedWarning
+	case rateLimitStatusRejected:
+		return rateLimitStatusRejected
+	default:
+		return rateLimitStatusUnrecognized
+	}
 }
 
 // rateLimitRetryAfter converts the CLI's absolute reset time into a duration
