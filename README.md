@@ -155,9 +155,14 @@ SYMPHONY_LINEAR_API_KEY_FILE=/path/to/a/mode-600-key-file \
 `--dry-run` emits a structured result for workflow parsing, tracker selection,
 workspace and log roots, hook syntax, executable availability, and a synthetic
 scheduler lifecycle. It does not contact Linear, execute hooks, start an agent
-session, or create configured logs or workspaces. With `agent.backend: claude`
-it additionally runs the CLI's own read-only `claude auth status` locally, as
-the `agent_authentication` check described below. A missing future root is a
+session, or create configured logs or workspaces. Every backend also gets an
+`agent_authentication` check, so the result never silently omits it: with
+`agent.backend: claude` it runs the CLI's own read-only `claude auth status`
+locally, as described below; `codex` has no equivalent side-effect-free probe,
+so the check reports a warning saying so rather than being left out of
+`Result.Checks` -- an unauthenticated Codex app-server fails the same way
+Claude does, at `thread/start` or mid-turn, just with no local check to catch
+it first. A missing future root is a
 warning; an
 invalid boundary is a failure and exits non-zero. The referenced file is read
 only to validate required configuration and is never sent anywhere during
@@ -671,8 +676,8 @@ capability". A `github:` block that does not resolve (an unreadable
 `token_file`, say) leaves the integration disabled, exactly as it does under
 `codex`, so it configures nothing and reaches neither rule.
 
-`--dry-run` adds one check for this backend, `agent_authentication`: it runs
-`claude auth status` and reads only the `loggedIn` boolean. That command also
+`--dry-run` emits an `agent_authentication` check for this backend by running
+`claude auth status` and reading only the `loggedIn` boolean. That command also
 reports the operator's email, organization, and subscription, none of which is
 read or logged. The check exists because an unauthenticated CLI otherwise
 surfaces only at dispatch, where it looks like a finished turn rather than a
@@ -684,6 +689,15 @@ five seconds -- every other preflight probe is a `sh -n` syntax check, a `PATH`
 lookup, or a `stat`, so this is the one call that runs a foreign program, and a
 CLI blocked on a keychain prompt or a token refresh must fail the check rather
 than leave `--dry-run` waiting.
+
+Under `agent.backend: codex` the same check is still present -- `Result.Checks`
+never simply omits `agent_authentication` depending on which backend is
+selected -- but reports a warning instead: the Codex launch command is
+`codex app-server`, the long-lived JSON-RPC service the coordinator drives, not
+a CLI with a bare status subcommand that can be asked without the side effect of
+starting that service. An unauthenticated Codex app-server fails the same way
+Claude does, at `thread/start` or mid-turn, just with no local probe to catch it
+ahead of a live run.
 
 **Operator prerequisite:** the user the Symphony process runs as must already be
 logged in to the Claude Code CLI. Symphony passes it no credential and performs

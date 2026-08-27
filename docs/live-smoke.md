@@ -62,6 +62,14 @@ prompt is safe to process. Confirm that the issue asks Codex to make no changes
 and that the project contains no other eligible issues. The service runs until
 interrupted, so stop it after the one expected issue has been observed.
 
+Unlike the Claude exercise below, `--dry-run` cannot verify the Codex
+credential ahead of time: the `agent_authentication` check it emits for
+`agent.backend: codex` is a warning saying no side-effect-free probe exists,
+not a verified pass. Confirm the Codex CLI is authenticated (`OPENAI_API_KEY`
+exported, as below) before running this live -- an unauthenticated app-server
+fails at `thread/start` or mid-turn instead, which still consumes a dispatch
+and a workspace.
+
 ```sh
 export LINEAR_API_KEY
 export OPENAI_API_KEY

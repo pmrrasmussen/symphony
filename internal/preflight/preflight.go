@@ -135,9 +135,16 @@ func run(ctx context.Context, workflowPath, logRoot, statusFile string, environm
 
 	// An unauthenticated agent CLI otherwise surfaces only at dispatch, where it
 	// looks like a finished turn rather than a setup problem: the Claude CLI
-	// reports an auth failure as a result with is_error set.
-	if launch.Backend == config.ClaudeAgentBackend {
-		switch status, err := authenticated(ctx, launch.Command, authenticationTimeout); {
+	// reports an auth failure as a result with is_error set, and an
+	// unauthenticated Codex app-server fails the same way at thread/start or
+	// mid-turn. The check is named for the role, not the backend, and it is
+	// always added -- even a backend with no probe reports why, rather than
+	// simply lacking the check -- so a caller reading Result.Checks cannot
+	// mistake "not applicable" for "not run".
+	if argv, ok := authenticationArgv(launch.Backend); !ok {
+		result.add("agent_authentication", StatusWarning, fmt.Sprintf("the %s backend offers no side-effect-free authentication probe; an unauthenticated agent surfaces only at dispatch, as a failed turn rather than a setup problem", launch.Backend))
+	} else {
+		switch status, err := authenticated(ctx, launch.Command, argv, authenticationTimeout); {
 		case err != nil:
 			result.add("agent_authentication", StatusFailed, err.Error())
 		case !status:
@@ -274,8 +281,25 @@ func executable(command, field string) error {
 // hung token refresh would otherwise leave --dry-run waiting forever.
 const authenticationTimeout = 5 * time.Second
 
-// authenticated asks the agent CLI whether it holds a session. It is read-only,
-// which is what makes it safe in a dry run.
+// authenticationArgv is the per-backend argv that asks an agent CLI to report
+// a stored login without starting a real session, factored out the same way
+// handoffToolName resolves a per-transport detail rather than branching on
+// backend inside run itself. The boolean reports whether the backend defines
+// one at all: Codex's launch command is "codex app-server", the long-lived
+// JSON-RPC service the coordinator drives, not a CLI with a bare status
+// subcommand it can be asked without the side effect of starting that service.
+func authenticationArgv(backend string) ([]string, bool) {
+	switch backend {
+	case config.ClaudeAgentBackend:
+		return []string{"auth", "status"}, true
+	default:
+		return nil, false
+	}
+}
+
+// authenticated asks the agent CLI whether it holds a session, using the argv
+// authenticationArgv resolved for the selected backend. It is read-only, which
+// is what makes it safe in a dry run.
 //
 // Only the boolean is read. The command also reports the operator's email,
 // organization, and subscription, none of which may reach a check message.
@@ -289,7 +313,7 @@ const authenticationTimeout = 5 * time.Second
 // command itself is gone.
 const probeWaitDelay = 500 * time.Millisecond
 
-func authenticated(ctx context.Context, command string, timeout time.Duration) (bool, error) {
+func authenticated(ctx context.Context, command string, argv []string, timeout time.Duration) (bool, error) {
 	fields := strings.Fields(command)
 	if len(fields) == 0 {
 		return false, errorsf("claude.command is empty")
@@ -299,7 +323,7 @@ func authenticated(ctx context.Context, command string, timeout time.Duration) (
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	probe := exec.CommandContext(ctx, fields[0], "auth", "status")
+	probe := exec.CommandContext(ctx, fields[0], argv...)
 	// Killing the probe on the deadline is not enough to return on it. The
 	// deadline kills the command itself, but Output waits for the output pipes
 	// to close, and any grandchild the command left behind still holds them --

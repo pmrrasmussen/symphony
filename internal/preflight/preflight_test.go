@@ -23,7 +23,7 @@ func TestRunExercisesLifecycleWithoutCreatingConfiguredState(t *testing.T) {
 	if !result.OK() {
 		t.Fatalf("result=%+v", result)
 	}
-	for _, check := range []string{"workflow", "github_handoff", "tracker", "workspace_root", "workspace_source", "log_root", "status_file", "agent_command", "hooks", "scheduler_lifecycle"} {
+	for _, check := range []string{"workflow", "github_handoff", "tracker", "workspace_root", "workspace_source", "log_root", "status_file", "agent_command", "agent_authentication", "hooks", "scheduler_lifecycle"} {
 		if !hasCheck(result, check) {
 			t.Fatalf("missing %s check: %+v", check, result)
 		}
@@ -207,6 +207,49 @@ func result(t *testing.T, workflow, dir string) Result {
 	return Run(context.Background(), workflow, filepath.Join(dir, "logs"), "")
 }
 
+// TestRunWithEnvironmentResolvesTokensFromItsOwnEnvironmentOverlay pins the
+// contract that makes RunWithEnvironment its own code path rather than a thin
+// alias for Run: a LaunchAgent's credential references live in its own host
+// environment, not the invoking terminal's, so the same workflow reads as
+// unavailable without the overlay and available with it.
+func TestRunWithEnvironmentResolvesTokensFromItsOwnEnvironmentOverlay(t *testing.T) {
+	const varName = "PMR122_PREFLIGHT_RUNWITHENV_TOKEN"
+	if _, ok := os.LookupEnv(varName); ok {
+		t.Fatalf("%s must not already be set in the test process environment", varName)
+	}
+	dir := t.TempDir()
+	workflow := filepath.Join(dir, "WORKFLOW.md")
+	content := "---\n" +
+		"tracker:\n  kind: linear\n  provider: {project_slug_id: preflight, api_key: not-a-live-key, handoff_state: In Review}\n" +
+		"  active_states: [Todo]\n  terminal_states: [Done]\n" +
+		"github: {owner: o, repository: r, token: $" + varName + "}\n" +
+		"workspace: {root: " + filepath.Join(dir, "workspaces") + ", source_root: " + dir + "}\n" +
+		"codex: {command: go}\n" +
+		"---\nWork on {{.issue.identifier}}"
+	if err := os.WriteFile(workflow, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	without := RunWithEnvironment(context.Background(), workflow, filepath.Join(dir, "logs"), "", nil)
+	if got := handoffStatus(without); got != StatusWarning {
+		t.Fatalf("github_handoff=%v without the token in the environment overlay, want warning", got)
+	}
+
+	withOverlay := RunWithEnvironment(context.Background(), workflow, filepath.Join(dir, "logs"), "", map[string]string{varName: "github-secret"})
+	if got := handoffStatus(withOverlay); got != StatusPassed {
+		t.Fatalf("github_handoff=%v with the token in the environment overlay, want passed", got)
+	}
+}
+
+func handoffStatus(result Result) Status {
+	for _, check := range result.Checks {
+		if check.Name == "github_handoff" {
+			return check.Status
+		}
+	}
+	return ""
+}
+
 func writeWorkflow(t *testing.T, path, workspaceRoot, command, beforeRun string) {
 	t.Helper()
 	content := "---\n" +
@@ -280,9 +323,14 @@ func writeAuthCommand(t *testing.T, body string) string {
 // command, an unreadable answer, a non-zero exit, and a probe that had to be
 // killed must all be distinguishable from a session that was actually verified.
 func TestAuthenticationProbeReportsEachOutcomeWithoutClaimingAnUncheckedPass(t *testing.T) {
+	argv, ok := authenticationArgv(config.ClaudeAgentBackend)
+	if !ok {
+		t.Fatal("claude backend has no authentication argv")
+	}
+
 	t.Run("authenticated session", func(t *testing.T) {
 		command := writeAuthCommand(t, `printf '%s' '`+authStatusJSON("true")+`'`)
-		status, err := authenticated(context.Background(), command, authenticationTimeout)
+		status, err := authenticated(context.Background(), command, argv, authenticationTimeout)
 		if err != nil || !status {
 			t.Fatalf("status=%v err=%v", status, err)
 		}
@@ -290,7 +338,7 @@ func TestAuthenticationProbeReportsEachOutcomeWithoutClaimingAnUncheckedPass(t *
 
 	t.Run("no authenticated session", func(t *testing.T) {
 		command := writeAuthCommand(t, `printf '%s' '`+authStatusJSON("false")+`'`)
-		status, err := authenticated(context.Background(), command, authenticationTimeout)
+		status, err := authenticated(context.Background(), command, argv, authenticationTimeout)
 		if status || err == nil || !strings.Contains(err.Error(), "no authenticated session") {
 			t.Fatalf("status=%v err=%v", status, err)
 		}
@@ -299,7 +347,7 @@ func TestAuthenticationProbeReportsEachOutcomeWithoutClaimingAnUncheckedPass(t *
 
 	t.Run("unreadable answer", func(t *testing.T) {
 		command := writeAuthCommand(t, `printf '%s' 'logged in as `+authEmail+`'`)
-		status, err := authenticated(context.Background(), command, authenticationTimeout)
+		status, err := authenticated(context.Background(), command, argv, authenticationTimeout)
 		if status || err == nil || !strings.Contains(err.Error(), "unreadable authentication status") {
 			t.Fatalf("status=%v err=%v", status, err)
 		}
@@ -309,14 +357,14 @@ func TestAuthenticationProbeReportsEachOutcomeWithoutClaimingAnUncheckedPass(t *
 
 	t.Run("non-zero exit", func(t *testing.T) {
 		command := writeAuthCommand(t, "exit 3")
-		status, err := authenticated(context.Background(), command, authenticationTimeout)
+		status, err := authenticated(context.Background(), command, argv, authenticationTimeout)
 		if status || err == nil || !strings.Contains(err.Error(), "could not report authentication status") {
 			t.Fatalf("status=%v err=%v", status, err)
 		}
 	})
 
 	t.Run("wrapper command is not probed and is not a pass", func(t *testing.T) {
-		status, err := authenticated(context.Background(), "sh -c exit", authenticationTimeout)
+		status, err := authenticated(context.Background(), "sh -c exit", argv, authenticationTimeout)
 		if status || err != nil {
 			t.Fatalf("status=%v err=%v", status, err)
 		}
@@ -331,7 +379,7 @@ func TestAuthenticationProbeReportsEachOutcomeWithoutClaimingAnUncheckedPass(t *
 		// this first failed in CI and not locally.
 		command := writeAuthCommand(t, "sleep 60 &\nwait")
 		start := time.Now()
-		status, err := authenticated(context.Background(), command, 50*time.Millisecond)
+		status, err := authenticated(context.Background(), command, argv, 50*time.Millisecond)
 		if status || err == nil || !strings.Contains(err.Error(), "did not report authentication status") {
 			t.Fatalf("status=%v err=%v", status, err)
 		}
@@ -343,10 +391,41 @@ func TestAuthenticationProbeReportsEachOutcomeWithoutClaimingAnUncheckedPass(t *
 	})
 
 	t.Run("empty command", func(t *testing.T) {
-		if _, err := authenticated(context.Background(), "   ", authenticationTimeout); err == nil || !strings.Contains(err.Error(), "claude.command is empty") {
+		if _, err := authenticated(context.Background(), "   ", argv, authenticationTimeout); err == nil || !strings.Contains(err.Error(), "claude.command is empty") {
 			t.Fatalf("err=%v", err)
 		}
 	})
+}
+
+// TestCodexHasNoAuthenticationArgvAndTheCheckSaysSo pins the Codex half of the
+// PMR-122 gap directly: the backend defines no probe, so run must still emit
+// an agent_authentication check -- warning, not simply absent -- naming the
+// backend and saying why there is nothing to ask.
+func TestCodexHasNoAuthenticationArgvAndTheCheckSaysSo(t *testing.T) {
+	if _, ok := authenticationArgv(config.DefaultAgentBackend); ok {
+		t.Fatal("codex unexpectedly has an authentication argv")
+	}
+
+	message := checkMessage(t, "codex", "agent_authentication")
+	if !strings.Contains(message, "codex") || !strings.Contains(message, "no side-effect-free authentication probe") {
+		t.Fatalf("agent_authentication reported %q for codex", message)
+	}
+
+	dir := t.TempDir()
+	workflow := filepath.Join(dir, "WORKFLOW.md")
+	writeWorkflow(t, workflow, filepath.Join(dir, "workspaces"), "go", "")
+	found := false
+	for _, check := range result(t, workflow, dir).Checks {
+		if check.Name == "agent_authentication" {
+			found = true
+			if check.Status != StatusWarning {
+				t.Fatalf("agent_authentication=%+v", check)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("a codex workflow produced no agent_authentication check")
+	}
 }
 
 // TestAuthenticationCheckKeepsAccountDetailsOutOfEveryResult is the whole-result
