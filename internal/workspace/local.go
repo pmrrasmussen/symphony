@@ -324,6 +324,13 @@ func (l *Local) AfterRun(ctx context.Context, ws domain.Workspace, issue domain.
 // That movement is explained and logged at Debug instead of alerted on. Any
 // other change to refs/heads/* -- a rewrite, a reset, a brand-new ref, or a
 // fast-forward to a commit no remote knows about -- still alerts at Error.
+//
+// Classifying a changed ref costs two extra `git` subprocess calls, each with
+// its own failure modes (a pruned or missing object, a concurrent `git gc`,
+// lock contention). Symphony cannot afford to let one of those failures look
+// like a benign fast-forward: diffSourceRefs fails closed and reports a ref
+// it could not classify as an alert, naming the classification failure,
+// rather than dropping it (PMR-147).
 func (l *Local) assertSourceIntegrity(ctx context.Context, ws domain.Workspace, issue domain.Issue) {
 	if ws.GitIntegrityBaseline == "" {
 		return
@@ -342,11 +349,7 @@ func (l *Local) assertSourceIntegrity(ctx context.Context, ws domain.Workspace, 
 		l.logger().Warn("workspace source integrity check failed", "issue_id", issue.ID, "issue_identifier", issue.Identifier, "error", err)
 		return
 	}
-	alerts, explained, err := diffSourceRefs(ctx, state.SourceRoot, baseline.Refs, current.Refs)
-	if err != nil {
-		l.logger().Warn("workspace source integrity check failed", "issue_id", issue.ID, "issue_identifier", issue.Identifier, "error", err)
-		return
-	}
+	alerts, explained := diffSourceRefs(ctx, state.SourceRoot, baseline.Refs, current.Refs)
 	if len(explained) > 0 {
 		l.logger().Debug("workspace source integrity change explained by a fast-forward reachable from a remote-tracking ref",
 			"issue_id", issue.ID, "issue_identifier", issue.Identifier, "changed_refs", formatRefChanges(explained))
@@ -390,8 +393,10 @@ func captureSourceIntegrity(ctx context.Context, sourceRoot string) (sourceInteg
 
 // refChange describes a single refs/heads/* entry whose value differs between
 // the prepare-time baseline and the post-run snapshot. Before or After is
-// empty when the ref did not exist on that side.
-type refChange struct{ Name, Before, After string }
+// empty when the ref did not exist on that side. Reason is set only when this
+// change is an alert because it could not be classified (see diffSourceRefs);
+// it names the git subprocess failure responsible.
+type refChange struct{ Name, Before, After, Reason string }
 
 // diffSourceRefs classifies every ref that moved between baseline and current
 // into alerts (report at Error) and explained (a fast-forward reachable from a
@@ -399,7 +404,15 @@ type refChange struct{ Name, Before, After string }
 // ref that is new, deleted, or moved by anything other than a fast-forward
 // landing a commit some remote already has is always an alert: only the one
 // documented, narrow shape of concurrent operator activity is explained.
-func diffSourceRefs(ctx context.Context, sourceRoot string, baseline, current map[string]string) (alerts, explained []refChange, err error) {
+//
+// Classification itself can fail -- isAncestor or reachableFromRemote can
+// return an error distinct from a negative answer, e.g. a pruned object, a
+// concurrent `git gc`, or lock contention. That is not evidence the change was
+// benign, so it is not silently dropped: it is reported as an alert with
+// Reason set to the classification failure (PMR-147). isAncestor's exit-code-1
+// "not an ancestor" result is a legitimate negative answer, not a failure, and
+// is handled by isAncestor itself.
+func diffSourceRefs(ctx context.Context, sourceRoot string, baseline, current map[string]string) (alerts, explained []refChange) {
 	names := make(map[string]struct{}, len(baseline)+len(current))
 	for name := range baseline {
 		names[name] = struct{}{}
@@ -417,12 +430,16 @@ func diffSourceRefs(ctx context.Context, sourceRoot string, baseline, current ma
 		if hadBefore && hasAfter {
 			ff, ffErr := isAncestor(ctx, sourceRoot, before, after)
 			if ffErr != nil {
-				return nil, nil, ffErr
+				change.Reason = ffErr.Error()
+				alerts = append(alerts, change)
+				continue
 			}
 			if ff {
 				reachable, reachErr := reachableFromRemote(ctx, sourceRoot, after)
 				if reachErr != nil {
-					return nil, nil, reachErr
+					change.Reason = reachErr.Error()
+					alerts = append(alerts, change)
+					continue
 				}
 				if reachable {
 					explained = append(explained, change)
@@ -434,7 +451,7 @@ func diffSourceRefs(ctx context.Context, sourceRoot string, baseline, current ma
 	}
 	sort.Slice(alerts, func(i, j int) bool { return alerts[i].Name < alerts[j].Name })
 	sort.Slice(explained, func(i, j int) bool { return explained[i].Name < explained[j].Name })
-	return alerts, explained, nil
+	return alerts, explained
 }
 
 // isAncestor reports whether ancestor is an ancestor of (or equal to)
@@ -467,7 +484,9 @@ func reachableFromRemote(ctx context.Context, dir, commit string) (bool, error) 
 
 // formatRefChanges renders ref changes for a log attribute: one
 // "name before->after" entry per change, "(none)" standing in for a ref that
-// did not exist on that side.
+// did not exist on that side. A change whose classification failed (Reason
+// set) appends " classification_failed=<error>" so an operator can triage it
+// as a diagnostic gap rather than mistake it for a plain ref move.
 func formatRefChanges(changes []refChange) string {
 	parts := make([]string, 0, len(changes))
 	for _, c := range changes {
@@ -478,7 +497,11 @@ func formatRefChanges(changes []refChange) string {
 		if after == "" {
 			after = "(none)"
 		}
-		parts = append(parts, fmt.Sprintf("%s %s->%s", c.Name, before, after))
+		entry := fmt.Sprintf("%s %s->%s", c.Name, before, after)
+		if c.Reason != "" {
+			entry += " classification_failed=" + c.Reason
+		}
+		parts = append(parts, entry)
 	}
 	return strings.Join(parts, "; ")
 }
