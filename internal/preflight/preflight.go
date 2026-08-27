@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -147,7 +148,7 @@ func run(ctx context.Context, workflowPath, logRoot, statusFile string, environm
 	case !status:
 		// The command is a wrapper, so there was nothing to ask. Say that
 		// rather than report an authenticated session that was never checked.
-		result.add("agent_authentication", StatusWarning, "authentication was not verified: the configured command is not a bare program name")
+		result.add("agent_authentication", StatusWarning, "authentication was not verified: the configured command is not a direct invocation of the agent CLI")
 	default:
 		result.add("agent_authentication", StatusPassed, "the agent CLI reports an authenticated session")
 	}
@@ -286,9 +287,18 @@ const authenticationTimeout = 5 * time.Second
 // exit 0 regardless of login state, while Codex's `login status` answers with
 // only its exit code -- 0 logged in, 1 not -- and a human sentence naming the
 // auth method, which this probe does not read.
+//
+// launchArgs is the fixed trailing argv this backend's own default command
+// carries after the bare program name -- empty for Claude ("claude"), but
+// {"app-server"} for Codex, whose documented invocation is "codex app-server"
+// and not a bare "codex". executable (above) already takes fields[0] as the
+// program for this same reason. Without launchArgs, every default Codex
+// configuration looked like a wrapper the probe could not safely re-invoke,
+// so the probe was defined but never reachable from a real workflow.
 type authenticationProbe struct {
-	argv    []string
-	outcome func(out []byte, runErr error) (bool, error)
+	launchArgs []string
+	argv       []string
+	outcome    func(out []byte, runErr error) (bool, error)
 }
 
 // authenticationProbeFor resolves the probe for the selected backend.
@@ -300,7 +310,7 @@ func authenticationProbeFor(backend string) authenticationProbe {
 	case config.ClaudeAgentBackend:
 		return authenticationProbe{argv: []string{"auth", "status"}, outcome: claudeAuthenticationOutcome}
 	default:
-		return authenticationProbe{argv: []string{"login", "status"}, outcome: codexAuthenticationOutcome}
+		return authenticationProbe{launchArgs: []string{"app-server"}, argv: []string{"login", "status"}, outcome: codexAuthenticationOutcome}
 	}
 }
 
@@ -352,14 +362,17 @@ const probeWaitDelay = 500 * time.Millisecond
 // produces directly, rather than through the probe's own outcome.
 //
 // The boolean reports whether authentication was actually established. A
-// wrapper command cannot be asked, and reporting that as success would claim a
-// check that never ran.
+// command whose trailing arguments do not match the backend's own
+// launchArgs cannot be asked -- it may be a wrapper (a shell, "mise exec --",
+// a container entrypoint) that does not accept the probe's argv the same way
+// the real CLI does -- and reporting that as success would claim a check
+// that never ran.
 func authenticated(ctx context.Context, command, field string, probe authenticationProbe, timeout time.Duration) (bool, error) {
 	fields := strings.Fields(command)
 	if len(fields) == 0 {
 		return false, errorsf("%s is empty", field)
 	}
-	if len(fields) > 1 {
+	if !slices.Equal(fields[1:], probe.launchArgs) {
 		return false, nil
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
