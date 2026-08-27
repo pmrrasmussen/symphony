@@ -973,6 +973,39 @@ func TestAThrottledRateLimitStatusIsANonTerminalDiagnostic(t *testing.T) {
 	}
 }
 
+// TestAnUnrecognizedRateLimitStatusIsNormalizedBeforeItLeavesTheBackend keeps
+// a future CLI status (which could contain arbitrary diagnostic text) out of
+// domain.Event and therefore out of the coordinator's logs.
+func TestAnUnrecognizedRateLimitStatusIsNormalizedBeforeItLeavesTheBackend(t *testing.T) {
+	dir := t.TempDir()
+	const rawStatus = "token=do-not-log-this"
+	script := writeFakeClaude(t, dir, "cat <<'EOF'\n"+initLine(dir, allCodingTools)+"\n"+
+		`{"type":"rate_limit_event","rate_limit_info":{"status":"`+rawStatus+`","rateLimitType":"five_hour","utilization":0.92}}`+"\n"+
+		resultLine(false, "")+"\nEOF\n")
+	backend := New(settingsFunc())
+	_, events, err := backend.Start(context.Background(), request(t, dir, script))
+	if err != nil {
+		t.Fatal(err)
+	}
+	collected := drain(t, events)
+	var diagnostic *domain.Event
+	for i := range collected {
+		if collected[i].Kind == domain.EventDiagnostic {
+			diagnostic = &collected[i]
+			break
+		}
+	}
+	if diagnostic == nil {
+		t.Fatalf("events=%v, want an unrecognized rate-limit diagnostic", kinds(collected))
+	}
+	if diagnostic.RateLimitStatus != rateLimitStatusUnrecognized {
+		t.Fatalf("status=%q, want %q", diagnostic.RateLimitStatus, rateLimitStatusUnrecognized)
+	}
+	if strings.Contains(diagnostic.Message, rawStatus) {
+		t.Fatalf("raw rate-limit status crossed the backend boundary: %q", diagnostic.Message)
+	}
+}
+
 // TestTheModelAndDenyFlagsArePassed covers two flags the documentation
 // enumerates that no other test constrained.
 func TestTheModelAndDenyFlagsArePassed(t *testing.T) {

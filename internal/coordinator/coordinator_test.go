@@ -2787,16 +2787,16 @@ func TestEventFailedStaysAgentEventAndPassesThroughObservabilityText(t *testing.
 	}
 }
 
-// TestRateLimitStatusIsRedactedLikeAnyOtherWireText guards against the raw
-// CLI-reported status bypassing observability.Text's redaction: both the
-// terminal EventRateLimited record and the non-terminal EventDiagnostic
-// record (PMR-126's "allowed_warning" case) log the status through the same
-// redaction every other wire-sourced field goes through.
-func TestRateLimitStatusIsRedactedLikeAnyOtherWireText(t *testing.T) {
+// TestRateLimitStatusUsesFixedLogVocabulary keeps coordinator logging on the
+// backend's closed rate-limit vocabulary. The backend test covers conversion
+// from the arbitrary CLI wire value; this test pins the operator-visible
+// fallback and the registered operation on the non-terminal warning record.
+func TestRateLimitStatusUsesFixedLogVocabulary(t *testing.T) {
 	w := testSettings(t)
 	issue := testIssue()
-	events := make(chan domain.Event, 1)
-	events <- domain.Event{Kind: domain.EventRateLimited, At: time.Now(), Message: "claude reported a rate limit: rejected (five_hour)", RateLimitStatus: "token=do-not-log-this"}
+	events := make(chan domain.Event, 2)
+	events <- domain.Event{Kind: domain.EventDiagnostic, At: time.Now(), Message: "claude reported a rate limit: unrecognized (five_hour)", RateLimitStatus: "unrecognized"}
+	events <- domain.Event{Kind: domain.EventCompleted, At: time.Now()}
 	close(events)
 	agent := &fakeAgent{events: func() <-chan domain.Event { return events }}
 	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{})}
@@ -2809,10 +2809,16 @@ func TestRateLimitStatusIsRedactedLikeAnyOtherWireText(t *testing.T) {
 	}
 	output := logs.String()
 	if strings.Contains(output, "do-not-log-this") {
-		t.Fatalf("rejection status leaked unredacted wire text: %s", output)
+		t.Fatalf("rate-limit status leaked wire text: %s", output)
 	}
-	if !strings.Contains(output, "[REDACTED]") {
-		t.Fatalf("rejection status was not redacted at all: %s", output)
+	if !strings.Contains(output, `"status":"unrecognized"`) {
+		t.Fatalf("rejection status was not normalized to the fallback: %s", output)
+	}
+	if !strings.Contains(output, `"operation":"rate_limit"`) {
+		t.Fatalf("rejection rate-limit operation was not logged: %s", output)
+	}
+	if strings.Contains(output, "[REDACTED]") {
+		t.Fatalf("fallback status was redacted instead of normalized: %s", output)
 	}
 }
 
@@ -2850,6 +2856,9 @@ func TestRateLimitedEventEndsTheRunAndSchedulesFromTheReportedResetTime(t *testi
 	records := log.String()
 	if !strings.Contains(records, `"msg":"agent rate limit rejected"`) || !strings.Contains(records, `"status":"rejected"`) {
 		t.Fatalf("rejection did not log its own status: %s", records)
+	}
+	if !strings.Contains(records, `"operation":"rate_limit"`) {
+		t.Fatalf("rejection did not log its rate-limit operation: %s", records)
 	}
 	if strings.Contains(records, `"msg":"agent stderr"`) {
 		t.Fatalf("rejection was logged as undecodable stderr instead of its own record: %s", records)

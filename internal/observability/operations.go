@@ -41,6 +41,9 @@ const (
 	// "the issue was abandoned, and the board still says otherwise" is exactly
 	// what an operator has to be able to query for.
 	OperationDispatchAbandoned Operation = "dispatch_abandoned"
+	// OperationRateLimit identifies a Claude CLI rate-limit status the backend
+	// decoded into the fixed status vocabulary before it reached the scheduler.
+	OperationRateLimit Operation = "rate_limit"
 
 	// The three operations below describe state changes Symphony did NOT
 	// perform: the handoff state is human-controlled, so every change out of it
@@ -82,6 +85,7 @@ var known = map[Operation]bool{
 	OperationMergeReconciled:      true,
 	OperationReviewCompleted:      true,
 	OperationDispatchAbandoned:    true,
+	OperationRateLimit:            true,
 	OperationReviewApproved:       true,
 	OperationReworkRequested:      true,
 	OperationExternalReversion:    true,

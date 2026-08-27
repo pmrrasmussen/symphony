@@ -136,11 +136,12 @@ type Event struct {
 	ItemID, ItemType, ToolName string
 	Outcome                    string
 	DurationMs                 int64
-	// RateLimitStatus is the backend's own rate-limit classification (for
-	// example Claude's "allowed_warning" or "rejected"), set on an
-	// EventDiagnostic or EventRateLimited record so the scheduler can log and
-	// classify it without parsing formatted Message text. Empty for every
-	// other event.
+	// RateLimitStatus is the backend's fixed, host-owned rate-limit category
+	// (Claude currently emits allowed_warning, rejected, or unrecognized; the
+	// healthy allowed status emits no event), set on an EventDiagnostic or
+	// EventRateLimited record so the scheduler can log and classify it without
+	// parsing formatted Message text. It is never arbitrary backend wire text.
+	// Empty for every other event.
 	RateLimitStatus string
 	// RetryAfter is the backend-reported delay before a rate-limited run
 	// should be retried, set alongside an EventRateLimited record when the
