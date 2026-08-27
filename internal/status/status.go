@@ -164,6 +164,12 @@ func secureDirectory(path string) error {
 // Errors are reported through report and never returned to, or block, the
 // coordinator's scheduling path.
 //
+// Each publish derives its ProcessState from the coordinator snapshot's own
+// Stopping flag rather than hardcoding Running, so the periodic publisher
+// keeps ticking, and reporting freshly, straight through a graceful shutdown:
+// once the coordinator starts draining, the very next tick reports Stopping
+// without any coordination from the caller beyond leaving Run running.
+//
 // A write failure is usually structural -- an owner-only directory
 // requirement violated by the operator, say -- so it recurs unchanged on
 // every subsequent tick. report is therefore called once per distinct error,
@@ -176,7 +182,12 @@ func (p *Publisher) Run(ctx context.Context, interval time.Duration, source func
 	}
 	var lastReported string
 	publish := func() {
-		err := p.Write(Running, source())
+		snapshot := source()
+		state := Running
+		if snapshot.Stopping {
+			state = Stopping
+		}
+		err := p.Write(state, snapshot)
 		if err == nil {
 			lastReported = ""
 			return

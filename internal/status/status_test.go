@@ -8,6 +8,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -217,6 +218,114 @@ func TestRunSuppressesRepeatedIdenticalWriteFailures(t *testing.T) {
 	if !strings.Contains(reports[0].Error(), "owner-only") {
 		t.Fatalf("report=%v, want owner-only directory refusal", reports[0])
 	}
+}
+
+// TestRunDerivesProcessStateFromCoordinatorSnapshotStopping pins PMR-119: Run
+// must publish ProcessState Stopping exactly when the coordinator snapshot it
+// reads reports Stopping, and Running otherwise, so the two can never disagree.
+func TestRunDerivesProcessStateFromCoordinatorSnapshotStopping(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		stopping bool
+		want     ProcessState
+	}{
+		{"running", false, Running},
+		{"stopping", true, Stopping},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "runtime", "status.json")
+			publisher, err := New(path, Metadata{PID: 1, StartedAt: time.Now()})
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Cancelled before Run starts: Run still publishes once, from the
+			// unconditional call ahead of its select loop, and then returns
+			// immediately on the already-closed ctx.Done().
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			publisher.Run(ctx, time.Hour, func() coordinator.Snapshot {
+				return coordinator.Snapshot{Stopping: test.stopping}
+			}, nil)
+
+			got := readStatusSnapshot(t, path)
+			if got.State != test.want {
+				t.Fatalf("state=%q want %q", got.State, test.want)
+			}
+		})
+	}
+}
+
+// TestRunKeepsRefreshingThroughAShutdownLongerThanTheInterval pins PMR-119: the
+// periodic publisher must keep ticking, and reporting a fresh generated_at,
+// for as long as Run keeps running -- including through a coordinator drain
+// that outlasts one publish interval, rather than going stale the moment
+// shutdown begins.
+func TestRunKeepsRefreshingThroughAShutdownLongerThanTheInterval(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "runtime", "status.json")
+	publisher, err := New(path, Metadata{PID: 1, StartedAt: time.Now()})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var stopping atomic.Bool
+	interval := 5 * time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		publisher.Run(ctx, interval, func() coordinator.Snapshot {
+			return coordinator.Snapshot{Stopping: stopping.Load()}
+		}, nil)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+
+	waitForStatusState(t, path, Running)
+	stopping.Store(true)
+	waitForStatusState(t, path, Stopping)
+
+	// A shutdown that drains for several publish intervals must still refresh
+	// generated_at at least once during that window, not just at its start.
+	before := readStatusSnapshot(t, path)
+	deadline := time.Now().Add(20 * interval)
+	for time.Now().Before(deadline) {
+		time.Sleep(interval)
+		current := readStatusSnapshot(t, path)
+		if current.State != Stopping {
+			t.Fatalf("state=%q during simulated drain, want %q", current.State, Stopping)
+		}
+		if current.GeneratedAt.After(before.GeneratedAt) {
+			return
+		}
+	}
+	t.Fatal("status file was never refreshed during the simulated shutdown drain")
+}
+
+func readStatusSnapshot(t *testing.T, path string) Snapshot {
+	t.Helper()
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var snapshot Snapshot
+	if err := json.Unmarshal(contents, &snapshot); err != nil {
+		t.Fatalf("snapshot is not parseable JSON: %v\n%s", err, contents)
+	}
+	return snapshot
+}
+
+func waitForStatusState(t *testing.T, path string, want ProcessState) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(path); err == nil && readStatusSnapshot(t, path).State == want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("status file never reported state %q", want)
 }
 
 func TestWriteRejectsExistingDirectoryThatIsNotOwnerOnly(t *testing.T) {

@@ -42,16 +42,34 @@ configured, `claude_model`. Fields for the other backend are omitted. The
 runtime snapshot schema remains version 1 because this effective-configuration
 projection is not part of `status.json`.
 
-Symphony writes the snapshot on startup and every second while it runs, then
-writes a final `"state":"stopped"` record after graceful shutdown. Snapshot
-publication is observational: a filesystem failure is logged but never blocks
-or changes coordinator scheduling. A write failure is logged once and then
-suppressed while it stays identical from tick to tick, rather than once per
-second for the rest of the process's life; it is logged again if the failure
-changes or the writes recover. A crash can leave a `"running"` record
-behind, so clients must treat it as a hint rather than liveness authority:
-compare `generated_at` with a freshness threshold and check the PID/service
-manager state (for example launchd) independently. The structured log at
-`.symphony/logs/symphony.jsonl` is separate redacted event history, not this
-current-state snapshot. For the managed multi-instance layout, see
-[macOS repository services](macos-services.md).
+`state` is one of three values, each written at a specific point in the
+process lifecycle:
+
+* `"running"` -- written on startup and then every second for as long as the
+  coordinator is neither draining nor stopped. It is derived from the same
+  coordinator snapshot as every other field on the document (specifically its
+  `stopping` flag), so it cannot disagree with `"stopping"` below.
+* `"stopping"` -- written once immediately when shutdown begins (`SIGINT` or
+  `SIGTERM`), and then on every subsequent one-second tick for as long as
+  `Coordinator.Shutdown` is still draining running sessions. The periodic
+  publisher is deliberately kept running through this whole window rather than
+  stopped ahead of it, specifically so `generated_at` keeps advancing while a
+  shutdown that can take up to twenty seconds is in progress: without it, the
+  file would go stale the moment shutdown began and only jump straight from
+  `"running"` to `"stopped"` once it finished, leaving an operator unable to
+  tell a draining daemon from a hung one.
+* `"stopped"` -- written once, after `Coordinator.Shutdown` returns (whether it
+  drained cleanly or timed out) and the periodic publisher has been stopped.
+  This is always the final write of a graceful shutdown.
+
+Snapshot publication is observational: a filesystem failure is logged but
+never blocks or changes coordinator scheduling. A write failure is logged once
+and then suppressed while it stays identical from tick to tick, rather than
+once per second for the rest of the process's life; it is logged again if the
+failure changes or the writes recover. A crash can leave a `"running"` or
+`"stopping"` record behind, so clients must treat `state` as a hint rather
+than liveness authority: compare `generated_at` with a freshness threshold and
+check the PID/service manager state (for example launchd) independently. The
+structured log at `.symphony/logs/symphony.jsonl` is separate redacted event
+history, not this current-state snapshot. For the managed multi-instance
+layout, see [macOS repository services](macos-services.md).

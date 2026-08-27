@@ -226,6 +226,31 @@ func (t theme) liveness(state operator.Liveness) string {
 	return t.livenessStyle(state).Render(livenessGlyph(state) + " " + label)
 }
 
+// serviceStyle colors the daemon's own reported status.ProcessState, which is
+// distinct from launchd's process observation above it: "stopping" is the
+// graceful-shutdown window (PMR-119), during which a draining daemon must
+// read differently from one that is simply running or already gone.
+func (t theme) serviceStyle(state string) lipgloss.Style {
+	switch state {
+	case "running":
+		return t.ok
+	case "stopping":
+		return t.warn
+	case "stopped":
+		return t.muted
+	default:
+		return lipgloss.NewStyle()
+	}
+}
+
+// serviceState renders a status.ProcessState value with serviceStyle's color.
+func (t theme) serviceState(state string) string {
+	if !t.layout {
+		return state
+	}
+	return t.serviceStyle(state).Render(state)
+}
+
 // checks colors a findings summary by its worst severity. The dashboard form is
 // abbreviated because this cell is the widest on the row and wrapped once the
 // window narrowed.
