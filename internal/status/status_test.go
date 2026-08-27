@@ -30,7 +30,10 @@ func TestWriteSerializesOnlyTheVersionedSafeSnapshot(t *testing.T) {
 			Usage:                domain.Usage{InputTokens: 3, OutputTokens: 5, TotalTokens: 8},
 			OutstandingOperation: &coordinator.OutstandingOperationSnapshot{Type: "dynamicToolCall", Name: "github_publish_pr", StartedAt: started, AgeMS: 60000},
 		}},
-		Waiting: []coordinator.WaitingSnapshot{{IssueIdentifier: "PMR-77", IssueState: "Merging", Since: started, WaitingMS: 60000}},
+		Waiting: []coordinator.WaitingSnapshot{
+			{IssueIdentifier: "PMR-77", IssueState: "Merging", Reason: "at_capacity", Since: started, WaitingMS: 60000},
+			{IssueIdentifier: "PMR-90", IssueState: "Todo", Reason: "blocked_by_relation", BlockedBy: []string{"PMR-80"}, Since: started, WaitingMS: 120000},
+		},
 	}
 	if err := publisher.Write(Running, snapshot); err != nil {
 		t.Fatal(err)
@@ -46,8 +49,23 @@ func TestWriteSerializesOnlyTheVersionedSafeSnapshot(t *testing.T) {
 	if got.SchemaVersion != SchemaVersion || got.PID != 42 || got.State != Running || got.Coordinator.Running[0].IssueState != "In Progress" || got.Coordinator.Running[0].OutstandingOperation.Name != "github_publish_pr" {
 		t.Fatalf("snapshot=%+v", got)
 	}
-	if len(got.Coordinator.Waiting) != 1 || got.Coordinator.Waiting[0].IssueIdentifier != "PMR-77" || got.Coordinator.Waiting[0].IssueState != "Merging" {
-		t.Fatalf("snapshot missing waiting entry=%+v", got.Coordinator)
+	if len(got.Coordinator.Waiting) != 2 {
+		t.Fatalf("snapshot missing waiting entries=%+v", got.Coordinator)
+	}
+	byIdentifier := map[string]coordinator.WaitingSnapshot{}
+	for _, w := range got.Coordinator.Waiting {
+		byIdentifier[w.IssueIdentifier] = w
+	}
+	capacity, blocked := byIdentifier["PMR-77"], byIdentifier["PMR-90"]
+	if capacity.IssueState != "Merging" || capacity.Reason != "at_capacity" || len(capacity.BlockedBy) != 0 {
+		t.Fatalf("capacity waiting entry=%+v", capacity)
+	}
+	if blocked.Reason != "blocked_by_relation" || len(blocked.BlockedBy) != 1 || blocked.BlockedBy[0] != "PMR-80" {
+		t.Fatalf("blocked waiting entry=%+v, want its blocker identifier and no other reason", blocked)
+	}
+	// A waiting entry is never reported under both reasons at once.
+	if capacity.Reason == blocked.Reason {
+		t.Fatalf("capacity and blocked entries share a reason: %+v / %+v", capacity, blocked)
 	}
 	for _, prohibited := range []string{"description", "prompt", "workspace", "arguments", "api_key", "credential"} {
 		if strings.Contains(strings.ToLower(string(contents)), prohibited) {

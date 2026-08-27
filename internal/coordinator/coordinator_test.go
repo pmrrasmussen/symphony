@@ -432,6 +432,169 @@ func TestPollSummaryNeverCarriesIssueIdentifiers(t *testing.T) {
 	}
 }
 
+// TestBlockedIssueAppearsInSnapshotWithBlockerIdentifiersUntilResolved guards
+// the PMR-152 operator-visibility requirement: a Todo issue held ineligible
+// by an open blocker relation earns no claim and no retry timer, exactly like
+// a capacity-only rejection (PMR-139), so it must appear in Waiting with its
+// blocker identifiers and disappear the moment the blocker is resolved.
+func TestBlockedIssueAppearsInSnapshotWithBlockerIdentifiersUntilResolved(t *testing.T) {
+	w := testSettings(t)
+	blocked := testIssue()
+	blocked.Dispatchable = false
+	blocked.BlockedBy = []domain.Blocker{{ID: "blocker-id", Identifier: "ENG-0", State: "In Progress", Dispatchable: false}}
+	tracker := &issueMapTracker{candidates: []domain.Issue{blocked}, issues: map[string]domain.Issue{blocked.ID: blocked}}
+	block := make(chan domain.Event)
+	agent := &fakeAgent{events: func() <-chan domain.Event { return block }, started: make(chan struct{}, 1)}
+	ws := &fakeWorkspace{after: make(chan struct{}, 1)}
+	c := testCoordinator(w.Config, tracker, agent, ws)
+
+	c.Tick(context.Background())
+	snapshot := c.Snapshot()
+	if len(snapshot.Waiting) != 1 {
+		t.Fatalf("waiting=%+v, want exactly the blocked issue", snapshot.Waiting)
+	}
+	if got := snapshot.Waiting[0]; got.IssueIdentifier != blocked.Identifier || got.IssueState != "Todo" || got.Reason != "blocked_by_relation" || len(got.BlockedBy) != 1 || got.BlockedBy[0] != "ENG-0" || got.WaitingMS < 0 {
+		t.Fatalf("blocked waiting entry=%+v", got)
+	}
+
+	// Resolve the blocker and re-poll: the issue must become dispatchable,
+	// leave Waiting, and (capacity being free) get admitted, exactly as a
+	// capacity-only wait clears once a slot opens (PMR-139).
+	resolved := blocked
+	resolved.Dispatchable = true
+	resolved.BlockedBy = []domain.Blocker{{ID: "blocker-id", Identifier: "ENG-0", State: "Done", Dispatchable: true}}
+	tracker.setIssue(resolved)
+	c.Tick(context.Background())
+	<-agent.started
+
+	snapshot = c.Snapshot()
+	if len(snapshot.Waiting) != 0 {
+		t.Fatalf("waiting=%+v, want empty once the blocker resolves", snapshot.Waiting)
+	}
+	if len(snapshot.Running) != 1 || snapshot.Running[0].IssueIdentifier != blocked.Identifier {
+		t.Fatalf("running=%+v, want the formerly blocked issue", snapshot.Running)
+	}
+	if err := c.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	<-ws.after
+}
+
+// TestBlockedWaitReasonChangesToCapacityWithoutStayingBlocked guards two
+// PMR-152 acceptance criteria at once: an issue is never reported under both
+// waiting reasons at once, and a reason change (here, a resolved blocker
+// immediately followed by full capacity) still counts as leaving the
+// blocked-by-relation state and re-entering as a fresh, separately dated
+// wait rather than a stale one that silently changed meaning underneath its
+// own timestamp.
+func TestBlockedWaitReasonChangesToCapacityWithoutStayingBlocked(t *testing.T) {
+	w := testSettings(t)
+	w.Config.Agent.MaxConcurrent = 1
+	occupying := testIssue()
+	occupying.ID, occupying.Identifier = "occupying", "ENG-OCCUPY"
+	blocked := testIssue()
+	blocked.ID, blocked.Identifier = "blocked", "ENG-BLOCKED"
+	blocked.Dispatchable = false
+	blocked.BlockedBy = []domain.Blocker{{ID: "blocker-id", Identifier: "ENG-0", State: "In Progress", Dispatchable: false}}
+	tracker := &issueMapTracker{candidates: []domain.Issue{blocked}, issues: map[string]domain.Issue{occupying.ID: occupying, blocked.ID: blocked}}
+	c := testCoordinator(w.Config, tracker, &fakeAgent{}, &fakeWorkspace{})
+	clock := &mutableClock{now: time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)}
+	c.clock = clock
+
+	c.mu.Lock()
+	c.claimed[occupying.ID] = true
+	c.admitted[occupying.ID] = config.Norm(occupying.State)
+	c.mu.Unlock()
+
+	c.Tick(context.Background())
+	snapshot := c.Snapshot()
+	if len(snapshot.Waiting) != 1 || snapshot.Waiting[0].Reason != "blocked_by_relation" {
+		t.Fatalf("waiting=%+v, want exactly one blocked_by_relation entry", snapshot.Waiting)
+	}
+
+	clock.set(clock.now.Add(time.Minute))
+	resolved := blocked
+	resolved.Dispatchable = true
+	resolved.BlockedBy = []domain.Blocker{{ID: "blocker-id", Identifier: "ENG-0", State: "Done", Dispatchable: true}}
+	tracker.setIssue(resolved)
+	c.Tick(context.Background())
+
+	snapshot = c.Snapshot()
+	if len(snapshot.Waiting) != 1 {
+		t.Fatalf("waiting=%+v, want the issue still waiting, now for capacity", snapshot.Waiting)
+	}
+	got := snapshot.Waiting[0]
+	if got.Reason != "at_capacity" || len(got.BlockedBy) != 0 {
+		t.Fatalf("waiting entry after blocker resolved=%+v, want at_capacity with no blockers", got)
+	}
+	if got.WaitingMS != 0 {
+		t.Fatalf("waiting entry since=%v, want reset to the poll that observed the reason change, not the original blocked_by_relation entry", got.WaitingMS)
+	}
+}
+
+// TestBlockedWaitLoggedOnceNotPerPoll guards the PMR-152 acceptance criterion
+// that a blocker hold is edge-triggered, mirroring PMR-139's own waiting-for-
+// capacity record: an issue that stays blocked across several polls must log
+// "issue blocked by an open dependency" exactly once, on the poll it entered
+// the state, not on every subsequent poll that merely reobserves it.
+func TestBlockedWaitLoggedOnceNotPerPoll(t *testing.T) {
+	w := testSettings(t)
+	blocked := testIssue()
+	blocked.Dispatchable = false
+	blocked.BlockedBy = []domain.Blocker{{ID: "blocker-id", Identifier: "ENG-0", State: "In Progress", Dispatchable: false}}
+	tracker := &issueMapTracker{candidates: []domain.Issue{blocked}, issues: map[string]domain.Issue{blocked.ID: blocked}}
+	var logs bytes.Buffer
+	c := New(tracker, &fakeAgent{}, &fakeWorkspace{}, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&logs, nil)))
+
+	c.Tick(context.Background())
+	c.Tick(context.Background())
+	c.Tick(context.Background())
+
+	output := logs.String()
+	if got := strings.Count(output, `"msg":"issue blocked by an open dependency"`); got != 1 {
+		t.Fatalf("blocked-entry log fired %d times across 3 polls, want exactly 1: %s", got, output)
+	}
+}
+
+// TestBlockedWaitEscalatesToWarnAfterThreshold guards the proposal's
+// escalation for a blocker hold that outlasts the poll cadence by a wide
+// margin -- the signal that the blocker is not actually scheduled -- mirroring
+// PMR-139's own capacity-wait escalation.
+func TestBlockedWaitEscalatesToWarnAfterThreshold(t *testing.T) {
+	w := testSettings(t)
+	w.Config.Polling.Interval = time.Second
+	blocked := testIssue()
+	blocked.Dispatchable = false
+	blocked.BlockedBy = []domain.Blocker{{ID: "blocker-id", Identifier: "ENG-0", State: "In Progress", Dispatchable: false}}
+	tracker := &issueMapTracker{candidates: []domain.Issue{blocked}, issues: map[string]domain.Issue{blocked.ID: blocked}}
+	var logs bytes.Buffer
+	c := New(tracker, &fakeAgent{}, &fakeWorkspace{}, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&logs, nil)))
+	clock := &mutableClock{now: time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)}
+	c.clock = clock
+
+	c.Tick(context.Background())
+	if strings.Contains(logs.String(), `"msg":"issue still blocked by an open dependency"`) {
+		t.Fatalf("escalated before the threshold: %s", logs.String())
+	}
+
+	clock.set(clock.now.Add(waitingEscalationFloor))
+	c.Tick(context.Background())
+	output := logs.String()
+	if got := strings.Count(output, `"msg":"issue still blocked by an open dependency"`); got != 1 {
+		t.Fatalf("blocked-entry escalation fired %d times, want exactly 1: %s", got, output)
+	}
+	if !strings.Contains(output, `"blocked_by":"ENG-0"`) {
+		t.Fatalf("escalation missing the blocker identifier: %s", output)
+	}
+
+	// A further poll past the threshold must not escalate a second time.
+	clock.set(clock.now.Add(time.Minute))
+	c.Tick(context.Background())
+	if got := strings.Count(logs.String(), `"msg":"issue still blocked by an open dependency"`); got != 1 {
+		t.Fatalf("blocked-entry escalation fired again: %s", logs.String())
+	}
+}
+
 func TestHeartbeatAndStallRecordOutstandingOperation(t *testing.T) {
 	w := testSettings(t)
 	w.Config.Codex.StallTimeout = time.Second

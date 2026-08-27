@@ -122,15 +122,18 @@ func TestReadSnapshotProjectsSafeRuntimeFields(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "status.json")
 	write(t, path, `{
 "schema_version":1,"pid":73,"process_started_at":"2026-08-25T10:00:00Z","generated_at":"2026-08-25T12:00:00Z","state":"running",
-"coordinator":{"claimed":2,"running":[{"issue_identifier":"PMR-75","issue_state":"In Progress","attempt":1,"turn_count":3,"started_at":"2026-08-25T11:00:00Z","last_activity_at":"2026-08-25T11:59:00Z","usage":{"input_tokens":8,"output_tokens":5,"total_tokens":13},"rate_limit":{"remaining":4},"outstanding_operation":{"type":"mcpToolCall","name":"github_pr_context","started_at":"2026-08-25T11:59:30Z","age_ms":30000}}],"retrying":[{"issue_identifier":"PMR-76","attempt":2,"kind":"retry","reason":"timeout","due_at":"2026-08-25T12:01:00Z"}],"waiting":[{"issue_identifier":"PMR-77","issue_state":"Merging","since":"2026-08-25T11:50:00Z","waiting_ms":600000}]},
+"coordinator":{"claimed":2,"running":[{"issue_identifier":"PMR-75","issue_state":"In Progress","attempt":1,"turn_count":3,"started_at":"2026-08-25T11:00:00Z","last_activity_at":"2026-08-25T11:59:00Z","usage":{"input_tokens":8,"output_tokens":5,"total_tokens":13},"rate_limit":{"remaining":4},"outstanding_operation":{"type":"mcpToolCall","name":"github_pr_context","started_at":"2026-08-25T11:59:30Z","age_ms":30000}}],"retrying":[{"issue_identifier":"PMR-76","attempt":2,"kind":"retry","reason":"timeout","due_at":"2026-08-25T12:01:00Z"}],"waiting":[{"issue_identifier":"PMR-77","issue_state":"Merging","reason":"at_capacity","since":"2026-08-25T11:50:00Z","waiting_ms":600000},{"issue_identifier":"PMR-90","issue_state":"Todo","reason":"blocked_by_relation","blocked_by":["PMR-80"],"since":"2026-08-25T11:55:00Z","waiting_ms":300000}]},
 "untrusted_prompt":"must not be projected"}`)
 
 	snapshot, err := readSnapshot(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if snapshot.PID != 73 || snapshot.UpdatedAt.Format(time.RFC3339) != "2026-08-25T12:00:00Z" || len(snapshot.Coordinator.Running) != 1 || snapshot.Coordinator.Running[0].Usage.TotalTokens != 13 || len(snapshot.Coordinator.Retrying) != 1 || len(snapshot.Coordinator.Waiting) != 1 || snapshot.Coordinator.Waiting[0].IssueIdentifier != "PMR-77" {
+	if snapshot.PID != 73 || snapshot.UpdatedAt.Format(time.RFC3339) != "2026-08-25T12:00:00Z" || len(snapshot.Coordinator.Running) != 1 || snapshot.Coordinator.Running[0].Usage.TotalTokens != 13 || len(snapshot.Coordinator.Retrying) != 1 || len(snapshot.Coordinator.Waiting) != 2 || snapshot.Coordinator.Waiting[0].IssueIdentifier != "PMR-77" || snapshot.Coordinator.Waiting[0].Reason != "at_capacity" {
 		t.Fatalf("snapshot=%#v", snapshot)
+	}
+	if blocked := snapshot.Coordinator.Waiting[1]; blocked.IssueIdentifier != "PMR-90" || blocked.Reason != "blocked_by_relation" || len(blocked.BlockedBy) != 1 || blocked.BlockedBy[0] != "PMR-80" {
+		t.Fatalf("blocked waiting entry=%#v", blocked)
 	}
 	encoded, err := json.Marshal(snapshot)
 	if err != nil {
