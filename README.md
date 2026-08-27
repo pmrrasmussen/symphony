@@ -211,6 +211,13 @@ budgets for `codex` and the `claude:` block supplies them for `claude`, so a
 workflow that never starts a Codex session is not rejected for an absent
 `codex:` block, and vice versa.
 
+The selected backend is also a security-relevant policy choice: the strength
+and coverage of the write boundary depend on it. Codex's `workspaceWrite`
+policy confines writes to the issue worktree and the Git metadata roots
+Symphony grants. Claude's sandbox confines `Bash` and its children, but its
+`Edit` and `Write` tools are outside that sandbox and can write outside the
+worktree. The detailed contracts and their limits follow below.
+
 `codex.thread_sandbox` sets the session's sandbox mode and the optional
 `codex.turn_sandbox_policy` object is validated against the Codex
 `SandboxPolicy` schema and then forwarded verbatim as every turn's sandbox
@@ -560,19 +567,19 @@ The sandbox in that payload is `enabled` with `failIfUnavailable: true` and
 `allowUnsandboxedCommands: false`; `filesystem.allowWrite` is the issue's own
 worktree plus exactly the two narrow Git metadata roots Symphony grants so a
 detached-HEAD commit can succeed -- the same grant the Codex profile makes --
-and `network.allowedDomains` is `["*"]`.
+and `network.allowedDomains` is `["*"]`. Claude has a fail-open fallback when
+`failIfUnavailable` is omitted: an initialization failure can leave a session
+unsandboxed. Symphony sets the flag to prevent that fallback. This is an
+initialization setting, not a coverage guarantee: PMR-156 established that the
+sandbox initialized and enforced `Bash` while `Edit`/`Write` still escaped it.
 
-`failIfUnavailable: true` is not tidiness. Verified against `claude` 2.1.245 by
-running the same broken-sandbox condition both ways. Without the flag, the CLI
-announces "Sandboxing is disabled for the rest of this session!" inside a tool
-result and then keeps running unconfined: a write outside `allowWrite`
-succeeded, and the turn still reported exit code 0 with no error. With the flag
-set, every sandboxed command failed instead and no write happened.
-
-Note what that means for observability: a sandbox that cannot initialize
-surfaces as repeated **failed** `Bash` item records, not as a failed turn. The
-turn itself can still complete, because the degradation is reported only in
-tool-result text, which Symphony deliberately does not parse.
+An initialization failure with this setting surfaces at best as repeated
+**failed** `Bash` item records, not as a failed turn, because the CLI puts the
+detail in tool-result text Symphony deliberately does not parse. That is
+separate from the coverage gap. In the PMR-156 verification on 2026-08-27, the
+gap produced no failed `Bash` record or other session warning: concurrent
+agents committed to the operator's own `main` and left another agent's edits in
+the primary working tree before the problem was noticed.
 
 What was verified to hold, on the same version: Bash writes are confined --
 attempts to write to `$HOME` and to `$TMPDIR` were refused with "operation not
@@ -583,16 +590,18 @@ Five limits of that boundary, stated rather than implied:
 
 1. The sandbox governs `Bash` and its children, and Bash writes were verified
    confined. `Edit` and `Write` are **not** sandboxed and have no path
-   restriction beyond existing: the rendered payload is
+   restriction: the rendered payload is
    `permissions.allow: ["Bash","Edit","Glob","Grep","Read","Write"]` with
    `defaultMode: dontAsk` -- bare tool names, which decide whether a tool
-   exists, not where it may write. Whether the file-editing tools themselves
-   refuse an absolute path outside the worktree was not verified, so it is not
-   claimed here. Nor would Symphony detect such a write: the post-run Git
-   integrity check re-verifies only the source repository's non-`symphony/*`
-   branch heads and its primary index, so it catches a write into the source
-   checkout's Git state and nothing else. A write to a path outside the
-   repository entirely is neither confined nor observed.
+   exists, not where it may write. PMR-156 verified this directly with
+   Symphony's exact launch contract: while a `Bash` append to the source
+   working tree was denied, `Write` successfully wrote that same absolute path.
+   The same session could write all of the source repository's `.git`, including
+   `refs/heads/`, through a plain shell redirect, `git update-ref`, and
+   `git commit`; the latter two moved `refs/heads/main` despite the declared
+   grant naming only `.git/objects`. This is an enforcement coverage gap, not a
+   sandbox-initialization failure, and it is not a safe or observable write
+   boundary.
 2. Reads are **not** confined, exactly as for Codex: a worker can read any file
    the user running Symphony can, including credential files outside the
    worktree.
@@ -627,14 +636,14 @@ Five limits of that boundary, stated rather than implied:
    creation is enabled. What remains is an observability gap, stated rather than
    claimed away: a capability invoked this way runs unrecorded.
 
-So the operative boundary has nearly the same shape as the Codex one: Bash
-writes confined, no host Linear or GitHub credential in the child environment
-(stripped by the same filter as Codex, described in
-[docs/architecture.md](docs/architecture.md)), but local reads
-and outbound network both available -- and, unlike the Codex profile, the
-file-editing tools sitting outside the sandbox entirely, per limit 1. What
-protects host credentials from exfiltration is that no untrusted input reaches
-the worker, not the sandbox.
+The selected backend therefore determines the operative write boundary. Codex
+confines writes to its configured worktree and Git roots; Claude confines
+`Bash` writes but leaves the file-editing tools and the source repository's
+`.git` outside that enforcement. Both backends leave local reads and outbound
+network available, and both strip host Linear and GitHub credentials from the
+child environment (as described in [docs/architecture.md](docs/architecture.md)).
+What protects host credentials from exfiltration is that no untrusted input
+reaches the worker, not the sandbox.
 
 A Claude workflow may enable Symphony's session capabilities --
 `tracker.provider.handoff_state`, `tracker.provider.followup_issue_creation`,
