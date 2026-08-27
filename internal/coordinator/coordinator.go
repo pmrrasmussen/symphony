@@ -1522,7 +1522,7 @@ func (c *Coordinator) logEvent(r *running, event domain.Event) {
 		}
 		c.log.Info("agent session started", attrs...)
 	case domain.EventUsage:
-		usage := c.updateUsage(r, event.Usage)
+		usage := c.updateUsage(r, event.Usage, event.UsageAuthoritative)
 		attrs = append(attrs, "input_tokens", usage.InputTokens, "output_tokens", usage.OutputTokens, "total_tokens", usage.TotalTokens)
 		c.log.Info("agent usage", attrs...)
 	case domain.EventRateLimit:
@@ -1612,14 +1612,31 @@ func (c *Coordinator) logItemEvent(r *running, event domain.Event, attrs []any) 
 	c.log.Debug("agent item event", attrs...)
 }
 
-func (c *Coordinator) updateUsage(r *running, update domain.Usage) domain.Usage {
+// updateUsage folds a new usage figure into the run's recorded total.
+// authoritative distinguishes two contracts this shared code has to serve for
+// different backends (PMR-153):
+//
+//   - Cumulative, monotonically increasing sources (authoritative == false;
+//     Codex's turn/completed notifications, and Claude's mid-turn provisional
+//     estimate) are merged with a component-wise maximum, which makes
+//     repeated or reordered notifications idempotent without ever reporting a
+//     figure lower than one already seen.
+//   - Authoritative sources (authoritative == true; today, only Claude's
+//     end-of-turn result) replace the recorded total outright. A max() here
+//     would be wrong: the CLI's own turn total is the settled truth for that
+//     turn even when it is lower than this host's own mid-turn estimate, and
+//     merging the two would let an inflated provisional figure latch
+//     permanently instead of being corrected.
+func (c *Coordinator) updateUsage(r *running, update domain.Usage, authoritative bool) domain.Usage {
 	update = normalizedUsage(update)
 	c.mu.Lock()
-	// App-server usage notifications are cumulative. Taking the component-wise
-	// maximum makes repeated notifications idempotent and avoids double-counting.
-	r.run.Usage.InputTokens = max(r.run.Usage.InputTokens, update.InputTokens)
-	r.run.Usage.OutputTokens = max(r.run.Usage.OutputTokens, update.OutputTokens)
-	r.run.Usage.TotalTokens = max(r.run.Usage.TotalTokens, update.TotalTokens)
+	if authoritative {
+		r.run.Usage = update
+	} else {
+		r.run.Usage.InputTokens = max(r.run.Usage.InputTokens, update.InputTokens)
+		r.run.Usage.OutputTokens = max(r.run.Usage.OutputTokens, update.OutputTokens)
+		r.run.Usage.TotalTokens = max(r.run.Usage.TotalTokens, update.TotalTokens)
+	}
 	if r.run.Usage.TotalTokens < r.run.Usage.InputTokens+r.run.Usage.OutputTokens {
 		r.run.Usage.TotalTokens = r.run.Usage.InputTokens + r.run.Usage.OutputTokens
 	}
