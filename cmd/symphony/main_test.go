@@ -158,7 +158,7 @@ func TestLogStartupCredentialStatusReportsConfigurationWithoutSecrets(t *testing
 	log := observability.New(slog.NewJSONHandler(&output, nil), nil)
 	logStartupCredentialStatus(log, config.Settings{
 		GitHub: config.GitHub{Enabled: true, Token: "github-secret"},
-	})
+	}, true)
 
 	var record map[string]any
 	if err := json.Unmarshal(output.Bytes(), &record); err != nil {
@@ -169,6 +169,24 @@ func TestLogStartupCredentialStatusReportsConfigurationWithoutSecrets(t *testing
 	}
 	if strings.Contains(output.String(), "github-secret") {
 		t.Fatalf("credential appeared in log: %s", output.String())
+	}
+}
+
+// TestLogStartupCredentialStatusReflectsTrackerValidateOutcome pins PMR-119: the
+// Linear field must be the caller's actual tracker.Validate() result, not a
+// literal true that would keep asserting success if validation ever moved,
+// became non-fatal, or was bypassed.
+func TestLogStartupCredentialStatusReflectsTrackerValidateOutcome(t *testing.T) {
+	var output bytes.Buffer
+	log := observability.New(slog.NewJSONHandler(&output, nil), nil)
+	logStartupCredentialStatus(log, config.Settings{}, false)
+
+	var record map[string]any
+	if err := json.Unmarshal(output.Bytes(), &record); err != nil {
+		t.Fatal(err)
+	}
+	if record["linear_credentials_configured"] != false {
+		t.Fatalf("record=%v, want linear_credentials_configured=false", record)
 	}
 }
 

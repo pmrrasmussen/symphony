@@ -134,11 +134,12 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 	tracker := linear.New(settings)
 	tracker.SetLogger(slog.New(log.Handler()))
-	if err := tracker.Validate(); err != nil {
-		fmt.Fprintln(stderr, "symphony startup configuration error:", err)
+	validateErr := tracker.Validate()
+	if validateErr != nil {
+		fmt.Fprintln(stderr, "symphony startup configuration error:", validateErr)
 		return 2
 	}
-	logStartupCredentialStatus(log, s)
+	logStartupCredentialStatus(log, s, validateErr == nil)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	ws := workspace.New(settings)
@@ -210,14 +211,24 @@ func run(args []string, stdout, stderr io.Writer) int {
 	cleanupTerminalWorkspaces(ctx, log, tracker, ws, settings().Tracker.TerminalStates)
 	c.Start(ctx)
 	<-ctx.Done()
-	if stopStatus != nil {
-		stopStatus()
-		<-statusDone
+	// The periodic publisher (started above) keeps ticking through the whole
+	// shutdown below, so generated_at stays fresh while the coordinator
+	// drains; it is stopped only once Shutdown returns. This explicit write
+	// announces the transition immediately, ahead of the ticker's own next
+	// tick and ahead of Shutdown setting coordinator.Snapshot.Stopping.
+	if statusPublisher != nil {
+		if err := statusPublisher.Write(status.Stopping, c.Snapshot()); err != nil {
+			log.Warn("runtime status snapshot write failed", "error", err)
+		}
 	}
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	if err := c.Shutdown(shutdownCtx); err != nil {
 		log.Error("graceful shutdown timed out", "error", err)
+	}
+	if stopStatus != nil {
+		stopStatus()
+		<-statusDone
 	}
 	if statusPublisher != nil {
 		if err := statusPublisher.Write(status.Stopped, c.Snapshot()); err != nil {
@@ -403,9 +414,12 @@ func wire(settings func() config.Settings, logger *slog.Logger) (map[string]doma
 // needed for Symphony's configured host integrations. It deliberately reports
 // only booleans: successful configuration resolution is not a remote
 // authentication check, and credentials must never appear in logs.
-func logStartupCredentialStatus(log *observability.Logger, settings config.Settings) {
+// linearCredentialsConfigured is the caller's tracker.Validate() outcome
+// rather than a value this function derives itself, so the record can never
+// drift from the check that actually gates startup.
+func logStartupCredentialStatus(log *observability.Logger, settings config.Settings, linearCredentialsConfigured bool) {
 	log.Info("startup credential configuration",
-		"linear_credentials_configured", true,
+		"linear_credentials_configured", linearCredentialsConfigured,
 		"github_credentials_configured", settings.GitHub.Enabled,
 	)
 }

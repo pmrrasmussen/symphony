@@ -631,6 +631,34 @@ func TestNoColorKeepsTheDashboardWithoutHue(t *testing.T) {
 	}
 }
 
+// TestServiceStateHasItsOwnStyle pins PMR-119: a draining daemon's
+// "stopping" state must not read the same as "running" or "stopped" on the
+// styled Status page, since that distinction is exactly what an operator
+// opens the TUI during a restart to see.
+func TestServiceStateHasItsOwnStyle(t *testing.T) {
+	now := time.Date(2026, 8, 25, 12, 0, 0, 0, time.UTC)
+	style := newTheme(true, true, 100, 0)
+	seen := map[string]string{}
+	for _, state := range []string{"running", "stopping", "stopped"} {
+		rendered := style.serviceStyle(state).Render(state)
+		if other, clash := seen[rendered]; clash {
+			t.Fatalf("%q and %q render identically (%q), so the distinction carries no color", state, other, rendered)
+		}
+		seen[rendered] = state
+
+		model := styledFixture([]operator.Instance{{
+			ID:       "com.pmrrasmussen.symphony",
+			Liveness: operator.LivenessRunning,
+			Snapshot: &operator.Snapshot{State: state},
+		}}, now)
+		model.page = statusPage
+		view := model.View(now)
+		if !strings.Contains(view, state) {
+			t.Fatalf("styled status page lost service state %q:\n%s", state, view)
+		}
+	}
+}
+
 func TestEachLivenessHasItsOwnGlyph(t *testing.T) {
 	seen := map[string]operator.Liveness{}
 	for _, state := range []operator.Liveness{

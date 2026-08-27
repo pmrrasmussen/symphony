@@ -164,7 +164,7 @@ func (m Model) statusPanel(instance operator.Instance, now time.Time, style them
 		snapshot := instance.Snapshot
 		pairs := [][2]string{}
 		if snapshot.State != "" {
-			pairs = append(pairs, [2]string{"service", snapshot.State})
+			pairs = append(pairs, [2]string{"service", style.serviceState(snapshot.State)})
 		}
 		if !snapshot.StartedAt.IsZero() {
 			pairs = append(pairs, [2]string{"uptime", formatDuration(now.Sub(snapshot.StartedAt))})
