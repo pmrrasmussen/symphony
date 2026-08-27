@@ -226,18 +226,19 @@ type Coordinator struct {
 	// subsequent poll-cadence wait. Cleared with the claim alongside
 	// landingWaits (PMR-116).
 	landingEscalated map[string]bool
-	// waiting records an eligible issue that could not reserve an orchestrator
-	// slot this poll and was never claimed, so no retry timer exists to
-	// remember it (PMR-139): a candidate rejected only for capacity is
-	// re-evaluated fresh from ListCandidates on the next poll, with nothing else
-	// tracking it in the interim. It is keyed by issue ID and cleared the moment
-	// the issue is no longer seen at capacity -- admitted, turned ineligible, or
-	// dropped from the tracker's candidate list.
+	// waiting records a Todo issue that is sitting idle for a reason that earns
+	// neither a claim nor a retry timer, so no other tracking remembers it
+	// (PMR-139, PMR-152): a candidate rejected only for capacity, or one held
+	// ineligible by an open blocker relation, is re-evaluated fresh from
+	// ListCandidates on the next poll, with nothing else tracking it in the
+	// interim. It is keyed by issue ID and cleared the moment the issue is no
+	// longer seen in either state -- admitted, unblocked, turned ineligible for
+	// some other reason, or dropped from the tracker's candidate list.
 	waiting map[string]waitingState
-	// waitingEscalated marks, per waiting issue, that the "still waiting for
-	// capacity" Warn has already fired once, mirroring landingEscalated: a
-	// queue that stays contended keeps logging Info every poll transition, not
-	// a Warn every poll.
+	// waitingEscalated marks, per waiting issue, that the "still waiting" Warn
+	// has already fired once, mirroring landingEscalated: an issue that stays
+	// stuck keeps logging Info only on the poll it first entered (or changed
+	// reason for) the waiting set, not a Warn every poll.
 	waitingEscalated map[string]bool
 	nextRetry        uint64
 	stopping         bool
@@ -255,13 +256,41 @@ type handoffObservation struct {
 	at    time.Time
 }
 
-// waitingState is the coordinator's memory of one eligible issue that has not
-// yet reserved an orchestrator slot. It stores the issue itself, exactly as
-// retryState does, only so Snapshot can report its current identifier and
-// state -- since is the timestamp of the first poll it was seen unadmitted.
+// waitReasonAtCapacity and waitReasonBlockedByRelation are the two disjoint
+// causes waitingState.reason can hold, mirroring the identically named
+// ineligibleReason/admissionRejectReason values that produce them: an issue
+// is either eligible and short only of an orchestrator slot, or held
+// ineligible by an open blocker relation (PMR-146). dispatchable() decides
+// Dispatchable before capacity is ever consulted, so the two are mutually
+// exclusive and an issue is never reported under both.
+const (
+	waitReasonAtCapacity        = "at_capacity"
+	waitReasonBlockedByRelation = "blocked_by_relation"
+)
+
+// waitingCandidate is one poll's observation of an issue sitting idle for
+// waitReasonAtCapacity or waitReasonBlockedByRelation, collected by tick and
+// handed to updateWaiting to reconcile against the coordinator's own memory.
+// blockedBy is set only when reason is waitReasonBlockedByRelation.
+type waitingCandidate struct {
+	issue     domain.Issue
+	reason    string
+	blockedBy []string
+}
+
+// waitingState is the coordinator's memory of one issue sitting idle for
+// waitReasonAtCapacity or waitReasonBlockedByRelation. It stores the issue
+// itself, exactly as retryState does, only so Snapshot can report its current
+// identifier and state. blockedBy carries the open blockers' identifiers
+// (PMR-146's blockerIdentifiers, identifiers only, never titles or
+// descriptions) and is set only when reason is waitReasonBlockedByRelation.
+// since is the timestamp of the first poll this issue was seen under its
+// current reason; a reason change is treated as a new wait.
 type waitingState struct {
-	issue domain.Issue
-	since time.Time
+	issue     domain.Issue
+	reason    string
+	blockedBy []string
+	since     time.Time
 }
 
 type running struct {
@@ -369,13 +398,20 @@ type RetrySnapshot struct {
 	Due         time.Time `json:"due_at"`
 }
 
-// WaitingSnapshot is one issue eligible for dispatch but not yet admitted.
-// WaitingMS is how long it has gone unadmitted, in milliseconds, computed at
-// snapshot time rather than stored as a duration so JSON does not have to
-// carry Go's duration encoding.
+// WaitingSnapshot is one issue sitting idle for waitReasonAtCapacity (eligible
+// but not yet admitted) or waitReasonBlockedByRelation (held ineligible by an
+// open blocker, PMR-146/PMR-152). Reason distinguishes the two; an issue is
+// never reported under both, since dispatchable() decides them in a fixed,
+// mutually exclusive order. BlockedBy carries only the open blockers'
+// identifiers -- never titles or descriptions -- and is empty for
+// waitReasonAtCapacity. WaitingMS is how long the issue has held its current
+// reason, in milliseconds, computed at snapshot time rather than stored as a
+// duration so JSON does not have to carry Go's duration encoding.
 type WaitingSnapshot struct {
 	IssueIdentifier string    `json:"issue_identifier"`
 	IssueState      string    `json:"issue_state"`
+	Reason          string    `json:"reason"`
+	BlockedBy       []string  `json:"blocked_by,omitempty"`
 	Since           time.Time `json:"since"`
 	WaitingMS       int64     `json:"waiting_ms"`
 }
@@ -409,7 +445,11 @@ func (c *Coordinator) Snapshot() Snapshot {
 		if age < 0 {
 			age = 0
 		}
-		snapshot.Waiting = append(snapshot.Waiting, WaitingSnapshot{IssueIdentifier: wait.issue.Identifier, IssueState: wait.issue.State, Since: wait.since, WaitingMS: age})
+		var blockedBy []string
+		if len(wait.blockedBy) > 0 {
+			blockedBy = append([]string(nil), wait.blockedBy...)
+		}
+		snapshot.Waiting = append(snapshot.Waiting, WaitingSnapshot{IssueIdentifier: wait.issue.Identifier, IssueState: wait.issue.State, Reason: wait.reason, BlockedBy: blockedBy, Since: wait.since, WaitingMS: age})
 	}
 	sort.Slice(snapshot.Running, func(i, j int) bool { return snapshot.Running[i].IssueIdentifier < snapshot.Running[j].IssueIdentifier })
 	sort.Slice(snapshot.Retrying, func(i, j int) bool {
@@ -530,7 +570,7 @@ func (c *Coordinator) tick(ctx context.Context) error {
 	}
 	sortIssues(issues)
 	summary := pollSummary{candidates: len(issues), rejected: map[string]int64{}}
-	waiting := map[string]domain.Issue{}
+	waiting := map[string]waitingCandidate{}
 	for _, i := range issues {
 		if ctx.Err() != nil || c.isStopping() {
 			c.logPollSummary(summary)
@@ -547,8 +587,10 @@ func (c *Coordinator) tick(ctx context.Context) error {
 		if reason := ineligibleReason(i, s); reason != "" {
 			summary.rejected[reason]++
 			attrs := []any{"issue_identifier", i.Identifier, "reason", reason}
-			if reason == "blocked_by_relation" {
-				attrs = append(attrs, "blocked_by", blockerIdentifiers(openBlockers(i)))
+			if reason == waitReasonBlockedByRelation {
+				blockers := blockerIdentifierList(openBlockers(i))
+				attrs = append(attrs, "blocked_by", strings.Join(blockers, ","))
+				waiting[i.ID] = waitingCandidate{issue: i, reason: waitReasonBlockedByRelation, blockedBy: blockers}
 			}
 			c.log.Debug("poll candidate rejected", attrs...)
 			continue
@@ -557,8 +599,8 @@ func (c *Coordinator) tick(ctx context.Context) error {
 		if reason := c.admissionRejectReason(i, s); reason != "" {
 			summary.rejected[reason]++
 			c.log.Debug("poll candidate rejected", "issue_identifier", i.Identifier, "reason", reason)
-			if reason == "at_capacity" {
-				waiting[i.ID] = i
+			if reason == waitReasonAtCapacity {
+				waiting[i.ID] = waitingCandidate{issue: i, reason: waitReasonAtCapacity}
 			}
 			continue
 		}
@@ -597,29 +639,34 @@ func (c *Coordinator) logPollSummary(summary pollSummary) {
 	c.log.Debug("poll summary", attrs...)
 }
 
-// waitingEscalationFloor is the lower bound on how long an eligible issue can
-// sit unadmitted for capacity before the wait is escalated to Warn. The
-// effective threshold is max(this, waitingEscalationMultiplier*poll interval),
-// mirroring handoffObservationFloor, so a fast-polling instance does not warn
-// after a couple of missed cycles and a slow-polling one is not held to an
+// waitingEscalationFloor is the lower bound on how long an issue can sit
+// unadmitted for capacity, or held by an open blocker, before the wait is
+// escalated to Warn. The effective threshold is max(this,
+// waitingEscalationMultiplier*poll interval), mirroring
+// handoffObservationFloor, so a fast-polling instance does not warn after a
+// couple of missed cycles and a slow-polling one is not held to an
 // unreasonably short deadline.
 const waitingEscalationFloor = 5 * time.Minute
 
 // waitingEscalationMultiplier is how many poll intervals an issue may go
-// unadmitted before waitingEscalationFloor's alternative kicks in. It is
-// deliberately generous: losing one or two admission races to fresher
-// candidates (PMR-129) is the queue working as designed, not a stuck issue.
+// unadmitted, or blocker-held, before waitingEscalationFloor's alternative
+// kicks in. It is deliberately generous: losing one or two admission races to
+// fresher candidates (PMR-129) is the queue working as designed, not a stuck
+// issue, and a freshly opened blocker relation deserves the same grace before
+// it is treated as a dependency nobody intends to schedule (PMR-152).
 const waitingEscalationMultiplier = 10
 
-// updateWaiting reconciles the coordinator's memory of eligible issues
-// rejected only for capacity ("at_capacity") this poll against the previous
-// poll's memory, and reports every genuinely new entry once by logging its
-// identifier and state -- the one thing pollSummary is not allowed to carry.
-// An issue absent from seen this poll is no longer waiting for whatever
-// reason (admitted, turned ineligible, or dropped from the tracker's
-// candidate list) and its memory is dropped here, so the waiting set can only
-// ever describe issues this exact poll actually re-observed at capacity.
-func (c *Coordinator) updateWaiting(seen map[string]domain.Issue, now time.Time, s config.Settings) {
+// updateWaiting reconciles the coordinator's memory of issues seen this poll
+// under waitReasonAtCapacity or waitReasonBlockedByRelation against the
+// previous poll's memory, and reports every genuinely new entry -- or one
+// whose reason just changed -- once, by logging its identifier, state, and
+// (for a blocker hold) the blocker itself: the things pollSummary is not
+// allowed to carry. An issue absent from seen this poll is no longer waiting
+// for whatever reason (admitted, unblocked, turned ineligible for some other
+// reason, or dropped from the tracker's candidate list) and its memory is
+// dropped here, so the waiting set can only ever describe issues this exact
+// poll actually re-observed.
+func (c *Coordinator) updateWaiting(seen map[string]waitingCandidate, now time.Time, s config.Settings) {
 	c.mu.Lock()
 	for id := range c.waiting {
 		if _, ok := seen[id]; !ok {
@@ -627,22 +674,44 @@ func (c *Coordinator) updateWaiting(seen map[string]domain.Issue, now time.Time,
 			delete(c.waitingEscalated, id)
 		}
 	}
-	var newlyWaiting []domain.Issue
-	for id, issue := range seen {
+	var newlyWaiting []waitingCandidate
+	for id, candidate := range seen {
 		entry, already := c.waiting[id]
-		if !already {
-			entry = waitingState{issue: issue, since: now}
-			newlyWaiting = append(newlyWaiting, issue)
+		if !already || entry.reason != candidate.reason {
+			entry = waitingState{issue: candidate.issue, reason: candidate.reason, blockedBy: candidate.blockedBy, since: now}
+			delete(c.waitingEscalated, id)
+			newlyWaiting = append(newlyWaiting, candidate)
 		} else {
-			entry.issue = issue
+			entry.issue = candidate.issue
+			entry.blockedBy = candidate.blockedBy
 		}
 		c.waiting[id] = entry
 	}
 	c.mu.Unlock()
-	for _, issue := range newlyWaiting {
-		c.log.Info("issue eligible but waiting for capacity", "issue_id", issue.ID, "issue_identifier", issue.Identifier, "issue_state", config.Norm(issue.State))
+	for _, candidate := range newlyWaiting {
+		c.logWaiting(c.log.Info, candidate.issue, candidate.reason, candidate.blockedBy, false)
 	}
 	c.escalateStuckWaits(now, s)
+}
+
+// logWaiting emits the "just entered" or "still stuck" waiting record at the
+// given level, naming the blocker for a waitReasonBlockedByRelation entry
+// exactly as the poll-rejection debug record does (PMR-146), and never
+// carrying anything beyond identifiers.
+func (c *Coordinator) logWaiting(level func(string, ...any), issue domain.Issue, reason string, blockedBy []string, stuck bool) {
+	attrs := []any{"issue_id", issue.ID, "issue_identifier", issue.Identifier, "issue_state", config.Norm(issue.State)}
+	message := "issue eligible but waiting for capacity"
+	if stuck {
+		message = "issue still waiting for capacity"
+	}
+	if reason == waitReasonBlockedByRelation {
+		attrs = append(attrs, "blocked_by", strings.Join(blockedBy, ","))
+		message = "issue blocked by an open dependency"
+		if stuck {
+			message = "issue still blocked by an open dependency"
+		}
+	}
+	level(message, attrs...)
 }
 
 // escalateStuckWaits raises a one-time Warn for any issue that has sat in the
@@ -650,25 +719,25 @@ func (c *Coordinator) updateWaiting(seen map[string]domain.Issue, now time.Time,
 // way finishLandingWait escalates a landing wait past
 // landingWaitEscalated. Below the threshold the Info logged by updateWaiting
 // on entry is enough; at and above it a wait that is still recurring is no
-// longer distinguishable, on the timeline alone, from a queue that will never
-// clear.
+// longer distinguishable, on the timeline alone, from one that will never
+// clear -- for a blocker hold, from a dependency nobody intends to schedule.
 func (c *Coordinator) escalateStuckWaits(now time.Time, s config.Settings) {
 	threshold := waitingEscalationFloor
 	if window := waitingEscalationMultiplier * s.Polling.Interval; window > threshold {
 		threshold = window
 	}
 	c.mu.Lock()
-	var escalated []domain.Issue
+	var escalated []waitingState
 	for id, entry := range c.waiting {
 		if c.waitingEscalated[id] || now.Sub(entry.since) < threshold {
 			continue
 		}
 		c.waitingEscalated[id] = true
-		escalated = append(escalated, entry.issue)
+		escalated = append(escalated, entry)
 	}
 	c.mu.Unlock()
-	for _, issue := range escalated {
-		c.log.Warn("issue still waiting for capacity", "issue_id", issue.ID, "issue_identifier", issue.Identifier, "issue_state", config.Norm(issue.State))
+	for _, entry := range escalated {
+		c.logWaiting(c.log.Warn, entry.issue, entry.reason, entry.blockedBy, true)
 	}
 }
 
@@ -702,7 +771,7 @@ func ineligibleReason(i domain.Issue, s config.Settings) string {
 	case !i.Dispatchable && i.AssigneeMismatch:
 		return "not_routable"
 	case !i.Dispatchable && len(openBlockers(i)) > 0:
-		return "blocked_by_relation"
+		return waitReasonBlockedByRelation
 	case !routable(i, s):
 		return "not_routable"
 	default:
@@ -724,18 +793,18 @@ func openBlockers(i domain.Issue) []domain.Blocker {
 	return open
 }
 
-// blockerIdentifiers renders a safe, content-free log value from a blocker
-// list: tracker issue identifiers only, never titles or descriptions, joined
-// into a plain string so the observability logger's attribute allowlist (which
-// omits unrecognized non-scalar kinds) does not drop it.
-func blockerIdentifiers(blockers []domain.Blocker) string {
+// blockerIdentifierList renders a safe, content-free value from a blocker
+// list: tracker issue identifiers only, never titles or descriptions. Callers
+// that need a single log attribute join it, mirroring the observability
+// logger's attribute allowlist, which omits unrecognized non-scalar kinds.
+func blockerIdentifierList(blockers []domain.Blocker) []string {
 	identifiers := make([]string, 0, len(blockers))
 	for _, b := range blockers {
 		if b.Identifier != "" {
 			identifiers = append(identifiers, b.Identifier)
 		}
 	}
-	return strings.Join(identifiers, ",")
+	return identifiers
 }
 
 // admissionRejectReason peeks at claim's own admission checks purely to
@@ -749,7 +818,7 @@ func (c *Coordinator) admissionRejectReason(i domain.Issue, s config.Settings) s
 	case c.claimed[i.ID]:
 		return "already_claimed"
 	case !c.capacityAvailableLocked(config.Norm(i.State), s):
-		return "at_capacity"
+		return waitReasonAtCapacity
 	default:
 		return ""
 	}
