@@ -107,8 +107,26 @@ type Event struct {
 	At                                   time.Time
 	SessionID, ThreadID, TurnID, Message string
 	PID                                  int
-	Usage                                Usage
-	RateLimit                            map[string]any
+	// Usage carries a backend's running-total token figure for an EventUsage
+	// record. Whether it is a settled total or a provisional estimate is
+	// UsageAuthoritative's job to say -- Usage alone cannot be trusted to be
+	// monotonically non-decreasing across a run (PMR-153).
+	Usage Usage
+	// UsageAuthoritative reports whether Usage is a settled figure the
+	// coordinator should adopt outright, rather than a provisional estimate to
+	// merge with what it already has by taking the component-wise maximum.
+	// Claude's end-of-turn result sets this: it is the CLI's own authoritative
+	// turn total, which can legitimately be lower than the mid-turn figure the
+	// backend emitted moments earlier while the turn was still running
+	// (PMR-136), because that mid-turn figure is this host's own running sum
+	// of per-API-call deltas and nothing guarantees it agrees with the CLI's
+	// own turn total once the turn closes. Codex's notifications leave this
+	// false: they are genuinely cumulative and monotonically increasing by
+	// construction, so max() is the correct merge for them and always agrees
+	// with taking the value outright. False for every event that is not
+	// EventUsage.
+	UsageAuthoritative bool
+	RateLimit          map[string]any
 	// ItemID and ItemType identify the outstanding operation for an EventItem
 	// record: a stable protocol-assigned call/item identifier and its
 	// protocol-defined type (for example "commandExecution", "mcpToolCall",

@@ -23,6 +23,7 @@ import (
 	"github.com/pmrrasmussen/symphony/internal/config"
 	"github.com/pmrrasmussen/symphony/internal/domain"
 	"github.com/pmrrasmussen/symphony/internal/linear"
+	"github.com/pmrrasmussen/symphony/internal/observability"
 )
 
 const maxResponse = 1 << 20
@@ -210,7 +211,7 @@ func (m *Manager) VerifyLanded(ctx context.Context, issue domain.Issue, commit s
 	}
 	pr, found, err := m.findPull(ctx, s, branch)
 	if err != nil {
-		m.logger.Warn("GitHub landing verification failed", "issue_id", issue.ID, "issue_identifier", issue.Identifier, "repository", s.Owner+"/"+s.Repository)
+		m.logger.Warn("GitHub landing verification failed", "issue_id", issue.ID, "issue_identifier", issue.Identifier, "repository", s.Owner+"/"+s.Repository, "error", observability.Text(err.Error()))
 		return false, err
 	}
 	if !found || !(pr.Merged || pr.MergedAt != nil) || !strings.EqualFold(strings.TrimSpace(pr.Head.SHA), commit) {
@@ -829,7 +830,7 @@ func (s *Session) refuse(ctx context.Context, reason string) (LandResult, error)
 	s.deferredFired = true
 	s.waitingOutcome = false
 	if _, err := s.linear.RefuseLanding(ctx, s.settings.MergeState); err != nil {
-		s.manager.logger.Warn("GitHub land Merging fallback transition failed", "issue_id", s.issue.ID, "issue_identifier", s.issue.Identifier, "reason", reason)
+		s.manager.logger.Warn("GitHub land Merging fallback transition failed", "issue_id", s.issue.ID, "issue_identifier", s.issue.Identifier, "reason", reason, "error", observability.Text(err.Error()))
 	}
 	return LandResult{}, errors.New(reason)
 }
@@ -864,10 +865,10 @@ func (s *Session) fireDeferredRefusal(ctx context.Context) {
 	}
 	s.deferredFired = true
 	if _, err := s.linear.RefuseLanding(ctx, s.settings.MergeState); err != nil {
-		s.manager.logger.Warn("GitHub land deferred Merging fallback transition failed", "issue_id", s.issue.ID, "issue_identifier", s.issue.Identifier)
+		s.manager.logger.Warn("GitHub land deferred Merging fallback transition failed", "issue_id", s.issue.ID, "issue_identifier", s.issue.Identifier, "error", observability.Text(err.Error()))
 	}
 	if err := s.linear.LandComment(ctx, landingRefusalComment(s.lastFailedGate)); err != nil {
-		s.manager.logger.Warn("GitHub land refusal comment failed", "issue_id", s.issue.ID, "issue_identifier", s.issue.Identifier)
+		s.manager.logger.Warn("GitHub land refusal comment failed", "issue_id", s.issue.ID, "issue_identifier", s.issue.Identifier, "error", observability.Text(err.Error()))
 	}
 }
 
@@ -908,10 +909,10 @@ func (s *Session) FinalizeLanding(ctx context.Context) {
 func (s *Session) auditPushedCommits(ctx context.Context, prNumber int, sha string) {
 	body := landingPushComment(s.issue.Identifier, sha)
 	if err := s.linear.LandComment(ctx, body); err != nil {
-		s.manager.logger.Warn("GitHub land push audit Linear comment failed", "issue_id", s.issue.ID, "issue_identifier", s.issue.Identifier, "pr_number", prNumber)
+		s.manager.logger.Warn("GitHub land push audit Linear comment failed", "issue_id", s.issue.ID, "issue_identifier", s.issue.Identifier, "pr_number", prNumber, "error", observability.Text(err.Error()))
 	}
 	if err := s.manager.commentPR(ctx, s.settings, prNumber, body); err != nil {
-		s.manager.logger.Warn("GitHub land push audit PR comment failed", "issue_id", s.issue.ID, "issue_identifier", s.issue.Identifier, "pr_number", prNumber)
+		s.manager.logger.Warn("GitHub land push audit PR comment failed", "issue_id", s.issue.ID, "issue_identifier", s.issue.Identifier, "pr_number", prNumber, "error", observability.Text(err.Error()))
 	}
 }
 
@@ -1528,7 +1529,7 @@ func (m *Manager) pollOne(ctx context.Context, linked *link) {
 	m.mu.Unlock()
 	pr, err := m.getPull(ctx, linked.settings, linked.prNumber)
 	if err != nil {
-		m.logger.Warn("GitHub pull request poll failed", "issue_id", linked.issueID, "issue_identifier", linked.identifier, "pr_number", linked.prNumber)
+		m.logger.Warn("GitHub pull request poll failed", "issue_id", linked.issueID, "issue_identifier", linked.identifier, "pr_number", linked.prNumber, "error", observability.Text(err.Error()))
 		return
 	}
 	if pr.Merged || pr.MergedAt != nil {
@@ -1538,7 +1539,7 @@ func (m *Manager) pollOne(ctx context.Context, linked *link) {
 		// the reconciliation to the review-target state alone.
 		changed, err := linked.linear.ReconcileMerged(ctx, linked.settings.MergeState)
 		if err != nil {
-			m.logger.Warn("GitHub merge Linear completion failed", "issue_id", linked.issueID, "issue_identifier", linked.identifier, "pr_number", linked.prNumber)
+			m.logger.Warn("GitHub merge Linear completion failed", "issue_id", linked.issueID, "issue_identifier", linked.identifier, "pr_number", linked.prNumber, "error", observability.Text(err.Error()))
 			return
 		}
 		m.mu.Lock()
@@ -1560,7 +1561,7 @@ func (m *Manager) pollOne(ctx context.Context, linked *link) {
 		m.mu.Lock()
 		linked.settled = true
 		m.mu.Unlock()
-		m.logger.Warn("GitHub pull request closed without merge; Linear issue remains in review", "issue_id", linked.issueID, "issue_identifier", linked.identifier, "pr_number", linked.prNumber)
+		m.logger.Warn("GitHub pull request closed without merge; Linear issue remains in review", "issue_id", linked.issueID, "issue_identifier", linked.identifier, "pr_number", linked.prNumber, "pr_url", linked.prURL)
 	}
 }
 
