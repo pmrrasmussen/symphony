@@ -266,7 +266,8 @@ Relative workspace and log paths are resolved from the workflow file; omitted
 See [docs/architecture.md](docs/architecture.md), the
 [Linear tracker profile](docs/linear-tracker.md), the
 [workspace ownership and recovery guide](docs/completion-markers.md), the
-[observability guide](docs/observability.md), and
+[observability guide](docs/observability.md), the
+[dogfooding operator guide](docs/dogfooding.md), and
 [WORKFLOW.example.md](WORKFLOW.example.md).
 
 By default the structured log at `--logs-root` (`.symphony/logs/symphony.jsonl`)

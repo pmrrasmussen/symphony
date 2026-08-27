@@ -36,7 +36,7 @@ handoff, rework, landing, and completion instructions. Read it, and
 - `internal/operator` — read-only discovery of local LaunchAgent instances, and the display-safe model built from launchd, status, configuration, and log observations.
 - `internal/service` — management of one repository-scoped macOS LaunchAgent (`install`, `status`, `restart`, `uninstall`, `migrate`).
 - `internal/tui` — the read-only operator dashboard (`symphony tui`), which renders `internal/operator` and can mutate nothing.
-- `docs/` — architecture, the Linear tracker profile, workspace recovery, observability, and the live smoke profile.
+- `docs/` — architecture, the Linear tracker profile, workspace recovery, observability, the live smoke profile, and the dogfooding operator guide.
 
 ## Working here
 
