@@ -850,15 +850,6 @@ func TestPublishRefusalCausesAreDistinctAgentActionableMessages(t *testing.T) {
 			want: "github publish HEAD is not based on the configured base branch",
 		},
 		{
-			name: "non-fast-forward remote branch",
-			base: &fakeGit{},
-			wrap: func(g *fakeGit) gitRunner {
-				return &failingGit{fakeGit: g, failArgs: []string{"merge-base", "--is-ancestor", "sha1", "head"}}
-			},
-			prExists: true,
-			want:     "github publish remote branch symphony/pmr-27 has commits this worktree no longer contains; merge origin/main instead of rebasing",
-		},
-		{
 			name: "remote head not fetched",
 			base: &fakeGit{},
 			wrap: func(g *fakeGit) gitRunner {
@@ -899,7 +890,6 @@ func TestPublishRefusalCausesAreDistinctAgentActionableMessages(t *testing.T) {
 		"github publish requires a committed HEAD",
 		"github publish requires committed changes",
 		"github publish HEAD is not based on the configured base branch",
-		"github publish remote branch symphony/pmr-27 has commits this worktree no longer contains; merge origin/main instead of rebasing",
 		"github publish remote branch symphony/pmr-27 has a head commit this worktree has not fetched, so the cause of the divergence cannot be established here",
 		"github publish could not push branch symphony/pmr-27 to the configured repository; retry once, and if it persists check the repository's push permissions and branch protection rules",
 	} {
@@ -975,30 +965,75 @@ func TestPublishForwardedFailuresAtEveryCallSiteCarryNoProviderOrWireDecodedText
 	})
 }
 
-// TestPublishRefusesNonFastForwardRemoteBranchBeforeAnyPush asserts the
-// stale-remote-branch check runs, and refuses, strictly before the push is
-// attempted: retrying a non-fast-forward push can never succeed, so the
-// worktree must never be left mid-push on this path (PMR-132, absorbing
-// PMR-137 proposal 2).
-func TestPublishRefusesNonFastForwardRemoteBranchBeforeAnyPush(t *testing.T) {
+// TestPublishForceWithLeasePushesARewrittenBranch asserts a worktree whose
+// HEAD no longer descends from the published pull request's remote head --
+// because it rebased instead of merged -- is still publishable. s.branch is
+// Symphony's own deterministic per-issue branch that nothing else writes, so
+// the push below runs under --force-with-lease bound to the remote head this
+// call just observed rather than being refused outright (PMR-137).
+func TestPublishForceWithLeasePushesARewrittenBranch(t *testing.T) {
 	api, linear := newAPI(t), &fakeLinear{}
 	api.prExists = true
 	base := &fakeGit{}
 	git := &failingGit{fakeGit: base, failArgs: []string{"merge-base", "--is-ancestor", "sha1", "head"}}
 	_, session := testSession(t, api, base, linear, nil)
 	session.manager.git = git
-	if _, err := session.Publish(context.Background(), testInput()); err == nil || !strings.Contains(err.Error(), "merge origin/main instead of rebasing") {
-		t.Fatalf("non-fast-forward publish error=%v", err)
+	if _, err := session.Publish(context.Background(), testInput()); err != nil {
+		t.Fatalf("rewritten-branch publish under lease failed: %v", err)
 	}
-	if api.created != 0 || len(linear.links) != 0 {
-		t.Fatalf("non-fast-forward publish mutated GitHub or Linear: created=%d links=%v", api.created, linear.links)
+	if len(linear.links) != 1 {
+		t.Fatalf("rewritten-branch publish did not hand off: links=%v", linear.links)
 	}
 	git.mu.Lock()
 	defer git.mu.Unlock()
+	wantPush := "push --force-with-lease=refs/heads/symphony/pmr-27:sha1 https://github.com/owner/repo.git HEAD:refs/heads/symphony/pmr-27"
+	found := false
 	for _, call := range git.calls {
 		if call[0] == "push" {
-			t.Fatalf("non-fast-forward publish attempted the push: %v", call)
+			found = true
+			if strings.Join(call, " ") != wantPush {
+				t.Fatalf("push call = %q, want %q", strings.Join(call, " "), wantPush)
+			}
 		}
+	}
+	if !found {
+		t.Fatal("rewritten-branch publish never pushed")
+	}
+}
+
+// nonFastForwardThenRacedPushGit simulates a worktree that rebased (so the
+// ancestor check below fails, and Publish falls back to a leased push) where
+// the remote branch then moved again before the leased push ran -- the lease
+// no longer matches what Publish observed via findPull.
+type nonFastForwardThenRacedPushGit struct{ *fakeGit }
+
+func (g *nonFastForwardThenRacedPushGit) Run(ctx context.Context, dir string, args, env []string) (string, error) {
+	if len(args) == 4 && args[0] == "merge-base" && args[1] == "--is-ancestor" && args[2] == "sha1" && args[3] == "head" {
+		return "", errors.New("not an ancestor")
+	}
+	if args[0] == "push" {
+		return "", errors.New("stale info; the remote branch was updated since the last fetch")
+	}
+	return g.fakeGit.Run(ctx, dir, args, env)
+}
+
+// TestPublishForceWithLeaseFailsClosedOnUnexpectedRemoteState asserts that
+// when the remote branch has moved since Publish observed it, so the lease no
+// longer matches, the push is refused rather than allowed to overwrite
+// whatever is now on the branch, and neither GitHub nor Linear is mutated
+// (PMR-137).
+func TestPublishForceWithLeaseFailsClosedOnUnexpectedRemoteState(t *testing.T) {
+	api, linear := newAPI(t), &fakeLinear{}
+	api.prExists = true
+	base := &fakeGit{}
+	git := &nonFastForwardThenRacedPushGit{fakeGit: base}
+	_, session := testSession(t, api, base, linear, nil)
+	session.manager.git = git
+	if _, err := session.Publish(context.Background(), testInput()); err == nil {
+		t.Fatal("racing push under a stale lease succeeded")
+	}
+	if api.created != 0 || len(linear.links) != 0 {
+		t.Fatalf("racing push under a stale lease mutated GitHub or Linear: created=%d links=%v", api.created, linear.links)
 	}
 }
 

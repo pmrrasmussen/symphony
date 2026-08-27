@@ -392,6 +392,7 @@ func (s *Session) Publish(ctx context.Context, input PublishInput) (Result, erro
 	if err != nil {
 		return Result{}, err
 	}
+	leaseAgainst := ""
 	if found && existing.Head.SHA != "" && existing.Head.SHA != head {
 		if _, err := s.manager.git.Run(ctx, s.workspace, []string{"cat-file", "-e", existing.Head.SHA + "^{commit}"}, nil); err != nil {
 			// The remote head commit was never fetched into this worktree (for
@@ -404,17 +405,26 @@ func (s *Session) Publish(ctx context.Context, input PublishInput) (Result, erro
 			return Result{}, errors.New("github publish remote branch " + s.branch + " has a head commit this worktree has not fetched, so the cause of the divergence cannot be established here")
 		}
 		// A published pull request's remote head that HEAD no longer descends
-		// from means this worktree rebased instead of merging: the push below
-		// would be a non-fast-forward that can never succeed by retrying, so
-		// name the fixable cause now rather than let the push fail opaquely.
+		// from means this worktree rebased instead of merging: a plain push
+		// below would be a non-fast-forward Git rejects outright. s.branch is
+		// Symphony's own deterministic per-issue branch that nothing else
+		// writes, so pushing under --force-with-lease bound to the remote
+		// head this call just observed is safe: the lease still fails closed,
+		// rather than overwriting, if the branch has moved to anything else
+		// by the time the push below runs (PMR-137).
 		if _, err := s.manager.git.Run(ctx, s.workspace, []string{"merge-base", "--is-ancestor", existing.Head.SHA, head}, nil); err != nil {
-			return Result{}, errors.New("github publish remote branch " + s.branch + " has commits this worktree no longer contains; merge origin/" + s.settings.BaseBranch + " instead of rebasing")
+			leaseAgainst = existing.Head.SHA
 		}
 	}
 	auth := base64.StdEncoding.EncodeToString([]byte("x-access-token:" + s.settings.Token))
 	env := []string{"GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=http.https://github.com/.extraheader", "GIT_CONFIG_VALUE_0=AUTHORIZATION: basic " + auth}
 	remote := "https://github.com/" + s.settings.Owner + "/" + s.settings.Repository + ".git"
-	if _, err := s.manager.git.Run(ctx, s.workspace, []string{"push", remote, "HEAD:refs/heads/" + s.branch}, env); err != nil {
+	pushArgs := []string{"push"}
+	if leaseAgainst != "" {
+		pushArgs = append(pushArgs, "--force-with-lease=refs/heads/"+s.branch+":"+leaseAgainst)
+	}
+	pushArgs = append(pushArgs, remote, "HEAD:refs/heads/"+s.branch)
+	if _, err := s.manager.git.Run(ctx, s.workspace, pushArgs, env); err != nil {
 		// execGit.Run discards the underlying git output, so this is never
 		// provider text; it is host-authored precisely because the generic
 		// "git operation failed" this replaces gave the agent nothing to act
