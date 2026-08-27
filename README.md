@@ -155,9 +155,15 @@ SYMPHONY_LINEAR_API_KEY_FILE=/path/to/a/mode-600-key-file \
 `--dry-run` emits a structured result for workflow parsing, tracker selection,
 workspace and log roots, hook syntax, executable availability, and a synthetic
 scheduler lifecycle. It does not contact Linear, execute hooks, start an agent
-session, or create configured logs or workspaces. With `agent.backend: claude`
-it additionally runs the CLI's own read-only `claude auth status` locally, as
-the `agent_authentication` check described below. A missing future root is a
+session, or create configured logs or workspaces. Every backend also gets an
+`agent_authentication` check, so the result never silently omits it: with
+`agent.backend: claude` it runs the CLI's own read-only `claude auth status`
+locally, as described below; with `agent.backend: codex` it runs `codex login
+status` and reads only its exit code -- 0 logged in, 1 not -- ignoring the
+sentence the CLI prints alongside it. Either way, an unauthenticated agent CLI
+otherwise fails the same way, at `thread/start` or mid-turn for Codex and as a
+result with `is_error` set for Claude, and this check is what catches that
+locally instead of at dispatch. A missing future root is a
 warning; an
 invalid boundary is a failure and exits non-zero. The referenced file is read
 only to validate required configuration and is never sent anywhere during
@@ -671,19 +677,42 @@ capability". A `github:` block that does not resolve (an unreadable
 `token_file`, say) leaves the integration disabled, exactly as it does under
 `codex`, so it configures nothing and reaches neither rule.
 
-`--dry-run` adds one check for this backend, `agent_authentication`: it runs
-`claude auth status` and reads only the `loggedIn` boolean. That command also
+`--dry-run` emits an `agent_authentication` check for this backend by running
+`claude auth status` and reading only the `loggedIn` boolean. That command also
 reports the operator's email, organization, and subscription, none of which is
 read or logged. The check exists because an unauthenticated CLI otherwise
 surfaces only at dispatch, where it looks like a finished turn rather than a
 setup problem -- the CLI reports an authentication failure as a result event
-with `is_error` set. A multi-word `claude.command` is a wrapper or a test stub
-with no reliable way to be asked for status, so the check does not probe it and
-does not fail on it: a pass is then evidence of nothing. The probe is bounded at
-five seconds -- every other preflight probe is a `sh -n` syntax check, a `PATH`
-lookup, or a `stat`, so this is the one call that runs a foreign program, and a
-CLI blocked on a keychain prompt or a token refresh must fail the check rather
-than leave `--dry-run` waiting.
+with `is_error` set. `claude.command` is expected to be a bare program name
+(`claude` by default); anything else -- a wrapper script, `mise exec --
+claude`, a test stub with extra arguments -- has no reliable way to be asked
+for status, so the check does not probe it and does not fail on it: a pass is
+then evidence of nothing. The probe is bounded at five seconds -- every other
+preflight probe is a `sh -n` syntax check, a `PATH` lookup, or a `stat`, so
+this is the one call that runs a foreign program, and a CLI blocked on a
+keychain prompt or a token refresh must fail the check rather than leave
+`--dry-run` waiting.
+
+Under `agent.backend: codex` the same check runs `codex login status` instead
+-- `Result.Checks` never simply omits `agent_authentication` depending on which
+backend is selected. That command is a bare status subcommand, distinct from
+`codex app-server`, the long-lived JSON-RPC service the coordinator actually
+drives, so asking it carries none of that service's side effects. It answers
+with only an exit code -- 0 logged in, 1 not -- and a human sentence naming the
+auth method; the check reads the exit code alone, the same "only the boolean
+is read" rule that keeps Claude's email, organization, and subscription out of
+its check message. Any exit other than 0 or 1 is a probe failure, not an
+authentication answer, since the CLI did not report a status this check
+understands.
+
+`codex.command` defaults to `codex app-server`, two words, not a bare program
+name -- so the check does not require a single-word command the way Claude's
+does. It instead checks that the command's own trailing arguments are exactly
+`app-server`, the same fixed subcommand `codex.command` always launches with,
+and if so runs `login status` against the leading program name. A command
+shaped any other way -- a wrapper, a container entrypoint, extra flags after
+`app-server` -- is treated the same as Claude's wrapper case: not probed, and
+not a pass.
 
 **Operator prerequisite:** the user the Symphony process runs as must already be
 logged in to the Claude Code CLI. Symphony passes it no credential and performs

@@ -23,7 +23,7 @@ func TestRunExercisesLifecycleWithoutCreatingConfiguredState(t *testing.T) {
 	if !result.OK() {
 		t.Fatalf("result=%+v", result)
 	}
-	for _, check := range []string{"workflow", "github_handoff", "tracker", "workspace_root", "workspace_source", "log_root", "status_file", "agent_command", "hooks", "scheduler_lifecycle"} {
+	for _, check := range []string{"workflow", "github_handoff", "tracker", "workspace_root", "workspace_source", "log_root", "status_file", "agent_command", "agent_authentication", "hooks", "scheduler_lifecycle"} {
 		if !hasCheck(result, check) {
 			t.Fatalf("missing %s check: %+v", check, result)
 		}
@@ -207,6 +207,49 @@ func result(t *testing.T, workflow, dir string) Result {
 	return Run(context.Background(), workflow, filepath.Join(dir, "logs"), "")
 }
 
+// TestRunWithEnvironmentResolvesTokensFromItsOwnEnvironmentOverlay pins the
+// contract that makes RunWithEnvironment its own code path rather than a thin
+// alias for Run: a LaunchAgent's credential references live in its own host
+// environment, not the invoking terminal's, so the same workflow reads as
+// unavailable without the overlay and available with it.
+func TestRunWithEnvironmentResolvesTokensFromItsOwnEnvironmentOverlay(t *testing.T) {
+	const varName = "PMR122_PREFLIGHT_RUNWITHENV_TOKEN"
+	if _, ok := os.LookupEnv(varName); ok {
+		t.Fatalf("%s must not already be set in the test process environment", varName)
+	}
+	dir := t.TempDir()
+	workflow := filepath.Join(dir, "WORKFLOW.md")
+	content := "---\n" +
+		"tracker:\n  kind: linear\n  provider: {project_slug_id: preflight, api_key: not-a-live-key, handoff_state: In Review}\n" +
+		"  active_states: [Todo]\n  terminal_states: [Done]\n" +
+		"github: {owner: o, repository: r, token: $" + varName + "}\n" +
+		"workspace: {root: " + filepath.Join(dir, "workspaces") + ", source_root: " + dir + "}\n" +
+		"codex: {command: go}\n" +
+		"---\nWork on {{.issue.identifier}}"
+	if err := os.WriteFile(workflow, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	without := RunWithEnvironment(context.Background(), workflow, filepath.Join(dir, "logs"), "", nil)
+	if got := handoffStatus(without); got != StatusWarning {
+		t.Fatalf("github_handoff=%v without the token in the environment overlay, want warning", got)
+	}
+
+	withOverlay := RunWithEnvironment(context.Background(), workflow, filepath.Join(dir, "logs"), "", map[string]string{varName: "github-secret"})
+	if got := handoffStatus(withOverlay); got != StatusPassed {
+		t.Fatalf("github_handoff=%v with the token in the environment overlay, want passed", got)
+	}
+}
+
+func handoffStatus(result Result) Status {
+	for _, check := range result.Checks {
+		if check.Name == "github_handoff" {
+			return check.Status
+		}
+	}
+	return ""
+}
+
 func writeWorkflow(t *testing.T, path, workspaceRoot, command, beforeRun string) {
 	t.Helper()
 	content := "---\n" +
@@ -275,14 +318,17 @@ func writeAuthCommand(t *testing.T, body string) string {
 	return script
 }
 
-// TestAuthenticationProbeReportsEachOutcomeWithoutClaimingAnUncheckedPass
-// covers every branch of the probe. The pass is the dangerous one: a wrapper
-// command, an unreadable answer, a non-zero exit, and a probe that had to be
-// killed must all be distinguishable from a session that was actually verified.
-func TestAuthenticationProbeReportsEachOutcomeWithoutClaimingAnUncheckedPass(t *testing.T) {
+// TestClaudeAuthenticationProbeReportsEachOutcomeWithoutClaimingAnUncheckedPass
+// covers every branch of the Claude probe. The pass is the dangerous one: a
+// wrapper command, an unreadable answer, a non-zero exit, and a probe that had
+// to be killed must all be distinguishable from a session that was actually
+// verified.
+func TestClaudeAuthenticationProbeReportsEachOutcomeWithoutClaimingAnUncheckedPass(t *testing.T) {
+	probe := authenticationProbeFor(config.ClaudeAgentBackend)
+
 	t.Run("authenticated session", func(t *testing.T) {
 		command := writeAuthCommand(t, `printf '%s' '`+authStatusJSON("true")+`'`)
-		status, err := authenticated(context.Background(), command, authenticationTimeout)
+		status, err := authenticated(context.Background(), command, "claude.command", probe, authenticationTimeout)
 		if err != nil || !status {
 			t.Fatalf("status=%v err=%v", status, err)
 		}
@@ -290,7 +336,7 @@ func TestAuthenticationProbeReportsEachOutcomeWithoutClaimingAnUncheckedPass(t *
 
 	t.Run("no authenticated session", func(t *testing.T) {
 		command := writeAuthCommand(t, `printf '%s' '`+authStatusJSON("false")+`'`)
-		status, err := authenticated(context.Background(), command, authenticationTimeout)
+		status, err := authenticated(context.Background(), command, "claude.command", probe, authenticationTimeout)
 		if status || err == nil || !strings.Contains(err.Error(), "no authenticated session") {
 			t.Fatalf("status=%v err=%v", status, err)
 		}
@@ -299,7 +345,7 @@ func TestAuthenticationProbeReportsEachOutcomeWithoutClaimingAnUncheckedPass(t *
 
 	t.Run("unreadable answer", func(t *testing.T) {
 		command := writeAuthCommand(t, `printf '%s' 'logged in as `+authEmail+`'`)
-		status, err := authenticated(context.Background(), command, authenticationTimeout)
+		status, err := authenticated(context.Background(), command, "claude.command", probe, authenticationTimeout)
 		if status || err == nil || !strings.Contains(err.Error(), "unreadable authentication status") {
 			t.Fatalf("status=%v err=%v", status, err)
 		}
@@ -309,14 +355,14 @@ func TestAuthenticationProbeReportsEachOutcomeWithoutClaimingAnUncheckedPass(t *
 
 	t.Run("non-zero exit", func(t *testing.T) {
 		command := writeAuthCommand(t, "exit 3")
-		status, err := authenticated(context.Background(), command, authenticationTimeout)
+		status, err := authenticated(context.Background(), command, "claude.command", probe, authenticationTimeout)
 		if status || err == nil || !strings.Contains(err.Error(), "could not report authentication status") {
 			t.Fatalf("status=%v err=%v", status, err)
 		}
 	})
 
 	t.Run("wrapper command is not probed and is not a pass", func(t *testing.T) {
-		status, err := authenticated(context.Background(), "sh -c exit", authenticationTimeout)
+		status, err := authenticated(context.Background(), "sh -c exit", "claude.command", probe, authenticationTimeout)
 		if status || err != nil {
 			t.Fatalf("status=%v err=%v", status, err)
 		}
@@ -331,7 +377,7 @@ func TestAuthenticationProbeReportsEachOutcomeWithoutClaimingAnUncheckedPass(t *
 		// this first failed in CI and not locally.
 		command := writeAuthCommand(t, "sleep 60 &\nwait")
 		start := time.Now()
-		status, err := authenticated(context.Background(), command, 50*time.Millisecond)
+		status, err := authenticated(context.Background(), command, "claude.command", probe, 50*time.Millisecond)
 		if status || err == nil || !strings.Contains(err.Error(), "did not report authentication status") {
 			t.Fatalf("status=%v err=%v", status, err)
 		}
@@ -343,10 +389,166 @@ func TestAuthenticationProbeReportsEachOutcomeWithoutClaimingAnUncheckedPass(t *
 	})
 
 	t.Run("empty command", func(t *testing.T) {
-		if _, err := authenticated(context.Background(), "   ", authenticationTimeout); err == nil || !strings.Contains(err.Error(), "claude.command is empty") {
+		if _, err := authenticated(context.Background(), "   ", "claude.command", probe, authenticationTimeout); err == nil || !strings.Contains(err.Error(), "claude.command is empty") {
 			t.Fatalf("err=%v", err)
 		}
 	})
+}
+
+// TestCodexAuthenticationProbeReportsEachOutcomeWithoutClaimingAnUncheckedPass
+// pins the Codex half of the PMR-122 gap: `codex login status` answers with
+// only an exit code (0 logged in, 1 not) and a human sentence this probe must
+// not read, so its outcomes are distinguished by exit status alone.
+func TestCodexAuthenticationProbeReportsEachOutcomeWithoutClaimingAnUncheckedPass(t *testing.T) {
+	probe := authenticationProbeFor(config.DefaultAgentBackend)
+	if len(probe.argv) == 0 {
+		t.Fatal("codex backend has no authentication argv")
+	}
+
+	// Codex's own documented invocation is "codex app-server", not a bare
+	// "codex", so every fake CLI here is invoked the same shape a real
+	// codex.command is: the script path followed by "app-server". Without that
+	// suffix, authenticated would (correctly) treat the command as a wrapper
+	// it cannot safely re-invoke and never reach the probe at all.
+	t.Run("authenticated session", func(t *testing.T) {
+		script := writeAuthCommand(t, `printf 'Logged in using ChatGPT'`)
+		status, err := authenticated(context.Background(), script+" app-server", "codex.command", probe, authenticationTimeout)
+		if err != nil || !status {
+			t.Fatalf("status=%v err=%v", status, err)
+		}
+	})
+
+	t.Run("no authenticated session", func(t *testing.T) {
+		script := writeAuthCommand(t, "printf 'Not logged in'\nexit 1")
+		status, err := authenticated(context.Background(), script+" app-server", "codex.command", probe, authenticationTimeout)
+		if status || err == nil || !strings.Contains(err.Error(), "no authenticated session") {
+			t.Fatalf("status=%v err=%v", status, err)
+		}
+		// The CLI's own sentence must not be quoted into the failure either.
+		if strings.Contains(err.Error(), "Not logged in") {
+			t.Fatalf("codex outcome leaked the CLI's own sentence: %v", err)
+		}
+	})
+
+	t.Run("non-auth failure", func(t *testing.T) {
+		script := writeAuthCommand(t, "exit 3")
+		status, err := authenticated(context.Background(), script+" app-server", "codex.command", probe, authenticationTimeout)
+		if status || err == nil || !strings.Contains(err.Error(), "could not report authentication status") {
+			t.Fatalf("status=%v err=%v", status, err)
+		}
+	})
+
+	t.Run("wrapper command is not probed and is not a pass", func(t *testing.T) {
+		status, err := authenticated(context.Background(), "sh -c exit", "codex.command", probe, authenticationTimeout)
+		if status || err != nil {
+			t.Fatalf("status=%v err=%v", status, err)
+		}
+	})
+
+	// This is the PMR-122 rework regression: codex.command defaults to
+	// "codex app-server", two tokens, not a bare program name. A probe that
+	// only recognized single-token commands was correct in isolation but
+	// unreachable from every default Codex configuration.
+	t.Run("codex's own default two-token shape reaches the probe", func(t *testing.T) {
+		script := writeAuthCommand(t, `printf 'Logged in using ChatGPT'`)
+		status, err := authenticated(context.Background(), script+" app-server", "codex.command", probe, authenticationTimeout)
+		if err != nil || !status {
+			t.Fatalf("status=%v err=%v", status, err)
+		}
+	})
+}
+
+// TestCodexAuthenticationCheckReflectsTheProbeOutcome asserts the Codex path's
+// agent_authentication check end to end: its name, status, and message, for
+// both an authenticated and an unauthenticated fake CLI.
+func TestCodexAuthenticationCheckReflectsTheProbeOutcome(t *testing.T) {
+	for name, tc := range map[string]struct {
+		body       string
+		wantStatus Status
+		wantSubstr string
+	}{
+		"authenticated": {
+			body:       `printf 'Logged in using ChatGPT'`,
+			wantStatus: StatusPassed,
+			wantSubstr: "authenticated session",
+		},
+		"not authenticated": {
+			body:       "printf 'Not logged in'\nexit 1",
+			wantStatus: StatusFailed,
+			wantSubstr: "no authenticated session",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			// codex.command is "<program> app-server", not a bare program name,
+			// so the workflow's override must carry the same shape a real
+			// codex.command does.
+			command := writeAuthCommand(t, tc.body) + " app-server"
+			dir := t.TempDir()
+			workflow := filepath.Join(dir, "WORKFLOW.md")
+			content := "---\n" +
+				"tracker:\n  kind: linear\n  provider: {project_slug_id: preflight, api_key: not-a-live-key}\n  active_states: [Todo]\n  terminal_states: [Done]\n" +
+				"workspace: {root: " + filepath.Join(dir, "workspaces") + ", source_root: " + dir + "}\n" +
+				"agent: {backend: codex}\n" +
+				"codex: {command: \"" + command + "\"}\n" +
+				"---\nWork on {{.issue.identifier}}"
+			if err := os.WriteFile(workflow, []byte(content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			found := false
+			for _, check := range result(t, workflow, dir).Checks {
+				if check.Name != "agent_authentication" {
+					continue
+				}
+				found = true
+				if check.Status != tc.wantStatus || !strings.Contains(check.Message, tc.wantSubstr) {
+					t.Fatalf("agent_authentication=%+v, want status=%v containing %q", check, tc.wantStatus, tc.wantSubstr)
+				}
+			}
+			if !found {
+				t.Fatalf("a codex workflow produced no agent_authentication check")
+			}
+		})
+	}
+}
+
+// TestCodexAuthenticationCheckReachesTheProbeUnderTheDefaultCommand pins the
+// PMR-122 rework gap directly: codex.command defaults to "codex app-server"
+// with no operator override at all, so this leaves codex.command unset and
+// puts the fake CLI on PATH under the literal name "codex" instead of naming
+// it explicitly, the way every real deployment does.
+func TestCodexAuthenticationCheckReachesTheProbeUnderTheDefaultCommand(t *testing.T) {
+	binDir := t.TempDir()
+	script := filepath.Join(binDir, "codex")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nprintf 'Logged in using ChatGPT'\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	dir := t.TempDir()
+	workflow := filepath.Join(dir, "WORKFLOW.md")
+	content := "---\n" +
+		"tracker:\n  kind: linear\n  provider: {project_slug_id: preflight, api_key: not-a-live-key}\n  active_states: [Todo]\n  terminal_states: [Done]\n" +
+		"workspace: {root: " + filepath.Join(dir, "workspaces") + ", source_root: " + dir + "}\n" +
+		"agent: {backend: codex}\n" +
+		"---\nWork on {{.issue.identifier}}"
+	if err := os.WriteFile(workflow, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	found := false
+	for _, check := range result(t, workflow, dir).Checks {
+		if check.Name != "agent_authentication" {
+			continue
+		}
+		found = true
+		if check.Status != StatusPassed {
+			t.Fatalf("agent_authentication=%+v, want an authenticated pass under the default codex.command", check)
+		}
+	}
+	if !found {
+		t.Fatalf("a codex workflow produced no agent_authentication check")
+	}
 }
 
 // TestAuthenticationCheckKeepsAccountDetailsOutOfEveryResult is the whole-result

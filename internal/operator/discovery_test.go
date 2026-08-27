@@ -3,6 +3,7 @@ package operator
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -14,6 +15,21 @@ import (
 type fakeInspector map[string]LaunchdStatus
 
 func (f fakeInspector) Launchd(_ context.Context, label string) LaunchdStatus { return f[label] }
+
+// fakeAuthenticatedAgentCommand stands in for the codex binary the discovery
+// fixtures need since every backend, not only Claude, now gets a real
+// agent_authentication probe: a real program on PATH, like the "go"
+// placeholder these fixtures used before that probe existed, no longer
+// reports a session, and Discover turns that failure into a SeverityError
+// finding that finalizeLiveness treats as LivenessInvalid.
+func fakeAuthenticatedAgentCommand(t *testing.T, dir string) string {
+	t.Helper()
+	path := filepath.Join(dir, "fake-codex")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
 
 func TestDiscoverMultipleIndependentInstancesAndStaleSnapshot(t *testing.T) {
 	dir := t.TempDir()
@@ -171,7 +187,7 @@ func TestEffectiveConfigReportsResolvedAgentBackendAlongsideCodexKeys(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{`"agent_backend":"codex"`, `"codex_command":"go"`} {
+	for _, want := range []string{`"agent_backend":"codex"`, fmt.Sprintf(`"codex_command":%q`, filepath.Join(dir, "fake-codex"))} {
 		if !strings.Contains(string(encoded), want) {
 			t.Fatalf("effective configuration JSON missing %s:\n%s", want, encoded)
 		}
@@ -277,7 +293,7 @@ func TestCredentialMetadataNeverExposesSecretValues(t *testing.T) {
 	t.Setenv("PMR74_LINEAR", "linear-secret-value")
 	t.Setenv("PMR74_GITHUB", "github-secret-value")
 	workflow := filepath.Join(dir, "WORKFLOW.md")
-	write(t, workflow, "---\ntracker: {kind: linear, provider: {project_slug_id: safe, api_key: $PMR74_LINEAR}, active_states: [Todo], terminal_states: [Done]}\nworkspace: {root: work, source_root: .}\ncodex: {command: go}\ngithub: {owner: owner, repository: repo, token: $PMR74_GITHUB}\n---\nprompt")
+	write(t, workflow, "---\ntracker: {kind: linear, provider: {project_slug_id: safe, api_key: $PMR74_LINEAR}, active_states: [Todo], terminal_states: [Done]}\nworkspace: {root: work, source_root: .}\ncodex: {command: "+fakeAuthenticatedAgentCommand(t, dir)+"}\ngithub: {owner: owner, repository: repo, token: $PMR74_GITHUB}\n---\nprompt")
 	logs := filepath.Join(dir, "logs")
 	if err := os.Mkdir(logs, 0o700); err != nil {
 		t.Fatal(err)
@@ -308,7 +324,7 @@ func TestDiscoverUsesLaunchAgentCredentialFileReferenceWithoutLeakingIt(t *testi
 	secretFile := filepath.Join(dir, "daemon-key")
 	write(t, secretFile, "daemon-secret-value")
 	workflow := filepath.Join(dir, "WORKFLOW.md")
-	write(t, workflow, "---\ntracker: {kind: linear, provider: {project_slug_id: service, api_key_file: $PMR74_SERVICE_FILE}, active_states: [Todo], terminal_states: [Done]}\nworkspace: {root: work, source_root: .}\ncodex: {command: go}\n---\nprompt")
+	write(t, workflow, "---\ntracker: {kind: linear, provider: {project_slug_id: service, api_key_file: $PMR74_SERVICE_FILE}, active_states: [Todo], terminal_states: [Done]}\nworkspace: {root: work, source_root: .}\ncodex: {command: "+fakeAuthenticatedAgentCommand(t, dir)+"}\n---\nprompt")
 	writePlistWithEnvironment(t, dir, labelPrefix+".service", workflow, filepath.Join(dir, "logs"), "", map[string]string{"PMR74_SERVICE_FILE": secretFile})
 	instances, err := Discover(context.Background(), Options{LaunchAgentsDir: dir, Inspector: fakeInspector{}})
 	if err != nil {
@@ -348,7 +364,7 @@ func fixtureWorkflow(t *testing.T, dir, name string) string {
 	if err := os.Mkdir(source, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	write(t, workflow, "---\ntracker: {kind: linear, provider: {project_slug_id: project-"+name+", api_key: dummy}, active_states: [Todo], terminal_states: [Done]}\nworkspace: {root: "+name+"-work, source_root: "+source+"}\ncodex: {command: go}\n---\nprompt")
+	write(t, workflow, "---\ntracker: {kind: linear, provider: {project_slug_id: project-"+name+", api_key: dummy}, active_states: [Todo], terminal_states: [Done]}\nworkspace: {root: "+name+"-work, source_root: "+source+"}\ncodex: {command: "+fakeAuthenticatedAgentCommand(t, dir)+"}\n---\nprompt")
 	return workflow
 }
 

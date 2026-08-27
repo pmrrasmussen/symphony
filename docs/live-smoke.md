@@ -62,6 +62,18 @@ prompt is safe to process. Confirm that the issue asks Codex to make no changes
 and that the project contains no other eligible issues. The service runs until
 interrupted, so stop it after the one expected issue has been observed.
 
+`--dry-run` verifies the Codex credential the same way it verifies Claude's,
+below: it runs the read-only `codex login status` and reads only its exit
+code. That reflects a login the CLI itself persisted -- `codex login` or
+`codex login --with-api-key` -- not a bare `OPENAI_API_KEY` export with no
+stored login, which `codex login status` reports as logged out even though
+the app-server picks the variable up directly at spawn time. If you rely on
+the export alone rather than persisting it with `codex login --with-api-key`,
+treat a failing `agent_authentication` check as inconclusive for this backend
+and confirm authentication some other way before running this live -- an
+unauthenticated app-server fails at `thread/start` or mid-turn instead, which
+still consumes a dispatch and a workspace.
+
 ```sh
 export LINEAR_API_KEY
 export OPENAI_API_KEY
