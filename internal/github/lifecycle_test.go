@@ -1227,6 +1227,81 @@ func TestPollRetainsAMergedLinkWhoseLinearReconciliationFailed(t *testing.T) {
 	}
 }
 
+// logRecordError decodes a JSONL log buffer and returns the "error" attribute
+// of the first record whose "msg" matches, or "" if no such record exists (a
+// present-but-empty attribute is indistinguishable from an absent one for
+// this issue's purposes: both leave an operator without a cause).
+func logRecordError(t *testing.T, logs, msg string) string {
+	t.Helper()
+	for _, line := range strings.Split(strings.TrimSpace(logs), "\n") {
+		if line == "" {
+			continue
+		}
+		var record map[string]any
+		if err := json.Unmarshal([]byte(line), &record); err != nil {
+			t.Fatalf("invalid log line %q: %v", line, err)
+		}
+		if record["msg"] != msg {
+			continue
+		}
+		errText, _ := record["error"].(string)
+		return errText
+	}
+	return ""
+}
+
+// TestPollFailureLogsTheUnderlyingError pins PMR-154: a poll failure must be
+// attributable from the log alone -- a 404 on a deleted pull request needs a
+// different operator response than a network blip, and neither is
+// distinguishable from "something failed, once, somewhere" without the error.
+func TestPollFailureLogsTheUnderlyingError(t *testing.T) {
+	api, git, linear := newAPI(t), &fakeGit{}, &fakeLinear{}
+	var logs bytes.Buffer
+	m, session := testSession(t, api, git, linear, &logs)
+	if _, err := session.Publish(context.Background(), testInput()); err != nil {
+		t.Fatal(err)
+	}
+	api.mu.Lock()
+	api.failMethod, api.failPath, api.failStatus = http.MethodGet, "/repos/owner/repo/pulls/7", http.StatusNotFound
+	api.mu.Unlock()
+	m.Poll(context.Background())
+
+	errText := logRecordError(t, logs.String(), "GitHub pull request poll failed")
+	if errText == "" || !strings.Contains(errText, "404") {
+		t.Fatalf("poll failure did not carry the underlying cause: error=%q logs=%s", errText, logs.String())
+	}
+}
+
+// TestPollFailureLogDoesNotLeakProviderResponseBody pins the property PR #104's
+// review established by inspection (PMR-132): every GitHub HTTP error is a
+// fixed string or interpolates only a numeric status code, so attaching it to
+// the poll-failure record cannot forward a response body or credential-derived
+// text into the log.
+func TestPollFailureLogDoesNotLeakProviderResponseBody(t *testing.T) {
+	const secret = "wire-secret-should-never-reach-the-log"
+	api, git, linear := newAPI(t), &fakeGit{}, &fakeLinear{}
+	var logs bytes.Buffer
+	m, session := testSession(t, api, git, linear, &logs)
+	if _, err := session.Publish(context.Background(), testInput()); err != nil {
+		t.Fatal(err)
+	}
+	api.mu.Lock()
+	api.failMethod, api.failPath, api.failStatus, api.failBody = http.MethodGet, "/repos/owner/repo/pulls/7", http.StatusInternalServerError, secret
+	api.mu.Unlock()
+	m.Poll(context.Background())
+
+	if strings.Contains(logs.String(), secret) {
+		t.Fatalf("poll failure log leaked the provider response body: %s", logs.String())
+	}
+	if strings.Contains(logs.String(), "private-token") {
+		t.Fatalf("poll failure log leaked the credential: %s", logs.String())
+	}
+	errText := logRecordError(t, logs.String(), "GitHub pull request poll failed")
+	if errText != "github request failed with status 500" {
+		t.Fatalf("poll failure error = %q", errText)
+	}
+}
+
 // TestForgetStopsPollingAndRepublicationTracksAgain covers the retention rule
 // for a link that is neither merged nor closed: only the host's explicit
 // terminal-issue signal evicts it, and doing so must not make the issue
