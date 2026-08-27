@@ -187,7 +187,7 @@ func TestInstallAllowsIndependentRepositoriesWithOneSharedBinary(t *testing.T) {
 		t.Fatal(err)
 	}
 	second := t.TempDir()
-	if err := os.WriteFile(filepath.Join(second, "WORKFLOW.md"), []byte("---\ntracker: {kind: linear, provider: {project_slug_id: second, api_key_file: $SYMPHONY_LINEAR_API_KEY_FILE}, active_states: [Todo], terminal_states: [Done]}\nworkspace: {root: .symphony/workspaces, source_root: .}\ncodex: {command: go}\n---\nprompt"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(second, "WORKFLOW.md"), []byte("---\ntracker: {kind: linear, provider: {project_slug_id: second, api_key_file: $SYMPHONY_LINEAR_API_KEY_FILE}, active_states: [Todo], terminal_states: [Done]}\nworkspace: {root: .symphony/workspaces, source_root: .}\ncodex: {command: "+fakeAuthenticatedAgentCommand(t, second)+"}\n---\nprompt"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	key := filepath.Join(second, "linear-key")
@@ -293,6 +293,20 @@ func TestRenderPlistEscapesSpecialPathCharacters(t *testing.T) {
 	}
 }
 
+// fakeAuthenticatedAgentCommand stands in for the codex binary preflight's
+// agent_authentication probe actually invokes: a real program on PATH, like
+// the "go" placeholder these fixtures used before every backend got a probe,
+// no longer reports a session, so install and migrate need something that
+// exits zero for the "login status" argv the probe runs.
+func fakeAuthenticatedAgentCommand(t *testing.T, dir string) string {
+	t.Helper()
+	path := filepath.Join(dir, "fake-codex")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
 func serviceFixture(t *testing.T) (string, Options, *fakeRunner) {
 	t.Helper()
 	dir := t.TempDir()
@@ -303,7 +317,7 @@ func serviceFixture(t *testing.T) (string, Options, *fakeRunner) {
 	if err := os.MkdirAll(launch, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	workflow := "---\ntracker: {kind: linear, provider: {project_slug_id: service, api_key_file: $SYMPHONY_LINEAR_API_KEY_FILE}, active_states: [Todo], terminal_states: [Done]}\nworkspace: {root: .symphony/workspaces, source_root: .}\ncodex: {command: go}\n---\nprompt"
+	workflow := "---\ntracker: {kind: linear, provider: {project_slug_id: service, api_key_file: $SYMPHONY_LINEAR_API_KEY_FILE}, active_states: [Todo], terminal_states: [Done]}\nworkspace: {root: .symphony/workspaces, source_root: .}\ncodex: {command: " + fakeAuthenticatedAgentCommand(t, dir) + "}\n---\nprompt"
 	if err := os.WriteFile(filepath.Join(dir, "WORKFLOW.md"), []byte(workflow), 0o600); err != nil {
 		t.Fatal(err)
 	}

@@ -137,23 +137,19 @@ func run(ctx context.Context, workflowPath, logRoot, statusFile string, environm
 	// looks like a finished turn rather than a setup problem: the Claude CLI
 	// reports an auth failure as a result with is_error set, and an
 	// unauthenticated Codex app-server fails the same way at thread/start or
-	// mid-turn. The check is named for the role, not the backend, and it is
-	// always added -- even a backend with no probe reports why, rather than
-	// simply lacking the check -- so a caller reading Result.Checks cannot
-	// mistake "not applicable" for "not run".
-	if argv, ok := authenticationArgv(launch.Backend); !ok {
-		result.add("agent_authentication", StatusWarning, fmt.Sprintf("the %s backend offers no side-effect-free authentication probe; an unauthenticated agent surfaces only at dispatch, as a failed turn rather than a setup problem", launch.Backend))
-	} else {
-		switch status, err := authenticated(ctx, launch.Command, argv, authenticationTimeout); {
-		case err != nil:
-			result.add("agent_authentication", StatusFailed, err.Error())
-		case !status:
-			// The command is a wrapper, so there was nothing to ask. Say that
-			// rather than report an authenticated session that was never checked.
-			result.add("agent_authentication", StatusWarning, "authentication was not verified: the configured command is not a bare program name")
-		default:
-			result.add("agent_authentication", StatusPassed, "the agent CLI reports an authenticated session")
-		}
+	// mid-turn. The check is named for the role, not the backend, and every
+	// supported backend defines a probe, so a caller reading Result.Checks
+	// never has to mistake "not applicable" for "not run".
+	probe := authenticationProbeFor(launch.Backend)
+	switch status, err := authenticated(ctx, launch.Command, launch.Backend+".command", probe, authenticationTimeout); {
+	case err != nil:
+		result.add("agent_authentication", StatusFailed, err.Error())
+	case !status:
+		// The command is a wrapper, so there was nothing to ask. Say that
+		// rather than report an authenticated session that was never checked.
+		result.add("agent_authentication", StatusWarning, "authentication was not verified: the configured command is not a bare program name")
+	default:
+		result.add("agent_authentication", StatusPassed, "the agent CLI reports an authenticated session")
 	}
 
 	if err := hooks(settings.Hooks); err != nil {
@@ -281,62 +277,38 @@ func executable(command, field string) error {
 // hung token refresh would otherwise leave --dry-run waiting forever.
 const authenticationTimeout = 5 * time.Second
 
-// authenticationArgv is the per-backend argv that asks an agent CLI to report
-// a stored login without starting a real session, factored out the same way
-// handoffToolName resolves a per-transport detail rather than branching on
-// backend inside run itself. The boolean reports whether the backend defines
-// one at all: Codex's launch command is "codex app-server", the long-lived
-// JSON-RPC service the coordinator drives, not a CLI with a bare status
-// subcommand it can be asked without the side effect of starting that service.
-func authenticationArgv(backend string) ([]string, bool) {
+// authenticationProbe is the per-backend detail for asking an agent CLI
+// whether it holds a stored login without starting a real session, factored
+// out the same way handoffToolName resolves a per-transport detail rather
+// than branching on backend inside run itself. argv is the read-only status
+// subcommand; outcome reads that subcommand's result the way its CLI reports
+// a session, since Claude answers with a JSON loggedIn boolean on stdout with
+// exit 0 regardless of login state, while Codex's `login status` answers with
+// only its exit code -- 0 logged in, 1 not -- and a human sentence naming the
+// auth method, which this probe does not read.
+type authenticationProbe struct {
+	argv    []string
+	outcome func(out []byte, runErr error) (bool, error)
+}
+
+// authenticationProbeFor resolves the probe for the selected backend.
+// config.LoadWithEnvironment validates agent.backend against the same two
+// values handoffToolName branches on, so the default case is Codex, not an
+// unmatched backend.
+func authenticationProbeFor(backend string) authenticationProbe {
 	switch backend {
 	case config.ClaudeAgentBackend:
-		return []string{"auth", "status"}, true
+		return authenticationProbe{argv: []string{"auth", "status"}, outcome: claudeAuthenticationOutcome}
 	default:
-		return nil, false
+		return authenticationProbe{argv: []string{"login", "status"}, outcome: codexAuthenticationOutcome}
 	}
 }
 
-// authenticated asks the agent CLI whether it holds a session, using the argv
-// authenticationArgv resolved for the selected backend. It is read-only, which
-// is what makes it safe in a dry run.
-//
-// Only the boolean is read. The command also reports the operator's email,
+// claudeAuthenticationOutcome reads `claude auth status`'s JSON body. Only the
+// loggedIn boolean is read. The command also reports the operator's email,
 // organization, and subscription, none of which may reach a check message.
-// The boolean reports whether authentication was actually established. A
-// wrapper command cannot be asked, and reporting that as success would claim a
-// check that never ran.
-//
-// The budget is a parameter so the bound itself is exercised by a test without
-// one waiting out the production value.
-// probeWaitDelay bounds how long the probe waits for its output pipes after the
-// command itself is gone.
-const probeWaitDelay = 500 * time.Millisecond
-
-func authenticated(ctx context.Context, command string, argv []string, timeout time.Duration) (bool, error) {
-	fields := strings.Fields(command)
-	if len(fields) == 0 {
-		return false, errorsf("claude.command is empty")
-	}
-	if len(fields) > 1 {
-		return false, nil
-	}
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	probe := exec.CommandContext(ctx, fields[0], argv...)
-	// Killing the probe on the deadline is not enough to return on it. The
-	// deadline kills the command itself, but Output waits for the output pipes
-	// to close, and any grandchild the command left behind still holds them --
-	// so without a WaitDelay the probe waits for that descendant instead of for
-	// its own budget, which is the hang this timeout exists to prevent.
-	probe.WaitDelay = probeWaitDelay
-	out, err := probe.Output()
-	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		// A probe that had to be killed is a failed check, not a pass: nothing
-		// was learned about the session.
-		return false, errorsf("claude.command did not report authentication status before its %s timeout expired", timeout)
-	}
-	if err != nil {
+func claudeAuthenticationOutcome(out []byte, runErr error) (bool, error) {
+	if runErr != nil {
 		return false, errorsf("claude.command could not report authentication status")
 	}
 	var status struct {
@@ -349,6 +321,63 @@ func authenticated(ctx context.Context, command string, argv []string, timeout t
 		return false, errorsf("claude.command reports no authenticated session; run its login command as the service user")
 	}
 	return true, nil
+}
+
+// codexAuthenticationOutcome reads only `codex login status`'s exit code, not
+// its stdout sentence ("Logged in using ChatGPT" or "Not logged in"), the
+// same "only the boolean is read" rule claudeAuthenticationOutcome applies to
+// its JSON fields. Exit 1 is the CLI's documented way of reporting no stored
+// session; any other failure means the probe could not ask at all.
+func codexAuthenticationOutcome(_ []byte, runErr error) (bool, error) {
+	if runErr == nil {
+		return true, nil
+	}
+	var exitErr *exec.ExitError
+	if errors.As(runErr, &exitErr) && exitErr.ExitCode() == 1 {
+		return false, errorsf("codex.command reports no authenticated session; run its login command as the service user")
+	}
+	return false, errorsf("codex.command could not report authentication status")
+}
+
+// The budget is a parameter so the bound itself is exercised by a test without
+// one waiting out the production value.
+// probeWaitDelay bounds how long the probe waits for its output pipes after the
+// command itself is gone.
+const probeWaitDelay = 500 * time.Millisecond
+
+// authenticated runs the resolved probe's argv against the configured agent
+// command and hands its result to the probe's own outcome reader. It is
+// read-only, which is what makes it safe in a dry run. field names the
+// backend's command setting (e.g. "claude.command") in the messages it
+// produces directly, rather than through the probe's own outcome.
+//
+// The boolean reports whether authentication was actually established. A
+// wrapper command cannot be asked, and reporting that as success would claim a
+// check that never ran.
+func authenticated(ctx context.Context, command, field string, probe authenticationProbe, timeout time.Duration) (bool, error) {
+	fields := strings.Fields(command)
+	if len(fields) == 0 {
+		return false, errorsf("%s is empty", field)
+	}
+	if len(fields) > 1 {
+		return false, nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, fields[0], probe.argv...)
+	// Killing the probe on the deadline is not enough to return on it. The
+	// deadline kills the command itself, but Output waits for the output pipes
+	// to close, and any grandchild the command left behind still holds them --
+	// so without a WaitDelay the probe waits for that descendant instead of for
+	// its own budget, which is the hang this timeout exists to prevent.
+	cmd.WaitDelay = probeWaitDelay
+	out, err := cmd.Output()
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		// A probe that had to be killed is a failed check, not a pass: nothing
+		// was learned about the session.
+		return false, errorsf("%s did not report authentication status before its %s timeout expired", field, timeout)
+	}
+	return probe.outcome(out, err)
 }
 
 func hooks(h config.Hooks) error {

@@ -21,12 +21,25 @@ import (
 	"github.com/pmrrasmussen/symphony/internal/tui"
 )
 
+// fakeAuthenticatedAgentCommand stands in for the codex binary --dry-run's
+// agent_authentication probe actually invokes: a real program on PATH, like
+// the "go" placeholder these fixtures used before every backend got a probe,
+// no longer reports a session and now fails the dry run.
+func fakeAuthenticatedAgentCommand(t *testing.T, dir string) string {
+	t.Helper()
+	path := filepath.Join(dir, "fake-codex")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
 func TestRunAcceptsPositionalWorkflowForDryRun(t *testing.T) {
 	dir := t.TempDir()
 	workflow := filepath.Join(dir, "workflow.md")
 	workspaceRoot := filepath.Join(dir, "workspaces")
 	logRoot := filepath.Join(dir, "logs")
-	content := "---\ntracker: {kind: linear, provider: {project_slug_id: preflight, api_key: dummy}, active_states: [Todo], terminal_states: [Done]}\nworkspace: {root: " + workspaceRoot + ", source_root: " + dir + "}\ncodex: {command: go}\n---\n{{.issue.identifier}}"
+	content := "---\ntracker: {kind: linear, provider: {project_slug_id: preflight, api_key: dummy}, active_states: [Todo], terminal_states: [Done]}\nworkspace: {root: " + workspaceRoot + ", source_root: " + dir + "}\ncodex: {command: " + fakeAuthenticatedAgentCommand(t, dir) + "}\n---\n{{.issue.identifier}}"
 	if err := os.WriteFile(workflow, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -53,7 +66,7 @@ func TestRunAcceptsStatusFileFlagInDryRun(t *testing.T) {
 	dir := t.TempDir()
 	workflow := filepath.Join(dir, "workflow.md")
 	statusFile := filepath.Join(dir, "runtime", "status.json")
-	content := "---\ntracker: {kind: linear, provider: {project_slug_id: preflight, api_key: dummy}, active_states: [Todo], terminal_states: [Done]}\nworkspace: {root: " + filepath.Join(dir, "workspaces") + ", source_root: " + dir + "}\ncodex: {command: go}\n---\n{{.issue.identifier}}"
+	content := "---\ntracker: {kind: linear, provider: {project_slug_id: preflight, api_key: dummy}, active_states: [Todo], terminal_states: [Done]}\nworkspace: {root: " + filepath.Join(dir, "workspaces") + ", source_root: " + dir + "}\ncodex: {command: " + fakeAuthenticatedAgentCommand(t, dir) + "}\n---\n{{.issue.identifier}}"
 	if err := os.WriteFile(workflow, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}

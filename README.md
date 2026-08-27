@@ -158,11 +158,12 @@ scheduler lifecycle. It does not contact Linear, execute hooks, start an agent
 session, or create configured logs or workspaces. Every backend also gets an
 `agent_authentication` check, so the result never silently omits it: with
 `agent.backend: claude` it runs the CLI's own read-only `claude auth status`
-locally, as described below; `codex` has no equivalent side-effect-free probe,
-so the check reports a warning saying so rather than being left out of
-`Result.Checks` -- an unauthenticated Codex app-server fails the same way
-Claude does, at `thread/start` or mid-turn, just with no local check to catch
-it first. A missing future root is a
+locally, as described below; with `agent.backend: codex` it runs `codex login
+status` and reads only its exit code -- 0 logged in, 1 not -- ignoring the
+sentence the CLI prints alongside it. Either way, an unauthenticated agent CLI
+otherwise fails the same way, at `thread/start` or mid-turn for Codex and as a
+result with `is_error` set for Claude, and this check is what catches that
+locally instead of at dispatch. A missing future root is a
 warning; an
 invalid boundary is a failure and exits non-zero. The referenced file is read
 only to validate required configuration and is never sent anywhere during
@@ -690,14 +691,17 @@ lookup, or a `stat`, so this is the one call that runs a foreign program, and a
 CLI blocked on a keychain prompt or a token refresh must fail the check rather
 than leave `--dry-run` waiting.
 
-Under `agent.backend: codex` the same check is still present -- `Result.Checks`
-never simply omits `agent_authentication` depending on which backend is
-selected -- but reports a warning instead: the Codex launch command is
-`codex app-server`, the long-lived JSON-RPC service the coordinator drives, not
-a CLI with a bare status subcommand that can be asked without the side effect of
-starting that service. An unauthenticated Codex app-server fails the same way
-Claude does, at `thread/start` or mid-turn, just with no local probe to catch it
-ahead of a live run.
+Under `agent.backend: codex` the same check runs `codex login status` instead
+-- `Result.Checks` never simply omits `agent_authentication` depending on which
+backend is selected. That command is a bare status subcommand, distinct from
+`codex app-server`, the long-lived JSON-RPC service the coordinator actually
+drives, so asking it carries none of that service's side effects. It answers
+with only an exit code -- 0 logged in, 1 not -- and a human sentence naming the
+auth method; the check reads the exit code alone, the same "only the boolean
+is read" rule that keeps Claude's email, organization, and subscription out of
+its check message. Any exit other than 0 or 1 is a probe failure, not an
+authentication answer, since the CLI did not report a status this check
+understands.
 
 **Operator prerequisite:** the user the Symphony process runs as must already be
 logged in to the Claude Code CLI. Symphony passes it no credential and performs

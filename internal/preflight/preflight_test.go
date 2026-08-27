@@ -318,19 +318,17 @@ func writeAuthCommand(t *testing.T, body string) string {
 	return script
 }
 
-// TestAuthenticationProbeReportsEachOutcomeWithoutClaimingAnUncheckedPass
-// covers every branch of the probe. The pass is the dangerous one: a wrapper
-// command, an unreadable answer, a non-zero exit, and a probe that had to be
-// killed must all be distinguishable from a session that was actually verified.
-func TestAuthenticationProbeReportsEachOutcomeWithoutClaimingAnUncheckedPass(t *testing.T) {
-	argv, ok := authenticationArgv(config.ClaudeAgentBackend)
-	if !ok {
-		t.Fatal("claude backend has no authentication argv")
-	}
+// TestClaudeAuthenticationProbeReportsEachOutcomeWithoutClaimingAnUncheckedPass
+// covers every branch of the Claude probe. The pass is the dangerous one: a
+// wrapper command, an unreadable answer, a non-zero exit, and a probe that had
+// to be killed must all be distinguishable from a session that was actually
+// verified.
+func TestClaudeAuthenticationProbeReportsEachOutcomeWithoutClaimingAnUncheckedPass(t *testing.T) {
+	probe := authenticationProbeFor(config.ClaudeAgentBackend)
 
 	t.Run("authenticated session", func(t *testing.T) {
 		command := writeAuthCommand(t, `printf '%s' '`+authStatusJSON("true")+`'`)
-		status, err := authenticated(context.Background(), command, argv, authenticationTimeout)
+		status, err := authenticated(context.Background(), command, "claude.command", probe, authenticationTimeout)
 		if err != nil || !status {
 			t.Fatalf("status=%v err=%v", status, err)
 		}
@@ -338,7 +336,7 @@ func TestAuthenticationProbeReportsEachOutcomeWithoutClaimingAnUncheckedPass(t *
 
 	t.Run("no authenticated session", func(t *testing.T) {
 		command := writeAuthCommand(t, `printf '%s' '`+authStatusJSON("false")+`'`)
-		status, err := authenticated(context.Background(), command, argv, authenticationTimeout)
+		status, err := authenticated(context.Background(), command, "claude.command", probe, authenticationTimeout)
 		if status || err == nil || !strings.Contains(err.Error(), "no authenticated session") {
 			t.Fatalf("status=%v err=%v", status, err)
 		}
@@ -347,7 +345,7 @@ func TestAuthenticationProbeReportsEachOutcomeWithoutClaimingAnUncheckedPass(t *
 
 	t.Run("unreadable answer", func(t *testing.T) {
 		command := writeAuthCommand(t, `printf '%s' 'logged in as `+authEmail+`'`)
-		status, err := authenticated(context.Background(), command, argv, authenticationTimeout)
+		status, err := authenticated(context.Background(), command, "claude.command", probe, authenticationTimeout)
 		if status || err == nil || !strings.Contains(err.Error(), "unreadable authentication status") {
 			t.Fatalf("status=%v err=%v", status, err)
 		}
@@ -357,14 +355,14 @@ func TestAuthenticationProbeReportsEachOutcomeWithoutClaimingAnUncheckedPass(t *
 
 	t.Run("non-zero exit", func(t *testing.T) {
 		command := writeAuthCommand(t, "exit 3")
-		status, err := authenticated(context.Background(), command, argv, authenticationTimeout)
+		status, err := authenticated(context.Background(), command, "claude.command", probe, authenticationTimeout)
 		if status || err == nil || !strings.Contains(err.Error(), "could not report authentication status") {
 			t.Fatalf("status=%v err=%v", status, err)
 		}
 	})
 
 	t.Run("wrapper command is not probed and is not a pass", func(t *testing.T) {
-		status, err := authenticated(context.Background(), "sh -c exit", argv, authenticationTimeout)
+		status, err := authenticated(context.Background(), "sh -c exit", "claude.command", probe, authenticationTimeout)
 		if status || err != nil {
 			t.Fatalf("status=%v err=%v", status, err)
 		}
@@ -379,7 +377,7 @@ func TestAuthenticationProbeReportsEachOutcomeWithoutClaimingAnUncheckedPass(t *
 		// this first failed in CI and not locally.
 		command := writeAuthCommand(t, "sleep 60 &\nwait")
 		start := time.Now()
-		status, err := authenticated(context.Background(), command, argv, 50*time.Millisecond)
+		status, err := authenticated(context.Background(), command, "claude.command", probe, 50*time.Millisecond)
 		if status || err == nil || !strings.Contains(err.Error(), "did not report authentication status") {
 			t.Fatalf("status=%v err=%v", status, err)
 		}
@@ -391,40 +389,106 @@ func TestAuthenticationProbeReportsEachOutcomeWithoutClaimingAnUncheckedPass(t *
 	})
 
 	t.Run("empty command", func(t *testing.T) {
-		if _, err := authenticated(context.Background(), "   ", argv, authenticationTimeout); err == nil || !strings.Contains(err.Error(), "claude.command is empty") {
+		if _, err := authenticated(context.Background(), "   ", "claude.command", probe, authenticationTimeout); err == nil || !strings.Contains(err.Error(), "claude.command is empty") {
 			t.Fatalf("err=%v", err)
 		}
 	})
 }
 
-// TestCodexHasNoAuthenticationArgvAndTheCheckSaysSo pins the Codex half of the
-// PMR-122 gap directly: the backend defines no probe, so run must still emit
-// an agent_authentication check -- warning, not simply absent -- naming the
-// backend and saying why there is nothing to ask.
-func TestCodexHasNoAuthenticationArgvAndTheCheckSaysSo(t *testing.T) {
-	if _, ok := authenticationArgv(config.DefaultAgentBackend); ok {
-		t.Fatal("codex unexpectedly has an authentication argv")
+// TestCodexAuthenticationProbeReportsEachOutcomeWithoutClaimingAnUncheckedPass
+// pins the Codex half of the PMR-122 gap: `codex login status` answers with
+// only an exit code (0 logged in, 1 not) and a human sentence this probe must
+// not read, so its outcomes are distinguished by exit status alone.
+func TestCodexAuthenticationProbeReportsEachOutcomeWithoutClaimingAnUncheckedPass(t *testing.T) {
+	probe := authenticationProbeFor(config.DefaultAgentBackend)
+	if len(probe.argv) == 0 {
+		t.Fatal("codex backend has no authentication argv")
 	}
 
-	message := checkMessage(t, "codex", "agent_authentication")
-	if !strings.Contains(message, "codex") || !strings.Contains(message, "no side-effect-free authentication probe") {
-		t.Fatalf("agent_authentication reported %q for codex", message)
-	}
-
-	dir := t.TempDir()
-	workflow := filepath.Join(dir, "WORKFLOW.md")
-	writeWorkflow(t, workflow, filepath.Join(dir, "workspaces"), "go", "")
-	found := false
-	for _, check := range result(t, workflow, dir).Checks {
-		if check.Name == "agent_authentication" {
-			found = true
-			if check.Status != StatusWarning {
-				t.Fatalf("agent_authentication=%+v", check)
-			}
+	t.Run("authenticated session", func(t *testing.T) {
+		command := writeAuthCommand(t, `printf 'Logged in using ChatGPT'`)
+		status, err := authenticated(context.Background(), command, "codex.command", probe, authenticationTimeout)
+		if err != nil || !status {
+			t.Fatalf("status=%v err=%v", status, err)
 		}
-	}
-	if !found {
-		t.Fatalf("a codex workflow produced no agent_authentication check")
+	})
+
+	t.Run("no authenticated session", func(t *testing.T) {
+		command := writeAuthCommand(t, "printf 'Not logged in'\nexit 1")
+		status, err := authenticated(context.Background(), command, "codex.command", probe, authenticationTimeout)
+		if status || err == nil || !strings.Contains(err.Error(), "no authenticated session") {
+			t.Fatalf("status=%v err=%v", status, err)
+		}
+		// The CLI's own sentence must not be quoted into the failure either.
+		if strings.Contains(err.Error(), "Not logged in") {
+			t.Fatalf("codex outcome leaked the CLI's own sentence: %v", err)
+		}
+	})
+
+	t.Run("non-auth failure", func(t *testing.T) {
+		command := writeAuthCommand(t, "exit 3")
+		status, err := authenticated(context.Background(), command, "codex.command", probe, authenticationTimeout)
+		if status || err == nil || !strings.Contains(err.Error(), "could not report authentication status") {
+			t.Fatalf("status=%v err=%v", status, err)
+		}
+	})
+
+	t.Run("wrapper command is not probed and is not a pass", func(t *testing.T) {
+		status, err := authenticated(context.Background(), "sh -c exit", "codex.command", probe, authenticationTimeout)
+		if status || err != nil {
+			t.Fatalf("status=%v err=%v", status, err)
+		}
+	})
+}
+
+// TestCodexAuthenticationCheckReflectsTheProbeOutcome asserts the Codex path's
+// agent_authentication check end to end: its name, status, and message, for
+// both an authenticated and an unauthenticated fake CLI.
+func TestCodexAuthenticationCheckReflectsTheProbeOutcome(t *testing.T) {
+	for name, tc := range map[string]struct {
+		body       string
+		wantStatus Status
+		wantSubstr string
+	}{
+		"authenticated": {
+			body:       `printf 'Logged in using ChatGPT'`,
+			wantStatus: StatusPassed,
+			wantSubstr: "authenticated session",
+		},
+		"not authenticated": {
+			body:       "printf 'Not logged in'\nexit 1",
+			wantStatus: StatusFailed,
+			wantSubstr: "no authenticated session",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			command := writeAuthCommand(t, tc.body)
+			dir := t.TempDir()
+			workflow := filepath.Join(dir, "WORKFLOW.md")
+			content := "---\n" +
+				"tracker:\n  kind: linear\n  provider: {project_slug_id: preflight, api_key: not-a-live-key}\n  active_states: [Todo]\n  terminal_states: [Done]\n" +
+				"workspace: {root: " + filepath.Join(dir, "workspaces") + ", source_root: " + dir + "}\n" +
+				"agent: {backend: codex}\n" +
+				"codex: {command: \"" + command + "\"}\n" +
+				"---\nWork on {{.issue.identifier}}"
+			if err := os.WriteFile(workflow, []byte(content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			found := false
+			for _, check := range result(t, workflow, dir).Checks {
+				if check.Name != "agent_authentication" {
+					continue
+				}
+				found = true
+				if check.Status != tc.wantStatus || !strings.Contains(check.Message, tc.wantSubstr) {
+					t.Fatalf("agent_authentication=%+v, want status=%v containing %q", check, tc.wantStatus, tc.wantSubstr)
+				}
+			}
+			if !found {
+				t.Fatalf("a codex workflow produced no agent_authentication check")
+			}
+		})
 	}
 }
 

@@ -449,9 +449,12 @@ matching field and are never read into a log record. The same holds for the
 Claude backend's stream: every event is decoded into a narrow struct with no
 member for `assistant.message.content[].text`, `tool_use.input`,
 `tool_result.content`, or `result.result`, so that content is discarded before
-anything is logged. The `agent_authentication` preflight check reads only the
-`loggedIn` boolean from `claude auth status`; the email, organization, and
-subscription that command also returns are neither read nor logged.
+anything is logged. The `agent_authentication` preflight check applies the
+same rule to both backends: it reads only the `loggedIn` boolean from `claude
+auth status` (the email, organization, and subscription that command also
+returns are neither read nor logged), and only the exit code from `codex
+login status` (the human sentence that command prints is neither read nor
+logged).
 
 **One caveat, and it is about Symphony's log only.** Everything above describes
 what Symphony writes. The Claude Code CLI keeps its own transcript: with
