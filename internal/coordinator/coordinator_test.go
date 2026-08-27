@@ -331,6 +331,7 @@ func TestWaitingIssueAppearsInSnapshotUntilAdmitted(t *testing.T) {
 	c.mu.Unlock()
 	c.Tick(context.Background())
 	<-agent.started
+	waitForRunning(t, c, "ENG-QUEUED")
 
 	snapshot = c.Snapshot()
 	if len(snapshot.Waiting) != 0 {
@@ -466,6 +467,7 @@ func TestBlockedIssueAppearsInSnapshotWithBlockerIdentifiersUntilResolved(t *tes
 	tracker.setIssue(resolved)
 	c.Tick(context.Background())
 	<-agent.started
+	waitForRunning(t, c, blocked.Identifier)
 
 	snapshot = c.Snapshot()
 	if len(snapshot.Waiting) != 0 {
