@@ -42,7 +42,7 @@ handoff, rework, landing, and completion instructions. Read it, and
 - `internal/operator` — read-only discovery of local LaunchAgent instances, and the display-safe model built from launchd, status, configuration, and log observations.
 - `internal/service` — management of one repository-scoped macOS LaunchAgent (`install`, `status`, `restart`, `uninstall`, `migrate`).
 - `internal/tui` — the read-only operator dashboard (`symphony tui`), which renders `internal/operator` and can mutate nothing.
-- `docs/` — architecture, the Linear tracker profile, workspace recovery, observability, the live smoke profile, and the dogfooding operator guide.
+- `docs/` — architecture, the Linear tracker profile, workspace recovery, observability, macOS services, the `--dry-run` preflight, runtime status, the live smoke profile, and the dogfooding operator guide.
 
 ## Working here
 
@@ -50,7 +50,25 @@ handoff, rework, landing, and completion instructions. Read it, and
    in an isolated Git worktree, never the primary checkout.
 2. Implement a focused, validated change with a clean local commit.
 3. Follow WORKFLOW.md's delivery-mode instructions to publish a pull request;
-   merge only after required checks and review, per `README.md`.
-4. Keep repository guidance (`README.md`, `WORKFLOW.md`, `WORKFLOW.example.md`,
-   `docs/`) describing one consistent state machine, bounded capabilities,
-   trust boundary, and recovery behavior.
+   merge only after required checks and review.
+4. Documenting a behaviour change means updating **one** page — the one that
+   owns that topic — and letting the links to it stand:
+
+   | Topic | Owning page |
+   | --- | --- |
+   | Entry point: what Symphony is, how to run it, the topic map | `README.md` |
+   | This repository's layout and conventions | `AGENTS.md` (served as `CLAUDE.md`) |
+   | Delivery policy and this repository's configured values | `WORKFLOW.md` |
+   | Every configuration field, its default, and its failure mode | `WORKFLOW.example.md` |
+   | Trust boundary, credential filter, backend contracts, capabilities, scheduling | `docs/architecture.md` |
+   | Lifecycle states, host-owned transitions, tracker configuration | `docs/linear-tracker.md` |
+   | Log records, levels, and redaction | `docs/observability.md` |
+   | macOS services, credential layout, the TUI | `docs/macos-services.md` |
+   | `--dry-run` | `docs/preflight.md` |
+   | `--status-file` | `docs/runtime-status.md` |
+   | Workspace ownership, cleanup, recovery | `docs/completion-markers.md` |
+   | Live smoke testing | `docs/live-smoke.md` |
+   | Running Symphony on Symphony | `docs/dogfooding.md` |
+
+   If a change genuinely spans two topics, say it once on each owner's page in
+   its own terms and cross-link; do not paste the same paragraph into both.

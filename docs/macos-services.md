@@ -22,8 +22,8 @@ installs the shared executable at `~/.local/bin/symphony` (or
 service. `symphony service install` is per-repository registration: it checks
 the repository's workflow and credentials, generates and validates a
 LaunchAgent, then loads that one service. Run it once from every repository
-that should run Symphony. The shared binary is intentionally not copied into
-those repositories and does not update itself.
+that owns a valid `WORKFLOW.md`. The shared binary is intentionally never
+copied into those repositories, and a running service never self-updates.
 
 This guide describes the supported operator surface. The raw plist example
 near the end is a lower-level troubleshooting/manual option, not the primary
@@ -181,7 +181,10 @@ eighty columns, and below sixty by fourteen the view asks for a larger window
 rather than drawing a wrapped one. A detail page taller than the window scrolls:
 `ctrl+d` and `ctrl+u` move half a screen, `pgdown` and `pgup` do the same, `g`
 and `G` jump to either end, and a position line reports where the viewport sits
-and which way there is more. `j` and `k` keep their one meaning throughout --
+and which way there is more, as `13-24 of 24`. That scrolling is not a
+convenience: the alternate screen has no scrollback, so without it the rows past
+the window would be unreachable rather than merely off screen. `j` and `k` keep
+their one meaning throughout --
 they change which instance you are looking at, on the overview and on a detail
 page alike. An instance list longer than the window keeps the selected row
 visible and reports the rest as `+N more`. Setting `NO_COLOR` to a non-empty
@@ -193,8 +196,9 @@ redacted log tail. In a terminal it repeats that scan every five seconds, and
 `r` repeats it on demand; each pass is an ordinary read of local files and
 launchd state. Redirected output prints plain frames and never polls. Close it
 whenever you like, with `q` or an interrupt: it does not start, stop,
-restart, pause, or otherwise affect repository services, and it has no
-connection to a central Symphony daemon.
+restart, pause, or otherwise affect repository services, requires no central
+registry, and has no connection to a Symphony daemon or to a remote Linear,
+GitHub, or agent service.
 
 ## Two repositories on one machine
 

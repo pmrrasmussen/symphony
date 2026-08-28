@@ -202,7 +202,10 @@ it was. That is what
 makes the record load-bearing — the board will keep showing the issue as
 active work, so this is the only place the give-up is visible. A later poll may
 start a fresh, equally bounded episode; an issue that keeps producing this
-record needs a person, not another retry. Below the ceiling nothing changes:
+record needs a person, not another retry. Abandonment is therefore not
+quarantine: an issue nobody acts on keeps starting new bounded episodes at the
+poll interval, which makes `dispatch_abandoned` a record to alert on rather than
+one to let accumulate. Below the ceiling nothing changes:
 each earlier failure keeps its warn-level `"msg":"agent run retry scheduled"`.
 Landing waits never reach it, because a wait does not escalate the attempt.
 
@@ -219,7 +222,22 @@ non-terminal landing wait logs `"msg":"agent landing waiting"` with
 followed by `"msg":"landing wait retry scheduled"` (same `operation`, plus
 `attempt`, `wait_attempt`, and `delay_ms`; it is logged only once the retry was
 actually armed) and the ordinary `"msg":"agent retry scheduled"` record carrying
-`retry_kind: landing`. A landing retry is always identified by that
+`retry_kind: landing`.
+
+That `reason` separates the two ways a required check can fail to be
+successful-yet. A name that never appears in either the combined-status or
+check-run table for the evaluated commit — a typo, a renamed CI job, or a
+workflow whose job is skipped on this path — cannot be told apart from a
+genuinely slow check on a single snapshot, so it waits rather than refuses. It
+is not silent, though: a purely-missing check reports `required checks have not
+reported: <names>`, while `required checks are pending` means at least one of
+the configured names has actually been seen pending. Both reach the log and
+`RetrySnapshot.Reason` in [the status file](runtime-status.md). And once one
+issue's `wait_attempt` has driven the redispatch delay up to (and saturated at)
+`agent.max_retry_backoff_ms`, that one `"msg":"landing wait retry scheduled"`
+record is raised to **warn** — once, not on every subsequent wait — so a landing
+stuck behind a check name that will never report is greppable instead of being
+visible only to someone watching the TUI or the status snapshot. A landing retry is always identified by that
 `retry_kind`; its `reason` is `landing_waiting`, or `landing_slot_unavailable`
 when the redispatch had to queue behind the state's concurrency limit. The
 `wait_attempt` count is the "this landing is stuck" signal — the agent `attempt`
@@ -331,7 +349,12 @@ CLI's `--print` stream is not the app-server protocol.
   refusals is logged as a diagnostic naming only the tool. A call to one of
   Symphony's own bounded capabilities also produces the `dynamicToolCall` pair
   the capability endpoint emits, as described above; that pair, not this one, is
-  the host-side view of the provider round trip.
+  the host-side view of the provider round trip. One failure gets its own
+  diagnostic rather than being left as an undifferentiated failed item: a `Bash`
+  call refused by the CLI's sandbox with the fixed "bind: operation not
+  permitted" marker is reported as a diagnostic naming the sandbox denial, so it
+  is not mistaken for a real regression. [architecture.md](architecture.md)
+  describes the sandbox grants that decide when this can happen.
 * **Token usage** — both backends report real usage, at different granularity
   and through different notifications, and the coordinator's `updateUsage`
   reconciles the two contracts (PMR-153): a non-authoritative figure is merged
