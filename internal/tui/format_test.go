@@ -6,7 +6,9 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/pmrrasmussen/symphony/internal/coordinator"
 	"github.com/pmrrasmussen/symphony/internal/operator"
+	"github.com/pmrrasmussen/symphony/internal/status"
 )
 
 func TestZeroTimestampsSayUnknownRatherThanMillionsOfHours(t *testing.T) {
@@ -21,9 +23,9 @@ func TestZeroTimestampsSayUnknownRatherThanMillionsOfHours(t *testing.T) {
 	model := styledFixture([]operator.Instance{{
 		ID:       "one",
 		Liveness: operator.LivenessRunning,
-		Snapshot: &operator.Snapshot{Coordinator: operator.RuntimeSnapshot{Running: []operator.RunningSnapshot{{
+		Snapshot: &operator.Snapshot{Snapshot: status.Snapshot{Coordinator: coordinator.Snapshot{Running: []coordinator.RunningSnapshot{{
 			IssueIdentifier: "PMR-75", IssueState: "In Progress", TurnCount: 1,
-		}}}},
+		}}}}},
 	}}, now)
 	model.page = statusPage
 	if view := model.View(now); strings.Contains(view, "2562047h") {

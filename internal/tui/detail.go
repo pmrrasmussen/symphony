@@ -164,7 +164,7 @@ func (m Model) statusPanel(instance operator.Instance, now time.Time, style them
 		snapshot := instance.Snapshot
 		pairs := [][2]string{}
 		if snapshot.State != "" {
-			pairs = append(pairs, [2]string{"service", style.serviceState(snapshot.State)})
+			pairs = append(pairs, [2]string{"service", style.serviceState(string(snapshot.State))})
 		}
 		if !snapshot.StartedAt.IsZero() {
 			pairs = append(pairs, [2]string{"uptime", formatDuration(now.Sub(snapshot.StartedAt))})
@@ -223,7 +223,7 @@ func (m Model) agentTable(instance operator.Instance, now time.Time, style theme
 			style.primary.Render(run.IssueIdentifier),
 			run.IssueState,
 			formatSince(now, run.StartedAt),
-			formatSince(now, run.LastActivityAt),
+			formatSince(now, run.LastEventAt),
 			fmt.Sprintf("%d%s", run.TurnCount, turns),
 			fmt.Sprintf("%d", run.Usage.TotalTokens),
 			waiting,

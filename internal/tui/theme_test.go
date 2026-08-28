@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/pmrrasmussen/symphony/internal/operator"
+	"github.com/pmrrasmussen/symphony/internal/status"
 )
 
 func TestWindowKeepsTheSelectionVisible(t *testing.T) {
@@ -92,7 +93,7 @@ func TestServiceStateHasItsOwnStyle(t *testing.T) {
 		model := styledFixture([]operator.Instance{{
 			ID:       "com.pmrrasmussen.symphony",
 			Liveness: operator.LivenessRunning,
-			Snapshot: &operator.Snapshot{State: state},
+			Snapshot: &operator.Snapshot{Snapshot: status.Snapshot{State: status.ProcessState(state)}},
 		}}, now)
 		model.page = statusPage
 		view := model.View(now)

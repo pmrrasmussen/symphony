@@ -6,7 +6,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pmrrasmussen/symphony/internal/coordinator"
+	"github.com/pmrrasmussen/symphony/internal/domain"
 	"github.com/pmrrasmussen/symphony/internal/operator"
+	"github.com/pmrrasmussen/symphony/internal/status"
 )
 
 func TestStatusViewRendersOnlySafeRuntimeFields(t *testing.T) {
@@ -17,18 +20,21 @@ func TestStatusViewRendersOnlySafeRuntimeFields(t *testing.T) {
 		Launchd:  operator.LaunchdStatus{Loaded: true, Process: true, PID: 45},
 		Config:   &operator.EffectiveConfig{MaxTurns: 20},
 		Snapshot: &operator.Snapshot{
-			State: "running", StartedAt: now.Add(-2 * time.Hour), UpdatedAt: now.Add(-time.Second),
-			Coordinator: operator.RuntimeSnapshot{
-				Claimed: 1,
-				Running: []operator.RunningSnapshot{{
-					IssueIdentifier: "PMR-75", IssueState: "In Progress", StartedAt: now.Add(-time.Hour), LastActivityAt: now.Add(-time.Minute), TurnCount: 4,
-					Usage: operator.Usage{InputTokens: 12, OutputTokens: 3, TotalTokens: 15}, RateLimit: map[string]int64{"remaining": 9},
-					OutstandingOperation: &operator.OutstandingOperation{Type: "mcpToolCall", Name: "github_pr_context", AgeMS: 3000},
-				}},
-				Retrying: []operator.RetrySnapshot{{IssueIdentifier: "PMR-76", Attempt: 2, Kind: "retry", Reason: "timeout", Due: now.Add(time.Minute)}},
-				Waiting: []operator.WaitingSnapshot{
-					{IssueIdentifier: "PMR-77", IssueState: "Merging", Reason: "at_capacity", Since: now.Add(-10 * time.Minute), WaitingMS: 600000},
-					{IssueIdentifier: "PMR-90", IssueState: "Todo", Reason: "blocked_by_relation", BlockedBy: []string{"PMR-70"}, Since: now.Add(-5 * time.Minute), WaitingMS: 300000},
+			UpdatedAt: now.Add(-time.Second),
+			Snapshot: status.Snapshot{
+				State: "running", StartedAt: now.Add(-2 * time.Hour),
+				Coordinator: coordinator.Snapshot{
+					Claimed: 1,
+					Running: []coordinator.RunningSnapshot{{
+						IssueIdentifier: "PMR-75", IssueState: "In Progress", StartedAt: now.Add(-time.Hour), LastEventAt: now.Add(-time.Minute), TurnCount: 4,
+						Usage: domain.Usage{InputTokens: 12, OutputTokens: 3, TotalTokens: 15}, RateLimit: map[string]int64{"remaining": 9},
+						OutstandingOperation: &coordinator.OutstandingOperationSnapshot{Type: "mcpToolCall", Name: "github_pr_context", AgeMS: 3000},
+					}},
+					Retrying: []coordinator.RetrySnapshot{{IssueIdentifier: "PMR-76", Attempt: 2, Kind: "retry", Reason: "timeout", Due: now.Add(time.Minute)}},
+					Waiting: []coordinator.WaitingSnapshot{
+						{IssueIdentifier: "PMR-77", IssueState: "Merging", Reason: "at_capacity", Since: now.Add(-10 * time.Minute), WaitingMS: 600000},
+						{IssueIdentifier: "PMR-90", IssueState: "Todo", Reason: "blocked_by_relation", BlockedBy: []string{"PMR-70"}, Since: now.Add(-5 * time.Minute), WaitingMS: 300000},
+					},
 				},
 			},
 		},
