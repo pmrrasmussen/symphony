@@ -141,6 +141,14 @@ agent:
   # github.poll_interval_ms below. Defaults to 5; must be a positive integer.
   max_attempts: 5
 codex:
+  # A shell command: it runs through `bash -c`, so quoting, expansion, and
+  # operators all work here. That shell is not a login shell, so ~/.bash_profile
+  # and its siblings are never sourced: a profile would otherwise re-export a
+  # credential the host filter strips on the way in, and put its own greetings
+  # on the stdout Symphony parses as JSON-RPC, failing the session at start.
+  # Anything this command needs from a profile -- a version manager, a PATH
+  # entry -- belongs in the command itself or in the daemon's own environment.
+  # Defaults to `codex app-server`.
   command: codex app-server
   approval_policy: never
   thread_sandbox: workspace-write
@@ -235,7 +243,7 @@ codex:
 # claude:
 #   # argv, not a shell command: split on whitespace and executed directly, so
 #   # no shell, no quoting, no expansion, and no operators. codex.command above
-#   # runs through bash -lc, so quoting that works there breaks here. --dry-run
+#   # runs through bash -c, so quoting that works there breaks here. --dry-run
 #   # checks both with sh -n, which is a loose superset for this field.
 #   # Defaults to claude.
 #   command: claude
