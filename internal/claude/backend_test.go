@@ -731,9 +731,7 @@ func readArgs(t *testing.T, dir string) []string {
 	t.Helper()
 	raw := readFile(t, filepath.Join(dir, "args.txt"))
 	var args []string
-	for _, line := range strings.Split(raw, "\n") {
-		args = append(args, line)
-	}
+	args = append(args, strings.Split(raw, "\n")...)
 	// A trailing newline yields one empty element; keep it, because an empty
 	// flag value is itself meaningful here (--setting-sources "").
 	return args

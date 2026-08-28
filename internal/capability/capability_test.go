@@ -1,6 +1,7 @@
 package capability
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -440,8 +441,8 @@ func TestTurnEndedIsSafeWithoutAGitHubSession(t *testing.T) {
 	// A nil registry and a registry with no GitHub session must both be no-ops,
 	// because the adapter calls this on every path that ends a turn.
 	var nilRegistry *Registry
-	nilRegistry.TurnEnded(nil)
-	Build(bindings(true, false, "Todo", "")).TurnEnded(nil)
+	nilRegistry.TurnEnded(context.TODO())
+	Build(bindings(true, false, "Todo", "")).TurnEnded(context.TODO())
 }
 
 // TestSecretMatcherCoversBothTheFrozenAndTheLiveForgeToken is the first

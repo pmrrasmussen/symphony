@@ -262,7 +262,7 @@ func repositoryRoot(ctx context.Context, runner Runner, requested string) (strin
 	}
 	root := strings.TrimSpace(string(out))
 	if root == "" {
-		return "", fmt.Errorf("Git did not report a repository root for %s", requested)
+		return "", fmt.Errorf("git did not report a repository root for %s", requested)
 	}
 	return filepath.Clean(root), nil
 }
@@ -378,7 +378,7 @@ func credentialReferences(workflow string) (credentials, error) {
 	base := filepath.Dir(workflow)
 	linear, err := credentialFromRaw(provider, "api_key_file", "api_key", base)
 	if err != nil {
-		return credentials{}, fmt.Errorf("Linear credential: %w", err)
+		return credentials{}, fmt.Errorf("linear credential: %w", err)
 	}
 	gh, err := credentialFromRaw(github, "token_file", "token", base)
 	if err != nil {

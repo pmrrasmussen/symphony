@@ -107,7 +107,7 @@ func safeAttr(attr slog.Attr) slog.Attr {
 		return slog.String(attr.Key, Text(value))
 	}
 	if value := attr.Value.Any(); value != nil {
-		switch value.(type) {
+		switch value := value.(type) {
 		case map[string]int64:
 			// Rate-limit summaries are generated from a fixed numeric allowlist.
 		case Operation:
@@ -116,8 +116,8 @@ func safeAttr(attr slog.Attr) slog.Attr {
 			// value. Membership is checked by value, not by type: an Operation
 			// converted from arbitrary text is not part of the log contract and
 			// must not bypass Text's scrubbing and truncation.
-			if operation, ok := value.(Operation); ok && known[operation] {
-				return slog.String(attr.Key, string(operation))
+			if known[value] {
+				return slog.String(attr.Key, string(value))
 			}
 			return slog.String(attr.Key, "[OMITTED]")
 		default:

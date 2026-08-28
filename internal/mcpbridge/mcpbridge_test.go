@@ -90,10 +90,10 @@ func (s *stubRegistry) TurnEnded(ctx context.Context) {
 
 // finalizerContext reports what the finalizer was handed: whether its context was
 // already done, whether it was budgeted, and how much of that budget was left.
-func (s *stubRegistry) finalizerContext() (error, bool, time.Duration) {
+func (s *stubRegistry) finalizerContext() (bool, time.Duration, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.finalizerErr, s.finalizerHadDeadline, s.finalizerBudgetLeft
+	return s.finalizerHadDeadline, s.finalizerBudgetLeft, s.finalizerErr
 }
 
 func (s *stubRegistry) turnEndedCount() int {
@@ -1298,6 +1298,7 @@ func TestRegisterRequiresCompleteWiring(t *testing.T) {
 	server := endpoint(t)
 	registry := newRegistry()
 	// A nil context is exactly what this guard refuses.
+	//lint:ignore SA1012 the nil is the input under test, not an oversight
 	if _, err := server.Register(nil, registry, func(domain.Event) {}); err == nil {
 		t.Fatal("a registration without a session context was accepted")
 	}
@@ -1406,7 +1407,7 @@ func TestTheFinalizersBudgetStartsAfterTheDrain(t *testing.T) {
 	if count := registry.turnEndedCount(); count != 1 {
 		t.Fatalf("the turn-ended finalizer ran %d times, want exactly 1", count)
 	}
-	failure, budgeted, left := registry.finalizerContext()
+	budgeted, left, failure := registry.finalizerContext()
 	if failure != nil {
 		t.Fatalf("the finalizer was handed an already-dead context: %v", failure)
 	}
