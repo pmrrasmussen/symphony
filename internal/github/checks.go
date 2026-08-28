@@ -188,7 +188,7 @@ func (m *Manager) checks(ctx context.Context, s config.GitHub, sha string) (Chec
 }
 
 // reviews reads pull request reviews and computes the effective review state
-// from each reviewer's most recent review, mirroring GitHub's own
+// from each reviewer's most recent state-bearing review, mirroring GitHub's own
 // approve/changes-requested precedence.
 func (m *Manager) reviews(ctx context.Context, s config.GitHub, number int) (string, []ReviewExcerpt, bool, error) {
 	var raw []struct {
@@ -202,21 +202,27 @@ func (m *Manager) reviews(ctx context.Context, s config.GitHub, number int) (str
 	if err := m.request(ctx, s, http.MethodGet, fmt.Sprintf("/repos/%s/%s/pulls/%d/reviews?per_page=100", s.Owner, s.Repository, number), nil, &raw); err != nil {
 		return "", nil, false, err
 	}
-	latestIndex := map[string]int{}
+	// A reviewer's changes-requested stands until that same reviewer files a
+	// new state-bearing review; a COMMENTED (or unsubmitted PENDING) review
+	// carries no state and must not supersede it. DISMISSED is state-bearing
+	// because GitHub rewrites the dismissed review's own state in place, so
+	// the dismissal is the reviewer's latest review and clears nothing else.
+	latestState := map[string]string{}
 	order := make([]string, 0, len(raw))
-	for i, review := range raw {
+	for _, review := range raw {
 		login := strings.TrimSpace(review.User.Login)
-		if login == "" {
+		state := strings.ToUpper(strings.TrimSpace(review.State))
+		if login == "" || state == "" || state == "COMMENTED" || state == "PENDING" {
 			continue
 		}
-		if _, exists := latestIndex[login]; !exists {
+		if _, exists := latestState[login]; !exists {
 			order = append(order, login)
 		}
-		latestIndex[login] = i
+		latestState[login] = state
 	}
 	changesRequested, approved := false, false
 	for _, login := range order {
-		switch strings.ToUpper(strings.TrimSpace(raw[latestIndex[login]].State)) {
+		switch latestState[login] {
 		case "CHANGES_REQUESTED":
 			changesRequested = true
 		case "APPROVED":

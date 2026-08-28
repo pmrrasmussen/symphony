@@ -778,6 +778,68 @@ func TestContextReturnsBoundedChecksReviewsCommentsAndUnresolvedThreads(t *testi
 	}
 }
 
+// Effective review state follows GitHub's own precedence: only a
+// state-bearing review supersedes a reviewer's earlier one.
+func TestContextEffectiveReviewStateFollowsGitHubPrecedence(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		reviews []map[string]any
+		want    string
+	}{
+		{
+			name: "comment after changes requested does not clear it",
+			reviews: []map[string]any{
+				{"user": map[string]any{"login": "bob"}, "state": "CHANGES_REQUESTED", "body": "no", "submitted_at": "t1"},
+				{"user": map[string]any{"login": "bob"}, "state": "COMMENTED", "body": "still need X", "submitted_at": "t2"},
+			},
+			want: "changes_requested",
+		},
+		{
+			name: "approval after changes requested clears it",
+			reviews: []map[string]any{
+				{"user": map[string]any{"login": "bob"}, "state": "CHANGES_REQUESTED", "body": "no", "submitted_at": "t1"},
+				{"user": map[string]any{"login": "bob"}, "state": "APPROVED", "body": "fixed", "submitted_at": "t2"},
+			},
+			want: "approved",
+		},
+		{
+			// A dismissal rewrites the original review's state in place, so
+			// the changes-requested review is simply no longer present.
+			name: "dismissed changes requested no longer counts",
+			reviews: []map[string]any{
+				{"user": map[string]any{"login": "bob"}, "state": "DISMISSED", "body": "no", "submitted_at": "t1"},
+				{"user": map[string]any{"login": "alice"}, "state": "APPROVED", "body": "lgtm", "submitted_at": "t2"},
+			},
+			want: "approved",
+		},
+		{
+			name: "comment-only review leaves the state pending",
+			reviews: []map[string]any{
+				{"user": map[string]any{"login": "bob"}, "state": "COMMENTED", "body": "a thought", "submitted_at": "t1"},
+			},
+			want: "pending",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			api, git, linear := newAPI(t), &fakeGit{}, &fakeLinear{}
+			_, session := testSession(t, api, git, linear, nil)
+			if _, err := session.Publish(context.Background(), testInput()); err != nil {
+				t.Fatal(err)
+			}
+			api.mu.Lock()
+			api.reviews = tc.reviews
+			api.mu.Unlock()
+			result, err := session.Context(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.ReviewState != tc.want {
+				t.Fatalf("review_state=%q want %q", result.ReviewState, tc.want)
+			}
+		})
+	}
+}
+
 func TestContextDoesNotMutateClosedOrMergedPullRequest(t *testing.T) {
 	api, git, linear := newAPI(t), &fakeGit{}, &fakeLinear{}
 	api.prExists, api.prState, api.prMerged, api.prBody = true, "closed", true, "already merged"

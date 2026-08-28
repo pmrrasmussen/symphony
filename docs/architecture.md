@@ -152,7 +152,7 @@ closed-unmerged PR is reopened; a PR whose head, base, or repository no
 longer matches the bound branch is rejected rather than reused. The context
 capability performs no mutation: it resolves the same bound PR and returns
 bounded, redacted check status, an effective review state computed from each
-reviewer's latest review, capped comment/review excerpts, and unresolved
+reviewer's latest state-bearing review, capped comment/review excerpts, and unresolved
 review-thread counts read over the GitHub GraphQL API, never raw provider
 payloads or credentials. Invalid arguments, provider failures, and
 unsupported states (a merged or unrecoverably closed PR, an ambiguous or
@@ -222,8 +222,10 @@ worktree, the one deterministic open PR for the bound branch, and the current
 Linear scope/state, pushing the worktree's HEAD first if it is ahead of the
 published branch. Immediately before the irreversible merge call it re-reads
 required checks, the effective review state (each reviewer's latest
-non-dismissed review; moving the issue to `merge_state` is itself the human
-approval, so no separate approving review is required), unresolved review
+state-bearing review, so a reviewer's changes-requested stands until that same
+reviewer approves or re-requests and a plain comment review does not clear it
+(PMR-174); moving the issue to `merge_state` is itself the human approval, so
+no separate approving review is required), unresolved review
 threads, the pull request's state and mergeability, and the base commit
 again. Missing or pending required checks, or undetermined mergeability,
 return a non-terminal waiting result without mutating Linear. A waiting result
