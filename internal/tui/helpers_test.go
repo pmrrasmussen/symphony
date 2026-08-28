@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/pmrrasmussen/symphony/internal/operator"
+	"github.com/pmrrasmussen/symphony/internal/status"
 )
 
 // styledFixture builds a styled model wide enough that no panel wraps, so these
@@ -38,7 +39,7 @@ func logFixture(t *testing.T, entries int, height int) Model {
 	model := styledFixture([]operator.Instance{{
 		ID:        "com.pmrrasmussen.symphony",
 		Liveness:  operator.LivenessRunning,
-		Snapshot:  &operator.Snapshot{State: "running"},
+		Snapshot:  &operator.Snapshot{Snapshot: status.Snapshot{State: status.Running}},
 		RecentLog: log,
 	}}, now)
 	model.height = height

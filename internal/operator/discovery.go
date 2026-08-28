@@ -12,15 +12,17 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
+	"howett.net/plist"
+
 	"github.com/pmrrasmussen/symphony/internal/config"
 	"github.com/pmrrasmussen/symphony/internal/preflight"
+	"github.com/pmrrasmussen/symphony/internal/status"
 )
 
 const (
@@ -121,76 +123,13 @@ type EffectiveConfig struct {
 	Credentials          Credentials    `json:"credentials"`
 }
 
-// Snapshot is the display-safe subset of status.Snapshot. It deliberately
-// mirrors only the status-file contract, rather than exposing coordinator
-// internals or arbitrary status-file fields to operator clients.
+// Snapshot is the runtime status snapshot as published by status.Publisher,
+// plus UpdatedAt, the one field discovery genuinely adds for itself: the
+// freshness timestamp used by finalizeLiveness and by readers of a snapshot
+// written before status.Snapshot carried GeneratedAt.
 type Snapshot struct {
-	SchemaVersion int             `json:"schema_version,omitempty"`
-	PID           int             `json:"pid,omitempty"`
-	StartedAt     time.Time       `json:"process_started_at,omitempty"`
-	GeneratedAt   time.Time       `json:"generated_at,omitempty"`
-	State         string          `json:"state,omitempty"`
-	Coordinator   RuntimeSnapshot `json:"coordinator"`
-
-	// UpdatedAt is retained for discovery's freshness calculation and older
-	// status snapshots. It is not a separate field in the current contract.
+	status.Snapshot
 	UpdatedAt time.Time `json:"-"`
-}
-
-// RuntimeSnapshot contains only fixed operational metadata made public by
-// the runtime status contract.
-type RuntimeSnapshot struct {
-	Claimed  int               `json:"claimed"`
-	Running  []RunningSnapshot `json:"running"`
-	Retrying []RetrySnapshot   `json:"retrying"`
-	Waiting  []WaitingSnapshot `json:"waiting"`
-	Stopping bool              `json:"stopping"`
-}
-
-type RunningSnapshot struct {
-	IssueIdentifier      string                `json:"issue_identifier"`
-	IssueState           string                `json:"issue_state"`
-	Attempt              int                   `json:"attempt"`
-	TurnCount            int                   `json:"turn_count"`
-	StartedAt            time.Time             `json:"started_at"`
-	LastActivityAt       time.Time             `json:"last_activity_at"`
-	Usage                Usage                 `json:"usage"`
-	RateLimit            map[string]int64      `json:"rate_limit,omitempty"`
-	OutstandingOperation *OutstandingOperation `json:"outstanding_operation,omitempty"`
-}
-
-type Usage struct {
-	InputTokens  int64 `json:"input_tokens"`
-	OutputTokens int64 `json:"output_tokens"`
-	TotalTokens  int64 `json:"total_tokens"`
-}
-
-type OutstandingOperation struct {
-	Type      string    `json:"type"`
-	Name      string    `json:"name,omitempty"`
-	StartedAt time.Time `json:"started_at"`
-	AgeMS     int64     `json:"age_ms"`
-}
-
-type RetrySnapshot struct {
-	IssueIdentifier string    `json:"issue_identifier"`
-	Attempt         int       `json:"attempt"`
-	Kind            string    `json:"kind"`
-	Reason          string    `json:"reason"`
-	Due             time.Time `json:"due_at"`
-}
-
-// WaitingSnapshot is an issue that has reserved neither a slot nor a retry
-// timer, mirroring coordinator.WaitingSnapshot. Reason is "at_capacity" or
-// "blocked_by_relation" (PMR-146/PMR-152); BlockedBy carries only the open
-// blockers' identifiers and is populated for "blocked_by_relation".
-type WaitingSnapshot struct {
-	IssueIdentifier string    `json:"issue_identifier"`
-	IssueState      string    `json:"issue_state"`
-	Reason          string    `json:"reason"`
-	BlockedBy       []string  `json:"blocked_by,omitempty"`
-	Since           time.Time `json:"since"`
-	WaitingMS       int64     `json:"waiting_ms"`
 }
 
 // LogEvent exposes the fixed structured-log envelope, not arbitrary log
@@ -327,7 +266,7 @@ func inspectCandidate(ctx context.Context, plistPath string, options Options) In
 		instance.ID = strings.TrimSuffix(filepath.Base(plistPath), ".plist")
 		return instance
 	}
-	values, err := parsePlist(ctx, plistPath, data)
+	values, err := parsePlist(data)
 	if err != nil {
 		add(&instance, "plist_invalid", SeverityError, err.Error())
 		instance.ID = strings.TrimSuffix(filepath.Base(plistPath), ".plist")
@@ -608,22 +547,26 @@ func inspectRuntimeFiles(instance *Instance, logLimit int, secretValues []string
 	}
 }
 
+// readSnapshot decodes directly into status.Snapshot, so a field the writer
+// adds is visible to every operator client without a second, mirrored
+// declaration here. json.Unmarshal already tolerates an older or newer
+// schema version -- a missing field simply decodes to its zero value and an
+// added one is ignored -- so no SchemaVersion check gates the decode.
+//
+// UpdatedAt falls back through the legacy field names a snapshot written
+// before GeneratedAt existed may still use, so an old snapshot still yields a
+// usable freshness reading rather than failing to parse.
 func readSnapshot(path string) (*Snapshot, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
 	var raw struct {
-		SchemaVersion  int             `json:"schema_version"`
-		PID            int             `json:"pid"`
-		StartedAt      time.Time       `json:"process_started_at"`
-		GeneratedAt    time.Time       `json:"generated_at"`
-		State          string          `json:"state"`
-		Coordinator    RuntimeSnapshot `json:"coordinator"`
-		UpdatedAt      string          `json:"updated_at"`
-		UpdatedAtCamel string          `json:"updatedAt"`
-		Timestamp      string          `json:"timestamp"`
-		UpdatedAtMS    int64           `json:"updated_at_ms"`
+		status.Snapshot
+		UpdatedAt      string `json:"updated_at"`
+		UpdatedAtCamel string `json:"updatedAt"`
+		Timestamp      string `json:"timestamp"`
+		UpdatedAtMS    int64  `json:"updated_at_ms"`
 	}
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return nil, fmt.Errorf("parse status snapshot: %w", err)
@@ -647,7 +590,7 @@ func readSnapshot(path string) (*Snapshot, error) {
 	} else if updated.IsZero() {
 		return nil, errors.New("status snapshot has no timestamp")
 	}
-	return &Snapshot{SchemaVersion: raw.SchemaVersion, PID: raw.PID, StartedAt: raw.StartedAt, GeneratedAt: raw.GeneratedAt, State: raw.State, Coordinator: raw.Coordinator, UpdatedAt: updated}, nil
+	return &Snapshot{Snapshot: raw.Snapshot, UpdatedAt: updated}, nil
 }
 
 func recentLog(path string, limit int, secretValues []string) ([]LogEvent, error) {
@@ -750,147 +693,16 @@ func add(instance *Instance, code string, severity FindingSeverity, message stri
 	instance.Findings = append(instance.Findings, Finding{Code: code, Severity: severity, Message: message})
 }
 
-// parsePlist relies on macOS's plist decoder. It writes converted JSON only to
-// stdout, so discovery never rewrites a LaunchAgent and can inspect XML and
-// binary plists alike.
-func parsePlist(ctx context.Context, path string, fallback []byte) (map[string]any, error) {
-	if runtime.GOOS == "darwin" {
-		output, err := exec.CommandContext(ctx, "plutil", "-convert", "json", "-o", "-", path).CombinedOutput()
-		if err != nil {
-			return nil, fmt.Errorf("parse plist: %w: %s", err, strings.TrimSpace(string(output)))
-		}
-		var values map[string]any
-		if err := json.Unmarshal(output, &values); err != nil {
-			return nil, fmt.Errorf("parse plist JSON: %w", err)
-		}
-		if values == nil {
-			return nil, errors.New("plist root is not a dict")
-		}
-		return values, nil
+// parsePlist decodes a property list's bytes with howett.net/plist, the same
+// decoder on every platform and for both the XML and binary formats launchd
+// uses. It never rewrites the LaunchAgent on disk.
+func parsePlist(data []byte) (map[string]any, error) {
+	var values map[string]any
+	if _, err := plist.Unmarshal(data, &values); err != nil {
+		return nil, fmt.Errorf("parse plist: %w", err)
 	}
-	return parseXMLPlist(fallback)
-}
-
-type xmlPlistNode struct {
-	name     string
-	text     strings.Builder
-	children []*xmlPlistNode
-}
-
-// parseXMLPlist is intentionally a small fallback for XML property lists when
-// discovery is tested or used off macOS. On macOS plutil above handles the
-// complete XML and binary plist formats used by launchd.
-func parseXMLPlist(data []byte) (map[string]any, error) {
-	root := &xmlPlistNode{}
-	stack := []*xmlPlistNode{root}
-	for cursor := 0; cursor < len(data); {
-		open := bytes.IndexByte(data[cursor:], '<')
-		if open < 0 {
-			stack[len(stack)-1].text.WriteString(xmlUnescape(string(data[cursor:])))
-			break
-		}
-		open += cursor
-		if open > cursor {
-			stack[len(stack)-1].text.WriteString(xmlUnescape(string(data[cursor:open])))
-		}
-		close := bytes.IndexByte(data[open:], '>')
-		if close < 0 {
-			return nil, errors.New("parse plist XML: unterminated tag")
-		}
-		close += open
-		tag := strings.TrimSpace(string(data[open+1 : close]))
-		cursor = close + 1
-		if strings.HasPrefix(tag, "?") || strings.HasPrefix(tag, "!") {
-			continue
-		}
-		if strings.HasPrefix(tag, "/") {
-			name := strings.TrimSpace(strings.TrimPrefix(tag, "/"))
-			if len(stack) == 1 || stack[len(stack)-1].name != name {
-				return nil, errors.New("parse plist XML: mismatched closing tag")
-			}
-			stack = stack[:len(stack)-1]
-			continue
-		}
-		selfClosing := strings.HasSuffix(tag, "/")
-		name := strings.Fields(strings.TrimSuffix(tag, "/"))
-		if len(name) == 0 {
-			return nil, errors.New("parse plist XML: empty tag")
-		}
-		node := &xmlPlistNode{name: name[0]}
-		parent := stack[len(stack)-1]
-		parent.children = append(parent.children, node)
-		if !selfClosing {
-			stack = append(stack, node)
-		}
-	}
-	if len(stack) != 1 || len(root.children) != 1 || root.children[0].name != "plist" {
-		return nil, errors.New("plist root must contain one plist element")
-	}
-	plist := root.children[0]
-	if len(plist.children) != 1 || plist.children[0].name != "dict" {
-		return nil, errors.New("plist root is not a dict")
-	}
-	value, err := xmlPlistValue(plist.children[0])
-	if err != nil {
-		return nil, err
-	}
-	values, ok := value.(map[string]any)
-	if !ok {
+	if values == nil {
 		return nil, errors.New("plist root is not a dict")
 	}
 	return values, nil
-}
-
-func xmlPlistValue(node *xmlPlistNode) (any, error) {
-	switch node.name {
-	case "string":
-		return strings.TrimSpace(node.text.String()), nil
-	case "integer":
-		value, err := strconv.ParseInt(strings.TrimSpace(node.text.String()), 10, 64)
-		if err != nil {
-			return nil, fmt.Errorf("parse plist integer: %w", err)
-		}
-		return value, nil
-	case "true":
-		return true, nil
-	case "false":
-		return false, nil
-	case "array":
-		values := make([]string, 0, len(node.children))
-		for _, child := range node.children {
-			value, err := xmlPlistValue(child)
-			if err != nil {
-				return nil, err
-			}
-			text, ok := value.(string)
-			if !ok {
-				return nil, errors.New("plist array must contain strings")
-			}
-			values = append(values, text)
-		}
-		return values, nil
-	case "dict":
-		if len(node.children)%2 != 0 {
-			return nil, errors.New("plist dict has an unpaired key")
-		}
-		values := make(map[string]any, len(node.children)/2)
-		for i := 0; i < len(node.children); i += 2 {
-			if node.children[i].name != "key" {
-				return nil, errors.New("plist dict key is invalid")
-			}
-			value, err := xmlPlistValue(node.children[i+1])
-			if err != nil {
-				return nil, err
-			}
-			values[strings.TrimSpace(node.children[i].text.String())] = value
-		}
-		return values, nil
-	default:
-		return nil, fmt.Errorf("unsupported plist value %q", node.name)
-	}
-}
-
-func xmlUnescape(value string) string {
-	replacer := strings.NewReplacer("&amp;", "&", "&lt;", "<", "&gt;", ">", "&quot;", "\"", "&apos;", "'")
-	return replacer.Replace(value)
 }

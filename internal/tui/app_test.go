@@ -10,6 +10,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 
 	"github.com/pmrrasmussen/symphony/internal/operator"
+	"github.com/pmrrasmussen/symphony/internal/status"
 )
 
 func TestRunRefreshesWithoutPersistentConnection(t *testing.T) {
@@ -165,7 +166,7 @@ func TestDriverClampsAScrollThatRanPastTheEnd(t *testing.T) {
 	// G sets an offset past any content; the frame knows the real length, so the
 	// driver corrects it and scrolling back responds on the first keypress.
 	view := newTestApp([]operator.Instance{{ID: "one", Liveness: operator.LivenessRunning,
-		Snapshot: &operator.Snapshot{State: "running"},
+		Snapshot: &operator.Snapshot{Snapshot: status.Snapshot{State: status.Running}},
 		RecentLog: []operator.LogEvent{
 			{Time: time.Now(), Level: "INFO", Message: "one"},
 			{Time: time.Now(), Level: "INFO", Message: "two"},
