@@ -60,7 +60,9 @@ func TestTheLaunchContractWithoutACapabilityIsUnchanged(t *testing.T) {
 		"--setting-sources", "",
 		"--settings", settings,
 		"--tools", "Bash,Edit,Glob,Grep,Read,Write",
-		"--allowedTools", "Bash,Edit,Glob,Grep,Read,Write",
+		// Edit and Write are scoped to the write roots -- see scopedAllow --
+		// so --allowedTools is no longer the bare tool surface.
+		"--allowedTools", strings.Join(scopedAllow(rootsOf(t, r), codingTools), ","),
 		"--disallowedTools", "WebFetch,WebSearch",
 		"--permission-mode", "dontAsk",
 		"--strict-mcp-config",
@@ -95,8 +97,9 @@ func TestTheLaunchContractPinsExactlyTheAdvertisedCapabilities(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			dir := t.TempDir()
+			r := request(t, dir, "unused")
 			endpoint := &capabilityEndpoint{url: "http://127.0.0.1:54321/mcp", token: "token-value", names: names}
-			contract, err := launchArgs(request(t, dir, "unused"), "session-1", true, endpoint)
+			contract, err := launchArgs(r, "session-1", true, endpoint)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -111,11 +114,12 @@ func TestTheLaunchContractPinsExactlyTheAdvertisedCapabilities(t *testing.T) {
 				"--verbose",
 				"--setting-sources", "",
 				"--settings", flagValue(t, contract.args, "--settings"),
-				// Both flags carry the same explicit list: --tools is what
-				// decides a tool exists, --allowedTools is what keeps
-				// dontAsk from denying it, and a session needs both.
+				// --tools is what decides a tool exists; --allowedTools is a
+				// permission rule, like the payload's own Allow list, so Edit
+				// and Write are scoped to the write roots there instead of
+				// bare -- see scopedAllow.
 				"--tools", tools,
-				"--allowedTools", tools,
+				"--allowedTools", strings.Join(scopedAllow(rootsOf(t, r), wantTools), ","),
 				"--disallowedTools", "WebFetch,WebSearch",
 				"--permission-mode", "dontAsk",
 				"--strict-mcp-config",
@@ -145,16 +149,16 @@ func TestTheLaunchContractPinsExactlyTheAdvertisedCapabilities(t *testing.T) {
 			if server.Type != "http" || server.URL != endpoint.url {
 				t.Fatalf("server=%+v", server)
 			}
-			// The payload's own permission allowlist must be the same surface
-			// the flags name. Under dontAsk anything not allowed is refused, so
-			// two disagreeing statements of what is permitted leave a reader
-			// unable to tell which one is authoritative.
+			// The payload's own permission allowlist must be the same rules
+			// --allowedTools names. Under dontAsk anything not allowed is
+			// refused, so two disagreeing statements of what is permitted
+			// leave a reader unable to tell which one is authoritative.
 			var rendered policy
 			if err := json.Unmarshal([]byte(flagValue(t, contract.args, "--settings")), &rendered); err != nil {
 				t.Fatal(err)
 			}
-			if strings.Join(rendered.Permissions.Allow, ",") != tools {
-				t.Fatalf("permissions.allow=%v, want the whole tool surface %q", rendered.Permissions.Allow, tools)
+			if strings.Join(rendered.Permissions.Allow, ",") != flagValue(t, contract.args, "--allowedTools") {
+				t.Fatalf("permissions.allow=%v, want the same rules as --allowedTools %q", rendered.Permissions.Allow, flagValue(t, contract.args, "--allowedTools"))
 			}
 			// The credential travels by ${VAR} reference. A rendered token
 			// would put a bearer credential in argv, which is world-readable
@@ -174,6 +178,32 @@ func TestTheLaunchContractPinsExactlyTheAdvertisedCapabilities(t *testing.T) {
 				t.Fatalf("the tool surface was pinned with a glob: %q", tools)
 			}
 		})
+	}
+}
+
+// TestScopedAllowConfinesOnlyEditAndWrite is the unit-level statement of the
+// PMR-156 fix: sandbox.filesystem.allowWrite governs Bash and its children
+// only, so a bare "Edit"/"Write" permission rule would let either tool write
+// anywhere under defaultMode dontAsk. scopedAllow is what closes that gap, and
+// it must do so without touching any other tool's rule -- Bash's own
+// confinement already comes from allowWrite, not from its permission rule, and
+// a capability tool name is opaque to the write-root boundary entirely.
+func TestScopedAllowConfinesOnlyEditAndWrite(t *testing.T) {
+	roots := []string{"/work/tree", "/work/git/objects"}
+	got := scopedAllow(roots, []string{"Bash", "Edit", "Glob", "Grep", "Read", "Write", "mcp__symphony__github_publish_pr"})
+	want := []string{
+		"Bash",
+		"Edit(//work/tree/**)",
+		"Edit(//work/git/objects/**)",
+		"Glob",
+		"Grep",
+		"Read",
+		"Write(//work/tree/**)",
+		"Write(//work/git/objects/**)",
+		"mcp__symphony__github_publish_pr",
+	}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("scopedAllow=%v, want %v", got, want)
 	}
 }
 

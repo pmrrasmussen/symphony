@@ -109,6 +109,18 @@ type permissionsPolicy struct {
 // flag saw no denials -- this file's doctrine is that policy is pinned in the
 // payload. Two disagreeing representations of "what is permitted" would leave a
 // reader unable to tell which one is authoritative.
+//
+// sandbox.filesystem.allowWrite governs Bash and its children only -- PMR-156
+// verified that Edit and Write ignore it entirely and will write anywhere a bare
+// "Edit"/"Write" permission rule reaches, which under dontAsk is everywhere. The
+// CLI's permission rules accept a path-glob specifier for exactly these tools
+// (verified against claude 2.1.248: the builtin /statusline command ships
+// "Read(~/**)" and "Edit(~/.claude/settings.json)" rules), so Allow expands
+// "Edit" and "Write" into one scoped rule per write root instead of the bare
+// name, closing that gap the same defaultMode already closes for Bash. Every
+// other tool -- including Bash, whose confinement comes from
+// sandbox.filesystem.allowWrite rather than from its own permission rule --
+// keeps the bare name unchanged.
 func buildPolicy(r domain.AgentRequest, allowed []string) (policy, error) {
 	roots, err := writeRoots(r)
 	if err != nil {
@@ -129,10 +141,35 @@ func buildPolicy(r domain.AgentRequest, allowed []string) (policy, error) {
 		},
 		Permissions: permissionsPolicy{
 			DefaultMode: permissionMode,
-			Allow:       append([]string(nil), allowed...),
+			Allow:       scopedAllow(roots, allowed),
 			Deny:        append([]string(nil), deniedTools...),
 		},
 	}, nil
+}
+
+// editWriteTools are the tool names sandbox.filesystem.allowWrite does not
+// govern. scopedAllow is what confines them instead.
+var editWriteTools = map[string]bool{"Edit": true, "Write": true}
+
+// scopedAllow expands each of editWriteTools into one path-scoped permission
+// rule per write root, and leaves every other tool name in allowed unchanged.
+//
+// The path syntax is the CLI's own: a rule argument beginning with "//" is an
+// absolute path, so root -- always absolute, per writeRoots -- becomes
+// "//"+root+"/**". "/**" matches anything under the root, never the root path
+// itself, which is exactly right here since a root is always a directory.
+func scopedAllow(roots []string, allowed []string) []string {
+	rules := make([]string, 0, len(allowed))
+	for _, tool := range allowed {
+		if !editWriteTools[tool] {
+			rules = append(rules, tool)
+			continue
+		}
+		for _, root := range roots {
+			rules = append(rules, tool+"(/"+root+"/**)")
+		}
+	}
+	return rules
 }
 
 // writeRoots is the workspace plus its Git metadata roots, deduplicated and
@@ -271,8 +308,16 @@ func launchArgs(r domain.AgentRequest, sessionID string, resume bool, endpoint *
 		// content widen the boundary this launcher fixes.
 		"--setting-sources", "",
 		"--settings", string(settings),
+		// --tools is the tool surface itself -- the bare names verifyInit checks
+		// the init echo against -- while --allowedTools is a permission rule, like
+		// the payload's own Allow list, so it carries rendered.Permissions.Allow's
+		// path-scoped Edit/Write rules rather than the bare tool names. The two
+		// necessarily differ now: --tools cannot express a scoped rule and still
+		// mean "this tool exists", and rendered.Permissions.Allow already is the
+		// canonical list to keep --allowedTools in step with -- computing it twice
+		// would let the flag and the payload drift apart.
 		"--tools", tools,
-		"--allowedTools", tools,
+		"--allowedTools", strings.Join(rendered.Permissions.Allow, ","),
 		"--disallowedTools", strings.Join(deniedTools, ","),
 		"--permission-mode", permissionMode,
 		// --strict-mcp-config confines the session to the MCP configuration on
