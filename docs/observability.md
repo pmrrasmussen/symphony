@@ -271,14 +271,34 @@ CLI's `--print` stream is not the app-server protocol.
   Symphony's own bounded capabilities also produces the `dynamicToolCall` pair
   the capability endpoint emits, as described above; that pair, not this one, is
   the host-side view of the provider round trip.
-* **Token usage** — the CLI reports usage per turn, while the coordinator keeps
-  a component-wise maximum across a run (app-server notifications are
-  cumulative). The backend therefore accumulates turns itself and reports a
-  running total, so `"msg":"agent usage"` still grows monotonically across the
-  run. Its input count folds `cache_creation_input_tokens` and
-  `cache_read_input_tokens` in with `input_tokens`: on a resumed session almost
-  all input arrives as cache reads, so `input_tokens` alone understates what the
-  model processed by orders of magnitude.
+* **Token usage** — both backends report real usage, at different granularity
+  and through different notifications, and the coordinator's `updateUsage`
+  reconciles the two contracts (PMR-153): a non-authoritative figure is merged
+  with a component-wise maximum, so `"msg":"agent usage"` grows monotonically
+  across the run even from a cumulative or out-of-order source; an
+  authoritative figure replaces the recorded total outright. Claude reports
+  per API call, mid-turn, from the assistant message's own usage block
+  (non-authoritative: this host's running sum of deltas, which can overshoot
+  the turn's own settled figure); the terminating `result` event's usage then
+  replaces that running estimate outright (authoritative) once the turn
+  closes (PMR-136). Its input count folds `cache_creation_input_tokens` and
+  `cache_read_input_tokens` in with `input_tokens`: on a resumed session
+  almost all input arrives as cache reads, so `input_tokens` alone
+  understates what the model processed by orders of magnitude. Codex reports
+  from the app-server's `thread/tokenUsage/updated` notification, which
+  arrives during the turn as tokens are spent, not only at its end --
+  `turn/completed` itself carries no usage field at all. That is what makes
+  usage survive a session cancelled immediately after a successful publish
+  (PMR-155): the coordinator's own happy path ends the run by cancelling it
+  the moment the landing capability resolves, which kills the app-server
+  before it would ever reach `turn/completed`. The notification's own running
+  total across the thread is reported non-authoritative, since it is already
+  cumulative and monotonically increasing by construction. Its input count
+  folds `cachedInputTokens` and `cacheWriteInputTokens` into `inputTokens`,
+  and `reasoningOutputTokens` into `outputTokens`, mirroring Claude's own
+  cache folding. An extraction that finds no usage in a notification that
+  should carry it logs one diagnostic per session, naming only the
+  notification method, rather than staying silent.
 * **Session start** — one `"msg":"agent session started"` record per *turn*, not
   per run. `claude --print` runs a single turn and exits, so each continuation
   is a new process with a new `pid` and an incremented `turn_id`, resumed under

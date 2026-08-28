@@ -15,6 +15,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -39,7 +40,8 @@ IFS= read -r line
 printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thread-1"}}}'
 IFS= read -r line
 printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn-1"}}}'
-printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-1","usage":{"inputTokens":4,"outputTokens":6,"totalTokens":10}}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"thread/tokenUsage/updated","params":{"threadId":"thread-1","turnId":"turn-1","tokenUsage":{"last":{"cachedInputTokens":0,"cacheWriteInputTokens":0,"inputTokens":4,"outputTokens":6,"reasoningOutputTokens":0,"totalTokens":10},"total":{"cachedInputTokens":0,"cacheWriteInputTokens":0,"inputTokens":4,"outputTokens":6,"reasoningOutputTokens":0,"totalTokens":10},"modelContextWindow":128000}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-1","status":"completed","items":[]}}}'
 `
 	if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
 		t.Fatal(err)
@@ -53,15 +55,21 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"
 		t.Fatalf("session=%+v", session)
 	}
 	seen := map[domain.EventKind]bool{}
-	var started domain.Event
+	var started, usage domain.Event
 	for event := range events {
 		seen[event.Kind] = true
 		if event.Kind == domain.EventSessionStarted {
 			started = event
 		}
+		if event.Kind == domain.EventUsage {
+			usage = event
+		}
 	}
-	if !seen[domain.EventSessionStarted] || !seen[domain.EventCompleted] {
+	if !seen[domain.EventSessionStarted] || !seen[domain.EventCompleted] || !seen[domain.EventUsage] {
 		t.Fatalf("events=%v", seen)
+	}
+	if usage.Usage != (domain.Usage{InputTokens: 4, OutputTokens: 6, TotalTokens: 10}) {
+		t.Fatalf("usage=%+v", usage.Usage)
 	}
 	if started.SessionID != session.ID || started.ThreadID != session.ThreadID || started.TurnID != session.TurnID || started.PID <= 0 {
 		t.Fatalf("session-start event=%+v session=%+v", started, session)
@@ -168,6 +176,59 @@ func TestItemLifecycleClassifiesSafeFieldsWithoutParsingCommandOrArguments(t *te
 				t.Fatalf("item event leaked command/argument/output content %q: %s", secret, blob)
 			}
 		}
+	}
+}
+
+// TestThreadTokenUsageUpdatedFoldsCacheAndReasoningTokens pins usage
+// extraction against the app-server's own ThreadTokenUsageUpdatedNotification
+// shape, confirmed against codex-cli 0.149.1's generated protocol schema
+// (`codex app-server generate-json-schema`): a rename of any of these six
+// TokenUsageBreakdown keys, or a change to the tokenUsage/total nesting,
+// breaks this test instead of silently zeroing every Codex run's usage the
+// way turn/completed's non-existent "usage" field did (PMR-155).
+func TestThreadTokenUsageUpdatedFoldsCacheAndReasoningTokens(t *testing.T) {
+	events := make(chan domain.Event, 4)
+	c := &client{pending: map[int]chan callResult{}, active: events, activeReady: true, done: make(chan struct{})}
+	input := strings.NewReader(
+		`{"jsonrpc":"2.0","method":"thread/tokenUsage/updated","params":{"threadId":"thread-1","turnId":"turn-1","tokenUsage":{"last":{"cachedInputTokens":2,"cacheWriteInputTokens":1,"inputTokens":4,"outputTokens":6,"reasoningOutputTokens":3,"totalTokens":16},"total":{"cachedInputTokens":2,"cacheWriteInputTokens":1,"inputTokens":4,"outputTokens":6,"reasoningOutputTokens":3,"totalTokens":16},"modelContextWindow":128000}}}` + "\n",
+	)
+	if err := c.read(input); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case event := <-events:
+		if event.Kind != domain.EventUsage || event.UsageAuthoritative {
+			t.Fatalf("event=%+v", event)
+		}
+		if event.Usage != (domain.Usage{InputTokens: 7, OutputTokens: 9, TotalTokens: 16}) {
+			t.Fatalf("usage=%+v", event.Usage)
+		}
+	default:
+		t.Fatal("no usage event emitted")
+	}
+}
+
+// TestThreadTokenUsageUpdatedWithNoUsageLogsOneDiagnosticPerSession asserts
+// the miss is loud: an extraction that finds no usage in a notification that
+// is supposed to carry it must produce a diagnostic, not silence, and exactly
+// once per session so a chatty rolling notification cannot flood the log.
+func TestThreadTokenUsageUpdatedWithNoUsageLogsOneDiagnosticPerSession(t *testing.T) {
+	c := &client{pending: map[int]chan callResult{}, done: make(chan struct{})}
+	zero := `{"jsonrpc":"2.0","method":"thread/tokenUsage/updated","params":{"threadId":"thread-1","turnId":"turn-1","tokenUsage":{"last":{"cachedInputTokens":0,"cacheWriteInputTokens":0,"inputTokens":0,"outputTokens":0,"reasoningOutputTokens":0,"totalTokens":0},"total":{"cachedInputTokens":0,"cacheWriteInputTokens":0,"inputTokens":0,"outputTokens":0,"reasoningOutputTokens":0,"totalTokens":0}}}}` + "\n"
+	if err := c.read(strings.NewReader(zero + zero)); err != nil {
+		t.Fatal(err)
+	}
+	c.mu.Lock()
+	diagnostics := append([]domain.Event(nil), c.diagnostics...)
+	c.mu.Unlock()
+	count := 0
+	for _, event := range diagnostics {
+		if event.Kind == domain.EventDiagnostic && strings.Contains(event.Message, "thread/tokenUsage/updated reported no usage") {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("diagnostic count=%d want 1, diagnostics=%+v", count, diagnostics)
 	}
 }
 
@@ -447,6 +508,72 @@ wait
 	}
 	if got := pendingCount(c); got != 0 {
 		t.Fatalf("pending requests after cancellation=%d", got)
+	}
+}
+
+// TestUsageSurvivesCancellationBeforeTurnCompletes reproduces PMR-155's actual
+// failure: Symphony's own publish flow cancels the session the moment the
+// landing capability resolves, which kills the app-server well before it
+// would ever emit turn/completed on its own, so a fix that only read usage
+// from turn/completed could never have reported anything for this run. The
+// app-server's thread/tokenUsage/updated notification arrives during the
+// turn, so it must survive a cancellation that pre-empts the turn's own end.
+func TestUsageSurvivesCancellationBeforeTurnCompletes(t *testing.T) {
+	dir := t.TempDir()
+	script := writeAppServer(t, dir, `
+IFS= read -r line
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'
+IFS= read -r line
+IFS= read -r line
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thread-1"}}}'
+IFS= read -r line
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn-1"}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"thread/tokenUsage/updated","params":{"threadId":"thread-1","turnId":"turn-1","tokenUsage":{"last":{"cachedInputTokens":0,"cacheWriteInputTokens":0,"inputTokens":4,"outputTokens":6,"reasoningOutputTokens":0,"totalTokens":10},"total":{"cachedInputTokens":0,"cacheWriteInputTokens":0,"inputTokens":4,"outputTokens":6,"reasoningOutputTokens":0,"totalTokens":10},"modelContextWindow":128000}}}'
+sleep 30 &
+wait
+`)
+	b := New()
+	session, events, err := b.Start(context.Background(), request(dir, script))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	var usage domain.Event
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for event := range events {
+			if event.Kind == domain.EventUsage {
+				mu.Lock()
+				usage = event
+				mu.Unlock()
+			}
+		}
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		mu.Lock()
+		seen := usage.Kind == domain.EventUsage
+		mu.Unlock()
+		if seen {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("usage was not reported before cancellation")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := b.Cancel(ctx, session); err != nil {
+		t.Fatal(err)
+	}
+	<-done
+	mu.Lock()
+	got := usage.Usage
+	mu.Unlock()
+	if got != (domain.Usage{InputTokens: 4, OutputTokens: 6, TotalTokens: 10}) {
+		t.Fatalf("usage=%+v", got)
 	}
 }
 
