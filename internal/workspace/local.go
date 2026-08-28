@@ -16,6 +16,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -62,6 +63,13 @@ type Local struct {
 	// back to the process default, so the zero value and existing tests keep
 	// working.
 	log *observability.Logger
+	// fetchMu serializes every base-ref fetch addWorktree issues. It is the
+	// same invariant internal/github's Manager.fetchMu protects: refs/remotes/
+	// origin/<base> and packed-refs live in the shared Git common directory,
+	// not in any one workspace, so concurrent workspace creation racing that
+	// fetch is racing the same repository-wide ref, not independent state
+	// (PMR-162).
+	fetchMu sync.Mutex
 }
 
 // logger returns the operator log sink, defaulting to the process-wide
@@ -175,7 +183,7 @@ func (l *Local) Prepare(ctx context.Context, issue domain.Issue) (domain.Workspa
 			if err := l.writeState(issue, state); err != nil {
 				return domain.Workspace{}, err
 			}
-			if err := addWorktree(ctx, identity.sourceRoot, path, settings.GitHub.BaseBranch); err != nil {
+			if err := l.addWorktree(ctx, identity.sourceRoot, path, settings.GitHub.BaseBranch); err != nil {
 				return domain.Workspace{}, err
 			}
 			worktreeDir, err := worktreeIdentity(ctx, path, identity.commonDir)
@@ -1295,22 +1303,38 @@ func gitMetadataAllowEmpty(ctx context.Context, dir string, args ...string) (str
 // from the branch github.base_branch actually names -- the same ref
 // Session.Publish's descendant check reads -- rather than a literal that
 // silently diverges from it (PMR-135).
-func addWorktree(ctx context.Context, sourceRoot, path, baseBranch string) error {
+func (l *Local) addWorktree(ctx context.Context, sourceRoot, path, baseBranch string) error {
 	if baseBranch == "" {
 		baseBranch = "main"
 	}
-	refspec := "+refs/heads/" + baseBranch + ":refs/remotes/origin/" + baseBranch
-	if err := gitMutation(ctx, sourceRoot, "fetch", "--no-tags", "origin", refspec); err != nil {
-		return fmt.Errorf("refresh origin/%s before creating workspace: %w", baseBranch, err)
-	}
-	baseCommit, err := gitMetadata(ctx, sourceRoot, "rev-parse", "--verify", "refs/remotes/origin/"+baseBranch+"^{commit}")
+	baseCommit, err := l.fetchBaseCommit(ctx, sourceRoot, baseBranch)
 	if err != nil {
-		return fmt.Errorf("resolve refreshed origin/%s commit: %w", baseBranch, err)
+		return err
 	}
 	if err := gitMutation(ctx, sourceRoot, "worktree", "add", "--detach", path, baseCommit); err != nil {
 		return fmt.Errorf("create workspace worktree: %w", err)
 	}
 	return nil
+}
+
+// fetchBaseCommit fetches baseBranch into refs/remotes/origin/<baseBranch> in
+// sourceRoot's shared Git common directory and resolves its commit, holding
+// fetchMu across both calls. Every concurrently-created workspace shares that
+// one common directory, so without the lock two workspaces fetching the same
+// ref at once can lose a lock race on refs/remotes/origin/<baseBranch>, the
+// same hazard fetchMu's doc comment on the Local struct describes (PMR-162).
+func (l *Local) fetchBaseCommit(ctx context.Context, sourceRoot, baseBranch string) (string, error) {
+	l.fetchMu.Lock()
+	defer l.fetchMu.Unlock()
+	refspec := "+refs/heads/" + baseBranch + ":refs/remotes/origin/" + baseBranch
+	if err := gitMutation(ctx, sourceRoot, "fetch", "--no-tags", "origin", refspec); err != nil {
+		return "", fmt.Errorf("refresh origin/%s before creating workspace: %w", baseBranch, err)
+	}
+	baseCommit, err := gitMetadata(ctx, sourceRoot, "rev-parse", "--verify", "refs/remotes/origin/"+baseBranch+"^{commit}")
+	if err != nil {
+		return "", fmt.Errorf("resolve refreshed origin/%s commit: %w", baseBranch, err)
+	}
+	return baseCommit, nil
 }
 
 func gitRepositoryAvailable(ctx context.Context, state workspaceState) (bool, error) {

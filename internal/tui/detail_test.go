@@ -7,7 +7,10 @@ import (
 
 	lipgloss "charm.land/lipgloss/v2"
 
+	"github.com/pmrrasmussen/symphony/internal/coordinator"
+	"github.com/pmrrasmussen/symphony/internal/domain"
 	"github.com/pmrrasmussen/symphony/internal/operator"
+	"github.com/pmrrasmussen/symphony/internal/status"
 )
 
 // The dashboard lays the same fields out as tables, so a cell boundary now
@@ -20,12 +23,12 @@ func TestStyledDetailPagesTabulateTheSameFields(t *testing.T) {
 		ID:       "com.pmrrasmussen.symphony",
 		Liveness: operator.LivenessRunning,
 		Config:   &operator.EffectiveConfig{MaxTurns: 20, Credentials: operator.Credentials{Tracker: operator.CredentialPresence{Configured: true, EnvironmentNames: []string{"SECRET_ENV"}}}},
-		Snapshot: &operator.Snapshot{Coordinator: operator.RuntimeSnapshot{Running: []operator.RunningSnapshot{{
+		Snapshot: &operator.Snapshot{Snapshot: status.Snapshot{Coordinator: coordinator.Snapshot{Running: []coordinator.RunningSnapshot{{
 			IssueIdentifier: "PMR-75",
 			IssueState:      "In Progress",
 			TurnCount:       4,
-			Usage:           operator.Usage{InputTokens: 12, OutputTokens: 3, TotalTokens: 15},
-		}}}},
+			Usage:           domain.Usage{InputTokens: 12, OutputTokens: 3, TotalTokens: 15},
+		}}}}},
 	}
 	model := styledFixture([]operator.Instance{instance}, now)
 	model.page = statusPage

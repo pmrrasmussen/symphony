@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"howett.net/plist"
 )
 
 type fakeInspector map[string]LaunchdStatus
@@ -64,8 +66,8 @@ func TestDiscoverMultipleIndependentInstancesAndStaleSnapshot(t *testing.T) {
 	}
 }
 
-func TestParseXMLPlistFallback(t *testing.T) {
-	values, err := parseXMLPlist([]byte("<?xml version=\"1.0\"?><plist version=\"1.0\"><dict><key>Label</key><string>com.pmrrasmussen.symphony.test</string><key>ProgramArguments</key><array><string>/bin/sh</string><string>--workflow</string></array><key>ThrottleInterval</key><integer>10</integer></dict></plist>"))
+func TestParsePlistDecodesXML(t *testing.T) {
+	values, err := parsePlist([]byte("<?xml version=\"1.0\"?><plist version=\"1.0\"><dict><key>Label</key><string>com.pmrrasmussen.symphony.test</string><key>ProgramArguments</key><array><string>/bin/sh</string><string>--workflow</string></array><key>ThrottleInterval</key><integer>10</integer></dict></plist>"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -75,8 +77,48 @@ func TestParseXMLPlistFallback(t *testing.T) {
 	if got, want := stringSlice(values["ProgramArguments"]), []string{"/bin/sh", "--workflow"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("arguments = %v, want %v", got, want)
 	}
-	if got, want := values["ThrottleInterval"], int64(10); got != want {
+	if got, want := values["ThrottleInterval"], uint64(10); got != want {
 		t.Fatalf("ThrottleInterval = %#v, want %#v", got, want)
+	}
+}
+
+// TestParsePlistDecodesBinary is new coverage neither the old plutil branch
+// nor the old XML fallback exercised in the same test run: a binary plist,
+// the format launchd itself writes and rewrites, decoded by the same call
+// path as the fixtures above.
+func TestParsePlistDecodesBinary(t *testing.T) {
+	encoded, err := plist.Marshal(map[string]any{
+		"Label":            "com.pmrrasmussen.symphony.test",
+		"ProgramArguments": []string{"/bin/sh", "--workflow"},
+		"ThrottleInterval": int64(10),
+	}, plist.BinaryFormat)
+	if err != nil {
+		t.Fatal(err)
+	}
+	values, err := parsePlist(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := values["Label"], "com.pmrrasmussen.symphony.test"; got != want {
+		t.Fatalf("Label = %#v, want %#v", got, want)
+	}
+	if got, want := stringSlice(values["ProgramArguments"]), []string{"/bin/sh", "--workflow"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("arguments = %v, want %v", got, want)
+	}
+	if got, want := values["ThrottleInterval"], uint64(10); got != want {
+		t.Fatalf("ThrottleInterval = %#v, want %#v", got, want)
+	}
+}
+
+func TestParsePlistRejectsMalformedInput(t *testing.T) {
+	if _, err := parsePlist([]byte("not a plist")); err == nil {
+		t.Fatal("expected an error for malformed plist input")
+	}
+}
+
+func TestParsePlistRejectsNonDictRoot(t *testing.T) {
+	if _, err := parsePlist([]byte("<?xml version=\"1.0\"?><plist version=\"1.0\"><array><string>a</string></array></plist>")); err == nil {
+		t.Fatal("expected an error for a non-dict plist root")
 	}
 }
 
