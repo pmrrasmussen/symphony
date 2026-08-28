@@ -468,11 +468,11 @@ func (f *fakeBoundaries) GetIssues(context.Context, []string) ([]domain.Issue, e
 func (*fakeBoundaries) ListTerminal(context.Context, []string) ([]domain.Issue, error) {
 	return nil, nil
 }
-func (f *fakeBoundaries) Transition(context.Context, domain.Issue, string) error {
+func (f *fakeBoundaries) Transition(_ context.Context, _ domain.Issue, fromState, _ string) (domain.TransitionResult, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.transitions++
-	return nil
+	return domain.TransitionResult{FromState: fromState, Applied: true}, nil
 }
 func (f *fakeBoundaries) Prepare(context.Context, domain.Issue) (domain.Workspace, error) {
 	f.mu.Lock()

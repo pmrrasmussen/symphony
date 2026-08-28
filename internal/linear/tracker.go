@@ -225,52 +225,65 @@ func (t *Tracker) GetIssues(ctx context.Context, ids []string) ([]domain.Issue, 
 	return out, nil
 }
 
-// Transition moves the issue into the named workflow state using the host
-// Linear credential. It re-reads the issue (scoped to the configured project)
-// so a stale caller-supplied state cannot drive a wrong write, and it is
-// idempotent: an issue already in toState is a no-op. It reuses the same bound
-// GraphQL primitives as the session handoff path (scoped read, team state
-// resolution, and the fixed issueUpdate mutation), and never resolves a
-// terminal target. It is the host-owned transition primitive (used by the
-// coordinator's dispatch-time start move and the landing host methods); no
-// model-invokable tool can write the tracker.
-func (t *Tracker) Transition(ctx context.Context, issue domain.Issue, toState string) error {
-	toState = strings.TrimSpace(toState)
+// Transition moves the issue from fromState into toState using the host Linear
+// credential. It re-reads the issue (scoped to the configured project) and acts
+// on that read alone: the write is sent only while the fresh state still equals
+// fromState, so a human who cancelled or reparked the issue after the caller's
+// snapshot is never overridden — the same exact-source rule HandoffSession's
+// RefuseLanding enforces. It is idempotent: an issue already in toState is a
+// no-op. It reuses the same bound GraphQL primitives as the session handoff
+// path (scoped read, team state resolution, and the fixed issueUpdate
+// mutation), and never resolves a terminal target. It is the host-owned
+// transition primitive (used by the coordinator's dispatch-time start move and
+// the landing host methods); no model-invokable tool can write the tracker.
+func (t *Tracker) Transition(ctx context.Context, issue domain.Issue, fromState, toState string) (domain.TransitionResult, error) {
+	fromState, toState = strings.TrimSpace(fromState), strings.TrimSpace(toState)
 	if strings.TrimSpace(issue.ID) == "" {
-		return trackerError("invalid_transition_request", "issue ID is missing")
+		return domain.TransitionResult{}, trackerError("invalid_transition_request", "issue ID is missing")
+	}
+	if fromState == "" {
+		return domain.TransitionResult{}, trackerError("invalid_transition_request", "expected source state is required")
 	}
 	if toState == "" {
-		return trackerError("invalid_transition_request", "target state is required")
+		return domain.TransitionResult{}, trackerError("invalid_transition_request", "target state is required")
 	}
 	s := trackerSnapshot(t.settings())
 	if err := validateProvider(s.Tracker.Provider); err != nil {
 		t.invalidateViewer()
-		return err
+		return domain.TransitionResult{}, err
 	}
 	projectSlug := strings.TrimSpace(stringValue(s.Tracker.Provider["project_slug_id"]))
 	if projectSlug == "" {
-		return trackerError("invalid_tracker_config", "linear project_slug_id is missing")
+		return domain.TransitionResult{}, trackerError("invalid_tracker_config", "linear project_slug_id is missing")
 	}
 	current, err := readHandoffIssue(ctx, t.client, s, issue.ID)
 	if err != nil {
-		return err
+		return domain.TransitionResult{}, err
 	}
 	if current.ID != issue.ID || current.ProjectSlug() != projectSlug || current.TeamID() == "" {
-		return trackerError("transition_scope", "issue is outside the configured Linear project")
+		return domain.TransitionResult{}, trackerError("transition_scope", "issue is outside the configured Linear project")
 	}
-	if strings.EqualFold(strings.TrimSpace(current.State.Name), toState) {
+	freshState := strings.TrimSpace(current.State.Name)
+	if strings.EqualFold(freshState, toState) {
 		t.logTransitionSkip(current, toState)
-		return nil // Idempotent: the issue is already in the started state.
+		// Idempotent: the issue is already in the started state. Checked before
+		// the source guard so a re-dispatch whose snapshot is one edge stale
+		// still reconciles instead of reporting a refusal.
+		return domain.TransitionResult{FromState: freshState, Applied: true}, nil
+	}
+	if !strings.EqualFold(freshState, fromState) {
+		t.logTransitionRefused(current, fromState, toState)
+		return domain.TransitionResult{FromState: freshState}, nil
 	}
 	stateID, err := (&Handoff{client: t.client}).resolveState(ctx, s, current.TeamID(), toState)
 	if err != nil {
-		return err
+		return domain.TransitionResult{FromState: freshState}, err
 	}
 	response, err := requestWithSettings(ctx, t.client, s, handoffTransitionQuery, map[string]any{
 		"issueID": current.ID, "stateID": stateID,
 	})
 	if err != nil {
-		return err
+		return domain.TransitionResult{FromState: freshState}, err
 	}
 	var payload struct {
 		Data struct {
@@ -280,10 +293,10 @@ func (t *Tracker) Transition(ctx context.Context, issue domain.Issue, toState st
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(response, &payload); err != nil || !payload.Data.IssueUpdate.Success {
-		return trackerError("transition_response", "Linear did not accept the transition")
+		return domain.TransitionResult{FromState: freshState}, trackerError("transition_response", "Linear did not accept the transition")
 	}
 	t.logTransition(current, toState)
-	return nil
+	return domain.TransitionResult{FromState: freshState, Applied: true}, nil
 }
 
 // logTransition records one performed host-side Linear state change so it is
@@ -315,6 +328,25 @@ func (t *Tracker) logTransitionSkip(from handoffIssue, toState string) {
 		"to_state", strings.TrimSpace(toState),
 		"issue_id", from.ID,
 		"issue_identifier", from.Identifier,
+	)
+}
+
+// logTransitionRefused records the withheld write when the freshly read state
+// is neither the target nor the caller's expected source: someone else moved
+// the issue between the caller's read and this call. It is a warning, not a
+// skip, because the caller asked for an edge that no longer exists — the human
+// move it deferred to is the operator-visible event.
+func (t *Tracker) logTransitionRefused(current handoffIssue, fromState, toState string) {
+	if t.logger == nil {
+		return
+	}
+	t.logger.Warn("Linear transition refused: source state changed",
+		"operation", observability.OperationTransition,
+		"from_state", strings.TrimSpace(current.State.Name),
+		"expected_from_state", strings.TrimSpace(fromState),
+		"to_state", strings.TrimSpace(toState),
+		"issue_id", current.ID,
+		"issue_identifier", current.Identifier,
 	)
 }
 

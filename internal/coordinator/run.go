@@ -314,6 +314,11 @@ func (c *Coordinator) launch(parent context.Context, i domain.Issue, attempt int
 //     re-reads and no-ops if the live state already matches, so a run
 //     re-dispatched after a restart or turn-limit exhaustion (already In
 //     Progress) is never re-transitioned;
+//   - human-wins: the edge is named by the state the poll saw, and the adapter
+//     applies it only while the freshly read state is still that source. An
+//     operator who cancels or reparks the issue during the dispatch window (the
+//     poll interval plus workspace Prepare/BeforeRun) is never overridden, and
+//     the log below reports that fresh state rather than the stale snapshot;
 //   - fail-safe: a failed transition is logged and never blocks the run or
 //     causes a double dispatch — the session starts regardless, and the poll
 //     loop retries or reconciles the tracker state on a later tick.
@@ -325,11 +330,20 @@ func (c *Coordinator) transitionToStarted(ctx context.Context, i domain.Issue, s
 	if strings.EqualFold(strings.TrimSpace(i.State), strings.TrimSpace(target)) {
 		return target
 	}
-	if err := c.tracker.Transition(ctx, i, target); err != nil {
-		c.log.Warn("dispatch start transition failed", "operation", observability.OperationStartTransition, "issue_id", i.ID, "issue_identifier", i.Identifier, "from_state", config.Norm(i.State), "to_state", config.Norm(target), "error", err)
+	result, err := c.tracker.Transition(ctx, i, i.State, target)
+	from := config.Norm(result.FromState)
+	if from == "" {
+		from = config.Norm(i.State) // The adapter never read a state.
+	}
+	if err != nil {
+		c.log.Warn("dispatch start transition failed", "operation", observability.OperationStartTransition, "issue_id", i.ID, "issue_identifier", i.Identifier, "from_state", from, "to_state", config.Norm(target), "error", err)
 		return ""
 	}
-	c.log.Info("issue moved to started state", "operation", observability.OperationStartTransition, "issue_id", i.ID, "issue_identifier", i.Identifier, "from_state", config.Norm(i.State), "to_state", config.Norm(target))
+	if !result.Applied {
+		c.log.Info("dispatch start transition skipped: issue left the start state", "operation", observability.OperationStartTransition, "issue_id", i.ID, "issue_identifier", i.Identifier, "from_state", from, "expected_from_state", config.Norm(i.State), "to_state", config.Norm(target))
+		return ""
+	}
+	c.log.Info("issue moved to started state", "operation", observability.OperationStartTransition, "issue_id", i.ID, "issue_identifier", i.Identifier, "from_state", from, "to_state", config.Norm(target))
 	return target
 }
 

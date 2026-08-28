@@ -2,6 +2,7 @@ package coordinator
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"time"
 
@@ -17,11 +18,16 @@ type fakeTracker struct {
 	getErr        error
 	transitions   []trackerTransition
 	transitionErr error
-	getIssuesErr  error
+	// liveState, when set, is the state a concurrent writer (a human) left the
+	// issue in. Like the real adapter, the fake then refuses the write and
+	// reports that freshly read state back instead.
+	liveState    string
+	getIssuesErr error
 }
 
 // trackerTransition records one host-side dispatch transition request so tests
 // can assert the coordinator moved an issue into its started state (or did not).
+// from is the source state the coordinator asserted, not its snapshot's.
 type trackerTransition struct{ id, from, to string }
 
 func (f *fakeTracker) ListCandidates(context.Context, []string) ([]domain.Issue, error) {
@@ -53,11 +59,17 @@ func (f *fakeTracker) getCount() int {
 func (f *fakeTracker) ListTerminal(context.Context, []string) ([]domain.Issue, error) {
 	return nil, nil
 }
-func (f *fakeTracker) Transition(_ context.Context, issue domain.Issue, toState string) error {
+func (f *fakeTracker) Transition(_ context.Context, issue domain.Issue, fromState, toState string) (domain.TransitionResult, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.transitions = append(f.transitions, trackerTransition{id: issue.ID, from: issue.State, to: toState})
-	return f.transitionErr
+	f.transitions = append(f.transitions, trackerTransition{id: issue.ID, from: fromState, to: toState})
+	if f.transitionErr != nil {
+		return domain.TransitionResult{}, f.transitionErr
+	}
+	if f.liveState != "" && !strings.EqualFold(f.liveState, fromState) {
+		return domain.TransitionResult{FromState: f.liveState}, nil
+	}
+	return domain.TransitionResult{FromState: fromState, Applied: true}, nil
 }
 func (f *fakeTracker) transitionCalls() []trackerTransition {
 	f.mu.Lock()
@@ -110,8 +122,8 @@ func (*issueMapTracker) ListTerminal(context.Context, []string) ([]domain.Issue,
 	return nil, nil
 }
 
-func (*issueMapTracker) Transition(context.Context, domain.Issue, string) error {
-	return nil
+func (*issueMapTracker) Transition(_ context.Context, _ domain.Issue, fromState, _ string) (domain.TransitionResult, error) {
+	return domain.TransitionResult{FromState: fromState, Applied: true}, nil
 }
 
 func (t *issueMapTracker) setIssue(issue domain.Issue) {
@@ -417,8 +429,8 @@ func (*rateLimitPollTracker) GetIssues(context.Context, []string) ([]domain.Issu
 func (*rateLimitPollTracker) ListTerminal(context.Context, []string) ([]domain.Issue, error) {
 	return nil, nil
 }
-func (*rateLimitPollTracker) Transition(context.Context, domain.Issue, string) error {
-	return nil
+func (*rateLimitPollTracker) Transition(_ context.Context, _ domain.Issue, fromState, _ string) (domain.TransitionResult, error) {
+	return domain.TransitionResult{FromState: fromState, Applied: true}, nil
 }
 
 // stubForgetter records the issues the coordinator reported as finished. It

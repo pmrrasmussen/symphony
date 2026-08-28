@@ -13,7 +13,7 @@
 | `assignee` | optional | Unset permits all assignees. A non-empty ID permits only that assignee. `me` resolves the current Linear viewer ID for each read. |
 | `handoff_state` | optional | The single human-controlled review state `github_publish_pr` hands a bound issue off to, host-side. The name must be a non-active workflow state in the active issue's Linear team. It binds a Linear session and enables the scoped GitHub handoff tools, but is not itself a model-invokable tool. |
 | `handoff_comment_template` | optional | A repository-owned Go template for the comment Symphony posts when it performs the host-side review handoff. It requires `handoff_state` and receives only `issue`. |
-| `transitions` | optional | The single host-owned tracker transition policy. A structured object with two independent edge sets, both applied host-side with the host credential and never exposed to a Codex session: `start` (dispatch-time edges keyed by the issue's current state — the canonical `Todo -> In Progress`; both endpoints must be active, non-terminal states) and `refuse_landing` (the `Merging -> In Review` fallback `github_land_pr` applies on a hard gate, keyed by `github.merge_state`). The two sets are kept structurally distinct — never flattened into one map — because `Merging` is both a dispatchable state and the land-fallback source. Terminal and same-state edges are rejected; `start` moves are idempotent and fail-safe. |
+| `transitions` | optional | The single host-owned tracker transition policy. A structured object with two independent edge sets, both applied host-side with the host credential and never exposed to a Codex session: `start` (dispatch-time edges keyed by the issue's current state — the canonical `Todo -> In Progress`; both endpoints must be active, non-terminal states) and `refuse_landing` (the `Merging -> In Review` fallback `github_land_pr` applies on a hard gate, keyed by `github.merge_state`). The two sets are kept structurally distinct — never flattened into one map — because `Merging` is both a dispatchable state and the land-fallback source. Terminal and same-state edges are rejected; `start` moves are idempotent, fail-safe, and applied only while the issue's freshly read state is still the edge's source. |
 | `followup_issue_creation` | optional | Boolean. Enables the session-bound Codex `create_followup_issue` tool, described below. Disabled by default. `Backlog` must not be active/dispatchable. |
 | `child_issue_creation` | deprecated | Legacy alias for `followup_issue_creation`. It emits a migration warning and enables the new follow-up semantics; setting both names is rejected. |
 
@@ -135,7 +135,11 @@ Linear credential, so no model-invokable path can transition the board:
   Progress`), before the Codex session starts. Both endpoints of every `start`
   edge must be active, non-terminal states: the coordinator only dispatches
   active issues, and the issue must remain eligible for reconciliation after the
-  move.
+  move. The adapter re-reads the issue and applies the edge only while that
+  fresh state is still the edge's own source, so a human who cancels or reparks
+  the issue inside the dispatch window (the poll interval plus workspace
+  preparation) wins: the move becomes a logged no-op instead of dragging a
+  closed issue back into `In Progress` (PMR-173).
 - `github_publish_pr` performs the review handoff (`In Progress`/`Rework ->
   handoff_state`) host-side after it publishes the pull request.
 - `github_land_pr` completes landing (`Merging -> Done`) or, on a hard gate,

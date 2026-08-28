@@ -369,16 +369,24 @@ func TestTransitionMovesIssueToStartedStateAndIsIdempotent(t *testing.T) {
 	}}
 	tracker := New(func() config.Settings { return settings })
 
-	if err := tracker.Transition(context.Background(), domain.Issue{ID: "active", State: "Todo"}, "In Progress"); err != nil {
+	result, err := tracker.Transition(context.Background(), domain.Issue{ID: "active", State: "Todo"}, "Todo", "In Progress")
+	if err != nil {
 		t.Fatalf("first transition: %v", err)
+	}
+	if !result.Applied || result.FromState != "Todo" {
+		t.Fatalf("result=%+v, want the write applied from a freshly read Todo", result)
 	}
 	if transitions != 1 {
 		t.Fatalf("transitions=%d after first move, want 1", transitions)
 	}
 	// The issue is now In Progress; a second call must be an idempotent no-op
 	// that issues no mutation (the restart / turn-limit re-dispatch case).
-	if err := tracker.Transition(context.Background(), domain.Issue{ID: "active", State: "Todo"}, "In Progress"); err != nil {
+	result, err = tracker.Transition(context.Background(), domain.Issue{ID: "active", State: "Todo"}, "Todo", "In Progress")
+	if err != nil {
 		t.Fatalf("idempotent transition: %v", err)
+	}
+	if !result.Applied || result.FromState != "In Progress" {
+		t.Fatalf("result=%+v, want the already-started issue reported as applied", result)
 	}
 	if transitions != 1 {
 		t.Fatalf("transitions=%d after idempotent call, want still 1", transitions)
@@ -416,7 +424,7 @@ func TestTransitionLogsHostSideEdgeAndSkip(t *testing.T) {
 	var logs bytes.Buffer
 	tracker.SetLogger(slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
 
-	if err := tracker.Transition(context.Background(), domain.Issue{ID: "active", State: "Todo"}, "In Progress"); err != nil {
+	if _, err := tracker.Transition(context.Background(), domain.Issue{ID: "active", State: "Todo"}, "Todo", "In Progress"); err != nil {
 		t.Fatalf("transition: %v", err)
 	}
 	edge := findLogRecord(t, &logs, "Linear transition")
@@ -426,12 +434,62 @@ func TestTransitionLogsHostSideEdgeAndSkip(t *testing.T) {
 
 	// The issue is now In Progress; an idempotent call must record a skip at
 	// debug level, still carrying the operation and issue for reconstruction.
-	if err := tracker.Transition(context.Background(), domain.Issue{ID: "active", State: "Todo"}, "In Progress"); err != nil {
+	if _, err := tracker.Transition(context.Background(), domain.Issue{ID: "active", State: "Todo"}, "Todo", "In Progress"); err != nil {
 		t.Fatalf("idempotent transition: %v", err)
 	}
 	skip := findLogRecord(t, &logs, "Linear transition skipped")
 	if skip["operation"] != "transition" || skip["to_state"] != "In Progress" || skip["issue_identifier"] != "PMR-5" {
 		t.Fatalf("skip record missing operation/to/issue: %v", skip)
+	}
+}
+
+// TestTransitionRefusesWriteWhenSourceStateChanged covers the dispatch window:
+// the poll read the issue as Todo, an operator cancelled it while the workspace
+// was being prepared, and the start move must not un-terminate that Canceled
+// issue. No mutation may reach Linear, and the refusal must name both the fresh
+// state and the source the caller expected.
+func TestTransitionRefusesWriteWhenSourceStateChanged(t *testing.T) {
+	var mutations int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		query := decodeRequest(t, r)["query"].(string)
+		switch {
+		case strings.Contains(query, "SymphonyLinearHandoffIssue"):
+			writeJSON(t, w, map[string]any{"data": map[string]any{"issue": map[string]any{
+				"id": "active", "identifier": "PMR-5", "title": "Start", "project": map[string]string{"slugId": "project-1"},
+				"team": map[string]string{"id": "team-1"}, "state": map[string]string{"id": "canceled", "name": "Canceled"},
+			}}})
+		default:
+			mutations++
+			t.Errorf("unexpected query after a concurrent human move: %s", query)
+		}
+	}))
+	defer server.Close()
+	settings := config.Settings{Tracker: config.Tracker{
+		Provider:     map[string]any{"api_key": "test-token", "project_slug_id": "project-1", "endpoint": server.URL},
+		ActiveStates: []string{"Todo", "In Progress"}, TerminalStates: []string{"Done", "Canceled"},
+	}}
+	tracker := New(func() config.Settings { return settings })
+	var logs bytes.Buffer
+	tracker.SetLogger(slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+
+	result, err := tracker.Transition(context.Background(), domain.Issue{ID: "active", State: "Todo"}, "Todo", "In Progress")
+	if err != nil {
+		t.Fatalf("transition: %v", err)
+	}
+	if result.Applied {
+		t.Fatalf("result=%+v, want the Canceled issue left untouched", result)
+	}
+	if result.FromState != "Canceled" {
+		t.Fatalf("result.FromState=%q, want the freshly read Canceled state", result.FromState)
+	}
+	if mutations != 0 {
+		t.Fatalf("mutations=%d, want none sent for a concurrently cancelled issue", mutations)
+	}
+	refusal := findLogRecord(t, &logs, "Linear transition refused: source state changed")
+	if refusal["operation"] != "transition" || refusal["from_state"] != "Canceled" ||
+		refusal["expected_from_state"] != "Todo" || refusal["to_state"] != "In Progress" ||
+		refusal["issue_identifier"] != "PMR-5" {
+		t.Fatalf("refusal record missing operation/from/expected/to/issue: %v", refusal)
 	}
 }
 
@@ -466,7 +524,7 @@ func TestTransitionRejectsIssueOutsideConfiguredProject(t *testing.T) {
 		Provider:     map[string]any{"api_key": "test-token", "project_slug_id": "project-1", "endpoint": server.URL},
 		ActiveStates: []string{"Todo", "In Progress"}, TerminalStates: []string{"Done"},
 	}}
-	err := New(func() config.Settings { return settings }).Transition(context.Background(), domain.Issue{ID: "active", State: "Todo"}, "In Progress")
+	_, err := New(func() config.Settings { return settings }).Transition(context.Background(), domain.Issue{ID: "active", State: "Todo"}, "Todo", "In Progress")
 	assertCategory(t, err, "transition_scope")
 }
 
