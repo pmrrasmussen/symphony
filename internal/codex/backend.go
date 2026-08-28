@@ -33,6 +33,9 @@ type Backend struct {
 	settings    func() config.Settings
 	handoff     *linear.Handoff
 	github      *githubhost.Manager
+	// timer schedules every bound a session enforces itself. It defaults to the
+	// real one and is replaced only by a test. See Timer.
+	timer Timer
 }
 
 // finalizeBudget bounds the turn-ended finalizer's own work, which runs detached
@@ -69,7 +72,7 @@ const finalizeBudget = 5 * time.Second
 // this child may not inherit, on top of everything hostenv.Filter blocks for
 // every child Symphony spawns.
 func New(secretNames ...string) *Backend {
-	return &Backend{sessions: map[string]*client{}, secretNames: uniquePaths(secretNames)}
+	return &Backend{sessions: map[string]*client{}, secretNames: uniquePaths(secretNames), timer: realTimer{}}
 }
 
 // NewWithProviders binds already-built host providers to this backend instead
@@ -138,7 +141,7 @@ func (b *Backend) Start(ctx context.Context, r domain.AgentRequest) (domain.Agen
 	// spawns shares: this backend adds no name of its own beyond the ones its
 	// constructor was given, and nothing at all after filtering.
 	environment := hostenv.Filter(os.Environ(), b.secretNames, settings, capability.SecretMatcher(bindings, b.github))
-	c, err := start(ctx, r, environment, capabilities)
+	c, err := start(ctx, r, environment, capabilities, b.timer)
 	if err != nil {
 		return domain.AgentSession{}, nil, err
 	}
@@ -229,6 +232,7 @@ type client struct {
 	readTimeout         time.Duration
 	startTimeout        time.Duration
 	turnTimeout         time.Duration
+	timer               Timer
 	ctx                 context.Context
 	capabilities        *capability.Registry
 	mu                  sync.Mutex
@@ -269,7 +273,7 @@ type rpc struct {
 // built from its bindings -- and because a nil slice here would hand the child
 // the daemon's complete environment, which is exactly what the filter exists to
 // prevent.
-func start(ctx context.Context, r domain.AgentRequest, environment []string, capabilities *capability.Registry) (*client, error) {
+func start(ctx context.Context, r domain.AgentRequest, environment []string, capabilities *capability.Registry, timer Timer) (*client, error) {
 	command := strings.TrimSpace(r.Command)
 	if command == "" {
 		command = "codex app-server"
@@ -294,7 +298,7 @@ func start(ctx context.Context, r domain.AgentRequest, environment []string, cap
 	}
 	cmd.Stdout = outWriter
 	cmd.Stderr = stderrWriter
-	c := &client{cmd: cmd, in: in, workspace: r.Workspace, approval: r.ApprovalPolicy, policy: r.TurnSandboxPolicy, readTimeout: r.ReadTimeout, startTimeout: r.StartTimeout, turnTimeout: r.TurnTimeout, ctx: ctx, capabilities: capabilities, pending: map[int]chan callResult{}, done: make(chan struct{}), exited: make(chan struct{})}
+	c := &client{cmd: cmd, in: in, workspace: r.Workspace, approval: r.ApprovalPolicy, policy: r.TurnSandboxPolicy, readTimeout: r.ReadTimeout, startTimeout: r.StartTimeout, turnTimeout: r.TurnTimeout, timer: timer, ctx: ctx, capabilities: capabilities, pending: map[int]chan callResult{}, done: make(chan struct{}), exited: make(chan struct{})}
 	cmd.Cancel = func() error { return procgroup.Kill(c.cmd) }
 	if err := cmd.Start(); err != nil {
 		_ = out.Close()
@@ -402,11 +406,19 @@ func (c *client) call(ctx context.Context, method string, params any) (map[strin
 	return c.callWithTimeout(ctx, method, params, c.readTimeout)
 }
 
+// callWithTimeout bounds one round trip with the budget it is given.
+//
+// The budget is scheduled on the timer seam rather than folded into ctx, which
+// keeps two bounds that expire for different reasons distinguishable: this
+// call's own timeout, and the caller's cancellation. It is also what makes the
+// bound testable without waiting it out -- and, in a test, which budget is live
+// while a call is outstanding is the whole of "thread/start is governed by the
+// start timeout, not the read timeout" (see Timer).
 func (c *client) callWithTimeout(ctx context.Context, method string, params any, timeout time.Duration) (map[string]any, error) {
+	expired := make(chan struct{})
 	if timeout > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, timeout)
-		defer cancel()
+		stop := c.timer.AfterFunc(timeout, func() { close(expired) })
+		defer stop()
 	}
 	c.mu.Lock()
 	c.next++
@@ -423,6 +435,11 @@ func (c *client) callWithTimeout(ctx context.Context, method string, params any,
 	var result callResult
 	select {
 	case result = <-ch:
+	case <-expired:
+		c.removePending(id)
+		err := fmt.Errorf("codex %s timed out: %w", method, context.DeadlineExceeded)
+		c.abort(err)
+		return nil, err
 	case <-ctx.Done():
 		c.removePending(id)
 		err := fmt.Errorf("codex %s timed out: %w", method, ctx.Err())
@@ -503,15 +520,16 @@ func (c *client) turn(ctx context.Context, thread, prompt string, r domain.Agent
 	}
 	c.activate(events, s, pid)
 	if r.TurnTimeout > 0 {
+		stop := c.timer.AfterFunc(r.TurnTimeout, func() {
+			c.emit(domain.Event{Kind: domain.EventFailed, At: time.Now(), Message: "Codex turn timeout"})
+			c.kill()
+		})
+		// The budget is cancelled when the turn ends, so a turn that finished
+		// well inside it neither kills a process group the next turn is using nor
+		// leaves a timer alive for the rest of the run.
 		go func() {
-			timer := time.NewTimer(r.TurnTimeout)
-			defer timer.Stop()
-			select {
-			case <-turnDone:
-			case <-timer.C:
-				c.emit(domain.Event{Kind: domain.EventFailed, At: time.Now(), Message: "Codex turn timeout"})
-				c.kill()
-			}
+			<-turnDone
+			stop()
 		}()
 	}
 	return s, events, nil

@@ -77,13 +77,20 @@ run_race_tests() {
 # gate on either: a hard threshold on a repo ranging 32%-98% coverage per
 # package would either be trivially met or block everything today. Narrowing
 # this to a ratchet is future work once the baseline has run for a while.
+#
+# internal/agenttest is left out of the 0%-covered list, and only that list. It
+# is test support imported exclusively by other packages' tests, and Go measures
+# coverage per package, so every function in it reports 0% however heavily the
+# suites that import it exercise it. Listing all of them would add two dozen
+# permanently unactionable lines to a report whose whole value is that every line
+# on it is worth looking at.
 run_coverage() {
 	profile=$(mktemp -p "${TMPDIR:-/tmp}" symphony-coverage.XXXXXX)
 	trap 'rm -f "$profile"' EXIT
 	go test -timeout 5m -coverprofile="$profile" ./...
 	func_report=$(go tool cover -func="$profile")
 	printf '%s\n' "$func_report"
-	zero=$(printf '%s\n' "$func_report" | awk '$1 != "total:" && $NF == "0.0%"')
+	zero=$(printf '%s\n' "$func_report" | awk '$1 != "total:" && $NF == "0.0%" && $1 !~ /\/internal\/agenttest\//')
 	if [ -n "$zero" ]; then
 		printf '\n0%%-covered functions:\n%s\n' "$zero"
 	else
