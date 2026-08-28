@@ -82,6 +82,7 @@ type fakeLinear struct {
 	refuseErr        error
 	refused          int
 	refusedDestState string
+	refusedReason    string
 	completeErr      error
 	landCompleted    int
 
@@ -142,7 +143,7 @@ func (l *fakeLinear) EnsureMergeState(context.Context, string) error {
 	return l.mergeStateErr
 }
 
-func (l *fakeLinear) RefuseLanding(_ context.Context, mergeState string) (bool, error) {
+func (l *fakeLinear) RefuseLanding(_ context.Context, mergeState, reason string) (bool, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.refuseErr != nil {
@@ -150,6 +151,7 @@ func (l *fakeLinear) RefuseLanding(_ context.Context, mergeState string) (bool, 
 	}
 	l.refused++
 	l.refusedDestState = mergeState
+	l.refusedReason = reason
 	return true, nil
 }
 
@@ -1584,9 +1586,62 @@ func TestLandRefusesOnFailingRequiredChecks(t *testing.T) {
 	if linear.refused != 1 || linear.refusedDestState != "Merging" {
 		t.Fatalf("hard gate did not attempt the Merging fallback: refused=%d dest=%q", linear.refused, linear.refusedDestState)
 	}
+	// The refusal must name which gate fired, not merely that landing was
+	// refused, so an operator reading the Linear transition log record alone
+	// can tell this apart from every other hard gate (PMR-159).
+	if !strings.Contains(linear.refusedReason, "required checks failed") {
+		t.Fatalf("refused reason did not name the failing-checks gate: %q", linear.refusedReason)
+	}
 	if api.merges != 0 || linear.landCompleted != 0 {
 		t.Fatalf("failing checks must never merge: merges=%d completed=%d", api.merges, linear.landCompleted)
 	}
+}
+
+// TestLandRefusalReasonCarriesNoProviderOrCredentialText plants a secret in
+// the GitHub credential and in provider-authored free text (the pull request
+// body and a review body) that a hard gate's detection reads past, then
+// drives two distinct hard gates. The recorded refusal reason must never
+// carry that secret: every reason string is fixed or repository-config
+// derived (required check names), never provider response content or a
+// credential (PMR-159).
+func TestLandRefusalReasonCarriesNoProviderOrCredentialText(t *testing.T) {
+	const secret = "wire-secret-should-never-reach-the-log"
+
+	t.Run("failing required checks", func(t *testing.T) {
+		api, git, linear := newAPI(t), &fakeGit{}, &fakeLinear{}
+		api.prExists, api.prBody = true, secret
+		api.checkRuns = failingChecks("ci/build")
+		_, session := testLandingSession(t, api, git, linear, []string{"ci/build"}, "merge")
+		session.settings.Token = secret
+		if _, err := session.Land(context.Background()); err == nil {
+			t.Fatal("expected refusal")
+		}
+		if strings.Contains(linear.refusedReason, secret) {
+			t.Fatalf("refused reason leaked provider or credential text: %q", linear.refusedReason)
+		}
+		if !strings.Contains(linear.refusedReason, "ci/build") {
+			t.Fatalf("refused reason missing configured check name: %q", linear.refusedReason)
+		}
+	})
+
+	t.Run("merge conflicts", func(t *testing.T) {
+		api, git, linear := newAPI(t), &fakeGit{}, &fakeLinear{}
+		api.prExists, api.prBody = true, secret
+		passingRequiredChecks(api, "ci/build")
+		api.reviews = []map[string]any{{"user": map[string]any{"login": "alice"}, "state": "APPROVED", "body": secret, "submitted_at": "t1"}}
+		api.mergeable = boolPtr(false)
+		_, session := testLandingSession(t, api, git, linear, []string{"ci/build"}, "merge")
+		session.settings.Token = secret
+		if _, err := session.Land(context.Background()); err == nil {
+			t.Fatal("expected refusal")
+		}
+		if strings.Contains(linear.refusedReason, secret) {
+			t.Fatalf("refused reason leaked provider or credential text: %q", linear.refusedReason)
+		}
+		if !strings.Contains(linear.refusedReason, "merge conflicts") {
+			t.Fatalf("refused reason missing conflict gate: %q", linear.refusedReason)
+		}
+	})
 }
 
 func TestLandRefusesOnEffectiveChangesRequestedReview(t *testing.T) {
@@ -1964,6 +2019,11 @@ func TestLandExhaustionRefusesOnceWithGateComment(t *testing.T) {
 	if linear.refused != 1 || linear.refusedDestState != "Merging" {
 		t.Fatalf("refused=%d dest=%q", linear.refused, linear.refusedDestState)
 	}
+	// The deferred refusal path (exhausted retry budget) must also record which
+	// gate caused it, not only the immediate refusal path (PMR-159).
+	if !strings.Contains(linear.refusedReason, "required checks failed") {
+		t.Fatalf("deferred refusal reason did not name the gate: %q", linear.refusedReason)
+	}
 	if len(linear.landComments) != 1 || !strings.Contains(linear.landComments[0], "required checks failed") {
 		t.Fatalf("exhaustion comment=%v", linear.landComments)
 	}
@@ -1995,6 +2055,9 @@ func TestLandFinalizeAfterTurnEnd(t *testing.T) {
 	session.FinalizeLanding(context.Background())
 	if linear.refused != 1 || linear.refusedDestState != "Merging" {
 		t.Fatalf("finalize did not fire the transition: refused=%d", linear.refused)
+	}
+	if !strings.Contains(linear.refusedReason, "required checks failed") {
+		t.Fatalf("finalize reason did not name the gate: %q", linear.refusedReason)
 	}
 	if len(linear.landComments) != 1 || !strings.Contains(linear.landComments[0], "required checks failed") {
 		t.Fatalf("finalize comment=%v", linear.landComments)
@@ -2157,6 +2220,11 @@ func TestLandRefusesOnDivergedWorktreeHead(t *testing.T) {
 	}
 	if linear.refused != 1 || api.merges != 0 {
 		t.Fatalf("refused=%d merges=%d", linear.refused, api.merges)
+	}
+	// A diverged worktree head is a different gate from failing required
+	// checks and must be named distinctly in the recorded reason (PMR-159).
+	if !strings.Contains(linear.refusedReason, "diverged") || strings.Contains(linear.refusedReason, "required checks failed") {
+		t.Fatalf("refused reason did not name the diverged-head gate: %q", linear.refusedReason)
 	}
 }
 

@@ -322,15 +322,43 @@ func TestEnsureMergeStateRequiresExactCurrentState(t *testing.T) {
 func TestRefuseLandingAppliesConfiguredFallbackOnlyFromExactMergeState(t *testing.T) {
 	f := newHandoffFixture(t)
 	session := mergingSession(t, f, map[string]string{"Merging": "In Review"})
-	changed, err := session.RefuseLanding(context.Background(), "Merging")
+	var logs bytes.Buffer
+	session.logger = slog.New(slog.NewJSONHandler(&logs, nil))
+	changed, err := session.RefuseLanding(context.Background(), "Merging", "github required checks failed: build")
 	if err != nil || !changed || f.stateName != "In Review" || f.transitionAttempts != 1 {
 		t.Fatalf("changed=%v err=%v state=%s transitions=%d", changed, err, f.stateName, f.transitionAttempts)
 	}
+	edge := findLogRecord(t, &logs, "Linear transition")
+	if edge["operation"] != "landing_refused" || edge["reason"] != "github required checks failed: build" {
+		t.Fatalf("landing_refused edge missing operation/reason: %v", edge)
+	}
 	// The issue is no longer exactly in Merging (a prior call already moved
 	// it, or a human did): a retry must be a safe no-op, not another edge.
-	changed, err = session.RefuseLanding(context.Background(), "Merging")
+	changed, err = session.RefuseLanding(context.Background(), "Merging", "github required checks failed: build")
 	if err != nil || changed || f.transitionAttempts != 1 {
 		t.Fatalf("second call changed=%v err=%v transitions=%d", changed, err, f.transitionAttempts)
+	}
+}
+
+func TestRefuseLandingLogsTheGateReasonThatCausedIt(t *testing.T) {
+	// Two different gate reasons must produce two distinguishable log records,
+	// so an operator never has to re-derive which gate fired from the source
+	// (PMR-159).
+	for _, reason := range []string{
+		"github required checks failed: build",
+		"github land worktree head diverged from the published pull request",
+	} {
+		f := newHandoffFixture(t)
+		session := mergingSession(t, f, map[string]string{"Merging": "In Review"})
+		var logs bytes.Buffer
+		session.logger = slog.New(slog.NewJSONHandler(&logs, nil))
+		if _, err := session.RefuseLanding(context.Background(), "Merging", reason); err != nil {
+			t.Fatalf("reason %q: %v", reason, err)
+		}
+		edge := findLogRecord(t, &logs, "Linear transition")
+		if edge["reason"] != reason {
+			t.Fatalf("reason %q: logged reason = %v", reason, edge["reason"])
+		}
 	}
 }
 
@@ -338,7 +366,7 @@ func TestRefuseLandingIsANoOpWithoutAConfiguredFallbackEdge(t *testing.T) {
 	f := newHandoffFixture(t)
 	// No "Merging" source configured: only an unrelated edge exists.
 	session := mergingSession(t, f, map[string]string{"Todo": "In Progress"})
-	changed, err := session.RefuseLanding(context.Background(), "Merging")
+	changed, err := session.RefuseLanding(context.Background(), "Merging", "github required checks failed: build")
 	if err != nil || changed || f.transitionAttempts != 0 {
 		t.Fatalf("changed=%v err=%v transitions=%d", changed, err, f.transitionAttempts)
 	}
