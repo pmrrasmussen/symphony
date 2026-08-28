@@ -615,6 +615,184 @@ wait
 	}
 }
 
+// TestContinueReusesFrozenClientFieldsAcrossTurns pins Continue's documented
+// choice (backend.go's Continue) to rebuild the second turn's request from
+// the client's own fields, frozen once at Start, rather than from anything
+// live: the settings callback returns a different value on every call here,
+// yet the second turn/start still carries the workspace, approval policy, and
+// sandbox policy the session started with, and the settings callback is never
+// consulted again to produce them.
+func TestContinueReusesFrozenClientFieldsAcrossTurns(t *testing.T) {
+	dir := t.TempDir()
+	captured := filepath.Join(dir, "second-turn.json")
+	script := writeAppServer(t, dir, `
+IFS= read -r line
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'
+IFS= read -r line
+IFS= read -r line
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thread-1"}}}'
+IFS= read -r line
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn-1"}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{}}'
+IFS= read -r line
+printf '%s\n' "$line" > `+captured+`
+printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"turn":{"id":"turn-2"}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{}}'
+`)
+	settingsCalls := 0
+	settingsFn := func() config.Settings {
+		settingsCalls++
+		// A distinct value on every call: if Continue read this even once, it
+		// would be observable in the captured params asserted below.
+		return config.Settings{GitHub: config.GitHub{Owner: fmt.Sprintf("reload-%d", settingsCalls)}}
+	}
+	b := NewWithProviders(settingsFn, linear.NewHandoff(settingsFn), nil)
+	sandbox := map[string]any{"type": "workspaceWrite", "writableRoots": []string{"/frozen/root"}}
+	session, events, err := b.Start(context.Background(), domain.AgentRequest{
+		Workspace: dir, Prompt: "first", Command: "sh " + script,
+		ApprovalPolicy: "on-request", ThreadSandbox: "workspace-write", TurnSandboxPolicy: sandbox,
+		TurnTimeout: time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range events {
+	}
+	callsAfterStart := settingsCalls
+
+	continued, err := b.Continue(context.Background(), session, "second")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range continued {
+	}
+
+	if settingsCalls != callsAfterStart {
+		t.Fatalf("Continue consulted the settings callback: calls after Start=%d after Continue=%d", callsAfterStart, settingsCalls)
+	}
+	data, err := os.ReadFile(captured)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var request struct {
+		Params struct {
+			Cwd            string         `json:"cwd"`
+			ApprovalPolicy string         `json:"approvalPolicy"`
+			SandboxPolicy  map[string]any `json:"sandboxPolicy"`
+		} `json:"params"`
+	}
+	if err := json.Unmarshal(data, &request); err != nil {
+		t.Fatalf("captured second turn/start not JSON: %s", data)
+	}
+	if request.Params.Cwd != dir || request.Params.ApprovalPolicy != "on-request" {
+		t.Fatalf("second turn/start did not carry the frozen workspace/approval policy: %s", data)
+	}
+	want := map[string]any{"type": "workspaceWrite", "writableRoots": []any{"/frozen/root"}}
+	if !reflect.DeepEqual(request.Params.SandboxPolicy, want) {
+		t.Fatalf("second turn/start did not carry the frozen sandbox policy: got %v want %v", request.Params.SandboxPolicy, want)
+	}
+}
+
+// TestTurnStartFailureForceClosesActiveChannelBeforeActivation covers the
+// first of turn()'s two forceCloseActive call sites: the app-server process
+// exits with turn/start outstanding (an abort mid-turn), which fails that
+// pending call before activate() ever ran. forceCloseActive must still detach
+// and close the turn's channels, and turn() must report the failure without
+// ever handing back an events channel nobody can drain.
+func TestTurnStartFailureForceClosesActiveChannelBeforeActivation(t *testing.T) {
+	dir := t.TempDir()
+	script := writeAppServer(t, dir, `
+IFS= read -r line
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'
+IFS= read -r line
+IFS= read -r line
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thread-1"}}}'
+IFS= read -r line
+exit 0
+`)
+	c, err := start(context.Background(), request(dir, script), hostenv.Filter(os.Environ(), nil, config.Settings{}, nil), nil, realTimer{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.callWithTimeout(context.Background(), "initialize", map[string]any{}, c.startTimeout); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.notify("initialized", map[string]any{}); err != nil {
+		t.Fatal(err)
+	}
+	res, err := c.callWithTimeout(context.Background(), "thread/start", map[string]any{"cwd": dir}, c.startTimeout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	thread, ok := nestedString(res, "thread", "id")
+	if !ok {
+		t.Fatalf("thread/start response=%v", res)
+	}
+
+	_, events, turnErr := c.turn(context.Background(), thread, "work", domain.AgentRequest{Workspace: dir})
+	if turnErr == nil || !strings.Contains(turnErr.Error(), "process exited") {
+		t.Fatalf("turn error=%v, want the aborted process reported", turnErr)
+	}
+	if events != nil {
+		t.Fatal("a forced-closed turn must not hand back an events channel")
+	}
+	c.mu.Lock()
+	active, activeDone, activeReady := c.active, c.activeDone, c.activeReady
+	c.mu.Unlock()
+	if active != nil || activeDone != nil || activeReady {
+		t.Fatalf("forceCloseActive did not detach the turn's channels: active=%v activeDone=%v activeReady=%v", active, activeDone, activeReady)
+	}
+}
+
+// TestMalformedTurnStartResponseForceClosesActiveChannelBeforeActivation
+// covers turn()'s second forceCloseActive call site: a turn/start response
+// that answers but omits turn.id, the teardown-before-the-stream-is-ready
+// case, since activate() never runs on this path either.
+func TestMalformedTurnStartResponseForceClosesActiveChannelBeforeActivation(t *testing.T) {
+	dir := t.TempDir()
+	script := writeAppServer(t, dir, `
+IFS= read -r line
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'
+IFS= read -r line
+IFS= read -r line
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thread-1"}}}'
+IFS= read -r line
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{}}'
+`)
+	c, err := start(context.Background(), request(dir, script), hostenv.Filter(os.Environ(), nil, config.Settings{}, nil), nil, realTimer{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.callWithTimeout(context.Background(), "initialize", map[string]any{}, c.startTimeout); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.notify("initialized", map[string]any{}); err != nil {
+		t.Fatal(err)
+	}
+	res, err := c.callWithTimeout(context.Background(), "thread/start", map[string]any{"cwd": dir}, c.startTimeout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	thread, ok := nestedString(res, "thread", "id")
+	if !ok {
+		t.Fatalf("thread/start response=%v", res)
+	}
+
+	_, events, turnErr := c.turn(context.Background(), thread, "work", domain.AgentRequest{Workspace: dir})
+	if turnErr == nil || !strings.Contains(turnErr.Error(), "malformed turn/start response") {
+		t.Fatalf("turn error=%v, want the malformed response reported", turnErr)
+	}
+	if events != nil {
+		t.Fatal("a forced-closed turn must not hand back an events channel")
+	}
+	c.mu.Lock()
+	active, activeDone, activeReady := c.active, c.activeDone, c.activeReady
+	c.mu.Unlock()
+	if active != nil || activeDone != nil || activeReady {
+		t.Fatalf("forceCloseActive did not detach the turn's channels: active=%v activeDone=%v activeReady=%v", active, activeDone, activeReady)
+	}
+}
+
 func TestDrainReportsBoundedRedactedStderrBeforeTurn(t *testing.T) {
 	c := &client{}
 	drain(strings.NewReader("token=do-not-log-this\n"), c.diagnostic)
