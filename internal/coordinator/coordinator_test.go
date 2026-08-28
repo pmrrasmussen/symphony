@@ -877,10 +877,10 @@ func TestUpdateUsageAuthoritativeReplacesInflatedProvisionalPeak(t *testing.T) {
 }
 
 // TestUpdateUsageNonAuthoritativeNotificationsAccumulate pins the behavior
-// updateUsage's component-wise max() was written for: Codex's turn/completed
-// notifications are genuinely cumulative and monotonically increasing, so
-// repeated or successive notifications merge into a running total rather than
-// ever regressing (PMR-153).
+// updateUsage's component-wise max() was written for: Codex's
+// thread/tokenUsage/updated notifications are genuinely cumulative and
+// monotonically increasing, so repeated or successive notifications merge
+// into a running total rather than ever regressing (PMR-153).
 func TestUpdateUsageNonAuthoritativeNotificationsAccumulate(t *testing.T) {
 	w := testSettings(t)
 	issue := testIssue()
