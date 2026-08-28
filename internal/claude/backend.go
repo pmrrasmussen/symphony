@@ -93,6 +93,9 @@ type Backend struct {
 	handoff  *linear.Handoff
 	github   *githubhost.Manager
 	endpoint *mcpbridge.Server
+	// timer schedules every turn's budget. It defaults to the real one and is
+	// replaced only by a test. See Timer.
+	timer Timer
 
 	mu       sync.Mutex
 	sessions map[string]*session
@@ -156,7 +159,7 @@ type session struct {
 // New builds a Claude backend with no Symphony capabilities at all. secretNames
 // are environment variable names whose values must never reach the child.
 func New(settings func() config.Settings, secretNames ...string) *Backend {
-	return &Backend{settings: settings, secretNames: secretNames, sessions: map[string]*session{}}
+	return &Backend{settings: settings, secretNames: secretNames, sessions: map[string]*session{}, timer: realTimer{}}
 }
 
 // NewWithProviders binds already-built host providers, and the endpoint that
@@ -570,7 +573,7 @@ func (b *Backend) run(ctx context.Context, s *session, r domain.AgentRequest, re
 	if !resume {
 		s.request = r
 	}
-	t, err := spawn(ctx, r, contract, environment, events, endpoint)
+	t, err := spawn(ctx, r, contract, environment, events, endpoint, b.timer)
 	if err != nil {
 		s.mu.Unlock()
 		// Nothing will ever read this registration's stream, and no turn will
@@ -639,6 +642,9 @@ type turn struct {
 	exited chan struct{}
 
 	timeout time.Duration
+	// timer is the seam the turn's budget is scheduled on, carried from the
+	// backend so a test can decide when that budget elapses. See Timer.
+	timer Timer
 
 	// killOnce bounds the process-group signal to one delivery per turn. The
 	// group kill deliberately bypasses Go's post-Wait guard, so repeating it
@@ -671,7 +677,7 @@ type turn struct {
 }
 
 // spawn starts the CLI with the prompt on stdin and a scrubbed environment.
-func spawn(ctx context.Context, r domain.AgentRequest, contract launchContract, environment []string, events *sink, endpoint *capabilityEndpoint) (*turn, error) {
+func spawn(ctx context.Context, r domain.AgentRequest, contract launchContract, environment []string, events *sink, endpoint *capabilityEndpoint, timer Timer) (*turn, error) {
 	command := strings.TrimSpace(r.Command)
 	if command == "" {
 		command = "claude"
@@ -715,7 +721,7 @@ func spawn(ctx context.Context, r domain.AgentRequest, contract launchContract, 
 	opened = append(opened, stdin)
 	t := &turn{
 		cmd: cmd, stdout: stdout, stderr: stderr, exited: make(chan struct{}), timeout: r.TurnTimeout,
-		sink: events, contract: contract,
+		timer: timer, sink: events, contract: contract,
 	}
 	if endpoint != nil {
 		t.endpointURL, t.endpointToken = endpoint.url, endpoint.token
@@ -822,17 +828,18 @@ func (t *turn) stream(s *session, r domain.AgentRequest, turnNumber int) {
 	pending := map[string]pendingCall{}
 
 	// The turn budget is enforced here rather than by the context, so the
-	// timeout is reported as a normalized failure instead of an opaque kill.
-	var timer *time.Timer
+	// timeout is reported as a normalized failure instead of an opaque kill. It
+	// is scheduled on the timer seam so a test can elapse it rather than wait it
+	// out (see Timer).
 	timedOut := make(chan struct{})
 	if t.timeout > 0 {
-		timer = time.AfterFunc(t.timeout, func() {
+		stop := t.timer.AfterFunc(t.timeout, func() {
 			close(timedOut)
 			// kill closes the pipes as well, which is what unblocks the read
 			// loop below and lets this turn report its own timeout.
 			t.kill()
 		})
-		defer timer.Stop()
+		defer stop()
 	}
 
 	stderr := &boundedTail{}

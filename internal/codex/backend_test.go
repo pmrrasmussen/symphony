@@ -20,6 +20,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pmrrasmussen/symphony/internal/agenttest"
 	"github.com/pmrrasmussen/symphony/internal/capability"
 	"github.com/pmrrasmussen/symphony/internal/config"
 	"github.com/pmrrasmussen/symphony/internal/domain"
@@ -97,7 +98,7 @@ printf '%s\n' 'token=do-not-log-this' >&2
 	// This test is about stderr, not the environment, so it hands the child the
 	// filter's own no-op result rather than nil: a nil Env would inherit the
 	// test process's environment whole, which is never what a real launch does.
-	c, err := start(context.Background(), request(dir, script), hostenv.Filter(os.Environ(), nil, config.Settings{}, nil), nil)
+	c, err := start(context.Background(), request(dir, script), hostenv.Filter(os.Environ(), nil, config.Settings{}, nil), nil, realTimer{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -445,15 +446,23 @@ func TestDrainOversizedLineIsMaskedForCredentials(t *testing.T) {
 	}
 }
 
+// TestStartFailsPromptlyWhenProcessExitsWithPendingRequest pins that an
+// app-server which exits with a request outstanding fails that request on its
+// exit rather than leaving it to time out.
+//
+// "Promptly" is asserted by giving the session a timer that never elapses: with
+// no budget available to expire, the exit path is the only thing that can end
+// this call at all. It used to be asserted with a two-second context deadline,
+// which made a loaded machine's slow child look like the bug (PMR-96).
 func TestStartFailsPromptlyWhenProcessExitsWithPendingRequest(t *testing.T) {
 	dir := t.TempDir()
 	script := writeAppServer(t, dir, `
 IFS= read -r line
 exit 7
 `)
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	_, _, err := New().Start(ctx, request(dir, script))
+	b := New()
+	timedBackend(t, b)
+	_, _, err := b.Start(context.Background(), request(dir, script))
 	if err == nil || !strings.Contains(err.Error(), "process exited") {
 		t.Fatalf("error=%v", err)
 	}
@@ -782,60 +791,130 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{}}'
 	}
 }
 
-// TestStartTimeoutGovernsThreadStartDistinctlyFromReadTimeout proves the
-// cold-start seam (PMR-57): a thread/start that takes longer than the small
-// steady-state read timeout still succeeds when it stays within the generous
-// start timeout, and a thread/start is bounded by the start timeout rather
-// than the read timeout (a large read timeout cannot rescue it).
-func TestStartTimeoutGovernsThreadStartDistinctlyFromReadTimeout(t *testing.T) {
-	// The handshake responds immediately; only thread/start is deliberately slow
-	// (2s), well beyond a small read timeout.
-	slowThreadStart := `
+// gatedThreadStart is an app-server that answers the handshake at once and then
+// holds thread/start -- and, after that, turn/start -- open until the test
+// releases each in turn. Each hold announces itself with a marker file first, so
+// a test knows which call is outstanding rather than guessing: initialize and
+// thread/start share the start timeout, so "a start-timeout budget exists" does
+// not on its own say which of the two it belongs to.
+//
+// Holding a call open is what makes the budget governing it observable, and the
+// release is a handshake with the test, so nothing here is timed.
+func gatedThreadStart(dir string) string {
+	hold := func(call string) string {
+		return "printf 'x\\n' > " + filepath.Join(dir, "at-"+call) + "\n" +
+			"until [ -f " + filepath.Join(dir, "release-"+call) + " ]; do sleep 0.005; done\n"
+	}
+	return `
 IFS= read -r line
 printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'
 IFS= read -r line
 IFS= read -r line
-sleep 2
-printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thread-1"}}}'
+` + hold("thread-start") + `printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thread-1"}}}'
 IFS= read -r line
-printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn-1"}}}'
+` + hold("turn-start") + `printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn-1"}}}'
 printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{}}'
 `
-	t.Run("start timeout covers a slow thread/start beyond the read timeout", func(t *testing.T) {
-		dir := t.TempDir()
-		script := writeAppServer(t, dir, slowThreadStart)
+}
+
+// awaitHeld blocks until the scripted app-server is holding the named call open,
+// which is the point at which the only live budget is that call's.
+func awaitHeld(t *testing.T, dir, call string) {
+	t.Helper()
+	agenttest.AwaitFile(t, filepath.Join(dir, "at-"+call), func(string) bool { return true },
+		"the scripted app-server never reached "+call)
+}
+
+func release(t *testing.T, dir, call string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, "release-"+call), []byte("go\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestStartTimeoutGovernsThreadStartDistinctlyFromReadTimeout proves the
+// cold-start seam (PMR-57): thread/start is bounded by the generous start
+// timeout and not by the small steady-state read timeout, so a cold app-server's
+// first model load cannot trip mid-turn hang detection -- while every RPC after
+// it keeps the read timeout.
+//
+// The assertion is which budget is live while a call is outstanding, which is
+// the bound itself rather than a proxy for it. It used to be "a thread/start
+// that slept two real seconds neither failed nor was rescued", and that made the
+// outcome depend on how much CPU the test got: both halves failed reproducibly
+// under concurrent load, because a handshake that lost the CPU for a second
+// tripped the bound the test was not testing (PMR-96).
+func TestStartTimeoutGovernsThreadStartDistinctlyFromReadTimeout(t *testing.T) {
+	// A read timeout far smaller than the start timeout, so which of the two is
+	// scheduled is unambiguous. Neither elapses unless a subtest says so.
+	settings := func(dir, script string) domain.AgentRequest {
 		req := request(dir, script)
-		// The 2s thread/start exceeds this read timeout but stays within the
-		// generous start timeout, so a cold start must still succeed.
 		req.ReadTimeout = 200 * time.Millisecond
 		req.StartTimeout = 10 * time.Second
-		_, events, err := New().Start(context.Background(), req)
-		if err != nil {
-			t.Fatalf("cold thread/start within start timeout failed: %v", err)
+		return req
+	}
+	t.Run("thread/start is governed by the start timeout and the next call by the read timeout", func(t *testing.T) {
+		dir := t.TempDir()
+		script := writeAppServer(t, dir, gatedThreadStart(dir))
+		req := settings(dir, script)
+		b := New()
+		timer := timedBackend(t, b)
+		type outcome struct {
+			events <-chan domain.Event
+			err    error
+		}
+		started := make(chan outcome, 1)
+		go func() {
+			_, events, err := b.Start(context.Background(), req)
+			started <- outcome{events: events, err: err}
+		}()
+		// While thread/start is outstanding, the start timeout is the only live
+		// budget: a read timeout among them would mean the small steady-state
+		// bound governs a cold start.
+		awaitHeld(t, dir, "thread-start")
+		if live := timer.AwaitLive(t, req.StartTimeout); len(live) != 1 {
+			t.Fatalf("live budgets while thread/start was outstanding=%v, want only the start timeout", live)
+		}
+		release(t, dir, "thread-start")
+		// turn/start is a steady-state RPC, so it is the read timeout's.
+		awaitHeld(t, dir, "turn-start")
+		if live := timer.AwaitLive(t, req.ReadTimeout); len(live) != 1 {
+			t.Fatalf("live budgets while turn/start was outstanding=%v, want only the read timeout", live)
+		}
+		release(t, dir, "turn-start")
+		result := agenttest.Await(t, started, "the released thread/start never returned from Start")
+		if result.err != nil {
+			t.Fatalf("a cold start inside the start timeout failed: %v", result.err)
 		}
 		seenCompleted := false
-		for event := range events {
+		for _, event := range agenttest.DrainEvents(t, result.events) {
 			if event.Kind == domain.EventFailed {
-				t.Fatalf("slow-but-in-budget thread/start produced failure: %+v", event)
+				t.Fatalf("a slow-but-in-budget thread/start produced failure: %+v", event)
 			}
 			seenCompleted = seenCompleted || event.Kind == domain.EventCompleted
 		}
 		if !seenCompleted {
-			t.Fatal("slow-but-in-budget thread/start did not complete")
+			t.Fatal("a slow-but-in-budget thread/start did not complete")
 		}
 	})
-	t.Run("start timeout bounds thread/start regardless of a large read timeout", func(t *testing.T) {
+	t.Run("the elapsed start timeout is what fails a thread/start", func(t *testing.T) {
 		dir := t.TempDir()
-		script := writeAppServer(t, dir, slowThreadStart)
-		req := request(dir, script)
-		// A large read timeout cannot rescue thread/start: it is governed by the
-		// start timeout, which the 2s delay exceeds. The handshake responds well
-		// within this 1s budget, so the bound that fires is thread/start's.
-		req.ReadTimeout = 10 * time.Second
-		req.StartTimeout = time.Second
-		_, _, err := New().Start(context.Background(), req)
+		script := writeAppServer(t, dir, gatedThreadStart(dir))
+		req := settings(dir, script)
+		b := New()
+		timer := timedBackend(t, b)
+		failed := make(chan error, 1)
+		go func() {
+			_, _, err := b.Start(context.Background(), req)
+			failed <- err
+		}()
+		// The release marker is never written: with thread/start held open, its
+		// budget elapsing is the only thing that can end this call.
+		awaitHeld(t, dir, "thread-start")
+		timer.Elapse(t, req.StartTimeout)
+		err := agenttest.Await(t, failed, "the elapsed start timeout did not end thread/start at all")
 		if err == nil || !strings.Contains(err.Error(), "thread/start timed out") {
-			t.Fatalf("start timeout did not bound thread/start: err=%v", err)
+			t.Fatalf("the elapsed start timeout did not bound thread/start: err=%v", err)
 		}
 	})
 }
@@ -1321,7 +1400,17 @@ func (w responseThenExitWriteCloser) Write(p []byte) (int, error) {
 func (responseThenExitWriteCloser) Close() error { return nil }
 
 func bareClient(in io.WriteCloser) *client {
-	return &client{in: in, pending: map[int]chan callResult{}, done: make(chan struct{})}
+	return &client{in: in, timer: realTimer{}, pending: map[int]chan callResult{}, done: make(chan struct{})}
+}
+
+// timedBackend is a backend whose every session bound -- the handshake and
+// thread/start budgets, and the turn budget -- elapses when this test says so
+// rather than when a real clock says so. See codex.Timer and agenttest.FakeTimer.
+func timedBackend(t *testing.T, b *Backend) *agenttest.FakeTimer {
+	t.Helper()
+	timer := agenttest.NewFakeTimer()
+	b.timer = timer
+	return timer
 }
 
 func pendingCount(c *client) int {
