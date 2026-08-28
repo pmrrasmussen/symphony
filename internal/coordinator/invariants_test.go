@@ -60,6 +60,17 @@ func (c *Coordinator) checkInvariants() error {
 			return fmt.Errorf("%s: kept landing-wait accounting without a claim", id)
 		case st.landingEscalated && st.landingWaits == 0:
 			return fmt.Errorf("%s: escalated a landing wait it never had", id)
+		// The accumulated per-issue usage is meaningful only under the claim
+		// whose attempts spent it: the claim is the episode, so a released
+		// record still carrying a total would attribute one episode's cost to
+		// the next one to claim the issue (PMR-151).
+		case !st.claimed && st.usage != (domain.Usage{}):
+			return fmt.Errorf("%s: kept accumulated usage %+v without a claim", id, st.usage)
+		// The total only ever accrues, so no component may go negative: an
+		// authoritative correction subtracts an overshoot that was added to
+		// this same total first (see usageSpent).
+		case st.usage.InputTokens < 0 || st.usage.OutputTokens < 0 || st.usage.TotalTokens < 0:
+			return fmt.Errorf("%s: accumulated negative usage %+v", id, st.usage)
 		// The waiting escalation likewise only under a wait.
 		case st.waitingEscalated && st.waiting == nil:
 			return fmt.Errorf("%s: escalated a wait it is not in", id)
@@ -159,6 +170,18 @@ func (c *Coordinator) landingWaitRecords() int {
 		}
 	}
 	return count
+}
+
+// issueUsage is the issue's accumulated per-episode usage, so a test can
+// assert the total across attempts directly rather than only through whichever
+// surface happens to render it.
+func (c *Coordinator) issueUsage(id string) domain.Usage {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if st := c.states[id]; st != nil {
+		return st.usage
+	}
+	return domain.Usage{}
 }
 
 // admittedState is the normalized tracker state an issue's orchestrator slot

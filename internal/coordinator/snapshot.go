@@ -39,16 +39,22 @@ type Snapshot struct {
 }
 
 type RunningSnapshot struct {
-	IssueIdentifier      string                        `json:"issue_identifier"`
-	IssueState           string                        `json:"issue_state"`
-	SessionID            string                        `json:"session_id"`
-	ThreadID             string                        `json:"thread_id"`
-	TurnID               string                        `json:"turn_id"`
-	Attempt              int                           `json:"attempt"`
-	TurnCount            int                           `json:"turn_count"`
-	StartedAt            time.Time                     `json:"started_at"`
-	LastEventAt          time.Time                     `json:"last_activity_at"`
-	Usage                domain.Usage                  `json:"usage"`
+	IssueIdentifier string       `json:"issue_identifier"`
+	IssueState      string       `json:"issue_state"`
+	SessionID       string       `json:"session_id"`
+	ThreadID        string       `json:"thread_id"`
+	TurnID          string       `json:"turn_id"`
+	Attempt         int          `json:"attempt"`
+	TurnCount       int          `json:"turn_count"`
+	StartedAt       time.Time    `json:"started_at"`
+	LastEventAt     time.Time    `json:"last_activity_at"`
+	Usage           domain.Usage `json:"usage"`
+	// IssueUsage is what the issue has spent across every attempt of the
+	// dispatch episode this run belongs to, where Usage above is this run's own
+	// figure. A retry starts a fresh domain.Run, so the per-run figure alone
+	// leaves an issue on its thirty-eighth attempt looking as cheap as one on
+	// its first (PMR-151); see issueState.usage for the episode it covers.
+	IssueUsage           domain.Usage                  `json:"issue_usage"`
 	RateLimit            map[string]int64              `json:"rate_limit,omitempty"`
 	OutstandingOperation *OutstandingOperationSnapshot `json:"outstanding_operation,omitempty"`
 }
@@ -65,6 +71,12 @@ type RetrySnapshot struct {
 	// check run from a gate that will never settle (PMR-78).
 	WaitAttempt int       `json:"wait_attempt,omitempty"`
 	Due         time.Time `json:"due_at"`
+	// IssueUsage is what the issue has already spent across this episode's
+	// finished attempts. A waiting retry holds no run at all, so this is the
+	// only place its cost is visible -- and an issue queued for yet another
+	// attempt is exactly when "is this worth continuing" is being asked
+	// (PMR-151).
+	IssueUsage domain.Usage `json:"issue_usage"`
 }
 
 // WaitingSnapshot is one issue sitting idle for waitReasonAtCapacity (eligible
@@ -105,10 +117,10 @@ func (c *Coordinator) Snapshot() Snapshot {
 	for _, st := range c.states {
 		if run := st.run; run != nil {
 			item := snapshotOutstanding(run.outstanding, now)
-			snapshot.Running = append(snapshot.Running, RunningSnapshot{IssueIdentifier: run.issue.Identifier, IssueState: run.issue.State, SessionID: run.session.ID, ThreadID: run.session.ThreadID, TurnID: run.session.TurnID, Attempt: run.run.Attempt, TurnCount: run.run.TurnCount, StartedAt: run.run.StartedAt, LastEventAt: run.last, Usage: run.run.Usage, RateLimit: copyRateLimit(run.rateLimit), OutstandingOperation: item})
+			snapshot.Running = append(snapshot.Running, RunningSnapshot{IssueIdentifier: run.issue.Identifier, IssueState: run.issue.State, SessionID: run.session.ID, ThreadID: run.session.ThreadID, TurnID: run.session.TurnID, Attempt: run.run.Attempt, TurnCount: run.run.TurnCount, StartedAt: run.run.StartedAt, LastEventAt: run.last, Usage: run.run.Usage, IssueUsage: st.usage, RateLimit: copyRateLimit(run.rateLimit), OutstandingOperation: item})
 		}
 		if retry := st.retry; retry != nil {
-			snapshot.Retrying = append(snapshot.Retrying, RetrySnapshot{IssueIdentifier: retry.issue.Identifier, Attempt: retry.attempt, Kind: string(retry.kind), Reason: retry.reason, WaitAttempt: st.landingWaits, Due: retry.due})
+			snapshot.Retrying = append(snapshot.Retrying, RetrySnapshot{IssueIdentifier: retry.issue.Identifier, Attempt: retry.attempt, Kind: string(retry.kind), Reason: retry.reason, WaitAttempt: st.landingWaits, Due: retry.due, IssueUsage: st.usage})
 		}
 		if wait := st.waiting; wait != nil {
 			age := now.Sub(wait.since).Milliseconds()

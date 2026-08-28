@@ -122,3 +122,53 @@ func TestTallDetailBodyScrollsInsteadOfBeingCutOff(t *testing.T) {
 		t.Fatalf("scrolled frame pushed the hint bar off screen:\n%s", view)
 	}
 }
+
+// TestDetailPagesShowPerIssueCostBesideTheRunFigure covers PMR-151's operator
+// surface. The two figures are deliberately different here: a run that has
+// spent 15 tokens on an issue that has spent 750 across its attempts is the
+// whole point -- the per-run number alone makes an issue on its thirty-eighth
+// attempt look as cheap as one on its first. Both renderers are checked,
+// because the plain one is the scriptable surface and a field that exists on
+// only one of them is the drift this dashboard keeps having to undo.
+func TestDetailPagesShowPerIssueCostBesideTheRunFigure(t *testing.T) {
+	now := time.Date(2026, 8, 25, 12, 0, 0, 0, time.UTC)
+	snapshot := &operator.Snapshot{Snapshot: status.Snapshot{Coordinator: coordinator.Snapshot{
+		Running: []coordinator.RunningSnapshot{{
+			IssueIdentifier: "PMR-75",
+			IssueState:      "In Progress",
+			TurnCount:       4,
+			Usage:           domain.Usage{InputTokens: 12, OutputTokens: 3, TotalTokens: 15},
+			IssueUsage:      domain.Usage{InputTokens: 600, OutputTokens: 150, TotalTokens: 750},
+		}},
+		// A queued retry holds no run at all, so its per-issue total is the
+		// only cost the row can carry.
+		Retrying: []coordinator.RetrySnapshot{{
+			IssueIdentifier: "PMR-76", Attempt: 38, Kind: "agent", Reason: "agent_event",
+			Due: now.Add(time.Minute), IssueUsage: domain.Usage{TotalTokens: 4200},
+		}},
+	}}}
+	instance := operator.Instance{
+		ID:       "com.pmrrasmussen.symphony",
+		Liveness: operator.LivenessRunning,
+		Config:   &operator.EffectiveConfig{MaxTurns: 20},
+		Snapshot: snapshot,
+	}
+
+	styled := styledFixture([]operator.Instance{instance}, now)
+	styled.page = statusPage
+	view := styled.View(now)
+	for _, want := range []string{"ISSUE TOKENS", "750", "4200"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("styled status page lost %q:\n%s", want, view)
+		}
+	}
+
+	plain := New([]operator.Instance{instance}, now)
+	plain, _ = plain.Update("enter")
+	text := plain.View(now)
+	for _, want := range []string{"tokens: input 12, output 3, total 15", "issue tokens: input 600, output 150, total 750", "issue tokens 4200"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("plain status view missing %q:\n%s", want, text)
+		}
+	}
+}

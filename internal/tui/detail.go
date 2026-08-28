@@ -226,12 +226,17 @@ func (m Model) agentTable(instance operator.Instance, now time.Time, style theme
 			formatSince(now, run.LastEventAt),
 			fmt.Sprintf("%d%s", run.TurnCount, turns),
 			fmt.Sprintf("%d", run.Usage.TotalTokens),
+			fmt.Sprintf("%d", run.IssueUsage.TotalTokens),
 			waiting,
 		})
 	}
+	// TOKENS is what this attempt has spent; ISSUE TOKENS is what the issue has
+	// spent across every attempt of the episode. Both sit beside TURNS on
+	// purpose: attempt and turn counts say how long an issue has been going, and
+	// only the cumulative figure says what that has cost (PMR-151).
 	return style.borderless(
-		[]string{"ISSUE", "STATE", "RUN", "QUIET", "TURNS", "TOKENS", "WAITING"},
-		rows, 2, 3, 4, 5)
+		[]string{"ISSUE", "STATE", "RUN", "QUIET", "TURNS", "TOKENS", "ISSUE TOKENS", "WAITING"},
+		rows, 2, 3, 4, 5, 6)
 }
 
 // retryTable lists the issues waiting for another attempt.
@@ -246,10 +251,14 @@ func (m Model) retryTable(instance operator.Instance, now time.Time, style theme
 			style.primary.Render(retry.IssueIdentifier),
 			retry.Kind + "/" + retry.Reason,
 			fmt.Sprintf("%d", retry.Attempt),
+			fmt.Sprintf("%d", retry.IssueUsage.TotalTokens),
 			formatTimeOrAge(now, retry.Due),
 		})
 	}
-	return style.borderless([]string{"RETRY", "REASON", "ATTEMPT", "DUE"}, rows, 2)
+	// A queued retry holds no run, so its own token column is the only cost this
+	// row can show -- and "is this worth another attempt" is the question being
+	// asked of exactly these rows.
+	return style.borderless([]string{"RETRY", "REASON", "ATTEMPT", "ISSUE TOKENS", "DUE"}, rows, 2, 3)
 }
 
 // configPanel groups the effective configuration. It renders only
