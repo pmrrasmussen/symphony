@@ -175,7 +175,7 @@ func (l *Local) Prepare(ctx context.Context, issue domain.Issue) (domain.Workspa
 			if err := l.writeState(issue, state); err != nil {
 				return domain.Workspace{}, err
 			}
-			if err := addWorktree(ctx, identity.sourceRoot, path); err != nil {
+			if err := addWorktree(ctx, identity.sourceRoot, path, settings.GitHub.BaseBranch); err != nil {
 				return domain.Workspace{}, err
 			}
 			worktreeDir, err := worktreeIdentity(ctx, path, identity.commonDir)
@@ -1289,13 +1289,23 @@ func gitMetadataAllowEmpty(ctx context.Context, dir string, args ...string) (str
 	return value, nil
 }
 
-func addWorktree(ctx context.Context, sourceRoot, path string) error {
-	if err := gitMutation(ctx, sourceRoot, "fetch", "--no-tags", "origin", "+refs/heads/main:refs/remotes/origin/main"); err != nil {
-		return fmt.Errorf("refresh origin/main before creating workspace: %w", err)
+// addWorktree fetches baseBranch, defaulting to "main" when the github
+// integration is not configured (config.decodeGitHub only applies that same
+// default while the integration remains enabled), so a worktree is created
+// from the branch github.base_branch actually names -- the same ref
+// Session.Publish's descendant check reads -- rather than a literal that
+// silently diverges from it (PMR-135).
+func addWorktree(ctx context.Context, sourceRoot, path, baseBranch string) error {
+	if baseBranch == "" {
+		baseBranch = "main"
 	}
-	baseCommit, err := gitMetadata(ctx, sourceRoot, "rev-parse", "--verify", "refs/remotes/origin/main^{commit}")
+	refspec := "+refs/heads/" + baseBranch + ":refs/remotes/origin/" + baseBranch
+	if err := gitMutation(ctx, sourceRoot, "fetch", "--no-tags", "origin", refspec); err != nil {
+		return fmt.Errorf("refresh origin/%s before creating workspace: %w", baseBranch, err)
+	}
+	baseCommit, err := gitMetadata(ctx, sourceRoot, "rev-parse", "--verify", "refs/remotes/origin/"+baseBranch+"^{commit}")
 	if err != nil {
-		return fmt.Errorf("resolve refreshed origin/main commit: %w", err)
+		return fmt.Errorf("resolve refreshed origin/%s commit: %w", baseBranch, err)
 	}
 	if err := gitMutation(ctx, sourceRoot, "worktree", "add", "--detach", path, baseCommit); err != nil {
 		return fmt.Errorf("create workspace worktree: %w", err)

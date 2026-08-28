@@ -261,6 +261,60 @@ func TestPrepareUsesRefreshedOriginMainWithoutChangingSourceCheckout(t *testing.
 	}
 }
 
+// TestPrepareFetchesConfiguredBaseBranchNotMain asserts a non-"main"
+// github.base_branch is the ref addWorktree fetches and creates the worktree
+// from, rather than the literal "main" -- which the publish gate (reading
+// refs/remotes/origin/<base>) does not check (PMR-135).
+func TestPrepareFetchesConfiguredBaseBranchNotMain(t *testing.T) {
+	remote := filepath.Join(t.TempDir(), "remote.git")
+	runGit(t, filepath.Dir(remote), "init", "--bare", remote)
+	source := filepath.Join(t.TempDir(), "source")
+	if err := os.Mkdir(source, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, source, "init")
+	runGit(t, source, "config", "user.email", "test@example.invalid")
+	runGit(t, source, "config", "user.name", "Test")
+	if err := os.WriteFile(filepath.Join(source, "README.md"), []byte("source\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, source, "add", "README.md")
+	runGit(t, source, "commit", "-m", "initial")
+	runGit(t, source, "branch", "-M", "develop")
+	runGit(t, source, "remote", "add", "origin", remote)
+	runGit(t, source, "push", "-u", "origin", "develop")
+	runGit(t, remote, "symbolic-ref", "HEAD", "refs/heads/develop")
+
+	publisher := cloneRepository(t, source)
+	if err := os.WriteFile(filepath.Join(publisher, "remote.txt"), []byte("remote develop\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, publisher, "add", "remote.txt")
+	runGit(t, publisher, "commit", "-m", "advance remote develop")
+	runGit(t, publisher, "push", "origin", "develop")
+	remoteDevelop := gitShow(t, publisher, "HEAD")
+
+	root := filepath.Join(t.TempDir(), "workspaces")
+	s := config.Settings{Workspace: config.Workspace{Root: root, SourceRoot: source}, GitHub: config.GitHub{BaseBranch: "develop"}}
+	l := New(func() config.Settings { return s })
+	issue := domain.Issue{ID: "issue-135", Identifier: "PMR-135"}
+	ws, err := l.Prepare(context.Background(), issue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = l.Cleanup(context.Background(), issue) })
+
+	if got := gitShow(t, ws.Path, "HEAD"); got != remoteDevelop {
+		t.Fatalf("workspace HEAD = %s, want refreshed origin/develop %s", got, remoteDevelop)
+	}
+	if got := gitShow(t, source, "origin/develop"); got != remoteDevelop {
+		t.Fatalf("source origin/develop = %s, want refreshed remote commit %s", got, remoteDevelop)
+	}
+	if out, err := exec.Command("git", "-C", source, "rev-parse", "--verify", "refs/remotes/origin/main").CombinedOutput(); err == nil {
+		t.Fatalf("addWorktree unexpectedly created refs/remotes/origin/main for a non-main base branch: %s", out)
+	}
+}
+
 func TestPrepareExistingWorkspaceDoesNotRefreshOrReset(t *testing.T) {
 	source := newGitRepository(t)
 	publisher := cloneRepository(t, source)
