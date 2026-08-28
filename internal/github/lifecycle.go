@@ -824,6 +824,18 @@ func (s *Session) completeLanding(ctx context.Context, pr pull) (LandResult, err
 	// below fails and is retried.
 	s.landed = true
 	s.waitingOutcome = false
+	// github_land_pr merges through the GitHub API and never fetches
+	// afterwards, so refs/remotes/origin/<base> -- shared across every
+	// worktree, since it lives in the Git common directory rather than any one
+	// session's worktree -- stays stale until something else fetches. Refresh
+	// it here, best effort: a merge that already succeeded must still be
+	// reconciled to Done even if this fetch fails, so failure is logged rather
+	// than returned (PMR-135).
+	s.manager.fetchMu.Lock()
+	if _, err := s.manager.git.Run(ctx, s.workspace, []string{"fetch", "origin", s.settings.BaseBranch}, nil); err != nil {
+		s.manager.logger.Warn("GitHub post-land base ref refresh failed", "issue_id", s.issue.ID, "issue_identifier", s.issue.Identifier, "repository", s.settings.Owner+"/"+s.settings.Repository, "error", observability.Text(err.Error()))
+	}
+	s.manager.fetchMu.Unlock()
 	if _, err := s.linear.CompleteLanding(ctx, s.settings.MergeState); err != nil {
 		return LandResult{}, err
 	}

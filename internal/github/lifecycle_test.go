@@ -618,6 +618,29 @@ func (g *staleBaseGit) Run(ctx context.Context, dir string, args, env []string) 
 	return g.fakeGit.Run(ctx, dir, args, env)
 }
 
+// countingFailFetchGit fails exactly the nth "fetch" invocation (1-indexed)
+// and otherwise delegates to fakeGit, letting a test isolate the post-land
+// base ref refresh (PMR-135) from the two fetches Land already performs
+// earlier for its own stale-base gate.
+type countingFailFetchGit struct {
+	*fakeGit
+	failOnFetch int
+	fetchCount  int
+}
+
+func (g *countingFailFetchGit) Run(ctx context.Context, dir string, args, env []string) (string, error) {
+	if args[0] == "fetch" {
+		g.mu.Lock()
+		g.fetchCount++
+		n := g.fetchCount
+		g.mu.Unlock()
+		if n == g.failOnFetch {
+			return "", errors.New("boom")
+		}
+	}
+	return g.fakeGit.Run(ctx, dir, args, env)
+}
+
 // divergedHeadGit reports that the worktree HEAD is not a descendant of the
 // published pull request's head, simulating a worktree whose local branch
 // diverged from what was last published.
@@ -2353,6 +2376,62 @@ func TestLandDuplicateCallAfterMergeIsIdempotent(t *testing.T) {
 	}
 	if linear.landCompleted != 1 {
 		t.Fatalf("duplicate landing completion=%d", linear.landCompleted)
+	}
+}
+
+// TestLandCompletionRefreshesBaseRefAfterMerge asserts a successful
+// github_land_pr merge refreshes refs/remotes/origin/<base>. Landing merges
+// through the GitHub API and otherwise never fetches afterwards, so this is
+// the one remaining way local state reliably goes stale (PMR-135).
+func TestLandCompletionRefreshesBaseRefAfterMerge(t *testing.T) {
+	api := newAPI(t)
+	api.prExists = true
+	passingRequiredChecks(api, "ci/build")
+	readyToLand(api)
+	git := &fakeGit{}
+	linear := &fakeLinear{}
+	_, session := testLandingSession(t, api, git, linear, []string{"ci/build"}, "merge")
+	result, err := session.Land(context.Background())
+	if err != nil || result.Status != LandMerged {
+		t.Fatalf("landing failed: result=%+v err=%v", result, err)
+	}
+	fetches := 0
+	for _, call := range git.calls {
+		if len(call) == 3 && call[0] == "fetch" && call[1] == "origin" && call[2] == "main" {
+			fetches++
+		}
+	}
+	if fetches != 3 {
+		t.Fatalf("git fetch origin main calls=%d, want exactly 3 (two pre-merge stale-base checks plus the post-merge refresh)", fetches)
+	}
+}
+
+// TestLandPostMergeBaseRefRefreshFailureIsLoggedNotFatal asserts a failed
+// post-merge fetch does not undo an already-succeeded, irreversible GitHub
+// merge: it is logged and Land still reports LandMerged (PMR-135).
+func TestLandPostMergeBaseRefRefreshFailureIsLoggedNotFatal(t *testing.T) {
+	api := newAPI(t)
+	api.prExists = true
+	passingRequiredChecks(api, "ci/build")
+	readyToLand(api)
+	git := &countingFailFetchGit{fakeGit: &fakeGit{}, failOnFetch: 3}
+	linear := &fakeLinear{}
+	manager, session := testLandingSession(t, api, git, linear, []string{"ci/build"}, "merge")
+	var log bytes.Buffer
+	manager.logger = slog.New(slog.NewJSONHandler(&log, nil))
+
+	result, err := session.Land(context.Background())
+	if err != nil {
+		t.Fatalf("post-land base ref refresh failure must not fail landing: %v", err)
+	}
+	if result.Status != LandMerged {
+		t.Fatalf("result=%+v", result)
+	}
+	if linear.landCompleted != 1 {
+		t.Fatalf("linear completion=%d", linear.landCompleted)
+	}
+	if !strings.Contains(log.String(), "post-land base ref refresh failed") {
+		t.Fatalf("log=%q, want the post-land refresh failure logged", log.String())
 	}
 }
 
