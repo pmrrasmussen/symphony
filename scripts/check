@@ -49,8 +49,20 @@ run_vet() {
 # go run, not go install: go install writes to GOBIN outside this repository,
 # which an agent sandbox does not grant write access to. go run only touches
 # the module cache.
+#
+# GOTOOLCHAIN=auto is scoped to this one invocation and is load-bearing in CI.
+# staticcheck v0.8.1 needs go >= 1.26 to *build itself*, while go.mod declares
+# go 1.25.0 and actions/setup-go pins GOTOOLCHAIN=local, so the default would
+# refuse to fetch a newer toolchain and fail before analysing anything:
+#
+#   honnef.co/go/tools@v0.8.1 requires go >= 1.26.0 (running go 1.25.0;
+#   GOTOOLCHAIN=local)
+#
+# Setting it here rather than raising go.mod's directive keeps the module's
+# declared minimum Go an independent decision: this only governs which
+# toolchain builds the linter, never what Symphony itself requires.
 run_lint() {
-	go run "honnef.co/go/tools/cmd/staticcheck@${STATICCHECK_VERSION}" ./...
+	GOTOOLCHAIN=auto go run "honnef.co/go/tools/cmd/staticcheck@${STATICCHECK_VERSION}" ./...
 }
 
 run_tests() {
