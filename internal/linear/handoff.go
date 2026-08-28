@@ -287,7 +287,11 @@ func (s *HandoffSession) EnsureMergeState(ctx context.Context, mergeState string
 // issue elsewhere is never overridden. A missing or stale configured edge is
 // reported by returning (false, nil): the caller's hard-gate refusal must still
 // be honored even when no fallback transition is available or currently valid.
-func (s *HandoffSession) RefuseLanding(ctx context.Context, mergeState string) (bool, error) {
+// reason is the fixed or repository-config derived gate string the GitHub
+// adapter refused landing for (never provider or model text); it is recorded
+// on the transition log record so an operator can tell which gate fired
+// without reading the source (PMR-159).
+func (s *HandoffSession) RefuseLanding(ctx context.Context, mergeState, reason string) (bool, error) {
 	s.handoffMu.Lock()
 	defer s.handoffMu.Unlock()
 	current, err := s.readScopedIssue(ctx)
@@ -321,7 +325,7 @@ func (s *HandoffSession) RefuseLanding(ctx context.Context, mergeState string) (
 		return false, trackerError("handoff_response", "Linear did not apply the configured Merging fallback transition")
 	}
 	s.issue = updated
-	s.logEdge(observability.OperationLandingRefused, mergeState, target)
+	s.logEdge(observability.OperationLandingRefused, mergeState, target, "reason", observability.Text(reason))
 	return true, nil
 }
 
@@ -509,17 +513,21 @@ func (s *HandoffSession) log(outcome string) {
 // reconstructable from Symphony's logs alone: the operation, the from/to state
 // NAMES, and the bound issue. It is deliberately redaction-safe — state names
 // and issue identifiers only, never a rendered comment, prompt, or issue text.
-func (s *HandoffSession) logEdge(operation observability.Operation, fromState, toState string) {
+// extra is an optional set of additional fixed key/value pairs (for example,
+// RefuseLanding's already-redacted "reason") appended after the fixed fields.
+func (s *HandoffSession) logEdge(operation observability.Operation, fromState, toState string, extra ...any) {
 	if s.logger == nil {
 		return
 	}
-	s.logger.Info("Linear transition",
+	attrs := []any{
 		"operation", operation,
 		"from_state", strings.TrimSpace(fromState),
 		"to_state", strings.TrimSpace(toState),
 		"issue_id", s.issue.ID,
 		"issue_identifier", s.issue.Identifier,
-	)
+	}
+	attrs = append(attrs, extra...)
+	s.logger.Info("Linear transition", attrs...)
 }
 
 // logSkip records, at debug level, an idempotent transition that was a no-op

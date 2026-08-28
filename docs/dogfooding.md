@@ -58,8 +58,13 @@ Both names are reserved: `internal/config` lists them in
 `ReservedSecretEnvNames`, and `internal/hostenv.Filter` strips them from the
 environment of every process Symphony spawns. An agent session therefore cannot
 read the credentials that published its own pull request -- which is also why a
-host-side refusal is undiagnosable from inside a session, and why the operator
-has to read the daemon log to explain one.
+`github_land_pr` hard-gate refusal is undiagnosable from inside a session, and
+why the operator has to read the daemon log to explain one: the info-level
+`"msg":"Linear transition"` record with `operation: landing_refused` carries
+the exact gate as `reason` (`github required checks failed: ...`, `github land
+worktree head diverged from the published pull request`, and so on -- see
+[observability.md](observability.md)), so which gate fired is answered by that
+one record instead of by reading `internal/github/lifecycle.go` (PMR-159).
 
 ## 3. `WORKFLOW.local.md`: the one untracked file
 

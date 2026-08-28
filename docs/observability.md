@@ -37,6 +37,26 @@ names and issue identifiers only — never a rendered comment, issue
 description, or credential. (Agent turn token accounting is tracked
 separately.)
 
+`operation: landing_refused` additionally carries `reason`: the exact hard
+gate that refused `github_land_pr`, so an operator can tell which one fired
+without reading `internal/github/lifecycle.go` (PMR-159). It is always one of
+a fixed, bounded set of host-authored strings — never a provider response
+body, model output, or credential — the same guarantee `landing_waiting`'s own
+`reason` already carries (see below): `github pull request for this issue is
+closed`, `github returned a mismatched pull request`, `github pull request
+head changed before landing`, `github required checks failed: <configured
+check names>`, `github pull request has an effective changes-requested
+review`, `github pull request has unresolved review threads`, `github pull
+request has merge conflicts`, `github land worktree head diverged from the
+published pull request`, `github land active issue is no longer in the
+configured Merging state`, `github land configured base branch changed before
+landing`, `github merge request was not accepted`, `github returned a pull
+request without a head commit`, `github land could not update stale pull
+request branch`, and `github returned an invalid pull request after branch
+update`. The same reason also lands on the deferred refusal fired after a
+bounded-fix session exhausts its retry attempts (`fireDeferredRefusal`), not
+only on an immediate hard-gate refusal.
+
 Symphony also logs state changes it did **not** perform. The poll loop
 remembers each issue it drove into the review `handoff_state`, and if such an
 issue later reappears as an active candidate it logs exactly one record for
@@ -172,9 +192,10 @@ distinct from the `blocked`/`failed` statuses and from an agent failure's
 warn-level `"msg":"agent run retry scheduled"` (`reason: turn_limit_exhausted`
 and friends). A terminal landing logs `"msg":"agent landing resolved"` with
 `operation: landing_resolved`, and the hard-gate fallback keeps its existing
-`"msg":"Linear transition"` record with `operation: landing_refused`. Together
-these four records distinguish waiting, the delayed retry, a hard refusal, and
-an agent failure without reading the Codex rollout.
+`"msg":"Linear transition"` record with `operation: landing_refused` and its
+`reason` (see above). Together these four records distinguish waiting, the
+delayed retry, a hard refusal (and which gate caused it), and an agent failure
+without reading the Codex rollout.
 
 At startup, the info log also records `startup credential configuration` with
 `linear_credentials_configured` and `github_credentials_configured` booleans.
