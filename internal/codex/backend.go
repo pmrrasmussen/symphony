@@ -188,6 +188,23 @@ func (b *Backend) Start(ctx context.Context, r domain.AgentRequest) (domain.Agen
 	}()
 	return s, events, nil
 }
+
+// Continue starts another turn on an already-running app-server session. Its
+// signature carries only the session and the new prompt, so unlike Start it
+// has no live AgentRequest to read: every other field the turn needs is
+// rebuilt from the client's own fields, frozen once from the request that
+// started the session. That is deliberate -- a mid-run settings reload must
+// not change the workspace, approval policy, sandbox policy, or turn timeout
+// out from under a session already running against them -- and Continue
+// cannot do otherwise even by accident, since nothing here ever calls
+// b.settings.
+//
+// Two AgentRequest fields are not part of that reconstruction, and neither
+// omission is a bug: Model is never read anywhere in this package (Codex's
+// model is fixed by its own configuration, not per-request, so Start does not
+// forward it either), and StartTimeout only bounds the cold-start handshake
+// and thread/start, both already behind this session -- turn() consults only
+// TurnTimeout and the client's own frozen readTimeout.
 func (b *Backend) Continue(ctx context.Context, s domain.AgentSession, prompt string) (<-chan domain.Event, error) {
 	b.mu.Lock()
 	c := b.sessions[s.ID]

@@ -81,6 +81,14 @@ func checkRunOutcome(status, conclusion string) checkOutcome {
 // will never report are both possible from a single snapshot), but
 // requiredCheckWaitReason surfaces the distinction in the wait reason so a
 // stuck landing is diagnosable instead of indistinguishable from a slow one.
+//
+// The check-run table is read after the combined-status table and
+// overwrites whatever that table set, so a name reported in both wins by
+// its check-run outcome, not its commit status. This is the only case where
+// the two tables can disagree for the same required name, and it is
+// deliberate rather than incidental: GitHub Actions reports the same job as
+// both a check run and a legacy commit status for backward compatibility,
+// and the check run is the richer, purpose-built representation.
 func (m *Manager) requiredCheckOutcomes(ctx context.Context, s config.GitHub, sha string, required []string) (map[string]checkOutcome, error) {
 	outcomes := make(map[string]checkOutcome, len(required))
 	for _, name := range required {
