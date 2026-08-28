@@ -64,7 +64,7 @@ why the operator has to read the daemon log to explain one: the info-level
 the exact gate as `reason` (`github required checks failed: ...`, `github land
 worktree head diverged from the published pull request`, and so on -- see
 [observability.md](observability.md)), so which gate fired is answered by that
-one record instead of by reading `internal/github/lifecycle.go` (PMR-159).
+one record instead of by reading `internal/github/land.go` (PMR-159).
 
 A `github_publish_pr` refusal is diagnosed the same way: the warn-level
 `"msg":"GitHub publish refused"` record with `operation: publish_refused`
