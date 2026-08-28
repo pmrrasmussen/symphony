@@ -246,6 +246,14 @@ refusal logs `terminal workspace cleanup failed` on every restart, so they
 accumulate as a visible backlog rather than as silent data loss. That is the
 guard working, not a bug.
 
+Every one of those warnings names a workspace that is still there. A successful
+landing used to be able to warn about a workspace it had just removed itself,
+because the run and the poll loop each cleaned up the same worktree at once and
+the loser reported the winner's completed removal as a `git` failure; since
+PMR-160 the two attempts serialize and only one has anything to remove. So a
+cleanup warning after a landing is worth reading rather than worth learning to
+ignore.
+
 Clearing the backlog is an operator decision, and the safe order is archive,
 then remove:
 

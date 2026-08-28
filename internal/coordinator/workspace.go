@@ -27,8 +27,23 @@ const workspaceCleanupTimeout = 15 * time.Second
 // reconciliation already holds live -- the poll loop's own stopTerminal branch
 // and a redispatch retry's refresh -- are authoritative: their failure is
 // always reported at WARN.
+//
+// This form is for the one authoritative caller that holds no run: a landing
+// retry whose refresh found the issue already terminal. It races no other
+// attempt, because an armed retry timer and a live session are mutually
+// exclusive.
 func (c *Coordinator) cleanupWorkspace(ctx context.Context, issue domain.Issue) {
-	c.finalizeWorkspace(ctx, issue, nil)
+	c.finalizeWorkspace(ctx, issue, nil, false)
+}
+
+// cleanupWorkspaceForRun is cleanupWorkspace for the poll loop's stopTerminal
+// branch, which holds the run it has just stopped. Passing that run is what
+// makes this attempt and the run's own run-end attempt one serialized pair
+// instead of two concurrent removals of a single worktree (PMR-160); see
+// running.cleanup. It stays authoritative: it runs on reconciliation's own live
+// context, and its failure is always reported at WARN.
+func (c *Coordinator) cleanupWorkspaceForRun(ctx context.Context, r *running, issue domain.Issue) {
+	c.finalizeWorkspace(ctx, issue, r, false)
 }
 
 // cleanupWorkspaceAtRunEnd releases a workspace from inside runTurns, at the
@@ -47,21 +62,46 @@ func (c *Coordinator) cleanupWorkspace(ctx context.Context, issue domain.Issue) 
 // only re-cleans up on stopTerminal -- so a failure raced by one of those must
 // still reach WARN, or a genuine leak is swallowed as a duplicate that never
 // actually gets retried.
+//
+// That authoritative attempt is a retry, not a second concurrent removal: it
+// waits for this one through running.cleanup and only runs at all if this one
+// failed (PMR-160).
 func (c *Coordinator) cleanupWorkspaceAtRunEnd(ctx context.Context, r *running, issue domain.Issue) {
 	cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), workspaceCleanupTimeout)
 	defer cancel()
-	c.finalizeWorkspace(cctx, issue, r)
+	c.finalizeWorkspace(cctx, issue, r, true)
 }
 
-// finalizeWorkspace is cleanupWorkspace's and cleanupWorkspaceAtRunEnd's
-// shared implementation. r is nil for an authoritative caller and set for the
-// run-end caller whose failure reporting depends on whether reconciliation
-// raced it.
-func (c *Coordinator) finalizeWorkspace(ctx context.Context, issue domain.Issue, r *running) {
+// finalizeWorkspace is the shared implementation behind all three entry points.
+// r is the run whose workspace this is, or nil for a caller that holds none,
+// and atRunEnd marks the run-end caller whose failure reporting depends on
+// whether reconciliation raced it.
+//
+// Everything past the gate runs at most once per finished run: an attempt that
+// removed the workspace leaves nothing for the next caller to remove, report,
+// or tell the host about, so the next caller returns without calling Cleanup at
+// all. An attempt that failed leaves the workspace where it is, so the next
+// caller does run -- one attempt after another, never two at once, which is
+// what an operator's single "workspace cleanup" record per landing depends on.
+// Waiting is bounded because every attempt runs on a bounded context:
+// workspaceCleanupTimeout for the run-end caller, reconciliation's own poll
+// context for the authoritative one.
+func (c *Coordinator) finalizeWorkspace(ctx context.Context, issue domain.Issue, r *running, atRunEnd bool) {
+	if r != nil {
+		r.cleanup.Lock()
+		defer r.cleanup.Unlock()
+		if r.workspaceFinalized {
+			c.log.Debug("workspace cleanup skipped", "issue_id", issue.ID, "issue_identifier", issue.Identifier, "reason", "already_finalized")
+			return
+		}
+	}
 	if c.forget != nil {
 		c.forget.Forget(issue.ID)
 	}
 	outcome, err := c.workspaces.Cleanup(ctx, issue)
+	if r != nil && err == nil {
+		r.workspaceFinalized = true
+	}
 	status := cleanupStatus(outcome, err)
 	attrs := []any{"issue_id", issue.ID, "issue_identifier", issue.Identifier, "status", status}
 	if err == nil {
@@ -69,7 +109,7 @@ func (c *Coordinator) finalizeWorkspace(ctx context.Context, issue domain.Issue,
 		return
 	}
 	attrs = append(attrs, "error", err)
-	if r != nil {
+	if atRunEnd && r != nil {
 		c.mu.Lock()
 		superseded := r.stopped == stopTerminal
 		c.mu.Unlock()

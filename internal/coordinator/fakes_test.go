@@ -227,6 +227,13 @@ type fakeWorkspace struct {
 	cleanupStarted chan struct{}
 	cleanupGate    <-chan struct{}
 	cleanupErr     error
+	// cleanupsInFlight and cleanupOverlap record whether two Cleanup calls were
+	// ever in flight at once, which is the corruption PMR-160 fixed: two
+	// attempts removing one worktree, the loser reporting the winner's completed
+	// removal as a git failure. No test needs to arrange the overlap to assert
+	// it never happens, so every test that pauses a cleanup checks this.
+	cleanupsInFlight int
+	cleanupOverlap   bool
 }
 
 func (f *fakeWorkspace) Prepare(ctx context.Context, _ domain.Issue) (domain.Workspace, error) {
@@ -256,12 +263,21 @@ func (f *fakeWorkspace) AfterRun(context.Context, domain.Workspace, domain.Issue
 func (f *fakeWorkspace) Cleanup(ctx context.Context, _ domain.Issue) (domain.CleanupOutcome, error) {
 	f.mu.Lock()
 	f.cleanups++
+	f.cleanupsInFlight++
+	if f.cleanupsInFlight > 1 {
+		f.cleanupOverlap = true
+	}
 	first := f.cleanups == 1
 	cleaned := f.cleaned
 	started := f.cleanupStarted
 	gate := f.cleanupGate
 	err := f.cleanupErr
 	f.mu.Unlock()
+	defer func() {
+		f.mu.Lock()
+		f.cleanupsInFlight--
+		f.mu.Unlock()
+	}()
 	if first {
 		if started != nil {
 			started <- struct{}{}
@@ -288,6 +304,14 @@ func (f *fakeWorkspace) counts() (prepares, marks, cleanups, checks int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.prepares, f.marks, f.cleanups, f.shouldRunCalls
+}
+
+// overlappedCleanups reports whether two Cleanup calls were ever in flight at
+// the same time.
+func (f *fakeWorkspace) overlappedCleanups() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.cleanupOverlap
 }
 
 type fakeTimer struct {

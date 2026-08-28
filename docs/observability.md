@@ -474,9 +474,22 @@ past the recorded base commit), `landed` (removed, and it did hold local
 commits, which Symphony verified as the merged pull request head for that
 issue), `dirty` (kept: uncommitted or untracked changes), `committed` (kept:
 local commits that are not verifiably merged, including a landing that could
-not be verified), or `blocked` (kept: any other fail-closed refusal, such as
-unowned or unverifiable state). Only `clean` and `landed` removed anything; the
-warn-level records carry the workspace package's own refusal text as `error`.
+not be verified), `blocked` (kept: any other fail-closed refusal that named
+itself one, such as unowned state), or `failed` (cleanup never reached a
+refusal decision at all -- a killed `git` subprocess, an unreadable path).
+Only `clean` and `landed` removed anything; the warn-level records carry the
+workspace package's own refusal text as `error`.
+
+There is exactly one such record per finished issue. Two call sites conclude
+the same run is finished and clean up after it -- the run's own
+landing-resolved or terminal branch, and the poll loop reconciling the same
+terminal issue -- and since PMR-160 they serialize on the run: the second waits
+for the first and, if the first removed the workspace, does nothing and logs a
+debug-level `"msg":"workspace cleanup skipped"` with
+`reason=already_finalized` instead. A first attempt that *failed* removed
+nothing, so the authoritative second one still runs. A pair of records for one
+landing, the second reporting `status=failed` against a worktree the first had
+already removed, is the symptom that fix removed.
 The read-only landing check that separates `landed` from `committed` logs its
 own info-level `"msg":"GitHub landing verified for workspace cleanup"` or
 `"msg":"GitHub landing unverified; workspace commits are preserved"` record

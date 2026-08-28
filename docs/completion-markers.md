@@ -65,21 +65,25 @@ only when worktree safety checks allow it.
 ## Terminal cleanup safety
 
 Cleanup of a terminal issue's owned Git worktree is fail-closed. Only the first
-two outcomes below remove anything; the remaining three preserve the worktree
-for a human:
+two outcomes below remove anything and the third finds the removal already
+done; the remaining three preserve the worktree for a human:
 
 | Worktree | Result |
 | --- | --- |
 | Clean, HEAD still at the recorded `base_commit` | Removed, logged `status: clean`. |
 | Clean, HEAD is a local commit that a landing verification confirms is the merged pull request head for this issue | Removed, logged `status: landed`. |
+| Already gone, whichever step discovers that | Nothing left to remove, logged `status: clean`. |
 | Uncommitted or untracked changes | Preserved, logged `status: dirty`. |
 | Clean, HEAD is a local commit that is not verifiably merged | Preserved, logged `status: committed`. |
-| Unowned, replaced, or unverifiable source identity | Preserved, logged `status: blocked`. |
+| Unowned, replaced, or unverifiable source identity | Preserved, logged `status: blocked` (or `status: failed` for a refusal whose reason does not name itself one). |
 
 The landing verification is host-owned, read-only, and reachable from every
 cleanup path — end of run, terminal reconciliation, retry, and the startup
 sweep after a restart — because it re-reads GitHub instead of relying on
-in-process memory of the landing. It asks one question: does the configured
+in-process memory of the landing. The first two of those paths can reach the
+same finished run, so they serialize on it and the second does nothing once the
+first has removed the workspace: one finished issue produces one cleanup
+attempt (PMR-160). It asks one question: does the configured
 repository have exactly one pull request for this issue's `symphony/<issue>`
 branch, is it merged, and is its head commit the commit still checked out in
 the worktree? Only an exact match permits removal, so a locally amended or

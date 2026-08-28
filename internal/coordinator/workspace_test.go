@@ -81,6 +81,9 @@ func TestRunEndCleanupSurvivesConcurrentReconciliationCancellation(t *testing.T)
 	if _, _, cleanups, _ := ws.counts(); cleanups != 1 {
 		t.Fatalf("cleanups=%d, want exactly the one run-end attempt", cleanups)
 	}
+	if ws.overlappedCleanups() {
+		t.Fatal("two cleanup attempts ran against one worktree at once")
+	}
 	lines := cleanupLogLines(log.String())
 	if len(lines) != 1 {
 		t.Fatalf("workspace cleanup records=%v, want exactly one", lines)
@@ -97,46 +100,32 @@ func TestRunEndCleanupSurvivesConcurrentReconciliationCancellation(t *testing.T)
 // PMR-130's reporting fix directly: even when the run-end cleanup attempt
 // fails for a reason that has nothing to do with context cancellation (here,
 // a stand-in for the read-after-write race PMR-112's landing hit against
-// GitHub), reconciliation's own concurrent, authoritative attempt succeeding
-// right after it means the first failure named no real call to action and
-// must not be logged at WARN.
+// GitHub), reconciliation's own authoritative attempt succeeding right after it
+// means the first failure named no real call to action and must not be logged
+// at WARN.
+//
+// The two attempts are what PMR-160 made sequential rather than concurrent, and
+// this is the half of that serialization which must keep running twice: an
+// attempt that failed removed nothing, so the workspace is still there and the
+// authoritative caller still has a removal to attempt.
 func TestRunEndCleanupFailureIsNotActionableWhenReconciliationSucceeds(t *testing.T) {
-	w := testSettings(t)
 	issue := testIssue()
-	terminal := issue
-	terminal.State = "Done"
-	terminal.Dispatchable = false
-	tracker := &fakeTracker{issue: issue}
-	tracker.setFresh(terminal)
 	var log syncBuffer
-	agent := &fakeAgent{events: completedEvents}
-	gate := make(chan struct{})
-	ws := &fakeWorkspace{
-		shouldRun:      true,
-		after:          make(chan struct{}, 1),
-		cleanupStarted: make(chan struct{}, 1),
-		cleanupGate:    gate,
-		cleanupErr:     errors.New("refusing to remove Git workspace whose HEAD c6e8a98 differs from recorded base commit 54bccf5; merged landing could not be verified"),
-	}
-	c := New(tracker, agent, ws, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&log, nil)))
+	ws := &fakeWorkspace{cleanupErr: errors.New("refusing to remove Git workspace whose HEAD c6e8a98 differs from recorded base commit 54bccf5; merged landing could not be verified")}
+	c := New(&fakeTracker{issue: issue}, &fakeAgent{}, ws, func() config.Settings { return testSettings(t).Config }, slog.New(slog.NewJSONHandler(&log, nil)))
 	defer assertInvariants(t, c)
-	c.clock = fakeClock{now: time.Date(2026, 8, 26, 7, 41, 0, 0, time.UTC)}
-	c.timer = &fakeTimer{}
+	// stopTerminal is the one stop reason that guarantees reconciliation holds
+	// an authoritative attempt of its own right after stopRun returns.
+	r := &running{issue: issue, stopped: stopTerminal}
 
-	c.Tick(context.Background())
-	<-ws.cleanupStarted // the run's own cleanup is now blocked before it fails
-
-	// Reconciliation independently reaches the same terminal issue while the
-	// run-end attempt is still in flight, stops the run, and runs its own
-	// cleanup on a live context -- the authoritative retry.
-	c.Tick(context.Background())
-	close(gate) // only now let the blocked, doomed first attempt fail
-
-	<-ws.after
-	waitForRelease(t, c, issue.ID)
+	c.cleanupWorkspaceAtRunEnd(context.Background(), r, issue)
+	c.cleanupWorkspaceForRun(context.Background(), r, issue)
 
 	if _, _, cleanups, _ := ws.counts(); cleanups != 2 {
 		t.Fatalf("cleanups=%d, want the run-end attempt and reconciliation's authoritative retry", cleanups)
+	}
+	if ws.overlappedCleanups() {
+		t.Fatal("two cleanup attempts ran against one worktree at once")
 	}
 	lines := cleanupLogLines(log.String())
 	if len(lines) != 2 {
@@ -147,14 +136,187 @@ func TestRunEndCleanupFailureIsNotActionableWhenReconciliationSucceeds(t *testin
 			t.Fatalf("a superseded first attempt must never be reported as an operator call to action: %s", line)
 		}
 	}
-	// Reconciliation's own cleanup runs synchronously within the second Tick
-	// call and so is logged first; the run-end attempt was still blocked on
-	// the gate at that point and only logs once it is released afterward.
-	if !strings.Contains(lines[0], `"status":"clean"`) {
-		t.Fatalf("reconciliation's retry record=%s, want a successful removal", lines[0])
+	if !strings.Contains(lines[0], `"status":"committed"`) {
+		t.Fatalf("run-end cleanup record=%s, want the classified committed refusal", lines[0])
 	}
-	if !strings.Contains(lines[1], `"status":"committed"`) {
-		t.Fatalf("run-end cleanup record=%s, want the classified committed refusal", lines[1])
+	if !strings.Contains(lines[1], `"status":"clean"`) {
+		t.Fatalf("reconciliation's retry record=%s, want a successful removal", lines[1])
+	}
+}
+
+// TestSucceededCleanupIsNotAttemptedAgain is the other half of PMR-160's
+// serialization, and the reason the observed WARN is gone: an attempt holds the
+// run's gate for as long as it is in flight, so the second caller cannot reach
+// Cleanup while the first is still removing the worktree, and once the first
+// has removed it there is nothing left for the second to do -- no Cleanup call,
+// no second record, and no second Forget of an issue the host already dropped.
+func TestSucceededCleanupIsNotAttemptedAgain(t *testing.T) {
+	issue := testIssue()
+	var log syncBuffer
+	gate := make(chan struct{})
+	ws := &fakeWorkspace{cleanupStarted: make(chan struct{}, 1), cleanupGate: gate}
+	c := New(&fakeTracker{issue: issue}, &fakeAgent{}, ws, func() config.Settings { return testSettings(t).Config }, slog.New(slog.NewJSONHandler(&log, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	defer assertInvariants(t, c)
+	forgetter := &stubForgetter{}
+	c.SetIssueForgetter(forgetter)
+	r := &running{issue: issue}
+
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		c.cleanupWorkspaceAtRunEnd(context.Background(), r, issue)
+	}()
+	<-ws.cleanupStarted
+	if r.cleanup.TryLock() {
+		r.cleanup.Unlock()
+		t.Fatal("an in-flight cleanup does not hold the run's gate, so a second caller could remove the same worktree concurrently")
+	}
+	close(gate)
+	<-finished
+
+	c.cleanupWorkspaceForRun(context.Background(), r, issue)
+
+	if _, _, cleanups, _ := ws.counts(); cleanups != 1 {
+		t.Fatalf("cleanups=%d, want only the attempt that had something to remove", cleanups)
+	}
+	if got := forgetter.issues(); len(got) != 1 {
+		t.Fatalf("host forget calls=%v, want exactly one", got)
+	}
+	if lines := cleanupLogLines(log.String()); len(lines) != 1 {
+		t.Fatalf("workspace cleanup records=%v, want exactly one", lines)
+	}
+	if !strings.Contains(log.String(), `"msg":"workspace cleanup skipped"`) || !strings.Contains(log.String(), `"reason":"already_finalized"`) {
+		t.Fatalf("the skipped attempt left no debug-level trace: %s", log.String())
+	}
+}
+
+// TestReconciliationCleanupAndRunEndCleanupShareOneAttempt is PMR-160's
+// observed pair of call sites, from reconciliation's end: the poll loop's
+// stopTerminal branch must clean up *through the run it just stopped*, so its
+// attempt and that run's own run-end attempt are one serialized pair. This is
+// the direction the observed logs showed inverted -- reconciliation reached the
+// worktree the landing's own cleanup was already removing, logged a second
+// "GitHub landing verified for workspace cleanup", and then warned that `git
+// worktree remove` had failed with "is not a working tree" on a landing that
+// had in fact succeeded.
+func TestReconciliationCleanupAndRunEndCleanupShareOneAttempt(t *testing.T) {
+	w := testSettings(t)
+	issue := testIssue()
+	terminal := issue
+	terminal.State = "Done"
+	terminal.Dispatchable = false
+	tracker := &fakeTracker{issue: issue}
+	tracker.setFresh(terminal)
+	var log syncBuffer
+	gate := make(chan struct{})
+	ws := &fakeWorkspace{cleanupStarted: make(chan struct{}, 1), cleanupGate: gate}
+	c := New(tracker, &fakeAgent{}, ws, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&log, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	defer assertInvariants(t, c)
+	r := &running{issue: issue, session: domain.AgentSession{ID: "s"}, last: c.clock.Now(), cancel: func() {}}
+	c.seedRunning(issue, r)
+
+	reconciled := make(chan struct{})
+	go func() {
+		defer close(reconciled)
+		if err := c.reconcile(context.Background()); err != nil {
+			t.Errorf("reconcile: %v", err)
+		}
+	}()
+	<-ws.cleanupStarted // reconciliation's own attempt is now in flight
+
+	// It has to be holding the stopped run's gate, or the run-end attempt that
+	// runs a moment later inside runTurns would remove the same worktree
+	// concurrently instead of waiting for this one.
+	if r.cleanup.TryLock() {
+		r.cleanup.Unlock()
+		t.Fatal("reconciliation cleaned up without the run's cleanup gate, so the run-end attempt could race it")
+	}
+	close(gate)
+	<-reconciled
+
+	// runTurns reaches its own terminal branch for the same issue right after.
+	c.cleanupWorkspaceAtRunEnd(context.Background(), r, terminal)
+
+	if _, _, cleanups, _ := ws.counts(); cleanups != 1 {
+		t.Fatalf("cleanups=%d, want exactly one attempt for one finished run", cleanups)
+	}
+	if ws.overlappedCleanups() {
+		t.Fatal("two cleanup attempts ran against one worktree at once")
+	}
+	lines := cleanupLogLines(log.String())
+	if len(lines) != 1 {
+		t.Fatalf("workspace cleanup records=%v, want exactly one", lines)
+	}
+	if strings.Contains(lines[0], `"level":"WARN"`) {
+		t.Fatalf("a successful removal must not report a cleanup failure: %s", lines[0])
+	}
+	if !strings.Contains(lines[0], `"status":"clean"`) {
+		t.Fatalf("cleanup record=%s, want a successful removal", lines[0])
+	}
+}
+
+// TestDocumentedCleanupRefusalsStayActionable holds the other half of PMR-160
+// in place: making an already-removed workspace a silent success must not make
+// a workspace Symphony is deliberately keeping silent too. Every refusal
+// docs/dogfooding.md section 7 tells an operator to expect -- uncommitted
+// changes, a HEAD moved off the recorded base commit, and a recorded source
+// path that no longer identifies the same repository -- must still reach WARN
+// carrying the workspace package's own reason, because each names work only a
+// human can decide the fate of.
+func TestDocumentedCleanupRefusalsStayActionable(t *testing.T) {
+	tests := []struct {
+		name       string
+		err        error
+		wantStatus string
+	}{
+		{
+			name:       "uncommitted or untracked changes",
+			err:        errors.New("refusing to remove Git workspace with uncommitted or untracked changes"),
+			wantStatus: "dirty",
+		},
+		{
+			name:       "HEAD moved off the recorded base commit",
+			err:        errors.New("refusing to remove Git workspace whose HEAD c6e8a98 differs from recorded base commit 54bccf5"),
+			wantStatus: "committed",
+		},
+		{
+			name:       "source repository is gone, so local changes cannot be verified",
+			err:        errors.New("recorded source and Git common directory are unavailable; refusing to remove a worktree whose local changes cannot be verified; preserve it outside the managed root for manual recovery"),
+			wantStatus: "blocked",
+		},
+		{
+			// This one names no "refusing", so cleanupStatus reports it in the
+			// failed bucket rather than as blocked. The distinction is only how
+			// the status reads: the record is still a WARN carrying the reason.
+			name:       "recorded source path identifies a different repository",
+			err:        errors.New("recorded source path now identifies a different Git repository; manual recovery is required"),
+			wantStatus: "failed",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			issue := testIssue()
+			var log syncBuffer
+			ws := &fakeWorkspace{cleanupErr: test.err}
+			c := New(&fakeTracker{issue: issue}, &fakeAgent{}, ws, func() config.Settings { return testSettings(t).Config }, slog.New(slog.NewJSONHandler(&log, nil)))
+			defer assertInvariants(t, c)
+
+			c.cleanupWorkspace(context.Background(), issue)
+
+			lines := cleanupLogLines(log.String())
+			if len(lines) != 1 {
+				t.Fatalf("workspace cleanup records=%v, want exactly one", lines)
+			}
+			if !strings.Contains(lines[0], `"level":"WARN"`) {
+				t.Fatalf("a refused cleanup must stay an operator call to action: %s", lines[0])
+			}
+			if !strings.Contains(lines[0], `"status":"`+test.wantStatus+`"`) {
+				t.Fatalf("workspace cleanup record=%s, want status %q", lines[0], test.wantStatus)
+			}
+			if !strings.Contains(lines[0], test.err.Error()) {
+				t.Fatalf("workspace cleanup record=%s, want the refusal reason %q", lines[0], test.err)
+			}
+		})
 	}
 }
 
