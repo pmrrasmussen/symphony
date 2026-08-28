@@ -1,9 +1,32 @@
 ---
+# This file is the annotated reference for every WORKFLOW.md front-matter
+# field: what each key does, what it defaults to, and which of them fail the
+# whole configuration rather than being ignored. This repository's own
+# WORKFLOW.md carries only its chosen values and points here for the
+# explanation.
+#
+# Front matter is validated for the supported core fields while unknown
+# extension keys are preserved for forward compatibility. Environment-backed
+# fields use exact $VARNAME syntax; braced or compound forms are rejected
+# rather than treated as a literal path or secret. Relative workspace and log
+# paths resolve from this file's own location. A changed workflow file is
+# reloaded for future work -- including a changed environment value or
+# credential-file content, so those can change without editing the file -- and
+# an invalid replacement keeps the last valid configuration. See
+# docs/architecture.md for what a reload does and does not affect, and
+# docs/preflight.md for validating a change with --dry-run before it reaches a
+# running daemon.
 tracker:
   kind: linear
   provider:
+    # Canonical Linear project scope. The legacy project_slug alias still works
+    # during its deprecation and emits a value-free migration warning;
+    # configuring both names is rejected as ambiguous.
     project_slug_id: example-project
-    # Recommended: point this variable at a mode-600 file outside the repo.
+    # Recommended: point this variable at a mode-600 file outside the repo. A
+    # literal trusted local path is also accepted for a workflow file that is
+    # not versioned. Inline and file-backed keys are whitespace-trimmed before
+    # use and never appear in a log.
     api_key_file: $SYMPHONY_LINEAR_API_KEY_FILE
     # Alternatively, inject the credential value directly from the environment:
     # api_key: $LINEAR_API_KEY
@@ -41,7 +64,7 @@ tracker:
     # unambiguously: review_approved needs github.merge_state below, and
     # rework_requested needs exactly one active_states entry that neither
     # transitions.start nor github.merge_state accounts for. Otherwise every
-    # such change keeps the warning; see README.md and docs/linear-tracker.md.
+    # such change keeps the warning; see docs/linear-tracker.md.
     handoff_state: In Review
     # Optional, opt-in Codex client tool for capturing meaningful out-of-scope
     # work. It creates a parentless issue only in this project/team, always in
@@ -61,9 +84,13 @@ tracker:
 polling:
   interval_ms: 30000
 workspace:
+  # Where per-issue agent workspaces are created. Omitting it defaults to
+  # symphony_workspaces under the system temporary directory.
   root: .symphony/workspaces
   # Optional: create each new issue workspace as a detached Git worktree at a
   # freshly fetched origin/main. Existing issue workspaces retain their history.
+  # The original checkout is never used as an agent workspace. See
+  # docs/completion-markers.md for ownership, cleanup, and recovery.
   source_root: .
 hooks:
   timeout_ms: 60000
@@ -117,8 +144,14 @@ codex:
   command: codex app-server
   approval_policy: never
   thread_sandbox: workspace-write
-  # Per-turn sandbox policy, validated here and then forwarded verbatim to
-  # Codex, where it overrides thread_sandbox for this and every later turn.
+  # Per-turn sandbox policy, validated against the Codex SandboxPolicy schema
+  # here and then forwarded verbatim to Codex, where it overrides
+  # thread_sandbox for this and every later turn -- so the two must agree, and
+  # a policy requesting write authority the thread mode does not have is
+  # rejected at load. writableRoots is rejected outright, since Symphony
+  # supplies the narrowed Git roots itself, and an unknown key inside the
+  # policy is rejected too, so a typo such as `networkAcces` cannot silently
+  # leave the setting off.
   #
   # workspaceWrite bounds *writes* to the issue's own worktree plus the two
   # narrow Git metadata roots Symphony grants for a local commit. It does not
@@ -165,22 +198,23 @@ codex:
 # permission mode, no settings discovery at all (user, project, and local
 # sources are excluded, so a workspace repository shipping its own
 # .claude/settings.json or hooks cannot widen the boundary),
-# no MCP server, and a sandbox that refuses to start rather than degrading,
+# at most one MCP server -- Symphony's own private loopback capability
+# endpoint, and only when this workflow configures a capability, as below --
+# and a sandbox that refuses to start rather than degrading,
 # bounding *writes* to the worktree plus the same two narrow Git metadata roots
 # the codex profile is granted.
 #
-# The same honest limits apply as above, plus one that is narrower than it
-# sounds: *reads* are not confined, outbound network is unrestricted, loopback
-# binding is separately granted so repository tests that stand up an httptest
-# server or similar can run in-session, and the sandbox governs Bash but not
-# Edit and Write. Those two are allowed by bare
-# tool name with no path restriction at all, so a write outside the worktree is
-# neither sandbox-confined nor detected by anything Symphony checks -- the
-# post-run Git integrity check looks only at the source repository's own branch
-# heads and primary index.
+# The same honest limits apply as above: *reads* are not confined and outbound
+# network is unrestricted, with loopback binding separately granted so
+# repository tests that stand up an httptest server or similar can run
+# in-session. The sandbox itself governs Bash by path; Edit and Write are
+# confined by their own path-scoped permission rule instead (PMR-156). One
+# gap remains open, in the CLI's own sandbox rather than in this payload: a
+# Bash command can still write anywhere under the source repository's .git
+# directory. docs/architecture.md states all five limits in full.
 #
 # The CLI also persists its own full transcript -- prompts, issue text, and tool
-# output -- under ~/.claude/projects/, outside the worktree; see README.md and
+# output -- under ~/.claude/projects/, outside the worktree; see
 # docs/observability.md.
 #
 # A claude workflow may configure Symphony's session capabilities --
@@ -196,16 +230,19 @@ codex:
 # github: integration nor followup_issue_creation (nothing model-facing uses it).
 # Both stay valid under codex. (A github: block that does not resolve stays
 # disabled, so it configures nothing and reaches neither rule.) The service
-# user must already be logged in to the CLI; --dry-run checks that with a
-# read-only, time-bounded claude auth status.
+# user must already be logged in to the CLI; docs/preflight.md describes the
+# read-only check --dry-run makes of that.
 # claude:
 #   # argv, not a shell command: split on whitespace and executed directly, so
 #   # no shell, no quoting, no expansion, and no operators. codex.command above
 #   # runs through bash -lc, so quoting that works there breaks here. --dry-run
 #   # checks both with sh -n, which is a loose superset for this field.
+#   # Defaults to claude.
 #   command: claude
-#   # Optional. Omit it to let the CLI select its own model.
+#   # Optional, and unset by default: omit it and the CLI is given no --model
+#   # flag at all, so it selects its own.
 #   model: sonnet
+#   # Defaults to 3600000 (one hour), as codex.turn_timeout_ms does.
 #   # Lowered from one hour (PMR-134), but not to the 900000 (15 min) first
 #   # tried: that value was live-tested during a dogfood session and killed a
 #   # real, productive turn at exactly 900000 ms, destroying 433 uncommitted
@@ -214,10 +251,21 @@ codex:
 #   # legitimate 17-minute, 10.4M-token turn run to completion.
 #   turn_timeout_ms: 1800000
 #   # There is no read_timeout_ms or start_timeout_ms counterpart: one turn is
-#   # one process, so there is no steady-state round trip to bound.
+#   # one process, so there is no steady-state round trip to bound. Defaults to
+#   # 300000, as codex.stall_timeout_ms does.
 #   stall_timeout_ms: 300000
-# Optional. Requires tracker.provider.handoff_state and a fine-grained token
-# restricted to exactly this repository.
+# Optional host-side GitHub integration: it publishes a completed, clean
+# worktree, creates or reuses that branch's pull request, and can land an
+# approved one. It requires tracker.provider.handoff_state above and a token
+# scoped to exactly this one repository, granting only the pull request,
+# checks, contents, and review permissions the integration uses. Store it in a
+# mode-600 file outside the repository and reference that path here; the token
+# is never committed, and Symphony strips the resolved value (and any inherited
+# environment variable containing it) from every child process it spawns. Note
+# that GitHub disabled the Checks permission for fine-grained tokens, which the
+# required-checks gate depends on -- see docs/dogfooding.md before choosing a
+# token type. Invalid or incomplete settings here disable the capabilities and
+# preserve the manual delivery path, except where noted below.
 # github:
 #   owner: your-github-owner
 #   repository: your-repository

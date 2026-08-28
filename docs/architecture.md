@@ -142,7 +142,8 @@ capability, a publish capability that accepts bounded `why`, `what_changed`,
 and `on_call` structured fields (no repository, issue, or branch selection),
 and a read-only `github_pr_context` capability with no input at all. The host
 verifies a clean, committed descendant of the
-configured base, pushes a deterministic issue branch, and creates or reuses
+configured base, pushes the deterministic issue branch
+`symphony/<lowercase-issue-identifier>`, and creates or reuses
 that branch's PR with a deterministic `Why`/`What changed`/`On Call` body
 built from the structured fields plus the bound Linear issue URL; repeat
 publication with unchanged fields leaves the body untouched, while changed
@@ -163,6 +164,17 @@ issue to `Done` after GitHub confirms a human merge; it has no merge
 operation. Closed-unmerged PRs only produce an operator warning. The
 linked-pair and completion guard are process-local, while retries reconcile
 durable GitHub PRs and Linear comments.
+
+Invalid or incomplete GitHub settings disable these capabilities rather than
+failing the workflow, which preserves the manual delivery path. That choice is
+what the two delivery modes are: with the integration enabled, workers create
+local commits and invoke the host capabilities instead of running `gh` or `git
+push` themselves, and all publishing authority stays with the host; without it,
+the host-generated delivery instructions tell the run that pull request delivery
+is unavailable and name the missing configuration rather than asking a worker to
+publish directly. The narrower `merge_state`, `merge_method`, and
+`required_checks` settings are the deliberate exception, validated fail-closed
+as described below.
 
 `refresh_base_ref` exists because a merge that lands on the base branch mid-run
 leaves a session's `refs/remotes/origin/<base>` stale, and the session cannot
@@ -239,7 +251,9 @@ exactly once; a pull request GitHub already reports merged, discovered at any
 point (including a race during the merge call itself), reconciles that same
 `Done` transition idempotently instead of merging again, which is also how a
 GitHub merge that succeeds despite a failed Linear completion call is
-recovered on retry.
+recovered on retry. Outside this one narrow, explicitly configured capability
+Symphony never merges a pull request at all: no poll, reconciliation, or
+cleanup path has a merge operation.
 
 The loader validates the supported core front-matter fields but preserves
 unknown extension keys for forward compatibility. It applies documented
@@ -251,8 +265,10 @@ published. The reload fingerprint includes those dependencies; an environment
 or secret-file correction therefore retries a rejected workflow without an
 unrelated file edit. Readers receive defensive copies of the last complete
 snapshot, and invalid reloads retain that snapshot. Prompts render strictly per
-run with lowercase `issue` and nullable `attempt` variables, so template
-failures do not prevent polling or configuration reload.
+run with two lowercase variables and no others: `issue` (for example
+`{{.issue.identifier}}`) and `attempt`, which is nil on the first run and then a
+1-based retry/continuation number. A template error fails only that run attempt,
+so it prevents neither polling nor configuration reload.
 
 Linear project scope is normalized to `project_slug_id`. The deprecated
 `project_slug` alias is converted before publication and produces only a
@@ -380,8 +396,11 @@ permits. Omitting the key leaves outbound access denied.
 So the operative boundary for a worker under this repository's policy is:
 writes confined to its own worktree and the narrowed Git roots, no host
 credential in its environment, but local reads and outbound network both
-available. What protects host credentials from exfiltration is therefore the
-absence of untrusted input reaching the worker, not the sandbox. Symphony's
+available. The environment guarantee covers exactly that -- the environment --
+and neither reachability nor files on disk. What protects host credentials from
+exfiltration is therefore the absence of untrusted input reaching the worker:
+the issue text and repository content it acts on are operator-owned. It is not
+the sandbox. Symphony's
 validation keeps the policy from widening further: `writableRoots` is rejected
 so the launcher remains the only source of writable paths, and unknown keys
 inside the policy are rejected so a misspelled field cannot silently change
@@ -464,7 +483,7 @@ only about what is advertised: a directly addressed call can reach nothing the
 model was not already permitted to call, so it grants no authority. Combined
 with each provider re-validating its own preconditions before it mutates
 anything, what is left is an observability gap -- such a call runs unrecorded --
-and that is stated in README.md rather than claimed away.
+and that is stated here rather than claimed away.
 
 The registration itself is per turn and is retired before the next turn's is
 minted, not merely at turn end. After a turn emits its terminal event its
@@ -502,7 +521,11 @@ payload it cannot parse, so a hand-assembled string, or a file unreadable at
 launch, would leave a session running with no policy and no diagnostic. Every
 one of these is re-applied on every turn: `claude --print` runs one turn and
 exits, a continuation is a new process resumed by an ID Symphony assigned
-itself, and the CLI restores none of the contract on `--resume`.
+itself (`--session-id <uuid>`, rather than reading one back), and the CLI
+restores none of the contract on `--resume`. There is therefore no long-lived
+process to cancel: cancelling between turns is a no-op because no process
+exists, while a running turn is killed by process group, so the CLI's own child
+commands go with it.
 
 That payload sets `sandbox.enabled` with `failIfUnavailable: true` and
 `allowUnsandboxedCommands: false`, `filesystem.allowWrite` to the worktree plus

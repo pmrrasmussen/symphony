@@ -14,7 +14,8 @@ bounded and cancellation-safe.
 
 The live profile is deliberately separate. It verifies configuration and a
 local full-lifecycle preflight with `--dry-run`; that flag does not contact
-Linear, launch Codex, execute hooks, or prepare a workspace. This
+Linear, launch Codex, execute hooks, or prepare a workspace (see
+[the preflight contract](preflight.md)). This
 keeps the default live check read-only and prevents the profile from consuming
 Codex capacity or changing an issue by accident.
 
@@ -22,6 +23,10 @@ Codex capacity or changing an issue by accident.
 
 - Use a dedicated, disposable Linear project that contains only smoke-test
   issues. Never use a production project, team, workspace, or customer data.
+  Concretely for this operator: never run a Symphony smoke test against
+  Dagligvare-app, or against any of its Linear workspace, team, or projects.
+  Live smoke testing is always opt-in and always uses dedicated Symphony test
+  artifacts.
 - Create a least-privilege Linear credential for that dedicated project and
   export it as `LINEAR_API_KEY` only in the shell or CI environment that runs
   the smoke test. Long-running local operation should instead set
@@ -62,9 +67,9 @@ prompt is safe to process. Confirm that the issue asks Codex to make no changes
 and that the project contains no other eligible issues. The service runs until
 interrupted, so stop it after the one expected issue has been observed.
 
-`--dry-run` verifies the Codex credential the same way it verifies Claude's,
-below: it runs the read-only `codex login status` and reads only its exit
-code. That reflects a login the CLI itself persisted -- `codex login` or
+`--dry-run` verifies the Codex credential with a read-only `codex login status`
+whose exit code alone is read; [the preflight contract](preflight.md) describes
+that check for both backends. It reflects a login the CLI itself persisted -- `codex login` or
 `codex login --with-api-key` -- not a bare `OPENAI_API_KEY` export with no
 stored login, which `codex login status` reports as logged out even though
 the app-server picks the variable up directly at spawn time. If you rely on

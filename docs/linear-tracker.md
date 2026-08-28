@@ -8,7 +8,7 @@
 | `project_slug_id` | yes | Linear project slug ID. Every read is restricted to this project. |
 | `project_slug` | deprecated | Legacy alias for `project_slug_id`. It emits a value-free migration warning; setting both names is rejected. |
 | `api_key` | alternative | Linear personal API key. Exact `$VARNAME` expansion is supported by `WORKFLOW.md`; surrounding whitespace is trimmed and the value is never logged. |
-| `api_key_file` | recommended | Trusted local file containing the API key. Prefer `$SYMPHONY_LINEAR_API_KEY_FILE`, whose value is the absolute file path; file contents and path dependencies are tracked by configuration loading. When both credential fields exist, this file takes precedence. |
+| `api_key_file` | recommended | Trusted local file containing the API key. Prefer `$SYMPHONY_LINEAR_API_KEY_FILE`, whose value is the absolute file path; file contents and path dependencies are tracked by configuration loading. A literal trusted local path is also accepted, for a workflow file that is not versioned. When both credential fields exist, this file takes precedence. |
 | `endpoint` | optional | Absolute HTTPS GraphQL endpoint; defaults to `https://api.linear.app/graphql`. HTTP is accepted only for `localhost`, `127.0.0.1`, or `::1` test hosts. |
 | `assignee` | optional | Unset permits all assignees. A non-empty ID permits only that assignee. `me` resolves the current Linear viewer ID for each read. |
 | `handoff_state` | optional | The single human-controlled review state `github_publish_pr` hands a bound issue off to, host-side. The name must be a non-active workflow state in the active issue's Linear team. It binds a Linear session and enables the scoped GitHub handoff tools, but is not itself a model-invokable tool. |
@@ -73,6 +73,57 @@ later of that delay and the normal polling interval through its timer; it never
 sleeps or immediately hot-loops. 5xx status errors are retryable. GraphQL
 response bodies and transport details are intentionally not included in public
 error text or logs.
+
+## The canonical lifecycle
+
+`Todo -> In Progress -> In Review <-> Rework -> Merging -> Done` (PMR-38).
+`Todo`, `In Progress`, `Rework`, and `Merging` are configured as
+`tracker.active_states` and are dispatchable; `In Review` is deliberately
+excluded so it stays the single, fixed, human-controlled review state
+(`handoff_state`) that is never dispatched; `Done` and `Canceled` are
+`terminal_states`.
+
+When the coordinator dispatches an issue whose state matches a configured
+`transitions.start` source it performs that move itself, host-side, with the
+host Linear credential, before the session starts. It is deterministic,
+idempotent, and fail-safe, so board-level observability never depends on the
+agent self-starting. An agent session then:
+
+1. Implements and validates the change (the issue is already `In Progress`).
+2. Publishes a structured pull request (`github_publish_pr`) and is handed to
+   `In Review`, host-side, once validated.
+3. Resumes -- in the same worktree, branch, and pull request -- when a human
+   moves the issue to `Rework`, and republishes to hand it back to `In Review`.
+4. Is dispatched again, with only the bounded zero-argument `github_land_pr`
+   tool, when a human moves the issue to `Merging`: that move is itself the
+   approval to land. Pending checks wait without changing Linear state -- the
+   run ends there and Symphony redispatches landing itself after
+   `github.poll_interval_ms`, escalating toward `agent.max_retry_backoff_ms`
+   while the gate stays unsettled, so a wait spends no further model turns. Any
+   other hard gate returns the issue to `In Review`; a successful or
+   already-completed merge reconciles the issue to `Done` and closes the
+   landing tool for that run.
+
+Without a configured GitHub landing capability the same lifecycle still runs up
+to review: publication hands the issue to `In Review`, and a human moves it to
+`Done` manually after merging the pull request.
+
+Concurrency is state-aware. `agent.max_concurrent_agents` bounds total
+concurrent sessions (this repository runs four), while
+`agent.max_concurrent_agents_by_state: {Merging: 1}` keeps landing serialized. A
+delayed retry never occupies a concurrency slot while it waits.
+
+The number of *runs* per issue is bounded by `agent.max_attempts`; the delayed
+landing retry and other host-settled waits are exempt from it, and abandoning a
+dispatch deliberately makes no tracker change at all. See
+[WORKFLOW.example.md](../WORKFLOW.example.md) for the settings and
+[observability.md](observability.md) for the records that make an abandoned
+dispatch visible, since no tracker state reflects one.
+
+[WORKFLOW.md](../WORKFLOW.md)'s prompt body is the per-state start,
+implementation, validation, review handoff, rework, landing, and completion
+playbook; [architecture.md](architecture.md) describes the trust model the
+lifecycle runs inside.
 
 ## Host-owned review handoff and transitions
 
@@ -163,6 +214,39 @@ state. A call already off the merge state is an idempotent no-op; reversed,
 terminal, stale, cross-project, and cross-team states are rejected. Host
 transitions are serialized per session, so a race or ambiguous provider result
 is reconciled by the next scoped call.
+
+## Operator prerequisites for the canonical lifecycle
+
+This repository's `WORKFLOW.md` is fully configured for the lifecycle above, but
+going live against a real Linear team requires manual, human-gated steps. None
+of them can be performed by Symphony, by an MCP integration that only reads and
+lists issue statuses, or by an agent:
+
+1. **Create the `Rework` and `Merging` Started states** in the Linear team that
+   backs `tracker.provider.project_slug_id`. Until both states exist, issues can
+   reach only `Todo`, `In Progress`, and `In Review`. `--dry-run` does not
+   contact Linear and cannot detect a missing remote state, so this is a
+   live-run precondition rather than something automated validation catches.
+2. **Provision the repository-scoped GitHub token file** referenced by
+   `$SYMPHONY_GITHUB_TOKEN_FILE`, saved to a mode-600 file outside the
+   repository. See [WORKFLOW.example.md](../WORKFLOW.example.md) for the
+   permissions it needs and [the dogfooding guide](dogfooding.md) for the token
+   type this repository's own operator settled on.
+3. **Confirm the configured `github.required_checks` names** match what GitHub
+   actually reports for the repository. `WORKFLOW.md` uses this repository's
+   current CI job names, from `.github/workflows/ci.yml`; update both files
+   together if those job names change. A name that matches no GitHub job does
+   not refuse -- it waits, holding the serialized `Merging` slot, so get the
+   names exactly right before relying on landing.
+4. **Disable the tracker's native PR-to-status automation** for the managed team
+   and project, as described under [disabling it](#disable-the-trackers-native-pr-to-status-automation-for-managed-issues)
+   above. This is verifiable only in the Linear UI.
+
+Until all four are complete Symphony keeps running safely: four-agent capacity
+and the `Todo`/`In Progress`/review-handoff path already work, an issue simply
+never reaches `Rework` or `Merging` in Linear (Linear itself has no such state
+to move it to), `github_land_pr` is never advertised, and completion continues
+through the human-merge fallback.
 
 ## Optional follow-up issue creation capability
 

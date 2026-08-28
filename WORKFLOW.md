@@ -1,4 +1,8 @@
 ---
+# This is Symphony's own delivery policy: the values this repository runs on,
+# plus the prompt body below, which is the single executable source of that
+# policy. Every field is explained once in WORKFLOW.example.md; the comments
+# here say only why this repository chose what it chose.
 tracker:
   kind: linear
   provider:
@@ -6,65 +10,25 @@ tracker:
     project_slug_id: 6e13e4a9f215
     # Set this to an absolute path for a mode-600 file outside the repository.
     api_key_file: $SYMPHONY_LINEAR_API_KEY_FILE
-    # Host-owned tracker transition policy. Symphony applies every edge here
-    # itself, with the host Linear credential; none is ever exposed to a Codex
-    # session, so the agent has no issue-state transition capability. The two edge
-    # sets are kept structurally distinct on purpose and must not be flattened
-    # into one map: Merging is both a dispatchable/active state and the
-    # land-fallback source, so a flat source->target map consumed at dispatch
-    # would wrongly move a freshly dispatched Merging landing agent's issue to
-    # In Review.
     transitions:
-      # Applied at dispatch, keyed by the issue's current state: a dispatched
-      # Todo issue is deterministically moved to In Progress before the session
-      # starts, so board-level observability never depends on the agent. Both
-      # endpoints must be active, non-terminal states. Idempotent and fail-safe:
-      # an already-started issue is untouched and a failed move never blocks the
-      # run.
       start:
         Todo: In Progress
-      # Applied only when a github_land_pr attempt hits a hard gate: the
-      # Merging -> In Review fallback, keyed by github.merge_state below.
       refuse_landing:
         Merging: In Review
-    # Optional, opt-in Codex client tool for capturing meaningful out-of-scope
-    # work. It creates a parentless issue only in this project/team, always in
-    # Backlog, with worker-supplied title, description, and acceptance criteria.
-    # The worker may only relate it to the active issue or mark it blocked by
-    # the active issue; it cannot select arbitrary scope or an initial state.
-    # Backlog must remain excluded from active_states below so a human promotion
-    # to Todo is required before Symphony can dispatch the follow-up.
     # followup_issue_creation: true
-    # Enables the scoped github_publish_pr/github_pr_context handoff tools for
-    # the bound issue and is where github_publish_pr hands the issue off for
-    # review, host-side. In Review is the single, fixed human-controlled review
-    # state: it is deliberately excluded from active_states below, so it is
-    # never dispatched. No Codex tool can move an issue into it (or any state);
-    # the host performs the handoff. Operator prerequisite: disable Linear's
-    # native GitHub PR-to-status automation for this team/project — it is an
-    # external writer that races this handoff and can flap the issue back to an
-    # active state (In Review -> In Progress; PMR-63). Symphony warns on any
-    # such external revert (operation: external_reversion) but does not
-    # re-assert the handoff itself. The expected human decisions out of In
-    # Review are logged as expected instead: In Review -> Merging as
-    # operation: review_approved and In Review -> Rework as
-    # operation: rework_requested. See README.md and docs/linear-tracker.md.
     handoff_state: In Review
   # The canonical lifecycle (PMR-38): Todo -> In Progress -> In Review <->
-  # Rework -> Merging -> Done. Rework and Merging are active/dispatchable so a
-  # human can resume implementation after requesting changes, or dispatch a
-  # landing agent, from the same worktree and branch. In Review stays
-  # human-controlled and non-dispatchable. See WORKFLOW.md's prompt body below
-  # for the full per-state playbook; it is this repository's single
-  # executable source of delivery policy.
+  # Rework -> Merging -> Done. Operator prerequisites for running it live,
+  # including disabling Linear's own PR-to-status automation, are in
+  # docs/linear-tracker.md.
   active_states: [Todo, In Progress, Rework, Merging]
   terminal_states: [Done, Canceled]
 polling:
   interval_ms: 30000
 workspace:
   root: .symphony/workspaces
-  # Each new issue receives a detached Git worktree at refreshed origin/main;
-  # later dispatches reuse that issue's existing worktree and commit history.
+  # Symphony develops itself, so each issue gets a detached worktree of this
+  # very repository.
   source_root: .
 hooks:
   timeout_ms: 60000
@@ -89,23 +53,15 @@ agent:
   # burned the full 20-turn budget without publishing. 8 leaves headroom above
   # every observed success without paying for as long a death spiral.
   max_turns: 8
-  # Bounds the number of runs, which max_turns (turns inside a run) and
-  # max_retry_backoff_ms (the delay between runs) do not: after this many
-  # dispatches of the same issue fail, Symphony logs one error-level
-  # dispatch_abandoned record and drops the claim instead of retrying at the
-  # backoff ceiling for the rest of the daemon's life. A landing wait is not a
-  # failure and is exempt.
+  # Left at the default. Bounds the number of runs, which max_turns and
+  # max_retry_backoff_ms do not.
   max_attempts: 5
 codex:
   command: codex app-server
   approval_policy: never
   thread_sandbox: workspace-write
-  # workspaceWrite bounds writes to this issue's worktree plus the two narrow
-  # Git metadata roots Symphony grants for a local commit. networkAccess: true
-  # grants unrestricted outbound network access, not merely local sockets:
-  # repository tests that bind loopback listeners are why it is enabled, not
-  # the limit of what it permits. The sandbox does not restrict reads, so a
-  # worker can read any file this user can, credential files included.
+  # networkAccess is enabled because this repository's own tests bind loopback
+  # listeners. It grants unrestricted egress, not just local sockets.
   turn_sandbox_policy:
     type: workspaceWrite
     networkAccess: true
@@ -115,38 +71,21 @@ codex:
   # block configures. See WORKFLOW.example.md's commented-out claude: block
   # for that number and the incident that set it.
   turn_timeout_ms: 3600000
-  # read_timeout_ms bounds every steady-state JSON-RPC round trip; keep it small
-  # so a hung session is detected mid-turn.
   read_timeout_ms: 5000
-  # start_timeout_ms applies only to the cold-start handshake and thread/start,
-  # which include app-server spawn and the first model load. It is deliberately
-  # generous so a cold start does not spuriously time out, without loosening
-  # read_timeout_ms.
   start_timeout_ms: 120000
   stall_timeout_ms: 300000
 # Host-side GitHub PR handoff and landing, fixed to this repository only
-# (PMR-36, PMR-37). The token is host-side and repository-scoped: it is read
-# once from a mode-600 file outside the repository via
-# $SYMPHONY_GITHUB_TOKEN_FILE, is never committed, and Symphony strips it (and
-# any inherited environment value containing it) from the Codex child
-# process. See README.md for the fine-grained token's required scopes and
-# permissions.
+# (PMR-36, PMR-37). WORKFLOW.example.md documents the token's required
+# permissions and every field below.
 github:
   owner: pmrrasmussen
   repository: symphony
   base_branch: main
   token_file: $SYMPHONY_GITHUB_TOKEN_FILE
-  # Paces the linked pull-request poll loop, and is also the floor for the
-  # delayed landing redispatch after github_land_pr reports a non-terminal
-  # wait. Consecutive waits escalate that delay toward
-  # agent.max_retry_backoff_ms, so a gate that never settles backs off instead
-  # of respawning a landing session every interval.
   poll_interval_ms: 30000
-  # Landing capability (PMR-37, activated for real dispatch by PMR-38). A
-  # session bound to an issue currently in Merging receives the zero-argument
-  # github_land_pr tool; moving the issue to Merging is itself the human
-  # approval to land. required_checks names the exact GitHub check names this
-  # repository's CI reports (the job names in .github/workflows/ci.yml).
+  # Landing capability (PMR-37, activated for real dispatch by PMR-38).
+  # required_checks names the exact GitHub check names this repository's CI
+  # reports (the job names in .github/workflows/ci.yml); change both together.
   merge_state: Merging
   merge_method: merge
   required_checks:
