@@ -1,3 +1,4 @@
+// Package coordinator owns all mutable scheduling state.
 package coordinator
 
 import (
