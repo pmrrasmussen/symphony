@@ -59,11 +59,22 @@ type Snapshot struct {
 // Publisher owns a single independently configured status path. Its mutex
 // serializes concurrent periodic and shutdown writes while readers observe
 // each complete replacement through rename(2).
+//
+// now and newTicker are Run's only sources of time. A test replaces them to
+// elapse publish intervals on its own terms; deciding from real elapsed time
+// that a publish must have happened by now asserts how much CPU the publisher
+// goroutine got, not what it wrote (PMR-170).
 type Publisher struct {
-	path     string
-	metadata Metadata
-	now      func() time.Time
-	mu       sync.Mutex
+	path      string
+	metadata  Metadata
+	now       func() time.Time
+	newTicker func(time.Duration) (<-chan time.Time, func())
+	mu        sync.Mutex
+}
+
+func realTicker(interval time.Duration) (<-chan time.Time, func()) {
+	ticker := time.NewTicker(interval)
+	return ticker.C, ticker.Stop
 }
 
 func New(path string, metadata Metadata) (*Publisher, error) {
@@ -76,7 +87,7 @@ func New(path string, metadata Metadata) (*Publisher, error) {
 	if metadata.StartedAt.IsZero() {
 		metadata.StartedAt = time.Now()
 	}
-	return &Publisher{path: filepath.Clean(path), metadata: metadata, now: time.Now}, nil
+	return &Publisher{path: filepath.Clean(path), metadata: metadata, now: time.Now, newTicker: realTicker}, nil
 }
 
 func (p *Publisher) Snapshot(state ProcessState, coordinatorSnapshot coordinator.Snapshot) Snapshot {
@@ -201,13 +212,13 @@ func (p *Publisher) Run(ctx context.Context, interval time.Duration, source func
 		}
 	}
 	publish()
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+	ticks, stop := p.newTicker(interval)
+	defer stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		case <-ticks:
 			publish()
 		}
 	}

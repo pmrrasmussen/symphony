@@ -260,6 +260,13 @@ func TestRunDerivesProcessStateFromCoordinatorSnapshotStopping(t *testing.T) {
 // for as long as Run keeps running -- including through a coordinator drain
 // that outlasts one publish interval, rather than going stale the moment
 // shutdown begins.
+//
+// Every interval here is handed to Run by the test rather than waited out, so
+// nothing decides from real elapsed time that a publish should have happened by
+// now. That measurement was this test's own flake: under -race on a loaded
+// runner the publisher goroutine could be starved for the whole window while
+// the test's sleeps elapsed on schedule, failing branches that do not touch
+// this package (PMR-170).
 func TestRunKeepsRefreshingThroughAShutdownLongerThanTheInterval(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "runtime", "status.json")
 	publisher, err := New(path, Metadata{PID: 1, StartedAt: time.Now()})
@@ -267,8 +274,24 @@ func TestRunKeepsRefreshingThroughAShutdownLongerThanTheInterval(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// An interval no test run can reach: every tick below comes from the test.
+	interval := time.Hour
+	ticks := make(chan time.Time)
+	var ticked time.Duration
+	publisher.newTicker = func(d time.Duration) (<-chan time.Time, func()) {
+		ticked = d
+		return ticks, func() {}
+	}
+	// A fake clock advancing one interval per publish: generated_at then moves
+	// exactly when a publish reads it, so "the file was refreshed" is a fact
+	// about the writes rather than about the host's clock resolution.
+	published := time.Date(2026, time.August, 28, 12, 0, 0, 0, time.UTC)
+	publisher.now = func() time.Time {
+		published = published.Add(interval)
+		return published
+	}
+
 	var stopping atomic.Bool
-	interval := 5 * time.Millisecond
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
@@ -282,25 +305,39 @@ func TestRunKeepsRefreshingThroughAShutdownLongerThanTheInterval(t *testing.T) {
 		<-done
 	})
 
-	waitForStatusState(t, path, Running)
-	stopping.Store(true)
-	waitForStatusState(t, path, Stopping)
+	// elapse hands Run one publish interval. Run receives it only while sitting
+	// at its select, which it reaches only after the previous publish returned,
+	// so each send is also the previous publish's completion signal -- a
+	// starved publisher makes this test slower, never red.
+	elapse := func() { ticks <- time.Time{} }
+
+	elapse()
+	if got := readStatusSnapshot(t, path); got.State != Running {
+		t.Fatalf("state=%q before the simulated drain, want %q", got.State, Running)
+	}
+	if ticked != interval {
+		t.Fatalf("Run ticked at %s, want the configured %s", ticked, interval)
+	}
 
 	// A shutdown that drains for several publish intervals must still refresh
-	// generated_at at least once during that window, not just at its start.
+	// generated_at during that window, not just at its start. Every publish
+	// from here on reads Stopping, and before is at most the first of them, so
+	// the two later ones the remaining sends confirm must have left the file
+	// strictly fresher.
+	stopping.Store(true)
+	elapse()
 	before := readStatusSnapshot(t, path)
-	deadline := time.Now().Add(20 * interval)
-	for time.Now().Before(deadline) {
-		time.Sleep(interval)
-		current := readStatusSnapshot(t, path)
-		if current.State != Stopping {
-			t.Fatalf("state=%q during simulated drain, want %q", current.State, Stopping)
-		}
-		if current.GeneratedAt.After(before.GeneratedAt) {
-			return
-		}
+	for range 3 {
+		elapse()
 	}
-	t.Fatal("status file was never refreshed during the simulated shutdown drain")
+
+	current := readStatusSnapshot(t, path)
+	if !current.GeneratedAt.After(before.GeneratedAt) {
+		t.Fatalf("status file was never refreshed during the simulated shutdown drain: generated_at stayed at %s", before.GeneratedAt)
+	}
+	if current.State != Stopping {
+		t.Fatalf("state=%q during simulated drain, want %q", current.State, Stopping)
+	}
 }
 
 func readStatusSnapshot(t *testing.T, path string) Snapshot {
@@ -314,18 +351,6 @@ func readStatusSnapshot(t *testing.T, path string) Snapshot {
 		t.Fatalf("snapshot is not parseable JSON: %v\n%s", err, contents)
 	}
 	return snapshot
-}
-
-func waitForStatusState(t *testing.T, path string, want ProcessState) {
-	t.Helper()
-	deadline := time.Now().Add(time.Second)
-	for time.Now().Before(deadline) {
-		if _, err := os.Stat(path); err == nil && readStatusSnapshot(t, path).State == want {
-			return
-		}
-		time.Sleep(time.Millisecond)
-	}
-	t.Fatalf("status file never reported state %q", want)
 }
 
 func TestWriteRejectsExistingDirectoryThatIsNotOwnerOnly(t *testing.T) {
