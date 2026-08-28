@@ -1955,6 +1955,53 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{}}'
 	}
 }
 
+// TestAnOperatorProfileReachesNeitherTheChildEnvironmentNorItsStream covers the
+// launch form rather than the filter: the app-server runs under `bash -c`, so
+// the operator's profile is never sourced and the filtered environment is the
+// environment the child actually gets. Under `bash -lc` this one fixture broke
+// the boundary twice -- it re-exported LINEAR_API_KEY, a reserved name
+// hostenv.Filter had just removed, and its greeting landed on the stdout read()
+// decodes as JSON-RPC, failing every session at start (PMR-172).
+//
+// HOME is redirected at this test's own process, so the fixture is the profile
+// a login shell would read and no operator file is involved.
+func TestAnOperatorProfileReachesNeitherTheChildEnvironmentNorItsStream(t *testing.T) {
+	home := t.TempDir()
+	profile := "echo 'nvm: a profile that prints on stdout'\nexport LINEAR_API_KEY=profile-re-exported-key\n"
+	if err := os.WriteFile(filepath.Join(home, ".bash_profile"), []byte(profile), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", home)
+	t.Setenv("LINEAR_API_KEY", "reserved-linear-key-value")
+
+	dir := t.TempDir()
+	environment := filepath.Join(dir, "environment")
+	script := writeAppServer(t, dir, `
+env > `+environment+`
+IFS= read -r line
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'
+IFS= read -r line
+IFS= read -r line
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thread-1"}}}'
+IFS= read -r line
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn-1"}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{}}'
+`)
+	_, events, err := New().Start(context.Background(), request(dir, script))
+	if err != nil {
+		t.Fatalf("the profile's stdout reached the JSON-RPC stream: %v", err)
+	}
+	for range events {
+	}
+	child := readChildEnvironment(t, environment)
+	if slices.Contains(childEnvironmentNames(child), "LINEAR_API_KEY") {
+		t.Fatalf("the profile re-exported the reserved name the filter removed: %s", child)
+	}
+	if strings.Contains(child, "profile-re-exported-key") {
+		t.Fatalf("the profile's value reached the child environment: %s", child)
+	}
+}
+
 // childEnvironmentNames reads the variable names out of `env` output, so an
 // absence assertion on one name cannot be satisfied by another name that merely
 // ends with it -- GITHUB_TOKEN inside SYMPHONY_GITHUB_TOKEN, for example.

@@ -401,12 +401,19 @@ has no session, so it passes no `SecretMatcher` and gets the three parts derived
 from settings alone, forgoing only a credential held by a live provider under a
 name and value no configuration mentions. Symphony adds `SYMPHONY_ISSUE_ID` and
 `SYMPHONY_ISSUE_IDENTIFIER` after filtering and blocks both names on the way in,
-so it is their only source. Hooks run under `sh -c` rather than `sh -lc`: a
-login shell sources the operator's profile, a second uncontrolled input to a
-process running in an agent-writable directory, and it is not the form
-`--dry-run` validates the script with (`sh -n -c`). A hook resolves commands
-from the daemon's own `PATH` -- under a LaunchAgent, the one written into the
-plist -- rather than from a profile.
+so it is their only source.
+
+No child Symphony spawns runs under a login shell: a hook takes `sh -c`, the
+Codex app-server `bash -c`, and each Claude turn is argv executed directly with
+no shell at all. A login shell sources the operator's profile *after* the filter
+ran, so it is both a second uncontrolled input to a process running in an
+agent-writable directory and a way for a name filters 1 through 3 just removed
+to be re-exported straight back into the child (PMR-172), and it is not the form
+`--dry-run` validates these commands with (`sh -n -c`). A profile's *output*
+costs something too: the app-server's stdout is the JSON-RPC stream this daemon
+decodes, so a profile that greets or warns fails every session at start. A child
+therefore resolves commands from the daemon's own `PATH` -- under a LaunchAgent,
+the one written into the plist -- rather than from a profile.
 
 `hostenv.Filter` applies all four parts in one pass. Its `entries` parameter is
 the caller's environment, normally `os.Environ()`. It is a parameter rather than

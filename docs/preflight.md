@@ -29,10 +29,16 @@ root is a warning; an invalid boundary is a failure and exits non-zero. Treat a
 non-zero exit as a failed preflight.
 
 Hook scripts are validated with `sh -n`, a shell syntax check. That is exact
-for `codex.command`, which runs through `bash -lc`, and a loose superset for
+for `codex.command`, which runs through `bash -c`, and a loose superset for
 `claude.command`, which is argv rather than a shell command: the syntax check
 accepts quoting that the Claude launcher passes through as literal argument
 text rather than interpreting.
+
+What that check validates is the command itself and nothing around it. No child
+Symphony spawns gets a login shell, so a passing check is a statement about the
+configured text rather than about an operator profile the run would then also
+execute -- there is none to check, and the same holds for hooks, which run under
+`sh -c` and are checked with `sh -n -c`.
 
 ## The `agent_authentication` check
 

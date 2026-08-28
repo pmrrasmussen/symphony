@@ -268,12 +268,18 @@ type rpc struct {
 // built from its bindings -- and because a nil slice here would hand the child
 // the daemon's complete environment, which is exactly what the filter exists to
 // prevent.
+//
+// `bash -c`, not `bash -lc`: a login shell sources the operator's profile after
+// the filter ran, so the profile could re-export a name the filter just removed
+// and its output would land on the stdout this client parses as JSON-RPC
+// (PMR-172). docs/architecture.md's "The host credential filter" states why no
+// child Symphony spawns gets a login shell.
 func start(ctx context.Context, r domain.AgentRequest, environment []string, capabilities *capability.Registry, timer Timer) (*client, error) {
 	command := strings.TrimSpace(r.Command)
 	if command == "" {
 		command = "codex app-server"
 	}
-	cmd := exec.CommandContext(ctx, "bash", "-lc", command)
+	cmd := exec.CommandContext(ctx, "bash", "-c", command)
 	cmd.Dir = r.Workspace
 	cmd.Env = environment
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
