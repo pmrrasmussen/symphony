@@ -391,8 +391,8 @@ what the operator believes is configured.
 
 **Decision: do not add a Symphony-owned OS sandbox now.** Such a sandbox would
 make the write boundary uniform and independent of a backend vendor, and would
-need to cover every process and tool write path to close the Claude gap recorded
-below. It would also duplicate the protection Codex already provides and change
+need to cover every process and tool write path to close the remaining Claude
+gap recorded below. It would also duplicate the protection Codex already provides and change
 the launch path for both backends. That extra layer can break repository test
 suites that need loopback listeners or module downloads, so it needs its own
 cross-platform design, compatibility evidence, and review rather than being
@@ -401,12 +401,21 @@ added as an incidental documentation change.
 This is not an assertion that the present Claude boundary is safe or uniform.
 The selected `agent.backend` determines its strength: Codex's configured
 `workspaceWrite` policy confines writes to the worktree and narrowed Git roots,
-while Claude confines `Bash` and its children only. If Symphony-owned
-enforcement is wanted, it must be a separate issue with an explicit OS-level
-profile and validation plan; this decision records the current trade-off rather
-than promising that the backend contracts are equivalent. No current product
-decision requires Symphony to impose a uniform OS-level boundary, so that work
-is not adopted as part of PMR-85.
+while Claude confines `Bash` and its children by path and confines `Edit`/
+`Write` by their own path-scoped permission rule (PMR-156), which together
+close every write path this launcher's settings payload can express. What that
+payload cannot express, and what a Symphony-owned OS sandbox would (PMR-156's
+still-open finding, see above): a `Bash` command inside the source
+repository's `.git` directory can still reach `refs/heads/*`, `packed-refs`,
+and the primary index, because the CLI's own sandbox generator widens the
+declared `.git/objects`/`.git/worktrees/<id>` grant to the whole enclosing
+`.git` directory, and no setting on this launcher's contract was found to
+narrow that back down. If Symphony-owned enforcement is wanted, it must be a
+separate issue with an explicit OS-level profile and validation plan; this
+decision records the current trade-off rather than promising that the backend
+contracts are equivalent. No current product decision requires Symphony to
+impose a uniform OS-level boundary, so that work is not adopted as part of
+PMR-85 or of PMR-156.
 
 The Claude backend has a fixed launch contract but not equivalent write
 containment, and none of that contract is configurable: the `claude:` block
@@ -415,8 +424,10 @@ launch contract itself is fixed in `internal/claude`. Each turn is launched with
 `--print --output-format stream-json --verbose`, `--permission-mode dontAsk`
 (the only fail-closed non-interactive mode; the prompt occupies stdin, so a
 mode that can block on stdin is unusable, and `bypassPermissions` is the
-opposite of fail-closed), `--tools` and `--allowedTools` restricted to
-`Bash`/`Edit`/`Glob`/`Grep`/`Read`/`Write` with
+opposite of fail-closed), `--tools` restricted to
+`Bash`/`Edit`/`Glob`/`Grep`/`Read`/`Write` and `--allowedTools` naming the same
+tools -- except that `Edit` and `Write` are each named once per write root as a
+path-scoped rule rather than bare (PMR-156; see below) -- with
 `--disallowedTools WebFetch,WebSearch`, `--strict-mcp-config`,
 `--setting-sources ""`, and an inline `--settings` payload. `--tools` is what
 removes a tool from the surface -- a permission allowlist alone still
@@ -505,28 +516,50 @@ domain allowlist (PMR-143), which is what several of this repository's own
 `httptest`- and `mcpbridge`-backed test suites need to run. Claude's default
 when `failIfUnavailable` is omitted permits a fail-open fallback after an
 initialization failure; Symphony sets the flag to prevent that fallback. It
-does not make the sandbox cover tools it never governs: PMR-156 verified that
-the sandbox initialized and enforced `Bash` while `Edit`/`Write` could still
-write outside the worktree. On the same CLI version, Bash writes to `$HOME` and
-`$TMPDIR` were refused with "operation not permitted" and per-domain network
-control worked in both directions.
+does not make the sandbox cover tools it never governs: PMR-156 found that the
+sandbox initialized and enforced `Bash` while `Edit`/`Write` could still write
+outside the worktree, and closed that gap for those two tools specifically --
+see below. On the same CLI version, Bash writes to `$HOME` and `$TMPDIR` were
+refused with "operation not permitted" and per-domain network control worked
+in both directions.
 
-Four limits are stated rather than implied. First, the sandbox governs `Bash`
-and its children, and Bash writes were verified confined; `Edit` and `Write`
-are not sandboxed and carry no path restriction at all, because the rendered
-payload allows the bare tool names `Bash`, `Edit`, `Glob`, `Grep`, `Read`, and
-`Write` under `defaultMode: dontAsk` -- a permission rule decides whether a
-tool exists, not where it may write. PMR-156 verified the consequence using
-Symphony's exact launch contract: a `Bash` append to an absolute path in the
-source working tree was denied, while `Write` wrote that same path
-successfully. The session could also write anywhere in the source repository's
-`.git`: a plain redirect to `refs/heads/`, `git update-ref`, and `git commit`
-all succeeded, and the latter two moved `refs/heads/main` despite the declared
-grant naming only `.git/objects`. This is a coverage gap, not evidence that the
-sandbox failed to initialize. It was invisible in the session: concurrent
-agents committed to the operator's `main` and left another agent's edits in the
-primary working tree before it was discovered. Second, reads are not confined,
-exactly as for Codex. Third, `network.allowedDomains: ["*"]` is unrestricted
+Five limits are stated rather than implied. First, the sandbox governs `Bash`
+and its children by path, via `sandbox.filesystem.allowWrite`; `Edit` and
+`Write` are never covered by that setting at all, because a permission rule
+decides whether a tool exists, not where it may write. PMR-156 verified the
+consequence using Symphony's exact launch contract -- a `Bash` append to an
+absolute path in the source working tree was denied, while `Write` wrote that
+same path successfully -- and closed it by giving `Edit` and `Write` their own
+path-scoped permission rule instead of the bare tool name: `Allow` carries one
+`Edit(//root/**)` and `Write(//root/**)` rule per write root (`scopedAllow` in
+`internal/claude/launch.go`), and `--allowedTools` carries the identical
+rendered list so the flag and the payload cannot disagree about what either
+tool may touch. The CLI's own builtin `/statusline` command was the source for
+this rule's syntax (`Read(~/**)`, `Edit(~/.claude/settings.json)`, verified
+against claude 2.1.248) since it is not part of the documented `--settings`
+schema. `Bash` itself keeps the bare tool name: its confinement was never the
+permission rule, and always came from `allowWrite`.
+
+Second, that leaves one confirmed gap `allowWrite` does not close, and it is a
+limitation of the CLI's own sandbox rather than of this launcher's payload: a
+`Bash` command can still write anywhere under the source repository's whole
+`.git` directory, not only the two roots the payload names. PMR-156's
+investigation demonstrated it directly -- with the declared grant naming only
+`.git/objects` and this worktree's own `.git/worktrees/<id>`, a plain redirect
+to `refs/heads/`, `git update-ref`, and `git commit` all succeeded from inside
+a live session, and the latter two moved `refs/heads/main`. The rendered
+`allowWrite` array itself names only the two documented roots -- this is a
+gap in what the CLI enforces from that array, not in what Symphony asks it to
+enforce, and no combination of settings this payload can express was found to
+narrow it. It was invisible in the session that first hit it: concurrent
+agents committed to the operator's `main` and left another agent's edits in
+the primary working tree before it was discovered. Closing it for `Bash` the
+way `Edit`/`Write` were closed -- with a boundary this process owns rather
+than one the CLI's own sandbox generator applies -- is exactly the
+Symphony-owned OS sandbox the "Sandbox ownership decision (PMR-85)" section
+below declined to build; that decision, not this one, is where reopening the
+question belongs. Third, reads are not confined,
+exactly as for Codex. Fourth, `network.allowedDomains: ["*"]` is unrestricted
 outbound access, the same deliberate choice as the Codex profile's
 `networkAccess: true`; per-domain control exists and works but is not used to
 restrict anything. `allowLocalBinding: true` is the separate grant that lets a
@@ -536,7 +569,7 @@ the grant is reported as an `EventDiagnostic` naming the sandbox denial
 (`internal/claude`'s stream decoder recognizes the fixed "bind: operation not
 permitted" marker in a failed tool result), rather than surfacing only as an
 undifferentiated failed item indistinguishable from a real regression.
-Fourth, the only confirmation that the contract applied is
+Fifth, the only confirmation that the contract applied is
 the CLI's own `system`/`init` event, which reports the working directory, tool
 surface, permission mode, and attached MCP servers: Symphony requires the tool
 surface and permission mode to match the contract that turn was launched under
@@ -591,10 +624,11 @@ inspected from the locally installed Codex schema generated on 2026-07-18;
 upstream Codex HEAD at inspection was `56395bddaf26eb2829387ca6a417bf9128e5b239`.
 The Claude Code CLI's launch flags, `--print` stream-JSON event shapes, and
 sandbox behaviour -- including the initialization fallback
-`failIfUnavailable` prevents and the PMR-156 tool-coverage gap -- were
-inspected empirically against locally installed `claude` 2.1.245 on macOS. None
-of it is a published protocol schema, so a CLI upgrade can change it: re-verify
-the launch contract and the event decode against the new version rather than
+`failIfUnavailable` prevents, the PMR-156 `Edit`/`Write` tool-coverage gap and
+its fix, and the still-open `.git`-widening gap -- were inspected empirically
+against locally installed `claude` 2.1.245 and 2.1.248 on macOS. None of it is
+a published protocol schema, so a CLI upgrade can change it: re-verify the
+launch contract and the event decode against the new version rather than
 assuming they carried over.
 
 One bounded-run recovery detail is intentionally Go-specific: active issues

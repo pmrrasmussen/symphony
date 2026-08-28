@@ -158,6 +158,40 @@ is still on its default branch and has a clean worktree, proving the exercise
 remained isolated. Stop the service and remove all disposable artifacts when
 the run finishes.
 
+## Live Claude sandbox boundary verification (PMR-156)
+
+`internal/claude.TestLiveClaudeSandboxDeniesEditAndWriteOutsideWriteRoots` is a
+separate, opt-in verification that a live `claude` session cannot use `Edit` or
+`Write` to escape its granted write roots. It is not part of `go test ./...`:
+it spawns the real CLI against a real, credentialed account and consumes real
+usage on every run, so `go test` skips it unless
+`SYMPHONY_LIVE_CLAUDE_SANDBOX_FIXTURE` is set.
+
+Point that variable at an existing, writable directory **outside `/tmp`**. The
+CLI's sandbox permits `/tmp` by default, and building this fixture there
+previously produced a false "the sandbox is not enforced at all" conclusion on
+this exact issue -- see the test's own doc comment for the full account. A
+process already running inside a sandboxed agent session cannot reliably
+create such a location for itself, which is why this is a manual step rather
+than something the test provisions on its own:
+
+```sh
+mkdir -p ~/symphony-sandbox-fixture
+SYMPHONY_LIVE_CLAUDE_SANDBOX_FIXTURE=~/symphony-sandbox-fixture \
+  go test ./internal/claude/... -run TestLiveClaudeSandboxDeniesEditAndWriteOutsideWriteRoots -v
+```
+
+The test builds a disposable source repository and linked worktree under that
+directory, launches a live turn instructed to overwrite a tracked file in the
+source working tree with both `Bash` and `Write`, and asserts the file is
+byte-for-byte unchanged afterward -- checking the CLI's actual enforcement on
+disk, not merely what the model's own report claims. It intentionally does not
+exercise `refs/heads/*`, `packed-refs`, or the primary index: those remain
+writable through `Bash` today, a CLI-level gap the "Sandbox ownership decision
+(PMR-85)" section of [architecture.md](architecture.md) records as open and
+declines to close without a separate, explicit OS-sandbox decision. Remove the
+fixture directory's contents when finished; nothing in it is durable state.
+
 ## GitHub Actions smoke
 
 The `live-smoke` job is not triggered by pushes or pull requests. It runs only

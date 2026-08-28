@@ -296,7 +296,9 @@ func assertFixedPolicy(t *testing.T, args []string, r domain.AgentRequest) {
 		// skills, plugins, and hooks from widening the boundary.
 		{"--setting-sources", ""},
 		{"--tools", strings.Join(codingTools, ",")},
-		{"--allowedTools", strings.Join(codingTools, ",")},
+		// Edit and Write are scoped to the write roots -- see scopedAllow -- so
+		// --allowedTools is no longer the bare tool surface.
+		{"--allowedTools", strings.Join(scopedAllow(rootsOf(t, r), codingTools), ",")},
 	} {
 		if got := flagValue(t, args, expected[0]); got != expected[1] {
 			t.Fatalf("%s=%q, want %q", expected[0], got, expected[1])
@@ -744,6 +746,17 @@ func readFile(t *testing.T, path string) string {
 		t.Fatal(err)
 	}
 	return strings.TrimSuffix(string(raw), "\n")
+}
+
+// rootsOf mirrors the write roots buildPolicy derives from r, so a test's
+// expectation and the production computation cannot silently drift apart.
+func rootsOf(t *testing.T, r domain.AgentRequest) []string {
+	t.Helper()
+	roots, err := writeRoots(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return roots
 }
 
 func flagValue(t *testing.T, args []string, flag string) string {
