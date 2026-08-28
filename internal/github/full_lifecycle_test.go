@@ -232,8 +232,12 @@ func (a *lifecycleAgentBackend) actOn(ctx context.Context, issue domain.Issue) e
 	case "todo":
 		// Host-owned dispatch-time start transition (the coordinator's job), not
 		// an agent capability: move it with the host Linear tracker credential.
-		if err := a.tracker.Transition(ctx, issue, "In Progress"); err != nil {
+		result, err := a.tracker.Transition(ctx, issue, issue.State, "In Progress")
+		if err != nil {
 			return fmt.Errorf("transition to In Progress: %w", err)
+		}
+		if !result.Applied {
+			return fmt.Errorf("start transition refused: issue is in %q", result.FromState)
 		}
 	case "in progress", "rework":
 		githubSession := a.githubManager.PrepareWithSettings(settings.GitHub, issue, "/fake/workspace", handoffSession)

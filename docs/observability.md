@@ -29,10 +29,17 @@ coordinator's dispatch-time move; `handoff` for the host review handoff;
 `landing_refused`, `landing_completed`, `merge_reconciled`, and
 `review_completed` for the GitHub landing edges; `transition` for a host-side
 move applied through the tracker adapter itself), the `from_state` and
-`to_state` state NAMES, and the issue (`issue_id`/`issue_identifier`). An
-idempotent no-op (the issue is already in the target state) instead logs a
-debug-level `"msg":"Linear transition skipped"` with the same fields, so a
-skip never appears as a state change. These records are redaction-safe: state
+`to_state` state NAMES, and the issue (`issue_id`/`issue_identifier`). Every
+`from_state` is the state the adapter freshly read when it decided to write,
+never the poll snapshot the caller asked with. An idempotent no-op (the issue
+is already in the target state) instead logs a debug-level `"msg":"Linear
+transition skipped"` with the same fields, so a skip never appears as a state
+change. A withheld write — the issue left the requested source state while the
+dispatch was being prepared — logs a warning-level `"msg":"Linear transition
+refused: source state changed"` carrying the fresh `from_state`, the
+`expected_from_state` the caller asked for, and `to_state`; the coordinator
+records the same pair at info level as `"msg":"dispatch start transition
+skipped: issue left the start state"`. These records are redaction-safe: state
 names and issue identifiers only — never a rendered comment, issue
 description, or credential. (Agent turn token accounting is tracked
 separately.)

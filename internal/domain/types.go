@@ -176,14 +176,28 @@ type Tracker interface {
 	ListCandidates(context.Context, []string) ([]Issue, error)
 	GetIssues(context.Context, []string) ([]Issue, error)
 	ListTerminal(context.Context, []string) ([]Issue, error)
-	// Transition moves an issue into the named workflow state using the host
+	// Transition moves an issue from fromState into toState using the host
 	// tracker credential. It backs the coordinator's deterministic
 	// dispatch-time start transition (Todo -> In Progress). The adapter
-	// re-reads the issue inside the call, so a stale caller-supplied state
-	// cannot drive a wrong transition, and it is idempotent: an issue already
-	// in the target state is a no-op. It never widens the running agent's
-	// capability surface.
-	Transition(ctx context.Context, issue Issue, toState string) error
+	// re-reads the issue inside the call and writes only while that fresh
+	// state still equals fromState, so a human who moved the issue after the
+	// caller's snapshot always wins; it is idempotent, an issue already in
+	// toState is a no-op. It never widens the running agent's capability
+	// surface.
+	Transition(ctx context.Context, issue Issue, fromState, toState string) (TransitionResult, error)
+}
+
+// TransitionResult reports what a host-side transition observed and did, so a
+// caller logs the state the write decision was actually made against rather
+// than the snapshot it asked with.
+type TransitionResult struct {
+	// FromState is the issue's freshly read state at the moment of that
+	// decision. It is empty only when the read itself failed.
+	FromState string
+	// Applied is true when the issue is in toState after the call — because
+	// this call wrote it, or because it was already there. It is false, with no
+	// mutation sent, when FromState no longer matches the requested fromState.
+	Applied bool
 }
 type AgentRequest struct {
 	Issue Issue

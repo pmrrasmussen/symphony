@@ -42,7 +42,9 @@ tracker:
       # Applied at dispatch, keyed by the issue's current state (Todo ->
       # In Progress); both endpoints must be active, non-terminal states.
       # Idempotent and fail-safe: an already-started issue is untouched and a
-      # failed move never blocks or double-dispatches the run.
+      # failed move never blocks or double-dispatches the run. The move is
+      # applied only while the issue's freshly read state is still the edge's
+      # source, so a human who moves it during dispatch is never overridden.
       start:
         Todo: In Progress
       # The Merging -> In Review fallback a refused github_land_pr uses (keyed
