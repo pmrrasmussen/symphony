@@ -1,4 +1,4 @@
-// The dashboard's detail pages. The plain renderer in tui.go keeps its prose:
+// The dashboard's detail pages. The plain renderer in view.go keeps its prose:
 // it is the scriptable, non-TTY surface, and pipes and scripts read its exact
 // wording. These lay the same fields out as tables for a terminal.
 package tui
