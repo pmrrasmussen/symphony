@@ -124,26 +124,24 @@ func handoffPolicy(provider map[string]any, activeStates, terminalStates []strin
 
 // hostTransitionPolicy parses the single repository-owned, host-applied
 // transition policy under tracker.provider.transitions. Symphony applies every
-// edge itself with the host credential; none is exposed to a Codex session, so
-// the agent has no issue-state transition capability. The two edge sets are
-// parsed and validated separately and never flattened into one map: the
-// canonical Merging state is both a dispatchable active state and the
-// land-fallback source, so a flat source->target map consumed at dispatch
+// edge itself with the host credential; none is exposed to an agent session.
+//
+// The two edge sets are parsed and validated separately and never flattened into
+// one map: the canonical Merging state is both a dispatchable active state and
+// the land-fallback source, so a flat source->target map consumed at dispatch
 // would wrongly move a freshly dispatched Merging landing agent's issue to In
 // Review.
 //
-//   - transitions.start: dispatch-time edges the coordinator applies when it
-//     launches an issue (Todo -> In Progress). Both endpoints of every edge
-//     must be active, non-terminal states, since the coordinator only
-//     dispatches active issues and the issue must remain eligible for
-//     reconciliation after the move.
+//   - transitions.start: dispatch-time edges (Todo -> In Progress). Both
+//     endpoints of every edge must be active, non-terminal states.
 //   - transitions.refuse_landing: the edges RefuseLanding applies after a
 //     github_land_pr hard gate (Merging -> In Review), keyed by
 //     github.merge_state. Never applied at dispatch; terminal and same-state
 //     edges are rejected.
 //
 // Source keys in both maps are lowercased so callers can compare them against a
-// normalized issue state directly.
+// normalized issue state directly. See docs/linear-tracker.md for the lifecycle
+// these edges implement.
 func hostTransitionPolicy(provider map[string]any, activeStates, terminalStates []string) (HostTransitions, error) {
 	value, exists := provider["transitions"]
 	if !exists {

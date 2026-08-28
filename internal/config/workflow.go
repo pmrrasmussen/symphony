@@ -201,49 +201,23 @@ func validateSettings(s Settings) (Settings, error) {
 		if strings.TrimSpace(s.Claude.Command) == "" || s.Claude.TurnTimeout <= 0 || s.Claude.StallTimeout <= 0 {
 			return s, errors.New("invalid configuration: non-positive duration or agent limit")
 		}
-		// A Claude session may now hold Symphony's bounded capabilities: the
-		// transport is the private loopback MCP endpoint, DeliveryInstructions
-		// renders the MCP tool names for this backend, and claude.Backend.Start
-		// cross-checks the rendered prompt against what the session it is about
-		// to start can serve. What is left are two residual rules, both narrower
-		// than the blanket refusal they replace, and both refused only for this
-		// backend.
+		// Two residual configuration rules, both refused only for this backend.
 		//
-		// Rule one: an enabled github integration requires handoff_state. With
-		// one, host-side publish works. Without one there are two outcomes and
-		// neither is acceptable. If follow-up issues are off, no Linear handoff
-		// session is prepared, so no GitHub session is either, and the enabled
-		// integration grants nothing. If follow-up issues are on, a handoff
-		// session *is* prepared -- LinearSessionCapabilityEnabled is satisfied by
-		// followup_issue_creation alone -- so a GitHub session is built and
-		// github_publish_pr and github_pr_context are advertised, while
-		// DeliveryInstructions branches on HostSidePublishPromised and tells the
-		// model publishing is unavailable. That second case is the dangerous one,
-		// and not merely because the prompt disagrees with the tool list: the
-		// guidance tells a Claude worker its tool list decides availability, and a
-		// worker that acts on the advertised tool reaches
-		// HandoffSession.LinkAndHandoff with an empty targetStateID, which
-		// comments the pull request onto the issue and then attempts a Linear
-		// transition to no state at all. The refusal arrives after an
-		// irreversible GitHub mutation. Refusing the configuration is the only
-		// place this is cheap.
+		// Rule one: an enabled github integration requires handoff_state. Without
+		// one, the configuration either grants nothing or -- with follow-up issues
+		// on -- advertises github_publish_pr while the rendered guidance says
+		// publishing is unavailable. A worker acting on the advertised tool reaches
+		// LinkAndHandoff with an empty targetStateID, which comments the pull
+		// request onto the issue and then transitions it to no state at all, so the
+		// refusal arrives after an irreversible GitHub mutation.
 		//
 		// Rule two: a configured capability that no session could advertise is
-		// refused rather than silently degraded. After rule one the only way left
-		// to write one is a handoff_state with no enabled github integration and
-		// no follow-up issues: the handoff object is prepared and nothing
-		// model-facing uses it.
+		// refused rather than silently degraded.
 		//
-		// Both are claude-only, and that is deliberate in both directions. Under
-		// codex these configurations behave identically -- the advertisement is
-		// the same registry's -- and they stay accepted there because they always
-		// have been; narrowing them would reject workflows already in the field,
-		// and the prompt/advertisement mismatch rule one describes is pre-existing
-		// under codex and is not fixed here. Under claude they are worth refusing:
-		// this is a new backend with no deployed configurations, and "no MCP
-		// server at all" in the init echo then keeps a single meaning -- this
-		// workflow configures no capability -- rather than also standing for a
-		// capability that was configured and could not be reached.
+		// Both stay accepted under codex, where they behave identically and always
+		// have. docs/architecture.md's opening section states why narrowing them
+		// there would reject workflows already in the field, and what "no MCP server
+		// at all" in the init echo is allowed to mean under claude.
 		if s.GitHub.Enabled && strings.TrimSpace(s.Tracker.HandoffState) == "" {
 			return s, errors.New("invalid configuration: agent.backend claude requires tracker.provider.handoff_state for an enabled github integration: without it the scoped publish capability either cannot be prepared at all or is advertised while the run is told host-side publishing is unavailable")
 		}

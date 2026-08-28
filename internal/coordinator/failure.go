@@ -70,65 +70,22 @@ func rateLimitRetryDelay(retryAfter, maxRetryBackoff time.Duration) time.Duratio
 }
 
 // systemicFailureReasons are the reasons -- from agentFailureReason or raised
-// directly at a call site -- that name a boundary the coordinator's own
-// host, or a shared backend, crosses -- never evidence that this issue's
-// work is unworkable -- so none of them arms attemptsExhausted's ceiling:
+// directly at a call site -- that name a boundary the coordinator's own host, or
+// a shared backend, crosses rather than evidence that this issue's work is
+// unworkable, so none of them arms attemptsExhausted's ceiling. Each says
+// something about the shared environment dispatching the issue, and a transient
+// account-wide condition would otherwise abandon every issue running at once.
 //
-//   - "agent_event": the ceiling's original exemption (PMR-111). It is
-//     agentFailureReason's fallback for domain.EventFailed carrying model
-//     or provider text the coordinator cannot itself name.
-//   - "agent_rate_limited": a Claude quota rejection (PMR-131), named by its
-//     own reason rather than falling through to "agent_event" as it did
-//     before this reason existed. Observed live: 203 such rejections across
-//     six healthy issues in one 2.5-hour window, an account-wide condition
-//     that would have abandoned every one of them under the ceiling -- and
-//     finishFailure schedules its retry from the backend's own reset time
-//     rather than the ordinary ladder (see rateLimitRetryDelay), so the
-//     exemption here is what stops the ceiling from cutting that wait short
-//     with an abandonment instead.
-//   - "issue_refresh": a tracker error from runTurns' post-turn GetIssues
-//     refresh (PMR-115, confirmed live: a 30s Linear client timeout
-//     following a turn the agent completed successfully). That is Linear
-//     infrastructure, not this issue: with this codebase's default
-//     max_attempts=5 and its escalating backoff, a two-and-a-half-minute
-//     Linear outage would otherwise abandon every issue currently running,
-//     since they all fail the same way at the same time.
-//   - "retry_refresh": the same tracker.GetIssues failure, observed instead
-//     at runRetry's pre-dispatch refresh (PMR-142). It is the same Linear
-//     infrastructure as "issue_refresh", just crossed at a different
-//     moment -- the moment an issue is waiting to redispatch rather than
-//     the moment one just finished a turn -- and a sustained outage drives
-//     every retrying issue through exactly this site, raising `attempt`
-//     each time. Governing it from the same map as "issue_refresh" is
-//     deliberate: the two must not be able to drift into opposite verdicts
-//     on identical evidence again.
-//   - "session_continue": Symphony's own backend adapter (agent.Continue)
-//     failing to resume a session. A broken `claude` binary or lapsed
-//     backend auth fails every running issue's next turn the same way, at
-//     the same time -- the same account-wide shape as the quota rejection
-//     above, just raised by Symphony's own code instead of the model's.
-//   - "stream_closed": the host's own event plumbing failing to deliver a
-//     verdict (see errStreamClosed). By construction every backend emits
-//     a terminal event before its channel closes, so this can never be a
-//     repository- or issue-specific outcome -- only ever a host bug, and a
-//     host bug affects whichever issues happen to be running when it
-//     fires, not the one that happened to surface it first.
+// The map is deliberately not exhaustive over finishFailure's reasons: the
+// absent ones ("workspace_prepare", "before_run", "prompt_render",
+// "session_start", "stalled", "agent_blocked", "turn_limit_exhausted") are
+// issue-attributable and do arm the ceiling. Adding or removing an entry here
+// changes which failures can abandon an issue, so state the case first.
 //
-// Once PMR-128 gives tracker errors a real Retryable signal, "issue_refresh"
-// and "retry_refresh" can narrow together from a blanket exemption to "arm
-// the ceiling only when the wrapped error is not Retryable" -- but that is
-// future work, not a precondition for this one.
-//
-// Of agentFailureReason's outputs, only "turn_limit_exhausted" and
-// "agent_blocked" are left to arm the ceiling -- each is evidence about
-// *this* issue's run (it exhausted its turns; its own agent reported a
-// blocker), the same way "prompt_render" is evidence about this issue's own
-// WORKFLOW.md template. None of the six reasons above says anything about
-// the issue at all; each says something about the shared environment
-// dispatching it. This map is not exhaustive for finishFailure's other
-// direct reasons ("workspace_prepare", "before_run", "prompt_render",
-// "session_start", "stalled") -- those are deliberately absent because they
-// are issue-attributable, not systemic.
+// docs/observability.md's "Abandoned dispatches" section is the one description of
+// what each of these six reasons is evidence of, what was observed live to
+// justify it, and the PMR-128 narrowing the two tracker-refresh entries are
+// waiting on.
 var systemicFailureReasons = map[string]bool{
 	"agent_event":        true,
 	"agent_rate_limited": true,
@@ -161,37 +118,18 @@ func (c *Coordinator) attemptsExhausted(i domain.Issue, kind retryKind, reason s
 // (PMR-111). The escalated attempt counter is the ceiling's unit: a failure at
 // attempt N ends the (N+1)th launch of the episode, so a boundary that fails
 // every time dispatches exactly max_attempts times and arms no further retry.
-// Of runRetry's two host-side escalations for a retryAgent episode, only the
-// failed retry refresh raises that counter and routes it through
-// attemptsExhausted at all -- but "retry_refresh" is itself one of
-// systemicFailureReasons' exemptions (PMR-142), so that check never actually
-// abandons the episode; the counter keeps climbing the ordinary backoff
-// ladder instead, the same way a classified "issue_refresh" failure does.
-// The other escalation, a contended orchestrator slot, never reaches here at
-// all: it is capacity contention rather than a failure, so it keeps the
-// attempt fixed (see agentSlotRetryDelay), the same way a retryLanding
-// episode's own escalations do (see runRetry), since the attempt feeds the
-// rendered prompt and neither a wait nor contention should inflate it.
 //
-// What it does NOT do is as deliberate as what it does:
+// What it does NOT do is as deliberate as what it does. It does not touch the
+// tracker: the issue stays where a human left it and stays re-poll-able, which
+// is what makes this error-level record the only trace of the give-up. It does
+// not comment either. And it does not apply to a landing wait -- finishLandingWait
+// keeps its own unbounded redispatch on purpose (see landingRetryDelay), because
+// a wait is not an agent failure, does not escalate the attempt, and never
+// reaches here.
 //
-//   - It does not touch the tracker. The issue stays where a human left it and
-//     stays re-poll-able, so a later poll starts a fresh, equally bounded
-//     episode rather than an in-process loop nothing can kill. That makes this
-//     record load-bearing: it is the only trace of the give-up, and it is at
-//     error level because abandonment bounds one episode rather than
-//     quarantining the issue — with nobody acting on it, new episodes keep
-//     starting at the poll interval.
-//   - It does not comment either, and that is the same decision rather than an
-//     omission. The coordinator holds only domain.Tracker (candidates, refresh,
-//     and the one start edge), and an abandoned dispatch has often failed before
-//     any session existed (workspace_prepare, before_run, prompt_render), so
-//     there is no HandoffSession whose LandComment shape could be reused —
-//     only a new host tracker-write path, for a record that would repeat on
-//     every episode.
-//   - It does not apply to a landing wait. finishLandingWait keeps its own
-//     unbounded redispatch on purpose (see landingRetryDelay): a wait is not an
-//     agent failure, does not escalate the attempt, and never reaches here.
+// docs/observability.md's "Abandoned dispatches" section states why each of those
+// three is a decision rather than an omission, and which of runRetry's
+// escalations can reach this check at all.
 func (c *Coordinator) abandonDispatch(i domain.Issue, maxAttempts int, attrs []any) {
 	attrs = append(attrs, "operation", observability.OperationDispatchAbandoned, "max_attempts", maxAttempts)
 	c.log.Error("dispatch abandoned after max attempts", attrs...)

@@ -143,6 +143,8 @@ operator mitigation is to disable the tracker's native PR-to-status automation
 re-asserting the handoff without overriding a legitimate human reactivation is
 a deferred follow-up.
 
+### Abandoned dispatches (`dispatch_abandoned`)
+
 One `operation` value names no tracker edge at all. When a dispatch reaches
 `agent.max_attempts` — the ceiling on how many times one issue may be launched
 before the coordinator gives up on that episode — Symphony logs a single
@@ -156,15 +158,22 @@ dispatching it.
 
 Six reasons never appear on that abandonment record, because none of them is
 evidence the issue itself is unworkable (`systemicFailureReasons` in
-`internal/coordinator/coordinator.go`):
+`internal/coordinator/failure.go`). Each names a boundary the coordinator's own
+host, or a shared backend, crosses:
 
 * `agent_event` — a run that ended on `domain.EventFailed` carrying model or
   provider text the coordinator cannot itself classify.
 * `agent_rate_limited` — a Claude quota rejection (PMR-131; see "Rate limit
-  status" under "The Claude backend" below). Unlike the other five reasons
+  status" under "The Claude backend" below), named by its own reason rather
+  than falling through to `agent_event` as it did before this reason existed.
+  Observed live: 203 such rejections across six healthy issues in one 2.5-hour
+  window, an account-wide condition that would have abandoned every one of them
+  under the ceiling. Unlike the other five reasons
   here, its retry is not scheduled from the ordinary backoff ladder either:
   `finishFailure` takes the delay from the rejection's own reset time, or a
-  floor well above `agent.max_retry_backoff_ms` when the CLI reported none.
+  floor well above `agent.max_retry_backoff_ms` when the CLI reported none — so
+  the exemption is also what stops the ceiling from cutting that wait short with
+  an abandonment instead.
 * `issue_refresh` — a tracker error from the post-turn `GetIssues` refresh
   that follows a turn the agent completed successfully (PMR-115; confirmed
   live as a 30s Linear client timeout). This is tracker infrastructure, not
@@ -178,6 +187,8 @@ evidence the issue itself is unworkable (`systemicFailureReasons` in
   that just finished a turn. A sustained outage drives every retrying issue
   through exactly this site, so leaving it off this exemption let the same
   outage abandon issues at that moment while sparing ones still running.
+  Governing it from the same map as `issue_refresh` is deliberate: the two must
+  not be able to drift into opposite verdicts on identical evidence again.
 * `session_continue` — Symphony's own backend adapter (`agent.Continue`)
   failing to resume a session. A broken agent binary or lapsed backend auth
   fails every running issue's next turn identically.
@@ -196,6 +207,12 @@ well as on the abandonment record itself — also carries the underlying
 attribute (`internal/observability.Text`) rather than omitted, including
 `agent_event`'s model/provider text.
 
+The blanket exemption for the two tracker-refresh reasons is provisional. Once
+PMR-128 gives tracker errors a real `Retryable` signal, `issue_refresh` and
+`retry_refresh` can narrow together from a blanket exemption to "arm the ceiling
+only when the wrapped error is not `Retryable`" — but that is future work, not a
+precondition for the exemption as it stands.
+
 That record is deliberately the *whole* outcome:
 the claim and the retry timer are dropped, and the tracker is left exactly as
 it was. That is what
@@ -208,6 +225,26 @@ poll interval, which makes `dispatch_abandoned` a record to alert on rather than
 one to let accumulate. Below the ceiling nothing changes:
 each earlier failure keeps its warn-level `"msg":"agent run retry scheduled"`.
 Landing waits never reach it, because a wait does not escalate the attempt.
+
+Abandonment does not comment on the issue either, and that is the same decision
+rather than an omission. The coordinator holds only `domain.Tracker` (candidates,
+refresh, and the one start edge), and an abandoned dispatch has often failed
+before any session existed (`workspace_prepare`, `before_run`, `prompt_render`),
+so there is no `HandoffSession` whose `LandComment` shape could be reused — only
+a new host tracker-write path, for a record that would repeat on every episode.
+
+The escalated attempt counter is the ceiling's unit: a failure at attempt N ends
+the (N+1)th launch of the episode, so a boundary that fails every time dispatches
+exactly `max_attempts` times and arms no further retry. Of the coordinator's two
+host-side escalations for a retrying agent episode, only the failed retry refresh
+raises that counter and routes it through the ceiling check at all — and
+`retry_refresh` is itself one of the exemptions above (PMR-142), so that check
+never actually abandons the episode; the counter keeps climbing the ordinary
+backoff ladder instead, the same way a classified `issue_refresh` failure does.
+The other escalation, a contended orchestrator slot, never reaches the ceiling at
+all: it is capacity contention rather than a failure, so it keeps the attempt
+fixed, the same way a landing episode's own escalations do, since the attempt
+feeds the rendered prompt and neither a wait nor contention should inflate it.
 
 Every `operation` value — the performed edges above, these three observed ones,
 and `dispatch_abandoned` — comes from one bounded vocabulary of fixed literals
@@ -432,7 +469,7 @@ CLI's `--print` stream is not the app-server protocol.
   `agent_rate_limited` (distinct from the unclassified `agent_event`
   fallback) in `"msg":"agent run retry scheduled"`, exempts it from
   `agent.max_attempts` the same way `issue_refresh` and `stream_closed` are
-  (see `systemicFailureReasons` in `internal/coordinator/coordinator.go`),
+  (see `systemicFailureReasons` in `internal/coordinator/failure.go`),
   and schedules the next attempt from the CLI's own reset time when it
   reported one, falling back to ten times `agent.max_retry_backoff_ms`
   otherwise — never the ordinary escalating ladder, which caps in minutes

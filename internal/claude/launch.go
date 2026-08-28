@@ -103,24 +103,15 @@ type permissionsPolicy struct {
 //
 // allowed is the session's whole tool surface, capability tools included, and it
 // is passed in rather than read from codingTools so the payload cannot describe
-// a narrower permission set than the flags do. Under defaultMode dontAsk
-// anything not allowed is refused, and while --allowedTools evidently supplies
-// the rule on its own -- a real-binary run with capability tools allowed only by
-// flag saw no denials -- this file's doctrine is that policy is pinned in the
-// payload. Two disagreeing representations of "what is permitted" would leave a
-// reader unable to tell which one is authoritative.
+// a narrower permission set than the flags do. This file's doctrine is that
+// policy is pinned in the payload: two disagreeing representations of "what is
+// permitted" would leave a reader unable to tell which one is authoritative.
 //
-// sandbox.filesystem.allowWrite governs Bash and its children only -- PMR-156
-// verified that Edit and Write ignore it entirely and will write anywhere a bare
-// "Edit"/"Write" permission rule reaches, which under dontAsk is everywhere. The
-// CLI's permission rules accept a path-glob specifier for exactly these tools
-// (verified against claude 2.1.248: the builtin /statusline command ships
-// "Read(~/**)" and "Edit(~/.claude/settings.json)" rules), so Allow expands
-// "Edit" and "Write" into one scoped rule per write root instead of the bare
-// name, closing that gap the same defaultMode already closes for Bash. Every
-// other tool -- including Bash, whose confinement comes from
-// sandbox.filesystem.allowWrite rather than from its own permission rule --
-// keeps the bare name unchanged.
+// sandbox.filesystem.allowWrite governs Bash and its children only, so Allow
+// expands "Edit" and "Write" into one path-scoped rule per write root instead of
+// the bare name (PMR-156). Every other tool, Bash included, keeps the bare name.
+// docs/architecture.md's "Sandbox ownership decision" section states what that
+// closed, what it did not, and where the rule syntax was verified.
 func buildPolicy(r domain.AgentRequest, allowed []string) (policy, error) {
 	roots, err := writeRoots(r)
 	if err != nil {

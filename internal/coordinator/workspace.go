@@ -47,21 +47,17 @@ func (c *Coordinator) cleanupWorkspaceForRun(ctx context.Context, r *running, is
 }
 
 // cleanupWorkspaceAtRunEnd releases a workspace from inside runTurns, at the
-// moment a run decides its own issue is done (landing resolved, or the issue
-// went terminal between turns). That decision races the poll loop's own
-// reconcile pass, which can concurrently reach the same conclusion about the
-// same issue and call stopRun -- cancelling the very context runTurns was
-// about to clean up on and turning a healthy landing into a killed git
-// subprocess (PMR-130). So this attempt runs on a context detached from the
-// run's own cancellation (bounded by workspaceCleanupTimeout instead), and if
-// r.stopped is stopTerminal once it finishes, reconcile's own stopTerminal
-// branch holds -- or is about to hold -- an authoritative attempt on its own
-// live context right after stopRun returns; this attempt's failure is then a
-// duplicate, not a call to action, and is reported below WARN. Any other stop
-// reason (ineligible, stalled) does not carry that guarantee -- reconcile
-// only re-cleans up on stopTerminal -- so a failure raced by one of those must
-// still reach WARN, or a genuine leak is swallowed as a duplicate that never
-// actually gets retried.
+// moment a run decides its own issue is done. That decision races the poll
+// loop's own reconcile pass, which can concurrently reach the same conclusion
+// and call stopRun -- cancelling the very context runTurns was about to clean up
+// on (PMR-130). So this attempt runs on a context detached from the run's own
+// cancellation, bounded by workspaceCleanupTimeout instead.
+//
+// The stop reason decides the log level, and only stopTerminal may be quieted:
+// reconcile re-cleans up only on stopTerminal, so its own authoritative attempt
+// makes this one's failure a duplicate rather than a call to action. Any other
+// stop reason (ineligible, stalled) carries no such guarantee, so a failure
+// raced by one of those must still reach WARN or a genuine leak is swallowed.
 //
 // That authoritative attempt is a retry, not a second concurrent removal: it
 // waits for this one through running.cleanup and only runs at all if this one
