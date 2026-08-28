@@ -215,8 +215,6 @@ type fakeWorkspace struct {
 	marks          int
 	cleanups       int
 	cleaned        chan struct{}
-	marked         chan struct{}
-	markErr        error
 	after          chan struct{}
 	prepareStarted chan struct{}
 	prepareGate    <-chan struct{}
