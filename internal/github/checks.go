@@ -89,7 +89,6 @@ func checkRunOutcome(status, conclusion string) checkOutcome {
 // deliberate rather than incidental: GitHub Actions reports the same job as
 // both a check run and a legacy commit status for backward compatibility,
 // and the check run is the richer, purpose-built representation.
-
 func (m *Manager) requiredCheckOutcomes(ctx context.Context, s config.GitHub, sha string, required []string) (map[string]checkOutcome, error) {
 	outcomes := make(map[string]checkOutcome, len(required))
 	for _, name := range required {
