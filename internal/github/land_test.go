@@ -149,6 +149,50 @@ func TestLandRefusesOnEffectiveChangesRequestedReview(t *testing.T) {
 	}
 }
 
+// A reviewer who follows their own Request Changes with a plain Comment
+// review has not withdrawn it: GitHub still shows changes requested, and so
+// must the landing gate.
+func TestLandRefusesWhenSameReviewerCommentsAfterRequestingChanges(t *testing.T) {
+	api, git, linear := newAPI(t), &fakeGit{}, &fakeLinear{}
+	api.prExists = true
+	passingRequiredChecks(api, "ci/build")
+	api.reviews = []map[string]any{
+		{"user": map[string]any{"login": "bob"}, "state": "CHANGES_REQUESTED", "body": "no", "submitted_at": "t1"},
+		{"user": map[string]any{"login": "bob"}, "state": "COMMENTED", "body": "still need X before merge", "submitted_at": "t2"},
+	}
+	api.mergeable = boolPtr(true)
+	_, session := testLandingSession(t, api, git, linear, []string{"ci/build"}, "merge")
+	if _, err := session.Land(context.Background()); err == nil || !strings.Contains(err.Error(), "changes-requested") {
+		t.Fatalf("changes-requested error=%v", err)
+	}
+	if linear.refused != 1 || api.merges != 0 {
+		t.Fatalf("refused=%d merges=%d", linear.refused, api.merges)
+	}
+}
+
+// The same reviewer's later APPROVED does supersede their changes-requested,
+// so the gate must not latch on a review the reviewer has withdrawn.
+func TestLandProceedsWhenSameReviewerApprovesAfterRequestingChanges(t *testing.T) {
+	api, git, linear := newAPI(t), &fakeGit{}, &fakeLinear{}
+	api.prExists = true
+	passingRequiredChecks(api, "ci/build")
+	api.reviews = []map[string]any{
+		{"user": map[string]any{"login": "bob"}, "state": "CHANGES_REQUESTED", "body": "no", "submitted_at": "t1"},
+		{"user": map[string]any{"login": "bob"}, "state": "COMMENTED", "body": "one more thing", "submitted_at": "t2"},
+		{"user": map[string]any{"login": "bob"}, "state": "APPROVED", "body": "fixed", "submitted_at": "t3"},
+	}
+	api.mergeable = boolPtr(true)
+	api.mergeableState = "clean"
+	_, session := testLandingSession(t, api, git, linear, []string{"ci/build"}, "merge")
+	result, err := session.Land(context.Background())
+	if err != nil {
+		t.Fatalf("land error=%v", err)
+	}
+	if result.Status != LandMerged || api.merges != 1 {
+		t.Fatalf("result=%+v merges=%d", result, api.merges)
+	}
+}
+
 func TestLandRefusesOnUnresolvedReviewThreads(t *testing.T) {
 	api, git, linear := newAPI(t), &fakeGit{}, &fakeLinear{}
 	api.prExists = true
