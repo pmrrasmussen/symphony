@@ -5,6 +5,7 @@ import (
 	"context"
 	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -362,5 +363,149 @@ func TestRateLimitStatusUsesFixedLogVocabulary(t *testing.T) {
 	}
 	if strings.Contains(output, "[REDACTED]") {
 		t.Fatalf("fallback status was redacted instead of normalized: %s", output)
+	}
+}
+
+// TestIssueUsageAccumulatesAcrossAttemptsAndSurvivesAKilledTurn is the
+// per-issue accounting PMR-151 adds: every dispatch builds a fresh domain.Run
+// whose Usage starts at zero, so an issue that reached attempt 38 left 38
+// unrelated cost records and no total. Both figures are asserted together
+// here, because the point is that they differ -- the per-run one answers "was
+// that turn expensive", the per-issue one "is this issue worth continuing".
+//
+// The first attempt ends in domain.EventFailed rather than a result event,
+// which is the shape of a turn killed by turn_timeout_ms. That is exactly when
+// its cost matters and exactly when nothing arrives to report it, so what it
+// spent has to already be banked on the issue's record by the time the retry
+// is armed -- not folded in from a summary the turn never produced.
+func TestIssueUsageAccumulatesAcrossAttemptsAndSurvivesAKilledTurn(t *testing.T) {
+	w := testSettings(t)
+	issue := testIssue()
+	first := domain.Usage{InputTokens: 100, OutputTokens: 50, TotalTokens: 150}
+	second := domain.Usage{InputTokens: 400, OutputTokens: 200, TotalTokens: 600}
+	both := domain.Usage{InputTokens: 500, OutputTokens: 250, TotalTokens: 750}
+	// The second attempt's stream stays open and test-driven so the running
+	// snapshot can be read while that attempt is still spending.
+	live := make(chan domain.Event)
+	var mu sync.Mutex
+	dispatches := 0
+	agent := &fakeAgent{started: make(chan struct{}, 2), events: func() <-chan domain.Event {
+		mu.Lock()
+		dispatches++
+		attempt := dispatches
+		mu.Unlock()
+		if attempt > 1 {
+			return live
+		}
+		ch := make(chan domain.Event, 2)
+		ch <- domain.Event{Kind: domain.EventUsage, At: time.Now(), Usage: first}
+		ch <- domain.Event{Kind: domain.EventFailed, At: time.Now(), Message: "claude turn timeout"}
+		close(ch)
+		return ch
+	}}
+	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{}, 2)}
+	var log syncBuffer
+	c := New(&fakeTracker{issue: issue}, agent, ws, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&log, nil)))
+	defer assertInvariants(t, c)
+	timer := &fakeTimer{signal: make(chan struct{}, 2)}
+	c.timer = timer
+
+	c.Tick(context.Background())
+	<-agent.started
+	<-ws.after
+	<-timer.signal
+
+	// The killed turn produced no result event, so this total exists only
+	// because it was accumulated while the turn was still spending.
+	if got := c.issueUsage(issue.ID); got != first {
+		t.Fatalf("issue usage after a killed turn=%+v, want %+v", got, first)
+	}
+	// A waiting retry holds no run, so its snapshot entry is the only place
+	// that cost is visible to an operator deciding whether to keep going.
+	retrying := c.Snapshot().Retrying
+	if len(retrying) != 1 || retrying[0].IssueUsage != first {
+		t.Fatalf("retry snapshot=%+v, want one entry carrying %+v", retrying, first)
+	}
+
+	timer.fire(0)
+	<-agent.started
+	waitForRunning(t, c, issue.Identifier)
+	live <- domain.Event{Kind: domain.EventUsage, At: time.Now(), Usage: second}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		var run RunningSnapshot
+		for _, entry := range c.Snapshot().Running {
+			if entry.IssueIdentifier == issue.Identifier {
+				run = entry
+			}
+		}
+		if run.Usage.TotalTokens != 0 {
+			// The second attempt's own figure is the smaller one: the issue has
+			// spent the first attempt's tokens too, and only this field says so.
+			if run.Usage != second || run.IssueUsage != both {
+				t.Fatalf("running snapshot usage=%+v issue usage=%+v, want %+v and %+v", run.Usage, run.IssueUsage, second, both)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the second attempt never reported its own usage")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	live <- domain.Event{Kind: domain.EventCompleted, At: time.Now()}
+	<-ws.after
+	if err := c.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	summary := findLine(t, log.String(), `"msg":"agent turn completed"`)
+	for _, field := range []string{`"total_tokens":600`, `"issue_input_tokens":500`, `"issue_output_tokens":250`, `"issue_total_tokens":750`} {
+		if !strings.Contains(summary, field) {
+			t.Fatalf("terminal summary missing %s: %s", field, summary)
+		}
+	}
+}
+
+// TestIssueUsageDoesNotOutliveTheClaimThatSpentIt pins the lifetime decision
+// PMR-151 made: the accumulated total is part of the claim group, dropped by
+// releaseLocked, because the claim *is* the dispatch episode -- attempt
+// numbering restarts with the next claim, so the cost behind it must too. The
+// contrast is deliberate and this test states it: the handoff memory, recorded
+// a moment before the very same release, is the field that does survive, and
+// it keeps the record alive here so a leaked total would have somewhere to
+// hide rather than being pruned away with it.
+func TestIssueUsageDoesNotOutliveTheClaimThatSpentIt(t *testing.T) {
+	w := testSettings(t)
+	w.Config.Tracker.HandoffState = "In Review"
+	w.Config.Tracker.ActiveStates = []string{"Todo", "In Progress"}
+	issue := testIssue()
+	issue.State = "In Progress"
+	handoff := issue
+	handoff.State = "In Review"
+	handoff.Dispatchable = false
+	tracker := &fakeTracker{issue: issue}
+	tracker.setFresh(handoff)
+	events := make(chan domain.Event, 2)
+	events <- domain.Event{Kind: domain.EventUsage, At: time.Now(), Usage: domain.Usage{InputTokens: 100, OutputTokens: 50, TotalTokens: 150}}
+	events <- domain.Event{Kind: domain.EventCompleted, At: time.Now()}
+	close(events)
+	agent := &fakeAgent{events: func() <-chan domain.Event { return events }}
+	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{}, 1)}
+	c := testCoordinator(w.Config, tracker, agent, ws)
+	defer assertInvariants(t, c)
+
+	c.Tick(context.Background())
+	<-ws.after
+	waitForRelease(t, c, issue.ID)
+
+	if _, ok := c.handoffMemory(issue.ID); !ok {
+		t.Fatal("the handoff observation did not survive the release, so this test no longer holds a record to check")
+	}
+	if got := c.issueUsage(issue.ID); got != (domain.Usage{}) {
+		t.Fatalf("issue usage after release=%+v, want it dropped with the claim", got)
+	}
+	if err := c.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
 	}
 }

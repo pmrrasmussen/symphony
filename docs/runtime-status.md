@@ -28,7 +28,12 @@ The versioned document includes the process PID and start time, generation
 time, effective workflow and log paths, coordinator claim/running/retry state,
 token usage, safe rate-limit counters, the current Linear state and last
 activity time for each running issue, plus any outstanding operation's fixed
-type/name and start/age. It deliberately excludes credentials, environment
+type/name and start/age. Token usage appears twice, as two `usage` and
+`issue_usage` objects of plain integer counts: the first is the attempt in
+front of you, the second what the issue has spent across every attempt of the
+dispatch episode, which a retrying entry carries even though it holds no run
+(PMR-151). Adding the second was purely additive, so the schema stays at
+version 1. It deliberately excludes credentials, environment
 values, issue descriptions, prompts, workspace paths or contents, command
 bodies, tool arguments and output, and raw Codex payloads.
 

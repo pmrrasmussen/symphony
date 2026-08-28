@@ -167,8 +167,9 @@ func (c *Coordinator) logEvent(r *running, event domain.Event) {
 		}
 		c.log.Info("agent session started", attrs...)
 	case domain.EventUsage:
-		usage := c.updateUsage(r, event.Usage, event.UsageAuthoritative)
+		usage, issueUsage := c.updateUsage(r, event.Usage, event.UsageAuthoritative)
 		attrs = append(attrs, "input_tokens", usage.InputTokens, "output_tokens", usage.OutputTokens, "total_tokens", usage.TotalTokens)
+		attrs = append(attrs, issueUsageAttrs(issueUsage)...)
 		c.log.Info("agent usage", attrs...)
 	case domain.EventRateLimit:
 		rateLimit := normalizedRateLimit(event.RateLimit)
@@ -272,9 +273,18 @@ func (c *Coordinator) logItemEvent(r *running, event domain.Event, attrs []any) 
 //     turn even when it is lower than this host's own mid-turn estimate, and
 //     merging the two would let an inflated provisional figure latch
 //     permanently instead of being corrected.
-func (c *Coordinator) updateUsage(r *running, update domain.Usage, authoritative bool) domain.Usage {
+//
+// It returns both the run's own recorded total and the issue's cumulative
+// total across the attempts of its current dispatch episode (PMR-151), keeping
+// the second in step with the first by applying whatever this update changed
+// about the run. Doing it here, per event, rather than folding a finished run's
+// figure in when it ends, is what makes the total complete for an attempt
+// killed by turn_timeout_ms: such a turn never reports a result, so its cost
+// has to have been accumulated while it was still spending.
+func (c *Coordinator) updateUsage(r *running, update domain.Usage, authoritative bool) (domain.Usage, domain.Usage) {
 	update = normalizedUsage(update)
 	c.mu.Lock()
+	before := r.run.Usage
 	if authoritative {
 		r.run.Usage = update
 	} else {
@@ -286,20 +296,43 @@ func (c *Coordinator) updateUsage(r *running, update domain.Usage, authoritative
 		r.run.Usage.TotalTokens = r.run.Usage.InputTokens + r.run.Usage.OutputTokens
 	}
 	usage := r.run.Usage
+	issueUsage := c.addIssueUsageLocked(r.issue.ID, usageSpent(before, usage))
 	c.mu.Unlock()
-	return usage
+	return usage, issueUsage
+}
+
+// usageSpent is what one run's recorded usage changed by between two readings,
+// which is what the issue's cumulative total has to move by. A component is
+// negative exactly when an authoritative figure corrects a provisional
+// overshoot back down (see updateUsage), which is what keeps the per-issue
+// total the sum of its attempts' settled figures rather than of their peaks.
+func usageSpent(before, after domain.Usage) domain.Usage {
+	return domain.Usage{
+		InputTokens:  after.InputTokens - before.InputTokens,
+		OutputTokens: after.OutputTokens - before.OutputTokens,
+		TotalTokens:  after.TotalTokens - before.TotalTokens,
+	}
+}
+
+// issueUsageAttrs names the per-issue total distinctly from the per-run figure
+// alongside it, so "what did this issue cost" is answerable from one record
+// instead of by summing every attempt's own record by hand afterwards.
+func issueUsageAttrs(usage domain.Usage) []any {
+	return []any{"issue_input_tokens", usage.InputTokens, "issue_output_tokens", usage.OutputTokens, "issue_total_tokens", usage.TotalTokens}
 }
 
 func (c *Coordinator) logTerminalSummary(r *running) {
 	c.mu.Lock()
 	issue := r.issue
 	usage := r.run.Usage
+	issueUsage := c.issueUsageLocked(issue.ID)
 	rateLimit := copyRateLimit(r.rateLimit)
 	started := r.run.StartedAt
 	attempt := r.run.Attempt
 	turnCount := r.run.TurnCount
 	c.mu.Unlock()
 	attrs := []any{"issue_id", issue.ID, "issue_identifier", issue.Identifier, "session_id", r.session.ID, "attempt", attempt, "turn_count", turnCount, "runtime_ms", c.clock.Now().Sub(started).Milliseconds(), "input_tokens", usage.InputTokens, "output_tokens", usage.OutputTokens, "total_tokens", usage.TotalTokens}
+	attrs = append(attrs, issueUsageAttrs(issueUsage)...)
 	if len(rateLimit) > 0 {
 		attrs = append(attrs, "rate_limit", rateLimit)
 	}

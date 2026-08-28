@@ -180,7 +180,7 @@ func TestReadSnapshotProjectsSafeRuntimeFields(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "status.json")
 	write(t, path, `{
 "schema_version":1,"pid":73,"process_started_at":"2026-08-25T10:00:00Z","generated_at":"2026-08-25T12:00:00Z","state":"running",
-"coordinator":{"claimed":2,"running":[{"issue_identifier":"PMR-75","issue_state":"In Progress","attempt":1,"turn_count":3,"started_at":"2026-08-25T11:00:00Z","last_activity_at":"2026-08-25T11:59:00Z","usage":{"input_tokens":8,"output_tokens":5,"total_tokens":13},"rate_limit":{"remaining":4},"outstanding_operation":{"type":"mcpToolCall","name":"github_pr_context","started_at":"2026-08-25T11:59:30Z","age_ms":30000}}],"retrying":[{"issue_identifier":"PMR-76","attempt":2,"kind":"retry","reason":"timeout","due_at":"2026-08-25T12:01:00Z"}],"waiting":[{"issue_identifier":"PMR-77","issue_state":"Merging","reason":"at_capacity","since":"2026-08-25T11:50:00Z","waiting_ms":600000},{"issue_identifier":"PMR-90","issue_state":"Todo","reason":"blocked_by_relation","blocked_by":["PMR-80"],"since":"2026-08-25T11:55:00Z","waiting_ms":300000}]},
+"coordinator":{"claimed":2,"running":[{"issue_identifier":"PMR-75","issue_state":"In Progress","attempt":1,"turn_count":3,"started_at":"2026-08-25T11:00:00Z","last_activity_at":"2026-08-25T11:59:00Z","usage":{"input_tokens":8,"output_tokens":5,"total_tokens":13},"issue_usage":{"input_tokens":600,"output_tokens":150,"total_tokens":750},"rate_limit":{"remaining":4},"outstanding_operation":{"type":"mcpToolCall","name":"github_pr_context","started_at":"2026-08-25T11:59:30Z","age_ms":30000}}],"retrying":[{"issue_identifier":"PMR-76","attempt":2,"kind":"retry","reason":"timeout","due_at":"2026-08-25T12:01:00Z","issue_usage":{"total_tokens":4200}}],"waiting":[{"issue_identifier":"PMR-77","issue_state":"Merging","reason":"at_capacity","since":"2026-08-25T11:50:00Z","waiting_ms":600000},{"issue_identifier":"PMR-90","issue_state":"Todo","reason":"blocked_by_relation","blocked_by":["PMR-80"],"since":"2026-08-25T11:55:00Z","waiting_ms":300000}]},
 "untrusted_prompt":"must not be projected"}`)
 
 	snapshot, err := readSnapshot(path)
@@ -192,6 +192,17 @@ func TestReadSnapshotProjectsSafeRuntimeFields(t *testing.T) {
 	}
 	if blocked := snapshot.Coordinator.Waiting[1]; blocked.IssueIdentifier != "PMR-90" || blocked.Reason != "blocked_by_relation" || len(blocked.BlockedBy) != 1 || blocked.BlockedBy[0] != "PMR-80" {
 		t.Fatalf("blocked waiting entry=%#v", blocked)
+	}
+	// The per-issue total is the one field on these entries that is not about
+	// the attempt in front of you (PMR-151). It decodes on both, and this is
+	// where its wire name is pinned: internal/operator no longer re-declares
+	// the snapshot, so this JSON is the whole contract between the coordinator
+	// that writes it and the dashboard that reads it.
+	if got := snapshot.Coordinator.Running[0].IssueUsage; got.InputTokens != 600 || got.OutputTokens != 150 || got.TotalTokens != 750 {
+		t.Fatalf("running issue usage=%#v", got)
+	}
+	if got := snapshot.Coordinator.Retrying[0].IssueUsage; got.TotalTokens != 4200 {
+		t.Fatalf("retrying issue usage=%#v", got)
 	}
 	encoded, err := json.Marshal(snapshot)
 	if err != nil {

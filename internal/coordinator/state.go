@@ -18,7 +18,7 @@ import (
 // Two groups of fields have deliberately different lifetimes:
 //
 //   - The claim group (claimed, state, reservation, run, retry, landingWaits,
-//     landingEscalated) is created by claim and dropped as a unit by
+//     landingEscalated, usage) is created by claim and dropped as a unit by
 //     releaseLocked. Nothing in it outlives the claim.
 //   - handoff, waiting, and waitingEscalated describe an issue Symphony is
 //     *not* currently working: the memory that it drove the issue into the
@@ -69,6 +69,23 @@ type issueState struct {
 	// one -- rather than a Warn on every subsequent poll-cadence wait. Cleared
 	// with the claim alongside landingWaits (PMR-116).
 	landingEscalated bool
+	// usage is every token this issue has spent across the attempts of the
+	// dispatch episode it is currently claimed under, including the attempt in
+	// flight. Both figures are kept because both are questions an operator
+	// asks: the per-run domain.Run.Usage answers "was that turn expensive",
+	// this answers "is this issue worth continuing" -- which attempt count
+	// alone cannot, since a cheap issue on attempt 30 and an expensive one on
+	// attempt 5 are different situations (PMR-151).
+	//
+	// It is deliberately part of the claim group rather than a survivor like
+	// handoff, because the claim *is* the episode: retries hold it across every
+	// attempt (scheduleRetry requires a claim), and domain.Run.Attempt -- the
+	// counter this total is the cost behind -- likewise restarts with the next
+	// claim. Outliving the release would mean either keeping a record for every
+	// issue ever dispatched, which pruneLocked exists to prevent, or a second
+	// lifetime rule for a total whose own episode the terminal summary has
+	// already recorded in the log.
+	usage domain.Usage
 	// handoff records that Symphony itself drove this issue into the configured
 	// review handoff state, so the poll loop can recognize and log an external
 	// actor (for example Linear's native GitHub PR automation) reverting that
@@ -94,9 +111,9 @@ type issueState struct {
 }
 
 // stateLive reports whether a record still remembers anything. The claim group
-// is covered by claimed alone -- reservation, retry, landingWaits, and
-// landingEscalated exist only under a claim, and run is checked separately
-// only because it is dropped a moment before the claim it belongs to.
+// is covered by claimed alone -- reservation, retry, landingWaits,
+// landingEscalated, and usage exist only under a claim, and run is checked
+// separately only because it is dropped a moment before the claim it belongs to.
 func (s *issueState) stateLive() bool {
 	return s.claimed || s.run != nil || s.handoff != nil || s.waiting != nil
 }
@@ -155,6 +172,33 @@ func (c *Coordinator) landingWaitsFor(id string) int {
 		return st.landingWaits
 	}
 	return 0
+}
+
+// addIssueUsageLocked folds one run's change in recorded usage into its
+// issue's cumulative per-episode total and returns that total. Like the
+// landing-wait accounting, the spend is counted against the claim it happened
+// under: an issue that no longer holds one has no episode left to attribute it
+// to, and by construction (see checkInvariants: running ⊆ claimed) a live
+// session always still holds its claim. Callers must hold c.mu.
+func (c *Coordinator) addIssueUsageLocked(id string, spent domain.Usage) domain.Usage {
+	st := c.claimedStateLocked(id)
+	if st == nil {
+		return domain.Usage{}
+	}
+	st.usage.InputTokens += spent.InputTokens
+	st.usage.OutputTokens += spent.OutputTokens
+	st.usage.TotalTokens += spent.TotalTokens
+	return st.usage
+}
+
+// issueUsageLocked reports the issue's cumulative per-episode usage, which is
+// zero unless it currently holds a claim to have spent it under. Callers must
+// hold c.mu.
+func (c *Coordinator) issueUsageLocked(id string) domain.Usage {
+	if st := c.claimedStateLocked(id); st != nil {
+		return st.usage
+	}
+	return domain.Usage{}
 }
 
 // claimedCountLocked is the number of issues this process owns, reserved or
@@ -254,10 +298,11 @@ func (c *Coordinator) capacityAvailableLocked(state string, s config.Settings) b
 }
 
 // release drops an issue's entire claim in one operation: the reservation, any
-// armed retry timer, the landing-wait accounting, and the claim itself. The
-// handoff and waiting memories are deliberately untouched -- they describe an
-// issue Symphony is not working, and the handoff one is recorded immediately
-// before the release that ends the run it belongs to.
+// armed retry timer, the landing-wait accounting, the episode's accumulated
+// usage, and the claim itself. The handoff and waiting memories are
+// deliberately untouched -- they describe an issue Symphony is not working, and
+// the handoff one is recorded immediately before the release that ends the run
+// it belongs to.
 func (c *Coordinator) release(id string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -279,5 +324,9 @@ func (c *Coordinator) releaseLocked(id string) {
 	st.state = ""
 	st.landingWaits = 0
 	st.landingEscalated = false
+	// The accumulated cost goes with the episode that spent it: a later
+	// dispatch of the same issue is a new episode, starting from attempt one
+	// and from zero tokens.
+	st.usage = domain.Usage{}
 	c.pruneLocked(id)
 }

@@ -359,7 +359,19 @@ CLI's `--print` stream is not the app-server protocol.
   and `reasoningOutputTokens` into `outputTokens`, mirroring Claude's own
   cache folding. An extraction that finds no usage in a notification that
   should carry it logs one diagnostic per session, naming only the
-  notification method, rather than staying silent.
+  notification method, rather than staying silent. Every such update also
+  accumulates onto the issue's own per-episode total, reported alongside the
+  per-run figure as `issue_input_tokens`/`issue_output_tokens`/
+  `issue_total_tokens` on `"msg":"agent usage"` and on the terminal
+  `"msg":"agent turn completed"` summary (PMR-151). Each dispatch builds a
+  fresh run whose usage starts at zero, so the per-run figure alone answers
+  "was that turn expensive" and nothing answered "what has this issue cost" —
+  an issue that reached attempt 38 left 38 unrelated records and no total.
+  Accumulating per event rather than folding in a finished run's figure is
+  what makes the total complete for a turn killed by `turn_timeout_ms`, which
+  never reports a result at all. The total is scoped to the dispatch episode:
+  it is dropped with the claim, exactly as the attempt counter it is the cost
+  behind restarts with the next one.
 * **Session start** — one `"msg":"agent session started"` record per *turn*, not
   per run. `claude --print` runs a single turn and exits, so each continuation
   is a new process with a new `pid` and an incremented `turn_id`, resumed under

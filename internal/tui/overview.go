@@ -209,6 +209,10 @@ func (m Model) writeStatus(b *strings.Builder, instance operator.Instance, now t
 			fmt.Fprintf(b, "/%d", instance.Config.MaxTurns)
 		}
 		fmt.Fprintf(b, "\n  tokens: input %d, output %d, total %d", run.Usage.InputTokens, run.Usage.OutputTokens, run.Usage.TotalTokens)
+		// The attempt's own figure above, the issue's across every attempt of
+		// the episode here. The plain renderer is the scriptable surface, so it
+		// carries the same field rather than leaving it to the styled one.
+		fmt.Fprintf(b, "\n  issue tokens: input %d, output %d, total %d", run.IssueUsage.InputTokens, run.IssueUsage.OutputTokens, run.IssueUsage.TotalTokens)
 		if run.OutstandingOperation != nil {
 			fmt.Fprintf(b, "\n  waiting: %s%s (%s)", run.OutstandingOperation.Type, named(run.OutstandingOperation.Name), formatDuration(time.Duration(run.OutstandingOperation.AgeMS)*time.Millisecond))
 		}
@@ -218,7 +222,7 @@ func (m Model) writeStatus(b *strings.Builder, instance operator.Instance, now t
 		b.WriteString("\n")
 	}
 	for _, retry := range snapshot.Coordinator.Retrying {
-		fmt.Fprintf(b, "\nRetry %s: %s/%s attempt %d, due %s\n", retry.IssueIdentifier, retry.Kind, retry.Reason, retry.Attempt, formatTimeOrAge(now, retry.Due))
+		fmt.Fprintf(b, "\nRetry %s: %s/%s attempt %d, issue tokens %d, due %s\n", retry.IssueIdentifier, retry.Kind, retry.Reason, retry.Attempt, retry.IssueUsage.TotalTokens, formatTimeOrAge(now, retry.Due))
 	}
 	for _, wait := range snapshot.Coordinator.Waiting {
 		if wait.Reason == "blocked_by_relation" {
