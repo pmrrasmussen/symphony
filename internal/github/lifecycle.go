@@ -53,9 +53,10 @@ type gitRunner interface {
 type execGit struct{}
 
 // Run returns the real git output as the error's text on failure, rather than
-// a generic placeholder: Publish's push gate is the one caller that surfaces
-// this detail, and only to the host log (via observability.Text), never to
-// the agent -- see the comment on Publish's push failure below.
+// a generic placeholder: Publish's push gate and Land's stale-branch push
+// gate are the two callers that surface this detail, and only to the host
+// log (via observability.Text), never to the agent -- see the comment on
+// each push failure below.
 func (execGit) Run(ctx context.Context, dir string, args, extraEnv []string) (string, error) {
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = dir
@@ -709,7 +710,15 @@ func (s *Session) Land(ctx context.Context) (LandResult, error) {
 			env := []string{"GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=http.https://github.com/.extraheader", "GIT_CONFIG_VALUE_0=AUTHORIZATION: basic " + auth}
 			remote := "https://github.com/" + s.settings.Owner + "/" + s.settings.Repository + ".git"
 			if _, err := s.manager.git.Run(ctx, s.workspace, []string{"push", remote, "HEAD:refs/heads/" + s.branch}, env); err != nil {
-				return LandResult{}, err
+				// As with Publish's push gate above, execGit.Run now returns real
+				// git/GitHub output on failure (PMR-163), and that can include the
+				// push invocation's own AUTHORIZATION header on a transport error.
+				// Forwarding err verbatim, as this line did before that change,
+				// would hand the agent that raw text; log it to the host only and
+				// return the same fixed, retryable gate reason gate/refuse always
+				// return to callers.
+				s.manager.logger.Warn("GitHub land could not push branch", "issue_id", s.issue.ID, "issue_identifier", s.issue.Identifier, "branch", s.branch, "push_error", observability.Text(err.Error()))
+				return s.gate(ctx, "github land could not push branch "+s.branch+" to the configured repository; retry once, and if it persists check the repository's push permissions and branch protection rules", true)
 			}
 			expectedHead = head
 			// A fix turn pushed new commits: record the delta on both the Linear

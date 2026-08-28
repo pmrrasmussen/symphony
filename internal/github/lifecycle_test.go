@@ -2461,6 +2461,44 @@ func TestLandPushesNewLocalCommitsBeforeLanding(t *testing.T) {
 	}
 }
 
+// TestLandPushFailureForwardsNoRawGitTextToTheAgent pins the review fix on
+// PMR-163: execGit.Run now returns real git/GitHub output on failure (so
+// Publish's push gate can log it), and Land's own stale-branch push at
+// lifecycle.go's push-before-land path shares that same gitRunner. Before this
+// fix, Land forwarded that error verbatim to the agent through
+// internal/capability/github.go's Land failure message -- exactly the raw,
+// possibly credential-shaped text Publish's push gate deliberately keeps off
+// the agent-facing path. The refusal reason reaching the caller must stay the
+// fixed, host-authored hint, and the raw git error must reach only the host
+// log.
+func TestLandPushFailureForwardsNoRawGitTextToTheAgent(t *testing.T) {
+	api, linear := newAPI(t), &fakeLinear{}
+	api.prExists, api.prSHA = true, "old-head"
+	passingRequiredChecks(api, "ci/build")
+	readyToLand(api)
+	const pushErr = "refusing to allow a Personal Access Token to create or update workflow `.github/workflows/ci.yml` without `workflow` scope"
+	base := &fakeGit{}
+	git := &failingGit{fakeGit: base, failArgs: []string{"push", "https://github.com/owner/repo.git", "HEAD:refs/heads/symphony/pmr-27"}, message: pushErr}
+	manager, session := testLandingSession(t, api, git, linear, []string{"ci/build"}, "merge")
+	var log bytes.Buffer
+	manager.logger = slog.New(slog.NewJSONHandler(&log, nil))
+
+	_, err := session.Land(context.Background())
+	if err == nil || strings.Contains(err.Error(), pushErr) {
+		t.Fatalf("agent-facing land error = %v, want only the fixed hint", err)
+	}
+	if !strings.Contains(err.Error(), "could not push branch symphony/pmr-27") {
+		t.Fatalf("agent-facing land error missing the fixed hint: %v", err)
+	}
+	output := log.String()
+	if !strings.Contains(output, `"push_error"`) || !strings.Contains(output, pushErr) {
+		t.Fatalf("host log missing the underlying git push error: %s", output)
+	}
+	if linear.refused != 1 {
+		t.Fatalf("refused=%d, want the push failure to refuse landing", linear.refused)
+	}
+}
+
 func TestLandRefusesOnHumanLinearStateOverride(t *testing.T) {
 	api, git := newAPI(t), &fakeGit{}
 	api.prExists = true

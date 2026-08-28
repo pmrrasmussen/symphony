@@ -52,10 +52,20 @@ published pull request`, `github land active issue is no longer in the
 configured Merging state`, `github land configured base branch changed before
 landing`, `github merge request was not accepted`, `github returned a pull
 request without a head commit`, `github land could not update stale pull
-request branch`, and `github returned an invalid pull request after branch
-update`. The same reason also lands on the deferred refusal fired after a
+request branch`, `github returned an invalid pull request after branch
+update`, and `github land could not push branch <branch> to the configured
+repository; retry once, and if it persists check the repository's push
+permissions and branch protection rules` (the stale-branch push-before-land
+gate). The same reason also lands on the deferred refusal fired after a
 bounded-fix session exhausts its retry attempts (`fireDeferredRefusal`), not
 only on an immediate hard-gate refusal.
+
+That last gate additionally logs a warn-level `"msg":"GitHub land could not
+push branch"` record carrying `push_error`: the underlying `git push` failure
+text, exactly like `github_publish_pr`'s own push gate below. Widening
+`execGit.Run` to return real git/GitHub output made this caller's error stop
+being the placeholder text it used to be too, so it is logged host-side and
+never forwarded to the agent (PMR-163).
 
 A `github_publish_pr` refusal gets the equivalent record, one level earlier in
 the lifecycle: before any push, pull request creation, or Linear handoff has
