@@ -374,22 +374,17 @@ func runTUI(args []string, input io.Reader, stdout, stderr io.Writer, discover t
 // It exists as a seam rather than inline wiring so the sharing is asserted by a
 // test: the manager comes back out of the backend that was given it, so the poll
 // loop and the landing verifier cannot end up on a second manager that merely
-// shares a configuration callback. That second manager is the whole hazard --
-// it would own its own linked-pull-request table and its own exactly-once
-// completion guard, so a merged pull request would leave its Linear issue
-// unreconciled while the guard on the polled manager never fired.
+// shares a configuration callback.
 //
-// The same reasoning extends to the loopback MCP capability endpoint: it is one
-// listener for the daemon's lifetime, shared by every concurrent session and
-// separated by per-registration bearer tokens, so it is built here and handed
-// back for the caller to close rather than bound inside a backend that has
-// nothing to close it with.
+// The loopback MCP capability endpoint is built here for the same reason -- one
+// listener for the daemon's lifetime, handed back for the caller to close rather
+// than bound inside a backend that has nothing to close it with.
 //
 // Optional host capabilities stay disabled until WORKFLOW.md supplies their
-// fixed scope; resolved credentials are filtered from the agent child. Either
-// backend may now bind them: the rendered guidance names a capability by the name
-// its transport serves it under, and internal/claude refuses a launch whose
-// prompt promises a capability its own registry does not advertise.
+// fixed scope; resolved credentials are filtered from the agent child.
+//
+// See docs/architecture.md's "One GitHub manager per process" for what a second
+// manager would break.
 func wire(settings func() config.Settings, logger *slog.Logger) (map[string]domain.AgentBackend, *githubhost.Manager, *mcpbridge.Server, error) {
 	handoff := linear.NewHandoff(settings)
 	handoff.SetLogger(logger)

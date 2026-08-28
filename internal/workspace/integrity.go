@@ -13,30 +13,22 @@ import (
 	"github.com/pmrrasmussen/symphony/internal/observability"
 )
 
-// assertSourceIntegrity is the PMR-65 defense-in-depth backstop. Even though the
-// narrowed sandbox grant should make it impossible, it re-checks that the run
-// left the source repository's branches (other than the symphony/* publish
-// branches Symphony itself creates) exactly as they were when the workspace was
-// prepared, and alerts if not. It deliberately only detects and alerts; it
-// never rewrites the operator's refs, because it cannot distinguish an agent
-// breach from a legitimate concurrent operator change and a destructive
-// "repair" could lose real work.
+// assertSourceIntegrity is the PMR-65 defense-in-depth backstop. It re-checks
+// that the run left the source repository's branches (other than the symphony/*
+// publish branches Symphony itself creates) exactly as they were when the
+// workspace was prepared, and alerts if not. It deliberately only detects and
+// alerts; it never rewrites the operator's refs, because it cannot distinguish
+// an agent breach from a legitimate concurrent operator change.
 //
-// A moved ref is not automatically an alert: an operator fast-forwarding
-// refs/heads/<branch> to a commit reachable from that branch's remote-tracking
-// ref (typically `git pull --ff-only`, the documented operator workflow) is
-// indistinguishable in outcome from a legitimate concurrent pull, and at the
-// cadence this project merges, essentially every run now spans one (PMR-145).
-// That movement is explained and logged at Debug instead of alerted on. Any
-// other change to refs/heads/* -- a rewrite, a reset, a brand-new ref, or a
-// fast-forward to a commit no remote knows about -- still alerts at Error.
+// A moved ref is not automatically an alert: a fast-forward to a commit
+// reachable from that branch's remote-tracking ref is logged at Debug instead
+// (PMR-145). Any other change to refs/heads/* still alerts at Error, and
+// diffSourceRefs fails closed on a ref it could not classify rather than
+// dropping it (PMR-147).
 //
-// Classifying a changed ref costs two extra `git` subprocess calls, each with
-// its own failure modes (a pruned or missing object, a concurrent `git gc`,
-// lock contention). Symphony cannot afford to let one of those failures look
-// like a benign fast-forward: diffSourceRefs fails closed and reports a ref
-// it could not classify as an alert, naming the classification failure,
-// rather than dropping it (PMR-147).
+// docs/architecture.md's "Workspace isolation and the sandbox boundary" section
+// states why classification is the expensive half and what its failure modes
+// are.
 func (l *Local) assertSourceIntegrity(ctx context.Context, ws domain.Workspace, issue domain.Issue) {
 	if ws.GitIntegrityBaseline == "" {
 		return

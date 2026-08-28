@@ -132,7 +132,10 @@ change except the human review gates is performed host-side, with the host
 Linear credential, so no model-invokable path can transition the board:
 
 - `transitions.start` is applied by the coordinator at dispatch (`Todo -> In
-  Progress`), before the Codex session starts.
+  Progress`), before the Codex session starts. Both endpoints of every `start`
+  edge must be active, non-terminal states: the coordinator only dispatches
+  active issues, and the issue must remain eligible for reconciliation after the
+  move.
 - `github_publish_pr` performs the review handoff (`In Progress`/`Rework ->
   handoff_state`) host-side after it publishes the pull request.
 - `github_land_pr` completes landing (`Merging -> Done`) or, on a hard gate,

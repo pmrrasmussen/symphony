@@ -133,23 +133,12 @@ func continuationGuidance(turn, maxTurns int) string {
 	// has no continuation-prompt field. Generate its prescribed guidance here
 	// so continuation turns do not resend the repository task template.
 	//
-	// This text is backend-neutral on purpose, and neutral in both directions.
-	// "workpad" and "thread" were Codex vocabulary and a Claude turn has neither;
-	// a note about tool-name prefixes is Claude vocabulary and a Codex turn has no
-	// prefix, so it does not belong here either. One shared prompt cannot carry
-	// either transport's wording, and the rule that decides what may live here is
-	// what rules it out: anything that varies from turn to turn belongs in this
-	// function, and everything else belongs in the initial prompt.
-	//
-	// The tool naming is emphatically the second kind. config.DeliveryInstructions
-	// renders it, every fresh dispatch renders that, and a resume replays it --
-	// and it is safe there because the advertised set is frozen when the session's
-	// registry is built (capability.landAdvertised reads Issue.State once, at
-	// Build time) and no later turn can change it. A landing_waiting redispatch is
-	// not a continuation: it goes through scheduleRetry/retryLanding to a fresh
-	// Start and therefore a fresh render. So there is nothing for a continuation
-	// turn to correct, and adding a note anyway only leaked one backend's
-	// vocabulary into the other's prompt.
+	// This text is backend-neutral on purpose, and the rule that decides what may
+	// live here is what keeps it so: anything that varies from turn to turn belongs
+	// in this function, and everything else -- tool naming included -- belongs in
+	// the initial prompt, which every fresh dispatch and every resume replays.
+	// Neither backend's vocabulary ("workpad" and "thread"; tool-name prefixes) may
+	// appear here, because the other backend has no such thing.
 	return fmt.Sprintf(`Continuation guidance:
 
 - The previous agent turn completed normally, but the tracker work item is still in an active state.

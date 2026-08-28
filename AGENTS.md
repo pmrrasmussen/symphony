@@ -12,9 +12,10 @@ handoff, rework, landing, and completion instructions. Read it, and
 
 - `cmd/symphony` — the CLI entry point (`--workflow`, `--dry-run`, `--logs-root`, `--log-level`).
 - `internal/config` — loads and validates `WORKFLOW.md`, and owns the reserved
-  host credential variable names plus the one description of the four-part filter
-  applied to the environment of every process Symphony spawns
-  (`ReservedSecretEnvNames`).
+  host credential variable names (`ReservedSecretEnvNames`), the fixed part of
+  the four-part filter applied to the environment of every process Symphony
+  spawns. The one description of that filter is
+  [docs/architecture.md](docs/architecture.md)'s "The host credential filter".
 - `internal/hostenv` — the one implementation of that filter (`Filter`), applied
   by every launcher. It depends only on `internal/config`, so a caller with no
   session passes no secret matcher and still gets the other three parts.
@@ -43,6 +44,12 @@ handoff, rework, landing, and completion instructions. Read it, and
 - `internal/service` — management of one repository-scoped macOS LaunchAgent (`install`, `status`, `restart`, `uninstall`, `migrate`).
 - `internal/tui` — the read-only operator dashboard (`symphony tui`), which renders `internal/operator` and can mutate nothing.
 - `docs/` — architecture, the Linear tracker profile, workspace recovery, observability, macOS services, the `--dry-run` preflight, runtime status, the live smoke profile, and the dogfooding operator guide.
+
+An in-code comment states the invariant, and the one alternative a reader must
+have already ruled out before editing the next line. The derivation behind it —
+the multi-paragraph argument, the failure walkthrough, the record of what was
+measured live — belongs to the `docs/` page that owns the topic, named by a
+one-line pointer at the code (PMR-171).
 
 ## Working here
 

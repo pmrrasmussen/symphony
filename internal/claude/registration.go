@@ -71,13 +71,11 @@ func reportRetirement(events *sink, expired error) {
 // expired, or a turn-ended finalizer that had not returned. Both are
 // operator-visible facts with no URL, token, argument, or result in them.
 //
-// The context passed to the revocation is the run's, and it is deliberately not
-// the finalizer's: it carries values and nothing else. The endpoint derives the
-// finalizer's own budgeted context after its drain, because the drain ignores a
-// context by design and is bounded at two minutes, so anything minted here would
-// routinely be spent before the finalizer started (see mcpbridge.finalizerBudget).
-// That is also why nothing here has a cancel to defer: a defer that fired when
-// the revocation returned could cut a still-running transition short.
+// The context passed to the revocation is the run's, and it carries values and
+// nothing else -- the endpoint derives the finalizer's own budgeted context after
+// its drain (see mcpbridge.finalizerBudget). That is also why nothing here has a
+// cancel to defer: a defer that fired when the revocation returned could cut a
+// still-running transition short.
 //
 // only, when non-nil, retires that registration and nothing else. The turn's own
 // shutdown passes its own registration because by then the session may already
@@ -86,10 +84,8 @@ func reportRetirement(events *sink, expired error) {
 //
 // The nil form means "whatever this session currently holds", so it is only ever
 // correct before the caller has stored a registration of its own. Calling it
-// after would revoke the turn it just launched, which is a live session losing
-// its capabilities with nothing reporting why -- the child simply starts getting
-// 401s. run() calls it as its first act for that reason, and Cancel is retiring
-// the session outright.
+// after would revoke the turn it just launched, and the child would simply start
+// getting 401s with nothing reporting why.
 func (s *session) retireEndpoint(only *registration) error {
 	s.mu.Lock()
 	target := s.endpoint

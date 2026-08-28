@@ -298,40 +298,98 @@ operation, all built from a fixed, narrow decode of protocol fields that
 never includes tool arguments, command bodies, outputs, or raw payloads. See
 [observability.md](observability.md).
 
-No host credential reaches a child Symphony spawns as an environment variable.
-There are three kinds of child, not two: the Codex app-server, each Claude turn,
-and each `WORKFLOW.md` workspace hook. One filter, described once, is applied by
-all of them, and it
-has four parts. First, a fixed set of reserved variable names -- the documented
-names Symphony's own tracker and forge credentials are read from -- is removed
-whatever the workflow configures, so it still applies to a workflow that
-references no credential at all. Second, the variable names this workflow
-actually references are removed; those are repository-chosen, so the fixed set
-cannot know them. This second part is also the only one that covers a
-credential *file path*: with `api_key_file` or `token_file` the variable holds a
-path rather than the credential, so the value filter below never matches it
-(PMR-80), and a worker that learned the path could read the file, which no
-sandbox mode prevents. Third, any variable whose value contains a configured
-credential is removed under any name, because an inherited variable Symphony has
-never heard of can still carry the credential, plain or wrapped as
-`Bearer <token>`; for a loaded workflow this is the broadest of the four, since
-the loader resolves both credentials to their values before deriving it. Fourth,
-the credential the run's bound providers actually hold is removed. That fourth
-part is defence-in-depth today rather than the sole cover for anything -- no
-loadable configuration separates it from the third -- and it becomes
-load-bearing as soon as a backend relaunches per turn with providers bound,
-because the first three parts are re-read from live settings on every turn while
-a provider session holds the credential it froze at session build. Both sides of
-that divergence are covered: every bound provider is asked, including the
-process-wide GitHub manager, which reads its settings live, so a token rotated
-by a reload is stripped alongside the frozen one the run still authenticates
-with. The Claude backend, which spawns one process per turn, is exactly that
-shape; it also adds exactly one variable after
-filtering -- this turn's capability endpoint token, the credential it
-deliberately hands over -- and blocks that name on the way in so it can have no
-other source. Everything else is inherited on purpose: both CLIs authenticate
-through the operator's own stored login, which lives in the home directory they
-read.
+## The host credential filter
+
+`internal/config`'s `ReservedSecretEnvNames` owns the reserved names, and this
+section is the one description of how host credentials are kept out of a process
+Symphony spawns. `hostenv.Filter` is the one implementation of it, and nothing
+else documents it separately: the names and the loader that derives the rest
+live in `internal/config`, beside each other because they are one policy, and
+the loop lives in `internal/hostenv`, where every launcher can reach it without
+depending on a session.
+
+The reserved names are the fixed half of the filter: names that never reach a
+child Symphony spawns, whatever a workflow says. They are the documented
+variables Symphony's own tracker and forge credentials are read from, and an
+agent reaches those providers through bounded capabilities, never directly.
+There are five:
+
+```
+LINEAR_API_KEY
+SYMPHONY_LINEAR_API_KEY_FILE
+GITHUB_TOKEN
+SYMPHONY_GITHUB_TOKEN
+SYMPHONY_GITHUB_TOKEN_FILE
+```
+
+That policy is a property of the trust boundary, not of any one child. One
+function reads it, `hostenv.Filter`, so a name added or removed cannot apply to
+one child Symphony spawns and not another.
+
+"Child" here means every process Symphony starts, not only an agent backend.
+There are three: the Codex app-server, each Claude turn, and a `WORKFLOW.md`
+workspace hook (`workspace.Local.hook` -- `after_create`, `before_run`,
+`after_run`, `before_remove`). The hook is the one that reads as an exception
+and is not: its script is repository-owned policy, but it runs in the agent's
+own worktree, so it can invoke anything the agent committed there, outside the
+agent sandbox. It ran with the daemon's complete environment until PMR-113,
+which is what a doctrine that enumerated only the backends could not make
+visible. Adding a fourth kind of child means adding it here too.
+
+A caller filters the inherited environment through four filters, and each
+one exists because the others cannot cover it:
+
+ 1. `ReservedSecretEnvNames` removes these five documented names, whatever the
+    workflow configures. It is the only filter that applies to a workflow
+    with no credential reference at all -- one whose tracker key is passed in
+    some other way, so filters 2 and 3 are both empty -- and it covers the two
+    documented `*_FILE` names even when nothing references them.
+ 2. `Settings.HostSecretEnvNames`, plus whatever names the caller blocks of
+    its own, removes the variables this workflow actually references. Filter
+    1 cannot: those names are repository-chosen. It is also the only filter
+    of any kind that covers a repository-chosen credential *file path*: for
+    the `api_key_file` and `token_file` forms the variable holds a path, not the
+    credential, so filter 3 never matches it and filter 1 does not know its
+    name (PMR-80).
+ 3. `Settings.HostSecretValues` removes any variable whose value *contains* a
+    configured credential, under any name. Neither name filter can: an
+    inherited variable Symphony has never heard of can still carry the
+    credential, plain or wrapped in something like `Bearer <token>`. For a
+    `Settings` produced by `Load` this is the broadest filter of the four --
+    `resolveProvider` writes resolved `api_key_file` contents back into
+    `provider["api_key"]`, and `decodeGitHub` disables the integration outright
+    for a literal inline token, so `hostSecretValues` sees both credentials in
+    resolved form.
+ 4. `capability.SecretMatcher` removes the credentials the providers bound to
+    this run actually hold, asking every one of them. Because of what filter 3
+    just resolved, no *loadable* configuration makes this the only filter that
+    catches a credential today: for now it is defence-in-depth against a
+    divergence between the two, and against a `Settings` assembled by anything
+    other than `Load`, which carries no `HostSecretValues` at all. It stops being
+    merely that as soon as a backend relaunches per turn with providers bound:
+    a launcher re-reads the live settings callback for filters 2 and 3 on
+    every turn, while a provider *session* holds the credential it froze at
+    session build, so a reload that rotates a credential mid-run leaves the
+    value the frozen session still authenticates with covered by nothing else.
+    `internal/claude` spawns one process per turn, which is exactly that shape.
+    Both sides of that divergence are covered rather than one: a bound
+    `githubhost.Manager` is asked too, and it reads its callback live, so the
+    rotated value is stripped alongside the frozen one. See `SecretMatcher`
+    below for why the Linear side has no such pair. It is the one filter a
+    caller may omit, because it is the one that needs a session: a process
+    Symphony spawns outside any session -- a workspace hook -- has no bindings
+    to build a matcher from and passes none, so it gets filters 1 through 3 and
+    forgoes only a credential held by a live provider under a name and value no
+    configuration mentions.
+
+A credential the caller deliberately hands over -- the Claude backend's
+capability endpoint token -- is appended after filtering, so no filter can
+strip it and no inherited value can pre-empt it. That is the caller's own
+business, not the filter's. The backend also blocks that name on the way in, so
+it can have no other source.
+
+Everything else is inherited on purpose: both CLIs authenticate through the
+operator's own login, which lives in the home directory they read.
 
 A workspace hook is a child on the same terms. Its script is repository-owned
 policy and is trusted as such, but `cmd.Dir` is the agent's own worktree, so a
@@ -350,19 +408,88 @@ process running in an agent-writable directory, and it is not the form
 from the daemon's own `PATH` -- under a LaunchAgent, the one written into the
 plist -- rather than from a profile.
 
-`internal/config`'s `ReservedSecretEnvNames` owns the reserved names and this
-description; `internal/hostenv`'s `Filter` is the one implementation, applied by
-every launcher, so the four parts cannot hold for one child and not another --
-which is what they did not, before `Filter` existed. They did not hold for hooks
-either until PMR-113, for the same reason in a different place: the doctrine
-enumerated the agent backends, so the third child was never weighed against it.
-`internal/capability`'s
-`SecretMatcher` builds the fourth part from the same bindings that decide which
-capabilities a session gets, so the providers a session can reach and the
-credentials it strips cannot diverge; it is the one part a caller may omit,
-because a process spawned outside any session has no bindings to build it from.
-Each part is proven once over `Filter`, and each launcher -- both backends and
-the hook path -- is proven to reach it with everything it must contribute.
+`hostenv.Filter` applies all four parts in one pass. Its `entries` parameter is
+the caller's environment, normally `os.Environ()`. It is a parameter rather than
+read inside `Filter` because it is the only way a test can present an entry
+`os.Environ()` cannot be made to hold, and both such entries matter: an entry
+carrying no `=` is dropped rather than forwarded, and only a value is ever
+offered to the value filters. A malformed entry conveys nothing to a child, and
+running a whole entry through the value filters would let a variable's own
+*name* trip a credential match and silently strip an unrelated variable. Names
+in `extraNames` and `s.HostSecretEnvNames` are trimmed, and blank ones dropped,
+so a hand-assembled `Settings` carrying `" NAME "` blocks the same variable for
+every caller. A blank configured value is skipped too: it is contained in every
+value, and honouring it would empty the child environment.
+
+`hostenv` lives outside both backends because this policy is a property of the
+trust boundary rather than of any one child, and it depends only on
+`internal/config`, so a caller with no session and no capability registry -- a
+workspace hook -- can use it. That was not a hypothetical twice over: PMR-94 was
+Claude children inheriting the provider secrets Codex children stripped, from
+two implementations that each carried a comment asserting the other matched it,
+and PMR-113 was hooks inheriting the daemon's environment whole because a
+doctrine written about agent backends never named the third child.
+
+### Filter 4: `capability.SecretMatcher`
+
+`SecretMatcher` reports the credentials the providers bound to one session
+actually hold, so a launcher can remove any inherited variable whose value
+carries one -- filter 4 of `config.ReservedSecretEnvNames`. It returns nil when
+nothing is bound, which every launcher reads as "no provider filter".
+
+It lives in `internal/capability`, beside `Build`, and takes the same `Bindings`,
+because the set of bound providers and the set of their credentials must not be
+able to diverge: a provider added to `Bindings` gains both its capabilities and
+its credential filter, or neither. Both backends call it, so the two cannot
+differ on which provider credential is stripped -- they did before, in the same
+way twice.
+
+Every bound provider is asked, and a match by any of them is a match. It is
+deliberately not a dispatch to whichever is most specific: the three read
+three different values, and the whole point of filter 4 is that a launcher
+cannot know which of them a given run is holding.
+
+`manager` is why this is a function rather than a closure at each call site, and
+it is asked for two distinct reasons:
+
+  - `githubhost.Manager.PrepareWithSettings` returns nil when no Linear handoff
+    was prepared, so a run with `github.enabled` but no `handoff_state` has a
+    bound manager, no session, and -- before this existed -- a live matcher that
+    answered false for every candidate, the forge token included.
+  - `Session.MatchesSecret` tests the `config.GitHub` frozen into it at
+    `PrepareWithSettings`, while `Manager.MatchesSecret` reads its settings
+    callback live. A `WORKFLOW.md` reload that rotates the forge token leaves the
+    session holding the old value and the manager the new one, and *both* must
+    be stripped: the session is what this run's capabilities will authenticate
+    with, and the live value is what the host process is using now. An earlier
+    version of this function returned the session's answer unconditionally
+    whenever a session existed, which made the manager unreachable in the
+    common case and left exactly that rotation uncovered -- the reload-drift
+    case `config.ReservedSecretEnvNames` names as filter 4's reason.
+
+The Linear side has no equivalent pair: `HandoffSession.MatchesSecret` is
+frozen the same way, but `linear.Handoff` exposes no live counterpart, so there
+is nothing further to consult there. A rotated tracker key's new value is
+covered by filter 3 instead, which `internal/claude` re-reads from the live
+settings callback on every turn. The gap that leaves is the exact analogue of
+the manager case above -- a `Settings` not produced by `Load`, carrying a tracker
+key with no handoff prepared, has no filter 4 cover for it -- and closing it
+would mean a live matcher on `linear.Handoff` that does not exist yet.
+
+### What proves each part
+
+Each numbered filter is proven once over `hostenv.Filter`, in
+`TestFilterAppliesEveryPartOfTheHostCredentialFilter`, and each launcher is
+proven to reach it with the whole of what it must contribute, because a hole
+would be silent either way: see `TestNoHostCredentialReachesTheChildEnvironment`
+in `internal/codex`, `TestHostSecretsNeverReachTheChild` plus
+`TestStartBindsTheHostProvidersAndTheirSecrets` in `internal/claude`, and
+`TestNoHostCredentialReachesAHook` in `internal/workspace`. Filter 1's
+names are also the names `internal/service` writes into the LaunchAgent plist;
+`TestReservedNamesCoverTheServiceCredentialVariables` holds those two lists
+together.
+
+## Workspace isolation and the sandbox boundary
 
 When `workspace.source_root` is configured, `LocalWorkspaceExecutor` creates a
 detached Git worktree for each issue. Before creating a new workspace, it
@@ -561,7 +688,13 @@ tool may touch. The CLI's own builtin `/statusline` command was the source for
 this rule's syntax (`Read(~/**)`, `Edit(~/.claude/settings.json)`, verified
 against claude 2.1.248) since it is not part of the documented `--settings`
 schema. `Bash` itself keeps the bare tool name: its confinement was never the
-permission rule, and always came from `allowWrite`.
+permission rule, and always came from `allowWrite`. The session's whole tool
+surface, capability tools included, is rendered into the settings payload as well
+as into the flags, even though `--allowedTools` evidently supplies the rule on
+its own -- a real-binary run with capability tools allowed only by flag saw no
+denials. `internal/claude/launch.go`'s doctrine is that policy is pinned in the
+payload, because two disagreeing representations of "what is permitted" would
+leave a reader unable to tell which one is authoritative.
 
 Second, that leaves one confirmed gap `allowWrite` does not close, and it is a
 limitation of the CLI's own sandbox rather than of this launcher's payload: a
@@ -619,7 +752,25 @@ and relocating it with `CLAUDE_CONFIG_DIR` breaks subscription authentication
 As a defense-in-depth backstop, after each run Symphony re-checks that the
 source repository's non-`symphony/*` branch heads and primary
 index are unchanged from a baseline captured at preparation, and alerts on
-drift. The host still owns all GitHub publishing authority. Workspace state below the configured
+drift. It deliberately only detects and alerts; it never rewrites the operator's
+refs, because it cannot distinguish an agent breach from a legitimate concurrent
+operator change and a destructive "repair" could lose real work.
+
+A moved ref is not automatically an alert. An operator fast-forwarding
+`refs/heads/<branch>` to a commit reachable from that branch's remote-tracking
+ref (typically `git pull --ff-only`, the documented operator workflow) is
+indistinguishable in outcome from a legitimate concurrent pull, and at the
+cadence this project merges, essentially every run now spans one (PMR-145). That
+movement is explained and logged at Debug instead of alerted on. Any other change
+to `refs/heads/*` — a rewrite, a reset, a brand-new ref, or a fast-forward to a
+commit no remote knows about — still alerts at Error. Classifying a changed ref
+costs two extra `git` subprocess calls, each with its own failure modes (a pruned
+or missing object, a concurrent `git gc`, lock contention), and Symphony cannot
+afford to let one of those failures look like a benign fast-forward: the
+classifier fails closed and reports a ref it could not classify as an alert,
+naming the classification failure, rather than dropping it (PMR-147).
+
+The host still owns all GitHub publishing authority. Workspace state below the configured
 root records durable ownership and Git cleanup identity; it never suppresses an
 otherwise active issue. Invalid ownership state, or missing state beside an
 existing workspace, fails closed during preparation. The schema, restart
@@ -678,3 +829,268 @@ Accordingly, the workflow body remains the configured first-turn task prompt,
 while later turns receive generated upstream-style continuation guidance using
 the configured `agent.max_turns` value. This avoids replaying the original task
 prompt already present in the live thread.
+
+That generated guidance is backend-neutral in both directions: `workpad` and
+`thread` are Codex vocabulary and a Claude turn has neither, while a note about
+tool-name prefixes is Claude vocabulary and a Codex turn has no prefix. The rule
+that keeps it so is that anything varying from turn to turn belongs in the
+continuation guidance and everything else belongs in the initial prompt. Tool
+naming is emphatically the second kind: `config.DeliveryInstructions` renders it,
+every fresh dispatch renders that, and a resume replays it — and it is safe there
+because the advertised set is frozen when the session's registry is built
+(`capability.landAdvertised` reads `Issue.State` once, at `Build` time) and no
+later turn can change it. A `landing_waiting` redispatch is not a continuation
+either: it goes through `scheduleRetry`/`retryLanding` to a fresh `Start` and
+therefore a fresh render. So there is nothing for a continuation turn to correct,
+and adding a note anyway only leaked one backend's vocabulary into the other's
+prompt.
+
+## The loopback MCP endpoint (`internal/mcpbridge`)
+
+`internal/mcpbridge` serves Symphony's agent-neutral capability registry to an
+agent process over MCP, in-process, on one loopback HTTP listener.
+
+**Why in-process HTTP.** The alternative was a `symphony <helper>` stdio MCP
+server that the agent CLI spawns, bridging back to this process over a unix
+domain socket. Both variants of that -- a private wire format between helper
+and daemon, or MCP itself with the helper as a pure byte pump -- rest on two
+undocumented CLI internals: that the CLI's own sandbox permits `connect()` on a
+socket path outside its write allowlist, and that MCP stdio servers are
+spawned inside that sandbox at all. The launch contract's doctrine
+(`internal/claude/launch.go`) is that policy must never depend on something the
+CLI can silently ignore, and a wrong guess here does not surface as an error:
+it surfaces as a 30-second MCP connect timeout. The CLI unquestionably makes
+outbound HTTP from its own process, which needs nothing undocumented to hold.
+The transport is kept deliberately narrow -- one listener, one fixed path, one
+JSON-RPC envelope, no streaming -- so replacing it with a socket later is a
+change confined to this package.
+
+**Trust boundary.** The agent process is untrusted, and "the agent process" is
+wider than the model's own tool calls: the child's shell holds the endpoint
+token and loopback is inside its sandbox, so anything running in that process
+can address this endpoint directly. It may call any advertised tool -- and
+only an advertised one, which is why the advertisement gate lives in `callTool`
+and not in a launch contract -- with any arguments, in parallel, at any time,
+and it may be killed mid-call. Nothing it sends is used for anything except
+selecting a capability by name and handing that capability its own arguments to
+validate. No provider credential crosses the boundary: the only secret the child
+holds is a per-registration bearer token that authorizes it to reach exactly one
+session's registry, and it travels in the child's environment rather than in
+argv, which is world-readable on Linux. All authority stays on this side --
+the registry decides what exists, and each provider re-validates its own
+preconditions inside the invocation.
+
+**Nothing in this package logs.** Its entire state -- endpoint URL, bearer token,
+tool arguments, tool results -- is exactly what must never reach an operator
+log, so a log record written here would carry a disclosure risk no call record
+can repay. What it does emit is the events a session's own consumer needs: a
+capability's terminal outcome, and the bounded `dynamicToolCall` item records the
+shared dispatch builds, which carry a registry-owned capability name, a
+host-minted call ID, an outcome, and a duration, and have no field an argument,
+a result, a URL, or a token could reach.
+
+### The advertisement gate
+
+`Registration.advertises` reports whether a resolved capability is one this
+registration advertises, which over this transport is the same question as
+whether the agent is allowed to call it. It is the `Allow` gate the shared
+dispatch consults after a name resolves and before any provider work, and a name
+it refuses is answered exactly as an unknown one is.
+
+The registry's own `Lookup` deliberately ignores advertisement, because on the
+Codex transport advertisement is only a filter over what the model is told
+about: the model can call nothing the app-server did not advertise, so
+dispatch could stay open and let each provider re-validate its own
+preconditions. That reasoning does not survive this transport. The child's
+shell holds the endpoint token and loopback is reachable from inside its
+sandbox, so the child can address this endpoint directly and name a
+capability that never appeared in `--tools`, in `--allowedTools`, or in
+`tools/list`. Provider re-validation still holds -- a landing re-checks the
+tracker state, a follow-up re-checks that creation is enabled -- so what the
+gate closes is not an authority hole but the gap between what the launch
+contract pins as reachable and what actually is. With it, the only
+capabilities reachable by any means are the ones the model was already
+permitted to call, which is what makes the set-equality the launch contract
+checks a statement about reachability rather than only about advertisement.
+
+The membership test walks `Definitions()` rather than caching it, because a
+registry's advertised set is fixed when it is built and the set is at most a
+handful of entries.
+
+### Response ordering and item records
+
+Both the result and any terminal event the capability produced are delivered
+before the deferred `endCall` releases the invocation slot, and that ordering is
+load-bearing. A `Revoke` waiting in `drain()` wakes the moment the slot is
+released and retires the registration; anything emitted after that is dropped.
+A turn cancelled while a landing is in flight is exactly the case this
+transport is built for -- the child is killed, the landing completes, reports
+waiting or merged, and that event is what schedules the delayed retry or ends
+the run. Releasing the slot first would destroy it, and the provider's own
+finalizer would then also do nothing, because it sees the waiting outcome the
+lost event was reporting. Dispatch responds before it emits and runs the
+release last, which is why the gate is handed to it as `Enter` rather than taken
+around it.
+
+A capability whose `Lifecycle` reports it as observable is reported as a
+`dynamicToolCall` pair, exactly as it is on the Codex transport (PMR-100). For a
+call the agent CLI made that is a second record of the same work -- the CLI's own
+stream already carries a `tool_use`/`tool_result` pair named
+`mcp__symphony__<tool>`, which the Claude backend pairs and classifies as an
+`mcpToolCall` -- but the two are distinct item types with distinct IDs, and only
+this one times the provider round trip itself rather than the CLI's view of the
+call. It is also the only record a call the child makes by other means produces
+at all: its shell holds the endpoint token and loopback is inside its sandbox,
+and such a call appears in no CLI stream.
+
+Nothing decoded from the wire is echoed into those records. The name is used
+only to select a capability -- `Dispatch` reports the resolved capability's own
+registry-owned `Definition().Name` -- and the call ID is minted in `callTool`
+rather than taken from the request's JSON-RPC ID, which is a value the untrusted
+child chose. Any log or event ever added to `internal/mcpbridge/protocol.go`
+must take the same care.
+
+### The single-invocation gate
+
+`beginCall` claims the registration's single invocation slot: exactly one
+invocation runs at a time per registration, and a parallel second call is
+refused rather than queued.
+
+This is not what makes concurrent entry safe. Every provider entry point
+behind the registry already holds its own session mutex for the whole call
+(`Publish`, `Context`, `Land`, `FinalizeLanding`, `LandingResolved`), so parallel
+HTTP requests would serialize there regardless, and a second parallel landing
+would be declined by the resolved-landing latch it reads on entry.
+
+What the gate buys is the difference between refusing in milliseconds and
+waiting minutes. Without it, a parallel call parks an HTTP goroutine on that
+session mutex behind a `Land` that can run for several bounded provider requests
+plus a Git push, and then runs against state the first call has already
+changed -- while the model waits, learning nothing. Refusing hands the model
+something it can act on immediately. It also keeps at most one provider
+operation per session outstanding, which is what makes `Revoke`'s drain a single
+bounded wait rather than a race with however many goroutines the child chose
+to open.
+
+Note what this does not cover: `Prepare` runs before the gate is taken, so
+argument validation is genuinely concurrent here where the Codex transport's
+inline dispatch serialized it. That is harmless only because every `Prepare` is
+pure parsing. A `Prepare` that ever touches provider session state must move
+inside the gate.
+
+### Revocation order, and the finalizer's own context
+
+`Revoke` retires a registration at the end of an agent turn, in a fixed order
+that the capability state depends on. First the registration is marked inactive
+and unlinked, so no new invocation can start and a revoked token authenticates
+against nothing. Then any invocation already running is drained -- including the
+terminal event it produces, which is emitted before the invocation releases the
+slot, so a landing's own outcome cannot be lost to the revocation that waited
+for it. Only then does the registry's turn-ended finalizer run, because that
+finalizer performs the deferred `Merging -> In Review` transition: running it
+while a landing call is still in flight would let the transition interleave with
+the merge it is the fallback for. The drain honours only its own bound, never
+`ctx`: a cancelled context is exactly the case where the child was killed
+mid-call, which is when skipping the drain would do the damage.
+
+`Revoke` is idempotent and always returns within its own bounds. It returns nil
+when it drained and finalized in order, and otherwise `ErrDrainExpired`,
+`ErrFinalizerExpired`, or both joined -- each of which means an invariant it
+exists to hold was knowingly given up on.
+
+`finalizerBudget` bounds the finalizer's own work, which is a different
+question from `finalizeTimeout`'s "how long will `Revoke` wait for it".
+
+It exists because the context `Revoke` is given cannot be that bound. The
+coordinator stops a run by cancelling the very context the backend's
+session holds and only then cancelling the session, so by the time `Revoke`
+runs, its `ctx` is routinely already done -- and the finalizer's whole job,
+the deferred `Merging -> In Review` transition, is precisely the work a
+stopped run still owes its issue (PMR-95). Nor can the caller pre-derive a
+budget and pass it in: the drain above runs first, ignores `ctx` by design,
+and is bounded at two minutes, so a budget minted before `Revoke` shares its
+clock with a wait twelve times its length and is routinely spent before the
+finalizer starts. So the finalizer's context is derived where the finalizer
+is actually invoked -- in `finalize`.
+
+Five seconds, because the work is a handful of sequential tracker requests
+and because the Codex transport, which invokes the same finalizer directly
+inside its `Cancel`, is bounded by the coordinator's five-second wait for a
+cancellation to return. Both transports therefore give the finalizer the
+same budget. It stays far inside `finalizeTimeout`, so a finalizer that is
+slow at its own work is ended by this and reported as complete, and
+`finalizeTimeout` is left for the case it exists for: a finalizer blocked
+before it reads a context at all.
+
+The price of expiry is not "the transition is retried later". It is that
+the transition is lost for good: the GitHub session latches its
+deferred-fired flag before attempting anything, so no later turn end will
+attempt it again. The issue is still redispatched -- the configured `Merging`
+state is a workflow active state -- but only into the same landing attempt
+against the same failed gate, holding the one state-aware `Merging` slot,
+with no human told to look at it. Latching on success instead is a change
+to that provider's idempotency contract and is deliberately not made here.
+
+`finalize` runs that finalizer on its own goroutine, because it can block before
+it consults any context: the GitHub session's finalizer takes that session's
+mutex as its first statement, and a landing holds the same mutex across Git
+children bounded only by the session context. Calling it inline would give
+`Revoke` the lifetime of a network-hung `git` process, and passing a bounded or
+already-cancelled `ctx` would not help, because the block happens before `ctx` is
+read. That goroutine is also where the finalizer's context is derived, and the
+timing is the whole point: the drain has finished by then, so a budget minted
+there is spent on the finalizer and nothing else -- unlike one minted by
+`Revoke`'s caller, which shares its clock with a two-minute, `ctx`-ignoring wait.
+The derivation drops the caller's cancellation and keeps its values, and
+cancelling it belongs to the same goroutine too: a defer in `finalize` would fire
+when the wait expires and cut a still-running transition short. An expired
+finalizer is not abandoned: it is idempotent, the deferred transition it may
+still perform must happen, and its own budget is what will end it. `Revoke` stops
+waiting and says so instead of waiting for it.
+
+The Codex transport's own `finalizeBudget` is the same five seconds, for the
+same reason read from the other side. The work it bounds is a handful of
+sequential Linear GraphQL round trips — the deferred transition re-reads the
+issue, resolves the team's states, transitions, re-reads to confirm, and
+comments — so seconds is the right order of magnitude, and the ceiling that binds
+is the coordinator's, which waits exactly five seconds for `agent.Cancel` to
+return,
+and a hard `Cancel` runs this finalizer before returning. A longer budget does
+not lose the transition -- the cancellation goroutine outlives the coordinator's
+wait -- but it does make the coordinator log "agent cancellation timed out" for a
+session that is shutting down exactly as designed. Two ceilings that look like
+they bind do not, and are recorded so they are not mistaken for constraints
+later: the daemon's twenty-second graceful shutdown deadline waits on the run
+goroutine, which is blocked on the child's exit rather than on this call, and the
+endpoint's thirty-second finalizer bound is on the other transport and starts
+after its drain, so it shares no clock with this.
+
+## One GitHub manager per process
+
+`cmd/symphony`'s `wire` builds the agent backend registry together with the host
+providers those backends share, and hands back the one GitHub manager this
+process may hold. It exists as a seam rather than inline wiring so the sharing is
+asserted by a test: the manager comes back out of the backend that was given it,
+so the poll loop and the landing verifier cannot end up on a second manager that
+merely shares a configuration callback. That second manager is the whole hazard
+-- it would own its own linked-pull-request table and its own exactly-once
+completion guard, so a merged pull request would leave its Linear issue
+unreconciled while the guard on the polled manager never fired.
+
+Both backends' `NewWithProviders` constructors exist for the same reason: they
+bind already-built providers instead of constructing them. `settings` must be the
+same callback the providers were built from. It is a separate parameter only
+because neither provider exposes the closure it captured, and Go cannot compare
+closures, so this cannot be enforced in the constructor: `Start` freezes one
+settings snapshot for the session (which capabilities exist, and the
+`config.GitHub` the session is bound to) while the manager independently reads its
+own callback for `Enabled`, `MatchesSecret`, and the read-only `VerifyLanded`.
+Feeding them different callbacks makes those disagree -- a session that froze
+GitHub as disabled beside a landing verifier that sees it enabled would let
+terminal cleanup discard local commits for an issue no session ever published.
+
+The same reasoning extends to the loopback MCP capability endpoint: it is one
+listener for the daemon's lifetime, shared by every concurrent session and
+separated by per-registration bearer tokens, so it is built in `wire` and handed
+back for the caller to close rather than bound inside a backend that has nothing
+to close it with.

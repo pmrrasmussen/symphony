@@ -25,17 +25,8 @@ const (
 // hook runs one WORKFLOW.md hook script. The script is repository-owned,
 // versioned policy and is trusted as such, but a hook is a child Symphony
 // spawns like any other, so its environment goes through hostenv.Filter and no
-// host credential reaches it (PMR-113). Trusting the script is not the same as
-// trusting what it reaches: cmd.Dir is the agent's own worktree, so `make
-// setup`, `./scripts/...`, or `npm run ...` runs code the agent wrote and
-// committed, outside the agent sandbox. before_run and after_run bracket every
-// turn on that worktree, which puts this on the ordinary lifecycle rather than
-// behind operator error.
-//
-// A hook has no session, so it passes no capability.SecretMatcher and gets
-// filters 1 through 3, which are derived from settings alone and cover every
-// credential a loaded workflow resolves; filter 4 is what any caller outside a
-// session forgoes. See config.ReservedSecretEnvNames for all four.
+// host credential reaches it (PMR-113). A hook has no session, so it passes no
+// capability.SecretMatcher and gets filters 1 through 3.
 //
 // The two SYMPHONY_ISSUE_* names are blocked on the way in and appended after
 // filtering, so this function is their only source: Go's exec keeps the last
@@ -43,11 +34,12 @@ const (
 //
 // `sh -c`, not `sh -lc`: a login shell sources the operator's profile, which is
 // a second uncontrolled input to a process running in an agent-writable
-// directory and could re-export a variable the filter just removed. It is also
-// the form preflight validates the script with (`sh -n -c`), so what is checked
-// is what runs. A hook resolves commands from the daemon's own PATH -- under a
-// LaunchAgent, the one internal/service writes into the plist -- rather than
-// from a profile.
+// directory, and it is not the form preflight validates the script with
+// (`sh -n -c`).
+//
+// docs/architecture.md's "The host credential filter" section states why
+// trusting the script is not the same as trusting what it reaches, and what
+// filter 4 costs a caller outside a session.
 func (l *Local) hook(ctx context.Context, ws domain.Workspace, issue domain.Issue, name, script string) error {
 	if script == "" {
 		return nil

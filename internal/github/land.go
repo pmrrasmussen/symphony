@@ -46,26 +46,23 @@ type LandResult struct {
 	Reason string     `json:"reason,omitempty"`
 }
 
-// Land merges the pull request already bound to this issue, repository,
-// base, and branch, using the configured merge method, once required checks
-// pass, the effective review state is not changes_requested, no review
-// thread is unresolved, the pull request is open and mergeable, and the
-// configured base has not moved. It accepts no input: repository, branch,
-// PR, method, and Linear state are all fixed by the bound session and
-// configuration, never by tool arguments.
+// Land merges the pull request already bound to this issue, repository, base,
+// and branch, using the configured merge method. It accepts no input:
+// repository, branch, PR, method, and Linear state are all fixed by the bound
+// session and configuration, never by tool arguments.
 //
-// A hard gate (failing checks, a changes-requested review, an unresolved
-// thread, a stale base, a merge conflict, or a closed/mismatched pull
-// request) refuses landing and attempts the configured Merging -> In Review
-// fallback transition, which is itself a no-op once the issue is no longer
-// exactly in the configured Merging state. When UpdateStaleBranch is enabled,
-// a clean stale base instead gets one deterministic update-branch attempt and
-// then waits for checks on its new head. Pending checks or undetermined
-// mergeability return a non-terminal LandWaiting result without mutating
-// Linear. A pull request GitHub already reports merged -- discovered up
-// front, immediately before the merge call, or because the merge call itself
-// raced with a concurrent merge -- reconciles the bound issue to Done
-// idempotently instead of attempting another merge.
+// Three outcomes, and they are not interchangeable. A hard gate (failing checks,
+// a changes-requested review, an unresolved thread, a stale base, a merge
+// conflict, or a closed/mismatched pull request) refuses landing and attempts
+// the configured Merging -> In Review fallback. Pending checks or undetermined
+// mergeability return a non-terminal LandWaiting result without mutating Linear.
+// A pull request GitHub already reports merged -- discovered up front,
+// immediately before the merge call, or because the merge call itself raced with
+// a concurrent merge -- reconciles the bound issue to Done idempotently instead
+// of attempting another merge.
+//
+// See docs/architecture.md for the full gate list and the update-stale-branch
+// behaviour.
 func (s *Session) Land(ctx context.Context) (LandResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -388,19 +385,15 @@ func (s *Session) fireDeferredRefusal(ctx context.Context) {
 // transition already fired.
 //
 // Two of those conditions are worth naming precisely, because a reader checking
-// which one carries the weight will otherwise get it wrong.
-//
-// The feature check is unreachable by construction and kept only as a statement
-// of intent: retryableGateHit is set exclusively by gate(), which returns through
-// refuse() before setting it whenever the feature is off, so no session can ever
-// reach here with the feature off and a gate on record.
-//
-// The landed check is genuinely redundant with fireDeferredRefusal's own, and
-// deliberately so: this is the guard a reader of this function needs to see, and
-// the case it covers -- a gate hit, then a fix turn's retry that merged -- is the
-// highest-consequence mistake available here, since firing would walk a merged,
-// Done issue back to review with a comment claiming fix attempts were exhausted.
-// Both transports assert that case end to end.
+// which one carries the weight will otherwise get it wrong. The feature check is
+// unreachable by construction and kept only as a statement of intent:
+// retryableGateHit is set exclusively by gate(), which returns through refuse()
+// before setting it whenever the feature is off. The landed check is genuinely
+// redundant with fireDeferredRefusal's own, and deliberately so: it covers the
+// highest-consequence mistake available here -- a gate hit, then a fix turn's
+// retry that merged, where firing would walk a merged, Done issue back to review
+// with a comment claiming fix attempts were exhausted. Both transports assert
+// that case end to end.
 func (s *Session) FinalizeLanding(ctx context.Context) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

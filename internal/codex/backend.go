@@ -39,33 +39,21 @@ type Backend struct {
 }
 
 // finalizeBudget bounds the turn-ended finalizer's own work, which runs detached
-// from the run's cancellation (see finalizeLanding).
+// from the run's cancellation (see finalizeLanding). The work is a handful of
+// sequential Linear GraphQL round trips.
 //
-// The work is a handful of sequential Linear GraphQL round trips: the deferred
-// transition re-reads the issue, resolves the team's states, transitions,
-// re-reads to confirm, and comments. Seconds is the right order of magnitude,
-// and the ceiling that actually binds is the coordinator's: it waits exactly five
+// The ceiling that actually binds is the coordinator's: it waits exactly five
 // seconds for agent.Cancel to return, and a hard Cancel runs this finalizer
-// before returning. A longer budget does not lose the transition -- the
-// cancellation goroutine outlives the coordinator's wait -- but it does make the
-// coordinator log "agent cancellation timed out" for a session that is shutting
-// down exactly as designed, so five seconds is what keeps a correct cancel quiet.
-// The Claude transport gives the same finalizer the same budget, derived at its
-// own transport's only correct point: see mcpbridge.finalizerBudget.
+// before returning. A longer budget does not lose the transition, but it does
+// make the coordinator log "agent cancellation timed out" for a session shutting
+// down exactly as designed. The Claude transport gives the same finalizer the
+// same budget, derived at its own transport's only correct point: see
+// mcpbridge.finalizerBudget.
 //
-// Two ceilings that look like they bind do not, and are recorded so they are not
-// mistaken for constraints later. The daemon's twenty-second graceful shutdown
-// deadline waits on the run goroutine, which is blocked on the child's exit
-// rather than on this call. And the endpoint's thirty-second finalizer bound is
-// on the other transport and starts after its drain, so it shares no clock with
-// this.
-//
-// The price of expiry is not "the transition is retried later". It is that the
-// transition is lost: the GitHub session latches its deferred-fired flag before
-// attempting anything, so an expired finalizer leaves the issue in Merging with
-// no later turn end that will attempt it again. Latching on success instead is a
-// change to that provider's idempotency contract and is deliberately not made
-// here.
+// The price of expiry is not "the transition is retried later" but that the
+// deferred Merging -> In Review transition is lost. See docs/architecture.md's
+// "The loopback MCP endpoint" section for that and for the two ceilings that
+// look like they bind and do not.
 const finalizeBudget = 5 * time.Second
 
 // New builds a Codex backend. secretNames are extra environment variable names
@@ -76,26 +64,16 @@ func New(secretNames ...string) *Backend {
 }
 
 // NewWithProviders binds already-built host providers to this backend instead
-// of constructing them. Both are process-wide and neither belongs to Codex, but
-// the GitHub manager is why this seam has to exist: one manager owns the linked
-// pull request table its poll loop walks and the exactly-once Linear completion
-// guard, so a process holding two of them would poll one table while sessions
-// write into the other, and a merged pull request would complete its issue
-// twice or never. While the manager could only be obtained by constructing a
-// Codex backend, no other backend could be given the one the host polls.
+// of constructing them. Both are process-wide and neither belongs to Codex, and
+// settings must be the same callback the two providers were built from -- it is
+// a separate parameter only because neither exposes the closure it captured, so
+// this cannot be enforced here.
+//
 // A nil provider leaves its capabilities unbound, exactly as an unconfigured
 // integration does.
 //
-// settings must be the same callback the two providers were built from. It is a
-// separate parameter only because neither provider exposes the closure it
-// captured, and Go cannot compare closures, so this cannot be enforced here:
-// Start freezes one settings snapshot for the session (which capabilities exist,
-// and the config.GitHub the session is bound to) while the manager independently
-// reads its own callback for Enabled, MatchesSecret, and the read-only
-// VerifyLanded. Feeding them different callbacks makes those disagree -- a
-// session that froze GitHub as disabled beside a landing verifier that sees it
-// enabled would let terminal cleanup discard local commits for an issue no
-// session ever published.
+// See docs/architecture.md's "One GitHub manager per process" for what a second
+// manager, or a second settings callback, would break.
 func NewWithProviders(settings func() config.Settings, handoff *linear.Handoff, github *githubhost.Manager, secretNames ...string) *Backend {
 	b := New(secretNames...)
 	b.settings = settings

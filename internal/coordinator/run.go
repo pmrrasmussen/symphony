@@ -42,20 +42,16 @@ type running struct {
 	// Two call sites conclude the same run's issue is finished and both clean up
 	// after it: runTurns' own terminal and landing-resolved branches, and
 	// reconcile's stopTerminal branch, which can stop this run while the first
-	// attempt is still in flight. Before PMR-160 that meant two concurrent
-	// Cleanup calls against one worktree, and whichever lost reported the
-	// winner's completed removal as an operator-actionable git failure ("is not
-	// a working tree") on a landing that had in fact succeeded. The second
-	// caller now waits for the first and then does nothing at all if the
-	// workspace is gone -- while a first attempt that *failed* is still retried,
-	// which is the read-after-write retry PMR-130 relies on.
+	// attempt is still in flight. The second caller waits for the first and then
+	// does nothing at all if the workspace is gone -- while a first attempt that
+	// *failed* is still retried, which is the read-after-write retry PMR-130
+	// relies on (PMR-160).
 	//
 	// The gate is per run, not per issue, because both call sites hold this same
-	// record: reconcile captured it before it stopped the run, so the gate stays
-	// valid across the release that drops the issue's own scheduling record
-	// (PMR-123's issueState), which that attempt can outlive. A landing retry
-	// that finds its issue already terminal (retry.go) holds no run and needs no
-	// gate: an armed retry timer excludes a live session, so it races nothing.
+	// record, so it stays valid across the release that drops the issue's own
+	// scheduling record (PMR-123's issueState), which that attempt can outlive. A
+	// landing retry that finds its issue already terminal (retry.go) holds no run
+	// and needs no gate: an armed retry timer excludes a live session.
 	cleanup            sync.Mutex
 	workspaceFinalized bool
 	// lastGeneric* coalesce repeated generic progress notifications (protocol

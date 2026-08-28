@@ -171,33 +171,17 @@ func toolList(g *Registration) []map[string]any {
 //
 // Both the result and any terminal event the capability produced are delivered
 // before the deferred endCall releases the invocation slot, and that ordering is
-// load-bearing. A Revoke waiting in drain() wakes the moment the slot is
-// released and retires the registration; anything emitted after that is dropped.
-// A turn cancelled while a landing is in flight is exactly the case this
-// transport is built for -- the child is killed, the landing completes, reports
-// waiting or merged, and that event is what schedules the delayed retry or ends
-// the run. Releasing the slot first would destroy it, and the provider's own
-// finalizer would then also do nothing, because it sees the waiting outcome the
-// lost event was reporting. Dispatch responds before it emits and runs the
-// release last, which is why the gate is handed to it as Enter rather than taken
-// around it.
+// load-bearing: a Revoke waiting in drain() wakes the moment the slot is
+// released, and anything emitted after that is dropped. Dispatch responds before
+// it emits and runs the release last, which is why the gate is handed to it as
+// Enter rather than taken around it.
 //
-// Item records. A capability whose Lifecycle reports it as observable is
-// reported here as a dynamicToolCall pair, exactly as it is on the Codex
-// transport (PMR-100). For a call the agent CLI made that is a second record of
-// the same work -- the CLI's own stream already carries a tool_use/tool_result
-// pair named mcp__symphony__<tool>, which the Claude backend pairs and
-// classifies as an mcpToolCall -- but the two are distinct item types with
-// distinct IDs, and only this one times the provider round trip itself rather
-// than the CLI's view of the call. It is also the only record a call the child
-// makes by other means produces at all: its shell holds the endpoint token and
-// loopback is inside its sandbox, and such a call appears in no CLI stream.
-//
-// Nothing decoded from the wire is echoed into those records. The name is used
-// only to select a capability -- Dispatch reports the resolved capability's own
-// registry-owned Definition().Name -- and the call ID is minted here rather than
-// taken from the request's JSON-RPC ID, which is a value the untrusted child
-// chose. Any log or event ever added to this file must take the same care.
+// Nothing decoded from the wire is echoed into the item records this produces.
+// The name is used only to select a capability, and the call ID is minted here
+// rather than taken from the request's JSON-RPC ID, which the untrusted child
+// chose. Any log or event ever added to this file must take the same care. See
+// docs/architecture.md's "The loopback MCP endpoint" section for what those item
+// records duplicate and what they are the only record of.
 func (g *Registration) callTool(params json.RawMessage, respond func(map[string]any)) {
 	var call struct {
 		Name      string          `json:"name"`
@@ -245,20 +229,10 @@ var callSequence atomic.Uint64
 // answered exactly as an unknown one is.
 //
 // The registry's own Lookup deliberately ignores advertisement, because on the
-// Codex transport advertisement is only a filter over what the model is told
-// about: the model can call nothing the app-server did not advertise, so
-// dispatch could stay open and let each provider re-validate its own
-// preconditions. That reasoning does not survive this transport. The child's
-// shell holds the endpoint token and loopback is reachable from inside its
-// sandbox, so the child can address this endpoint directly and name a
-// capability that never appeared in --tools, in --allowedTools, or in
-// tools/list. Provider re-validation still holds -- a landing re-checks the
-// tracker state, a follow-up re-checks that creation is enabled -- so what the
-// gate closes is not an authority hole but the gap between what the launch
-// contract pins as reachable and what actually is. With it, the only
-// capabilities reachable by any means are the ones the model was already
-// permitted to call, which is what makes the set-equality the launch contract
-// checks a statement about reachability rather than only about advertisement.
+// Codex transport the model can call nothing the app-server did not advertise.
+// That reasoning does not survive this transport: the child can address this
+// endpoint directly and name a capability that appeared in no flag and in no
+// tools/list. See docs/architecture.md's "The advertisement gate".
 //
 // The membership test walks Definitions() rather than caching it, because a
 // registry's advertised set is fixed when it is built and the set is at most a

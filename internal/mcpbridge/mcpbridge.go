@@ -1,44 +1,23 @@
 // Package mcpbridge serves Symphony's agent-neutral capability registry to an
 // agent process over MCP, in-process, on one loopback HTTP listener.
 //
-// Why in-process HTTP. The alternative was a `symphony <helper>` stdio MCP
-// server that the agent CLI spawns, bridging back to this process over a unix
-// domain socket. Both variants of that -- a private wire format between helper
-// and daemon, or MCP itself with the helper as a pure byte pump -- rest on two
-// undocumented CLI internals: that the CLI's own sandbox permits connect() on a
-// socket path outside its write allowlist, and that MCP stdio servers are
-// spawned inside that sandbox at all. The launch contract's doctrine
-// (internal/claude/launch.go) is that policy must never depend on something the
-// CLI can silently ignore, and a wrong guess here does not surface as an error:
-// it surfaces as a 30-second MCP connect timeout. The CLI unquestionably makes
-// outbound HTTP from its own process, which needs nothing undocumented to hold.
-// The transport is kept deliberately narrow -- one listener, one fixed path, one
-// JSON-RPC envelope, no streaming -- so replacing it with a socket later is a
-// change confined to this package.
-//
-// Trust boundary. The agent process is untrusted, and "the agent process" is
-// wider than the model's own tool calls: the child's shell holds the endpoint
-// token and loopback is inside its sandbox, so anything running in that process
-// can address this endpoint directly. It may call any advertised tool -- and
-// only an advertised one, which is why the advertisement gate lives in callTool
-// and not in a launch contract -- with any arguments, in parallel, at any time,
-// and it may be killed mid-call. Nothing it sends is used for anything except selecting a capability
-// by name and handing that capability its own arguments to validate. No provider
-// credential crosses the boundary: the only secret the child holds is a
-// per-registration bearer token that authorizes it to reach exactly one
-// session's registry, and it travels in the child's environment rather than in
-// argv, which is world-readable on Linux. All authority stays on this side --
-// the registry decides what exists, and each provider re-validates its own
-// preconditions inside the invocation.
+// The agent process is untrusted, and "the agent process" is wider than the
+// model's own tool calls: the child's shell holds the endpoint token and
+// loopback is inside its sandbox, so anything running in that process can
+// address this endpoint directly, with any arguments, in parallel, at any time,
+// and it may be killed mid-call. Nothing it sends is used for anything except
+// selecting a capability by name and handing that capability its own arguments
+// to validate. No provider credential crosses the boundary: the child holds only
+// a per-registration bearer token, in its environment rather than in argv.
 //
 // Nothing in this package logs. Its entire state -- endpoint URL, bearer token,
 // tool arguments, tool results -- is exactly what must never reach an operator
-// log, so a log record written here would carry a disclosure risk no call record
-// can repay. What it does emit is the events a session's own consumer needs: a
-// capability's terminal outcome, and the bounded dynamicToolCall item records the
-// shared dispatch builds, which carry a registry-owned capability name, a
-// host-minted call ID, an outcome, and a duration, and have no field an argument,
-// a result, a URL, or a token could reach. See callTool.
+// log. What it does emit is the events a session's own consumer needs; see
+// callTool.
+//
+// docs/architecture.md's "The loopback MCP endpoint" section is the one
+// description of why the transport is in-process HTTP rather than a stdio
+// helper, and of the trust boundary each gate in this package holds.
 package mcpbridge
 
 import (
@@ -95,37 +74,19 @@ const (
 	finalizeTimeout = 30 * time.Second
 
 	// finalizerBudget bounds the finalizer's own work, which is a different
-	// question from finalizeTimeout's "how long will Revoke wait for it".
+	// question from finalizeTimeout's "how long will Revoke wait for it". The
+	// context Revoke is given cannot be that bound: it is routinely already done
+	// by the time Revoke runs, and the drain that precedes the finalizer ignores
+	// contexts by design, so the budget is derived where the finalizer is actually
+	// invoked -- see finalize.
 	//
-	// It exists because the context Revoke is given cannot be that bound. The
-	// coordinator stops a run by cancelling the very context the backend's
-	// session holds and only then cancelling the session, so by the time Revoke
-	// runs, its ctx is routinely already done -- and the finalizer's whole job,
-	// the deferred Merging -> In Review transition, is precisely the work a
-	// stopped run still owes its issue (PMR-95). Nor can the caller pre-derive a
-	// budget and pass it in: the drain above runs first, ignores ctx by design,
-	// and is bounded at two minutes, so a budget minted before Revoke shares its
-	// clock with a wait twelve times its length and is routinely spent before the
-	// finalizer starts. So the finalizer's context is derived where the finalizer
-	// is actually invoked -- see finalize.
-	//
-	// Five seconds, because the work is a handful of sequential tracker requests
-	// and because the Codex transport, which invokes the same finalizer directly
-	// inside its Cancel, is bounded by the coordinator's five-second wait for a
-	// cancellation to return. Both transports therefore give the finalizer the
-	// same budget. It stays far inside finalizeTimeout, so a finalizer that is
-	// slow at its own work is ended by this and reported as complete, and
-	// finalizeTimeout is left for the case it exists for: a finalizer blocked
+	// Five seconds matches what the Codex transport gives the same finalizer, and
+	// stays far inside finalizeTimeout, which is left for a finalizer blocked
 	// before it reads a context at all.
 	//
-	// The price of expiry is not "the transition is retried later". It is that
-	// the transition is lost for good: the GitHub session latches its
-	// deferred-fired flag before attempting anything, so no later turn end will
-	// attempt it again. The issue is still redispatched -- the configured Merging
-	// state is a workflow active state -- but only into the same landing attempt
-	// against the same failed gate, holding the one state-aware Merging slot,
-	// with no human told to look at it. Latching on success instead is a change
-	// to that provider's idempotency contract and is deliberately not made here.
+	// The price of expiry is not "the transition is retried later" but that the
+	// deferred Merging -> In Review transition is lost for good. See
+	// docs/architecture.md's "The loopback MCP endpoint" section.
 	finalizerBudget = 5 * time.Second
 
 	serverName    = "symphony"
@@ -379,17 +340,11 @@ var (
 )
 
 // Revoke retires this registration at the end of an agent turn, in a fixed
-// order that the capability state depends on.
-//
-// First the registration is marked inactive and unlinked, so no new invocation
-// can start and a revoked token authenticates against nothing. Then any
-// invocation already running is drained -- including the terminal event it
-// produces, which is emitted before the invocation releases the slot, so a
-// landing's own outcome cannot be lost to the revocation that waited for it.
-// Only then does the registry's turn-ended finalizer run, because that finalizer
-// performs the deferred Merging -> In Review transition: running it while a
-// landing call is still in flight would let the transition interleave with the
-// merge it is the fallback for.
+// order that the capability state depends on: mark inactive and unlink, drain
+// any invocation already running (including the terminal event it produces),
+// and only then run the registry's turn-ended finalizer, because that finalizer
+// performs the deferred Merging -> In Review transition and must not interleave
+// with the landing it is the fallback for.
 //
 // The drain honours only its own bound, never ctx: a cancelled context is
 // exactly the case where the child was killed mid-call, which is when skipping
@@ -400,11 +355,8 @@ var (
 // ErrFinalizerExpired, or both joined -- each of which means an invariant this
 // function exists to hold was knowingly given up on.
 //
-// ctx is not the context the finalizer runs on and does not need to be live: the
-// drain above deliberately ignores it, and a caller cannot know how much of a
-// budget that drain will spend before the finalizer starts. Only ctx's values
-// reach the finalizer; its cancellation and deadline do not. See finalize and
-// finalizerBudget.
+// ctx is not the context the finalizer runs on and does not need to be live:
+// only its values reach the finalizer. See finalize and finalizerBudget.
 func (g *Registration) Revoke(ctx context.Context) error {
 	g.revokeOnce.Do(func() {
 		g.mu.Lock()
@@ -452,24 +404,16 @@ func (g *Registration) drain() bool {
 // The finalizer runs on its own goroutine because it can block before it
 // consults any context: the GitHub session's finalizer takes that session's
 // mutex as its first statement, and a landing holds the same mutex across Git
-// children bounded only by the session context. Calling it inline would give
-// Revoke the lifetime of a network-hung git process, and passing a bounded or
-// already-cancelled ctx would not help, because the block happens before ctx is
-// read.
+// children bounded only by the session context.
 //
-// That goroutine is also where the finalizer's context is derived, and the timing
-// is the whole point. The drain has finished by now, so a budget minted here is
-// spent on the finalizer and nothing else -- unlike one minted by Revoke's caller,
-// which shares its clock with a two-minute, ctx-ignoring wait. The derivation
-// drops the caller's cancellation (see finalizerBudget: the run that is being
-// stopped is exactly the run whose transition is still owed) and keeps its values.
-// Cancelling it belongs to the same goroutine too: a defer in finalize would fire
-// when the wait below expires and cut a still-running transition short.
+// That goroutine is also where the finalizer's context is derived, because the
+// drain has finished by then. The derivation drops the caller's cancellation and
+// keeps its values, and cancelling it belongs to this goroutine too: a defer here
+// would fire when the wait below expires and cut a still-running transition
+// short. An expired finalizer is not abandoned -- it is idempotent and its own
+// budget is what will end it; Revoke stops waiting and says so.
 //
-// An expired finalizer is not abandoned: it is idempotent, the deferred
-// Merging -> In Review transition it may still perform must happen, and its own
-// budget is what will end it. Revoke stops waiting and says so instead of waiting
-// for it.
+// See docs/architecture.md's "The loopback MCP endpoint" section.
 func (g *Registration) finalize(parent context.Context) bool {
 	finished := make(chan struct{})
 	go func() {
@@ -499,27 +443,18 @@ var (
 // invocation runs at a time per registration, and a parallel second call is
 // refused rather than queued.
 //
-// This is not what makes concurrent entry safe. Every provider entry point
-// behind the registry already holds its own session mutex for the whole call
-// (Publish, Context, Land, FinalizeLanding, LandingResolved), so parallel HTTP
-// requests would serialize there regardless, and a second parallel landing would
-// be declined by the resolved-landing latch it reads on entry.
-//
-// What the gate buys is the difference between refusing in milliseconds and
-// waiting minutes. Without it, a parallel call parks an HTTP goroutine on that
-// session mutex behind a Land that can run for several bounded provider requests
-// plus a Git push, and then runs against state the first call has already
-// changed -- while the model waits, learning nothing. Refusing hands the model
-// something it can act on immediately. It also keeps at most one provider
-// operation per session outstanding, which is what makes Revoke's drain a single
-// bounded wait rather than a race with however many goroutines the child chose
-// to open.
+// This is not what makes concurrent entry safe -- every provider entry point
+// behind the registry already holds its own session mutex for the whole call.
+// What the gate buys is refusing in milliseconds instead of parking a goroutine
+// for minutes, and keeping at most one provider operation per session
+// outstanding, which is what makes Revoke's drain a single bounded wait.
 //
 // Note what this does not cover: Prepare runs before the gate is taken, so
-// argument validation is genuinely concurrent here where the Codex transport's
-// inline dispatch serialized it. That is harmless only because every Prepare is
-// pure parsing. A Prepare that ever touches provider session state must move
-// inside the gate.
+// argument validation is genuinely concurrent here. That is harmless only
+// because every Prepare is pure parsing. A Prepare that ever touches provider
+// session state must move inside the gate.
+//
+// See docs/architecture.md's "The loopback MCP endpoint" section.
 func (g *Registration) beginCall() error {
 	g.mu.Lock()
 	defer g.mu.Unlock()

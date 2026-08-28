@@ -75,22 +75,16 @@ func (s Settings) HostSidePublishPromised() bool {
 //
 // It is deliberately the settings-only half of what internal/capability.Build
 // decides, and it is an upper bound: github_land_pr additionally depends on the
-// bound issue's current state, which no configuration can answer. What it does
-// answer exactly is the question configuration can be held to -- whether some
-// capability is reachable for some issue -- which is why it is what the Claude
-// residual configuration rule and the tool-naming guidance below both use.
+// bound issue's current state, which no configuration can answer.
 //
 // The github term is HostSidePublishPromised rather than GitHub.Enabled, and the
-// reason is narrower than it looks. A GitHub session is prepared only on top of a
-// prepared Linear handoff session, but followup_issue_creation alone prepares one
-// -- see LinearSessionCapabilityEnabled -- so an enabled integration with no
-// handoff_state does advertise github_publish_pr and github_pr_context whenever
-// follow-up issues are on. It is not the case that such a configuration
-// advertises nothing. What makes the term correct anyway is that the boolean is
-// already true through the FollowupIssueCreation term in exactly that case; and
-// that configuration is separately refused for claude, because advertising
-// publish with no handoff state is worse than advertising nothing. See the
-// residual rule in decode.
+// reason is narrower than it looks: an enabled integration with no handoff_state
+// does advertise github_publish_pr whenever follow-up issues are on, and what
+// makes the term correct anyway is that the boolean is already true through the
+// FollowupIssueCreation term in exactly that case. That configuration is
+// separately refused for claude -- see the residual rule in decode, and
+// docs/architecture.md's opening section for why advertising publish with no
+// handoff state is worse than advertising nothing.
 func (s Settings) SessionCapabilityAdvertisable() bool {
 	return s.Tracker.FollowupIssueCreation || s.HostSidePublishPromised()
 }
@@ -128,17 +122,12 @@ const MCPNamingRuleMarker = "Tool naming: Symphony's bounded tools reach you thr
 // transport names a tool is also not repository policy, so it must not be
 // configurable.
 //
-// The Claude branch is why this function takes a backend at all. WORKFLOW.md's
-// prompt body is repository-owned and names Symphony's tools bare --
-// create_followup_issue, github_publish_pr, github_pr_context, github_land_pr --
-// which is what a Codex dynamic tool is called and not what the same capability
-// is called once it is served over MCP. Carrying that mechanical naming detail
-// here is the role the paragraph above already claims for host-generated
-// guidance: it keeps one repository prompt correct under both backends without
-// editing WORKFLOW.md, and it cannot go stale against a workflow that adds a
-// tool name to its body, because the rule is stated over the prefix rather than
-// over an enumeration of names this package would have to keep in step with
-// internal/capability.
+// The Claude branch is why this function takes a backend at all: WORKFLOW.md's
+// prompt body is repository-owned and names Symphony's tools bare, which is what
+// a Codex dynamic tool is called and not what the same capability is called once
+// it is served over MCP. The rule below is stated over the prefix rather than
+// over an enumeration of names, so it cannot go stale against a workflow body
+// that adds one. See docs/architecture.md's opening section.
 func (s Settings) DeliveryInstructions(backend string) string {
 	// Only the Claude transport renames Symphony's tools. Every other backend --
 	// today only codex, whose dynamic tools carry the registry's own names --

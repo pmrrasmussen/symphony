@@ -10,30 +10,14 @@
 // The launch policy is fixed by launch.go, not configurable, and the only
 // confirmation that it applied is the CLI's own init event -- see verifyInit.
 //
-// One ordering problem is not solved here, and verifyPromises is the whole of
-// what stands in for a solution, so it is worth naming. The prompt that tells the
-// model which bounded tools exist is rendered by the coordinator before Start is
-// called, from the coordinator's own settings snapshot; the registry that decides
-// which of them this session can actually reach is built inside Start, from a
-// snapshot this backend reads later, plus the bound issue and the provider
-// sessions prepared for it. The component that promises a capability cannot see
-// the component that grants it, and the two do not even read the same
-// configuration.
-//
-// That last part is what makes the problem ordinary rather than exotic. A
-// WORKFLOW.md reload that disables the github integration between the render and
-// the launch leaves a prompt promising host-side publish and a session with no
-// publish capability, on a perfectly normal issue. (An issue identifier
-// containing no branch-safe character reaches the same state by a stranger
-// route.) Start compares the prompt against what the session serves and refuses,
-// because the failure is otherwise silent in the worst way available: every gate
-// passes and the turn ends completed with committed, unpublished work.
-//
-// The shape that removes the problem instead of detecting it is to hoist
-// capability.Build into the host and pass the *Registry on domain.AgentRequest,
-// so the prompt is rendered from the same registry the session serves and the
-// two cannot disagree. That touches internal/domain, both backends, and the
-// router, and is deliberately not done here.
+// One ordering problem is not solved here: the prompt that promises which
+// bounded tools exist is rendered by the coordinator before Start is called,
+// from a different settings snapshot than the registry that grants them is built
+// from. verifyPromises detects rather than removes the problem; the shape that
+// removes it -- hoisting capability.Build into the host and passing the
+// *Registry on domain.AgentRequest -- touches internal/domain, both backends,
+// and the router. docs/architecture.md's opening section states why detecting it
+// is not optional.
 package claude
 
 import (
@@ -145,23 +129,17 @@ func New(settings func() config.Settings, secretNames ...string) *Backend {
 // NewWithProviders binds already-built host providers, and the endpoint that
 // serves them, to this backend instead of constructing them.
 //
-// The providers are the same instances internal/codex is given, and sharing them
-// is not an optimization. One githubhost.Manager owns the linked pull request
-// table its poll loop walks and the exactly-once Linear completion guard, so a
-// process holding two would poll one table while sessions write into the other,
-// and a merged pull request would complete its issue twice or never. settings
-// must likewise be the callback both providers were built from, for the reasons
-// codex.NewWithProviders states.
+// The providers are the same instances internal/codex is given, and settings
+// must be the callback both were built from. Sharing them is not an
+// optimization: see docs/architecture.md's "One GitHub manager per process" for
+// what a second manager, or a second settings callback, would break.
 //
-// endpoint is the loopback MCP endpoint. It is a parameter rather than something
-// this backend binds for itself because it is one listener for the daemon's
-// lifetime, shared by every concurrent session and separated by per-registration
-// bearer tokens; a listener per backend would be a second socket nothing closes.
+// endpoint is likewise one loopback listener for the daemon's lifetime, shared
+// by every concurrent session and separated by per-registration bearer tokens.
 //
 // A nil provider leaves its capabilities unbound, exactly as an unconfigured
 // integration does, and a nil endpoint leaves the session with no reachable
-// capability at all -- which is what New produces and what every Claude session
-// still gets, because configuration refuses a Claude workflow that enables one.
+// capability at all -- which is what New produces.
 func NewWithProviders(settings func() config.Settings, handoff *linear.Handoff, github *githubhost.Manager, endpoint *mcpbridge.Server, secretNames ...string) *Backend {
 	b := New(settings, secretNames...)
 	b.handoff = handoff
@@ -253,52 +231,25 @@ func advertisedNames(registry mcpbridge.Capabilities) []string {
 
 // verifyPromises is the launch-time consistency guard: it refuses a turn whose
 // rendered prompt and whose reachable capability set do not describe the same
-// session. See the package comment for why a cross-check is what stands in for a
-// fix here.
+// session. It reads r.Prompt and not only settings, and that is the point: the
+// prompt was rendered by the coordinator from its own settings snapshot, this
+// function runs against a snapshot the backend read later, and no comparison
+// made purely within either snapshot sees a reload between the two.
 //
-// It reads r.Prompt and not only settings, and that is the point. The prompt was
-// rendered by the coordinator from its own settings snapshot; this function runs
-// against a snapshot the backend read later. A WORKFLOW.md reload that disables
-// the github integration between the two -- an ordinary reload, on an ordinary
-// issue -- produces a prompt that promises host-side publish and a session that
-// cannot serve it, and no comparison made purely within either snapshot sees it.
-// (The degenerate case where an issue identifier contains no branch-safe
-// character reaches the same state, but the reload is the plausible one.)
+// Three refusals, and they are three different failures: a promise with nothing
+// to serve it; publish advertised with no handoff state to publish into, which
+// is the more damaging direction because LinkAndHandoff mutates GitHub before it
+// fails; and a prompt that names an advertised capability without the rule that
+// maps it to the name this transport serves it under.
 //
-// Three refusals, and they are three different failures:
+// That third check is not "no bare name appears": a bare name is legitimate and
+// routine, and refusing every one would refuse every real dispatch. The
+// invariant is the conditional one -- a prompt that names an advertised
+// capability must also carry the rule that maps it, because the rule and the
+// prefixes are emitted together or not at all.
 //
-// A promise with nothing to serve it. Either snapshot promising publish while the
-// registry advertises none is the failure this guard was first written for. The
-// settings term is config.HostSidePublishPromised, called rather than restated so
-// it cannot drift from the branch it mirrors; the prompt term catches the reload
-// direction, where the settings term is false.
-//
-// Publish advertised with no handoff state. The reverse direction, and the more
-// damaging one. github_publish_pr's LinkAndHandoff comments the pull request onto
-// the issue and then transitions it to the configured handoff state; with no such
-// state configured the transition targets no state at all and fails, after the
-// pull request already exists. Configuration refuses this combination for this
-// backend, so reaching it means a settings snapshot that could not have been
-// loaded -- which is exactly when a launch should stop.
-//
-// An unmapped capability name in the prompt. This is the failure the naming work
-// in config.DeliveryInstructions exists to prevent, and until now nothing
-// verified it at runtime: the whole of its correctness was one backend-name
-// string comparison in another package. A prompt rendered for the wrong backend
-// names github_publish_pr while the CLI is pinned to
-// mcp__symphony__github_publish_pr; the launch contract is still
-// self-consistent, so verifyInit approves it, and the turn ends completed with
-// unpublished work.
-//
-// What is checked is not "no bare name appears". A bare name is legitimate and
-// routine: WORKFLOW.md's prompt body is repository-owned and names Symphony's
-// tools bare in several places -- this repository's own body does it seven times
-// -- and carrying that wording unchanged under both backends is the entire
-// purpose of the naming rule. A guard that refused any bare mention would refuse
-// every real dispatch. The invariant is the conditional one: a prompt that names
-// an advertised capability must also carry the rule that maps it. A prompt
-// rendered for the wrong backend fails that, because the rule and the prefixes
-// are emitted together or not at all.
+// See the package comment, and docs/architecture.md's opening section, for why a
+// cross-check is what stands in for a fix here.
 func verifyPromises(settings config.Settings, prompt string, advertised []string) error {
 	servesPublish := slices.Contains(advertised, capability.NameGitHubPublishPR)
 	promisesPublish := settings.HostSidePublishPromised() || strings.Contains(prompt, config.HostSidePublishPromiseMarker)
@@ -400,17 +351,12 @@ func (b *Backend) forget(id string) {
 //
 //   - The event channel exists first, because the endpoint registration must be
 //     able to deliver a capability's terminal outcome -- a landing that reports
-//     waiting or resolved is what ends the logical run -- and it has to be able
-//     to do that from the moment the child can call a tool.
+//     waiting or resolved is what ends the logical run -- from the moment the
+//     child can call a tool.
 //   - The previous turn's registration is retired before this turn's is minted.
-//     "Revoked at turn end" is not "revoked before the next turn": after
-//     emitting its terminal event, turn N's goroutine is still waiting on
-//     stderr, on Wait, and on the process-group kill, while the coordinator has
-//     already called Continue. Registering first would leave two live
-//     registrations for one session, so an escaped descendant of turn N could
-//     call a capability concurrently with turn N+1 -- against the same provider
-//     sessions, whose idempotency latches are all that stand between that and a
-//     second landing attempt presenting itself as a first.
+//     "Revoked at turn end" is not "revoked before the next turn"; see
+//     docs/architecture.md on why two live registrations for one session is the
+//     hazard, not a leaked struct.
 //   - The registration is minted before spawn, because the CLI connects to its
 //     MCP servers before it emits system/init. A token minted afterwards would
 //     race the handshake, and losing that race is not an error the child
