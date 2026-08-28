@@ -265,13 +265,49 @@ func (l *Local) AfterRun(ctx context.Context, ws domain.Workspace, issue domain.
 	l.assertSourceIntegrity(ctx, ws, issue)
 }
 
+// Cleanup discards the workspace Symphony owns for issue, or reports why it
+// refused to. It is idempotent in both directions: a workspace that is already
+// gone is removed work, not a failure, whichever step discovers that.
 func (l *Local) Cleanup(ctx context.Context, issue domain.Issue) (domain.CleanupOutcome, error) {
 	path, err := l.workspacePath(issue)
 	if err != nil {
 		return domain.CleanupClean, err
 	}
+	outcome, err := l.removeWorkspace(ctx, issue, path)
+	if err != nil && workspaceAbsent(path) {
+		// A removal that raced another removal of the same worktree fails on
+		// whichever step it happened to reach -- "fatal: this operation must be
+		// run in a work tree" from the change inspection, "fatal: '...' is not a
+		// working tree" from the removal itself -- and both were reported as
+		// operator-actionable cleanup failures for a workspace that was, by then,
+		// exactly as gone as this call was asking it to be (PMR-160). An absent
+		// path is the only thing forgiven here, so every refusal in
+		// docs/dogfooding.md section 7 still fails loudly: each of those is a
+		// decision to keep a workspace that is still there.
+		err = nil
+	}
+	if err != nil {
+		return outcome, err
+	}
+	// Do not discard the completion record until the workspace was removed.
+	return outcome, l.removeState(issue)
+}
+
+// workspaceAbsent reports whether nothing remains at path. It uses Lstat rather
+// than Stat so a dangling symlink counts as present -- something is still there
+// to look at, and Cleanup's own ownership checks refuse a symlinked workspace
+// rather than following it.
+func workspaceAbsent(path string) bool {
+	_, err := os.Lstat(path)
+	return os.IsNotExist(err)
+}
+
+// removeWorkspace is Cleanup's decision and removal body, without the state
+// record that outlives it. It reports the removal outcome and, on failure, the
+// reason -- which Cleanup reads together with the path itself.
+func (l *Local) removeWorkspace(ctx context.Context, issue domain.Issue, path string) (domain.CleanupOutcome, error) {
 	if _, err := os.Stat(path); os.IsNotExist(err) {
-		return domain.CleanupClean, l.removeState(issue)
+		return domain.CleanupClean, nil
 	} else if err != nil {
 		return domain.CleanupClean, err
 	}
@@ -335,8 +371,7 @@ func (l *Local) Cleanup(ctx context.Context, issue domain.Issue) (domain.Cleanup
 			return outcome, err
 		}
 	}
-	// Do not discard the completion record until the workspace was removed.
-	return outcome, l.removeState(issue)
+	return outcome, nil
 }
 
 // permitCommittedRemoval decides whether a worktree safety refusal may be

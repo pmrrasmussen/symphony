@@ -242,6 +242,78 @@ func TestCleanupReportsCleanRemovalWithoutVerifyingUnchangedWorktree(t *testing.
 	}
 }
 
+// TestCleanupSucceedsWhenTheWorktreeIsRemovedMidAttempt covers the removal half
+// of PMR-160: a cleanup whose worktree disappears while it is running has had
+// the outcome it asked for, so the step that then finds the worktree gone must
+// not report it as a failure. The before_remove hook stands in for the second,
+// concurrent attempt the coordinator used to allow for one landing, which left
+// whichever attempt lost warning about `git worktree remove` -- or `git status`
+// -- failing against a worktree the winner had already removed.
+func TestCleanupSucceedsWhenTheWorktreeIsRemovedMidAttempt(t *testing.T) {
+	source := newGitRepository(t)
+	root := filepath.Join(t.TempDir(), "workspaces")
+	s := config.Settings{Workspace: config.Workspace{Root: root, SourceRoot: source}}
+	l := New(func() config.Settings { return s })
+	issue := domain.Issue{ID: "issue-160", Identifier: "PMR-160"}
+	ws, err := l.Prepare(context.Background(), issue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The marker proves the hook really removed the worktree mid-attempt: a
+	// silently failed hook would leave the ordinary removal path to succeed and
+	// assert nothing at all.
+	marker := filepath.Join(t.TempDir(), "removed")
+	s.Hooks = config.Hooks{BeforeRemove: fmt.Sprintf("git -C %q worktree remove --force %q && : > %q", source, ws.Path, marker)}
+
+	outcome, err := l.Cleanup(context.Background(), issue)
+	if err != nil {
+		t.Fatalf("cleanup of an already-removed worktree error=%v, want a silent success", err)
+	}
+	if outcome != domain.CleanupClean {
+		t.Fatalf("outcome=%q, want %q", outcome, domain.CleanupClean)
+	}
+	if _, statErr := os.Stat(marker); statErr != nil {
+		t.Fatalf("the concurrent removal never happened, so nothing was exercised: %v", statErr)
+	}
+	if _, statErr := os.Stat(ws.Path); !os.IsNotExist(statErr) {
+		t.Fatalf("workspace remains: %v", statErr)
+	}
+	if _, found, err := l.loadState(issue); err != nil || found {
+		t.Fatalf("state must be discarded with the workspace: found=%t err=%v", found, err)
+	}
+}
+
+// TestCleanupStillRefusesAWorkspaceThatLostItsWorktreeIdentity is the boundary
+// of the leniency above. An absent path is the only thing forgiven: a directory
+// that is still there but no longer a worktree may hold local work nothing can
+// verify, so it stays a loud refusal and keeps its state record for manual
+// recovery.
+func TestCleanupStillRefusesAWorkspaceThatLostItsWorktreeIdentity(t *testing.T) {
+	source := newGitRepository(t)
+	root := filepath.Join(t.TempDir(), "workspaces")
+	s := config.Settings{Workspace: config.Workspace{Root: root, SourceRoot: source}}
+	l := New(func() config.Settings { return s })
+	issue := domain.Issue{ID: "issue-160", Identifier: "PMR-160"}
+	ws, err := l.Prepare(context.Background(), issue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { runGit(t, source, "worktree", "prune") })
+	if err := os.Remove(filepath.Join(ws.Path, ".git")); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := l.Cleanup(context.Background(), issue); err == nil || !strings.Contains(err.Error(), "no longer has its worktree identity") {
+		t.Fatalf("cleanup error=%v, want the unverifiable-workspace refusal", err)
+	}
+	if _, statErr := os.Stat(ws.Path); statErr != nil {
+		t.Fatalf("refused workspace was removed: %v", statErr)
+	}
+	if _, found, err := l.loadState(issue); err != nil || !found {
+		t.Fatalf("state must remain for manual recovery: found=%t err=%v", found, err)
+	}
+}
+
 func TestCleanupRetryPreservesMarkerUntilWorkspaceIsSafe(t *testing.T) {
 	source := newGitRepository(t)
 	root := filepath.Join(t.TempDir(), "workspaces")
