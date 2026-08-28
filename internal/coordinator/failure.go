@@ -211,11 +211,16 @@ func (c *Coordinator) finishLandingWait(ctx context.Context, i domain.Issue, att
 	}
 	s := c.settings()
 	c.mu.Lock()
-	c.landingWaits[i.ID]++
-	waits := c.landingWaits[i.ID]
-	escalate := landingWaitEscalated(s, waits) && !c.landingEscalated[i.ID]
-	if escalate {
-		c.landingEscalated[i.ID] = true
+	var waits int
+	escalate := false
+	// The wait is counted against the claim it happened under, so an issue that
+	// has already lost its claim records nothing and scheduleRetry below
+	// declines the redispatch anyway.
+	if st := c.claimedStateLocked(i.ID); st != nil {
+		st.landingWaits++
+		waits = st.landingWaits
+		escalate = landingWaitEscalated(s, waits) && !st.landingEscalated
+		st.landingEscalated = st.landingEscalated || escalate
 	}
 	c.mu.Unlock()
 	delay := landingRetryDelay(s, waits)

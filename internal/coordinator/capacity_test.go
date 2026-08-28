@@ -30,14 +30,12 @@ func TestWaitingIssueAppearsInSnapshotUntilAdmitted(t *testing.T) {
 	agent := &fakeAgent{events: func() <-chan domain.Event { return block }, started: make(chan struct{}, 1)}
 	ws := &fakeWorkspace{after: make(chan struct{}, 1)}
 	c := testCoordinator(w.Config, tracker, agent, ws)
+	defer assertInvariants(t, c)
 
 	// Occupy the only slot directly, exactly as other coordinator tests seed
 	// running/claimed/retrying state, so the poll observes real contention
 	// without needing a second live run.
-	c.mu.Lock()
-	c.claimed[occupying.ID] = true
-	c.admitted[occupying.ID] = config.Norm(occupying.State)
-	c.mu.Unlock()
+	c.occupySlot(occupying)
 
 	c.Tick(context.Background())
 	snapshot := c.Snapshot()
@@ -50,10 +48,7 @@ func TestWaitingIssueAppearsInSnapshotUntilAdmitted(t *testing.T) {
 
 	// Free the slot and re-poll: the queued issue must be admitted and drop out
 	// of Waiting, exactly as an issue newly claimed always has.
-	c.mu.Lock()
-	delete(c.claimed, occupying.ID)
-	delete(c.admitted, occupying.ID)
-	c.mu.Unlock()
+	c.releaseSlot(occupying.ID)
 	c.Tick(context.Background())
 	<-agent.started
 	waitForRunning(t, c, "ENG-QUEUED")
@@ -87,18 +82,20 @@ func TestWaitingListNeverDuplicatesARunningOrRetryingIssue(t *testing.T) {
 	queued.ID, queued.Identifier = "queued", "ENG-QUEUED"
 	tracker := &issueMapTracker{candidates: []domain.Issue{runningIssue, retrying, queued}, issues: map[string]domain.Issue{runningIssue.ID: runningIssue, retrying.ID: retrying, queued.ID: queued}}
 	c := testCoordinator(w.Config, tracker, &fakeAgent{}, &fakeWorkspace{})
+	defer assertInvariants(t, c)
 	timer := &fakeTimer{}
 	c.timer = timer
 
+	c.occupySlot(runningIssue)
 	c.mu.Lock()
-	c.claimed[runningIssue.ID] = true
-	c.admitted[runningIssue.ID] = config.Norm(runningIssue.State)
-	c.running[runningIssue.ID] = &running{issue: runningIssue, session: domain.AgentSession{ID: "s"}, last: time.Now(), cancel: func() {}}
+	c.stateLocked(runningIssue.ID).run = &running{issue: runningIssue, session: domain.AgentSession{ID: "s"}, last: time.Now(), cancel: func() {}}
 	// A retry timer holds only the duplicate-prevention claim, never an
 	// orchestrator slot (PMR-78/PMR-129), so it is seeded directly here rather
 	// than through claim(), which would itself require the capacity this test
 	// deliberately keeps fully occupied by runningIssue.
-	c.claimed[retrying.ID] = true
+	seeded := c.ensureStateLocked(retrying.ID)
+	seeded.claimed = true
+	seeded.state = config.Norm(retrying.State)
 	c.mu.Unlock()
 	c.scheduleRetry(context.Background(), retrying, domain.Workspace{}, 1, retryAgent, "test", time.Minute)
 
@@ -133,6 +130,7 @@ func TestBlockedIssueAppearsInSnapshotWithBlockerIdentifiersUntilResolved(t *tes
 	agent := &fakeAgent{events: func() <-chan domain.Event { return block }, started: make(chan struct{}, 1)}
 	ws := &fakeWorkspace{after: make(chan struct{}, 1)}
 	c := testCoordinator(w.Config, tracker, agent, ws)
+	defer assertInvariants(t, c)
 
 	c.Tick(context.Background())
 	snapshot := c.Snapshot()
@@ -185,13 +183,11 @@ func TestBlockedWaitReasonChangesToCapacityWithoutStayingBlocked(t *testing.T) {
 	blocked.BlockedBy = []domain.Blocker{{ID: "blocker-id", Identifier: "ENG-0", State: "In Progress", Dispatchable: false}}
 	tracker := &issueMapTracker{candidates: []domain.Issue{blocked}, issues: map[string]domain.Issue{occupying.ID: occupying, blocked.ID: blocked}}
 	c := testCoordinator(w.Config, tracker, &fakeAgent{}, &fakeWorkspace{})
+	defer assertInvariants(t, c)
 	clock := &mutableClock{now: time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)}
 	c.clock = clock
 
-	c.mu.Lock()
-	c.claimed[occupying.ID] = true
-	c.admitted[occupying.ID] = config.Norm(occupying.State)
-	c.mu.Unlock()
+	c.occupySlot(occupying)
 
 	c.Tick(context.Background())
 	snapshot := c.Snapshot()
@@ -232,6 +228,7 @@ func TestBlockedWaitLoggedOnceNotPerPoll(t *testing.T) {
 	tracker := &issueMapTracker{candidates: []domain.Issue{blocked}, issues: map[string]domain.Issue{blocked.ID: blocked}}
 	var logs bytes.Buffer
 	c := New(tracker, &fakeAgent{}, &fakeWorkspace{}, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&logs, nil)))
+	defer assertInvariants(t, c)
 
 	c.Tick(context.Background())
 	c.Tick(context.Background())
@@ -256,6 +253,7 @@ func TestBlockedWaitEscalatesToWarnAfterThreshold(t *testing.T) {
 	tracker := &issueMapTracker{candidates: []domain.Issue{blocked}, issues: map[string]domain.Issue{blocked.ID: blocked}}
 	var logs bytes.Buffer
 	c := New(tracker, &fakeAgent{}, &fakeWorkspace{}, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&logs, nil)))
+	defer assertInvariants(t, c)
 	clock := &mutableClock{now: time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)}
 	c.clock = clock
 
@@ -303,6 +301,7 @@ func TestFourImplementationAndReworkIssuesRunConcurrently(t *testing.T) {
 	agent := &fakeAgent{events: func() <-chan domain.Event { return block }, started: make(chan struct{}, 4)}
 	ws := &fakeWorkspace{after: make(chan struct{}, 4)}
 	c := testCoordinator(w.Config, tracker, agent, ws)
+	defer assertInvariants(t, c)
 
 	c.Tick(context.Background())
 	for range 4 {
@@ -312,9 +311,7 @@ func TestFourImplementationAndReworkIssuesRunConcurrently(t *testing.T) {
 	if starts != 4 {
 		t.Fatalf("starts=%d, want four concurrent implementation/rework agents", starts)
 	}
-	c.mu.Lock()
-	admitted := len(c.admitted)
-	c.mu.Unlock()
+	admitted := c.admittedTotal()
 	if admitted != 4 {
 		t.Fatalf("admitted=%d, want the global four-agent capacity fully occupied", admitted)
 	}
@@ -366,6 +363,7 @@ func TestMergingAndUnrelatedImplementationRunConcurrentlyUnderByStateCapacity(t 
 	agent := &fakeAgent{events: func() <-chan domain.Event { return block }, started: make(chan struct{}, 4)}
 	ws := &fakeWorkspace{after: make(chan struct{}, 4)}
 	c := testCoordinator(w.Config, tracker, agent, ws)
+	defer assertInvariants(t, c)
 	timer := &fakeTimer{}
 	c.timer = timer
 
@@ -384,9 +382,7 @@ func TestMergingAndUnrelatedImplementationRunConcurrentlyUnderByStateCapacity(t 
 		t.Fatal("retryable issue was not claimed")
 	}
 	c.scheduleRetry(context.Background(), retryable, domain.Workspace{}, 1, retryAgent, "test", time.Minute)
-	c.mu.Lock()
-	admitted := len(c.admitted)
-	c.mu.Unlock()
+	admitted := c.admittedTotal()
 	if admitted != 2 {
 		t.Fatalf("admitted=%d, want a queued retry timer to consume no concurrency slot", admitted)
 	}

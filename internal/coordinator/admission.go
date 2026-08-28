@@ -150,24 +150,24 @@ const waitingEscalationMultiplier = 10
 // poll actually re-observed.
 func (c *Coordinator) updateWaiting(seen map[string]waitingCandidate, now time.Time, s config.Settings) {
 	c.mu.Lock()
-	for id := range c.waiting {
-		if _, ok := seen[id]; !ok {
-			delete(c.waiting, id)
-			delete(c.waitingEscalated, id)
+	for id, st := range c.states {
+		if _, ok := seen[id]; st.waiting != nil && !ok {
+			st.waiting = nil
+			st.waitingEscalated = false
+			c.pruneLocked(id)
 		}
 	}
 	var newlyWaiting []waitingCandidate
 	for id, candidate := range seen {
-		entry, already := c.waiting[id]
-		if !already || entry.reason != candidate.reason {
-			entry = waitingState{issue: candidate.issue, reason: candidate.reason, blockedBy: candidate.blockedBy, since: now}
-			delete(c.waitingEscalated, id)
+		st := c.ensureStateLocked(id)
+		if st.waiting == nil || st.waiting.reason != candidate.reason {
+			st.waiting = &waitingState{issue: candidate.issue, reason: candidate.reason, blockedBy: candidate.blockedBy, since: now}
+			st.waitingEscalated = false
 			newlyWaiting = append(newlyWaiting, candidate)
-		} else {
-			entry.issue = candidate.issue
-			entry.blockedBy = candidate.blockedBy
+			continue
 		}
-		c.waiting[id] = entry
+		st.waiting.issue = candidate.issue
+		st.waiting.blockedBy = candidate.blockedBy
 	}
 	c.mu.Unlock()
 	for _, candidate := range newlyWaiting {
@@ -210,12 +210,12 @@ func (c *Coordinator) escalateStuckWaits(now time.Time, s config.Settings) {
 	}
 	c.mu.Lock()
 	var escalated []waitingState
-	for id, entry := range c.waiting {
-		if c.waitingEscalated[id] || now.Sub(entry.since) < threshold {
+	for _, st := range c.states {
+		if st.waiting == nil || st.waitingEscalated || now.Sub(st.waiting.since) < threshold {
 			continue
 		}
-		c.waitingEscalated[id] = true
-		escalated = append(escalated, entry)
+		st.waitingEscalated = true
+		escalated = append(escalated, *st.waiting)
 	}
 	c.mu.Unlock()
 	for _, entry := range escalated {
@@ -297,7 +297,7 @@ func (c *Coordinator) admissionRejectReason(i domain.Issue, s config.Settings) s
 	switch {
 	case c.stopping:
 		return "stopping"
-	case c.claimed[i.ID]:
+	case c.claimedStateLocked(i.ID) != nil:
 		return "already_claimed"
 	case !c.capacityAvailableLocked(config.Norm(i.State), s):
 		return waitReasonAtCapacity
@@ -308,45 +308,19 @@ func (c *Coordinator) admissionRejectReason(i domain.Issue, s config.Settings) s
 
 func (c *Coordinator) claim(i domain.Issue, s config.Settings) bool {
 	c.mu.Lock()
-	if c.stopping || c.claimed[i.ID] || !c.capacityAvailableLocked(config.Norm(i.State), s) {
+	if c.stopping || c.claimedStateLocked(i.ID) != nil || !c.capacityAvailableLocked(config.Norm(i.State), s) {
 		c.mu.Unlock()
 		return false
 	}
-	c.claimed[i.ID] = true
-	c.claimState[i.ID] = config.Norm(i.State)
+	st := c.ensureStateLocked(i.ID)
+	st.claimed = true
+	c.setClaimStateLocked(st, config.Norm(i.State))
 	// A claimed issue is being actively worked; any prior handoff memory is
 	// stale (the poll loop already reported an external revert before this).
-	delete(c.handoffs, i.ID)
+	st.handoff = nil
 	c.mu.Unlock()
 	c.log.Debug("issue claimed", "issue_id", i.ID, "issue_identifier", i.Identifier, "state", config.Norm(i.State))
 	return true
-}
-
-func (c *Coordinator) reserveLocked(i domain.Issue, s config.Settings) bool {
-	if _, admitted := c.admitted[i.ID]; !c.claimed[i.ID] || admitted || !c.capacityAvailableLocked(config.Norm(i.State), s) {
-		return false
-	}
-	state := config.Norm(i.State)
-	c.admitted[i.ID] = state
-	c.claimState[i.ID] = state
-	return true
-}
-
-func (c *Coordinator) capacityAvailableLocked(state string, s config.Settings) bool {
-	if len(c.admitted) >= s.Agent.MaxConcurrent {
-		return false
-	}
-	limit, ok := s.Agent.ByState[state]
-	if !ok {
-		return true
-	}
-	count := 0
-	for _, admittedState := range c.admitted {
-		if admittedState == state {
-			count++
-		}
-	}
-	return count < limit
 }
 
 func active(i domain.Issue, s config.Settings) bool {

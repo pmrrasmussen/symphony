@@ -41,6 +41,7 @@ func TestActiveIssueAtTurnLimitIsBlockedAndRetriedWithoutCompletionMarker(t *tes
 	agent := &fakeAgent{events: completedEvents}
 	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{}, 1)}
 	c := testCoordinator(w.Config, &fakeTracker{issue: issue}, agent, ws)
+	defer assertInvariants(t, c)
 	timer := &fakeTimer{signal: make(chan struct{}, 1)}
 	c.timer = timer
 
@@ -56,9 +57,7 @@ func TestActiveIssueAtTurnLimitIsBlockedAndRetriedWithoutCompletionMarker(t *tes
 	if marks != 0 {
 		t.Fatalf("completion markers=%d, want 0 for an active exhausted issue", marks)
 	}
-	c.mu.Lock()
-	retry := c.retries[issue.ID]
-	c.mu.Unlock()
+	retry, _ := c.armedRetry(issue.ID)
 	if retry.kind != retryAgent || retry.reason != "turn_limit_exhausted" || retry.attempt != 1 {
 		t.Fatalf("retry=%+v", retry)
 	}
@@ -79,6 +78,7 @@ func TestLandingResolvedEndsRunWithoutAnotherTurn(t *testing.T) {
 	agent := &fakeAgent{events: landingResolvedEvents}
 	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{}, 1)}
 	c := New(&fakeTracker{issue: issue}, agent, ws, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&log, nil)))
+	defer assertInvariants(t, c)
 	c.clock = fakeClock{now: time.Date(2026, 8, 25, 9, 41, 0, 0, time.UTC)}
 	timer := &fakeTimer{}
 	c.timer = timer
@@ -124,6 +124,7 @@ func TestBoundedRunRefreshesAndContinuesSameSessionToExactMaxTurns(t *testing.T)
 	}
 	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{}, 1)}
 	c := testCoordinator(w.Config, tracker, agent, ws)
+	defer assertInvariants(t, c)
 	timer := &fakeTimer{signal: make(chan struct{}, 3)}
 	c.timer = timer
 
@@ -163,9 +164,7 @@ func TestBoundedRunRefreshesAndContinuesSameSessionToExactMaxTurns(t *testing.T)
 	if marks != 0 {
 		t.Fatalf("completion markers=%d, want 0 for an active exhausted issue", marks)
 	}
-	c.mu.Lock()
-	retry := c.retries[issue.ID]
-	c.mu.Unlock()
+	retry, _ := c.armedRetry(issue.ID)
 	if retry.kind != retryAgent || retry.reason != "turn_limit_exhausted" || retry.attempt != 1 {
 		t.Fatalf("retry=%+v", retry)
 	}
@@ -182,6 +181,7 @@ func TestBlockedEventStopsContinuationAndLogsSafeRetryReason(t *testing.T) {
 	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{}, 1)}
 	var logs bytes.Buffer
 	c := New(&fakeTracker{issue: issue}, agent, ws, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&logs, nil)))
+	defer assertInvariants(t, c)
 	c.clock = fakeClock{now: time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)}
 	timer := &fakeTimer{signal: make(chan struct{}, 1)}
 	c.timer = timer
@@ -194,9 +194,7 @@ func TestBlockedEventStopsContinuationAndLogsSafeRetryReason(t *testing.T) {
 	if starts != 1 || continues != 0 || cancels != 1 {
 		t.Fatalf("starts=%d continues=%d cancels=%d", starts, continues, cancels)
 	}
-	c.mu.Lock()
-	retry := c.retries[issue.ID]
-	c.mu.Unlock()
+	retry, _ := c.armedRetry(issue.ID)
 	if retry.kind != retryAgent || retry.reason != "agent_blocked" || retry.attempt != 1 {
 		t.Fatalf("retry=%+v", retry)
 	}
@@ -225,6 +223,7 @@ func TestBoundedRunStopsAtHandoffWithoutContinuationOrMarker(t *testing.T) {
 	agent := &fakeAgent{events: completedEvents}
 	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{}, 1)}
 	c := testCoordinator(w.Config, tracker, agent, ws)
+	defer assertInvariants(t, c)
 	timer := &fakeTimer{}
 	c.timer = timer
 
@@ -248,6 +247,7 @@ func TestBoundedRunCancellationDuringContinuationDelayStopsCleanly(t *testing.T)
 	agent := &fakeAgent{events: completedEvents, continuationEvents: []func() <-chan domain.Event{completedEvents}}
 	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{}, 1)}
 	c := testCoordinator(w.Config, &fakeTracker{issue: issue}, agent, ws)
+	defer assertInvariants(t, c)
 	timer := &fakeTimer{signal: make(chan struct{}, 1)}
 	c.timer = timer
 
@@ -276,6 +276,7 @@ func TestBoundedRunContinuationFailureStopsSessionAndUsesFailureRetry(t *testing
 	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{}, 1)}
 	var log syncBuffer
 	c := New(&fakeTracker{issue: issue}, agent, ws, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&log, nil)))
+	defer assertInvariants(t, c)
 	c.clock = fakeClock{now: time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)}
 	timer := &fakeTimer{signal: make(chan struct{}, 2)}
 	c.timer = timer
@@ -294,9 +295,7 @@ func TestBoundedRunContinuationFailureStopsSessionAndUsesFailureRetry(t *testing
 	if marks != 0 {
 		t.Fatalf("failed continuation markers=%d, want 0", marks)
 	}
-	c.mu.Lock()
-	retry := c.retries[issue.ID]
-	c.mu.Unlock()
+	retry, _ := c.armedRetry(issue.ID)
 	if retry.kind != retryAgent || retry.reason != "session_continue" || retry.attempt != 1 {
 		t.Fatalf("failed continuation retry=%+v", retry)
 	}
@@ -311,6 +310,7 @@ func TestClosedEventStreamSchedulesDeterministicAgentRetry(t *testing.T) {
 	agent := &fakeAgent{events: closedEvents}
 	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{}, 1)}
 	c := testCoordinator(w.Config, &fakeTracker{issue: issue}, agent, ws)
+	defer assertInvariants(t, c)
 	timer := &fakeTimer{signal: make(chan struct{}, 1)}
 	c.timer = timer
 
@@ -319,9 +319,7 @@ func TestClosedEventStreamSchedulesDeterministicAgentRetry(t *testing.T) {
 	if timer.scheduled() != 1 || timer.delays[0] != 10*time.Second {
 		t.Fatalf("retries=%v", timer.delays)
 	}
-	c.mu.Lock()
-	retry := c.retries[issue.ID]
-	c.mu.Unlock()
+	retry, _ := c.armedRetry(issue.ID)
 	if retry.kind != retryAgent || retry.reason != "stream_closed" || retry.attempt != 1 {
 		t.Fatalf("retry=%+v", retry)
 	}
@@ -340,15 +338,14 @@ func TestPostTurnRefreshFailureSchedulesDistinctAgentRetry(t *testing.T) {
 	tracker := &fakeTracker{issue: issue, getErr: errors.New("linear tracker_request: Linear request failed")}
 	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{}, 1)}
 	c := New(tracker, agent, ws, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&log, nil)))
+	defer assertInvariants(t, c)
 	timer := &fakeTimer{signal: make(chan struct{}, 1)}
 	c.timer = timer
 
 	c.Tick(context.Background())
 	<-timer.signal
 
-	c.mu.Lock()
-	retry := c.retries[issue.ID]
-	c.mu.Unlock()
+	retry, _ := c.armedRetry(issue.ID)
 	if retry.kind != retryAgent || retry.reason != "issue_refresh" || retry.attempt != 1 {
 		t.Fatalf("retry=%+v", retry)
 	}
@@ -363,6 +360,7 @@ func TestCompletedEventAfterReconciliationCancellationDoesNotComplete(t *testing
 	agent := &fakeAgent{events: completedEvents}
 	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{}, 1)}
 	c := testCoordinator(w.Config, &fakeTracker{issue: issue}, agent, ws)
+	defer assertInvariants(t, c)
 	r := &running{issue: issue, stopped: stopTerminal}
 	events := make(chan domain.Event, 1)
 	events <- domain.Event{Kind: domain.EventCompleted, SessionID: "t-u"}
@@ -388,6 +386,7 @@ func TestCompletionRevalidatesTerminalIssueBeforeMarker(t *testing.T) {
 	agent := &fakeAgent{events: completedEvents}
 	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{}, 1), cleaned: make(chan struct{}, 1)}
 	c := testCoordinator(w.Config, tracker, agent, ws)
+	defer assertInvariants(t, c)
 
 	c.Tick(context.Background())
 	<-ws.cleaned

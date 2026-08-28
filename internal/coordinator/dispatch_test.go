@@ -19,6 +19,7 @@ func TestDispatchMovesTodoIssueToInProgress(t *testing.T) {
 	agent := &fakeAgent{events: completedEvents}
 	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{}, 1)}
 	c := testCoordinator(s, tracker, agent, ws)
+	defer assertInvariants(t, c)
 
 	c.Tick(context.Background())
 	<-ws.after
@@ -46,6 +47,7 @@ func TestDispatchStartTransitionLogsOperationAndEdge(t *testing.T) {
 	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{}, 1)}
 	var logs bytes.Buffer
 	c := New(tracker, agent, ws, func() config.Settings { return s }, slog.New(slog.NewJSONHandler(&logs, nil)))
+	defer assertInvariants(t, c)
 	c.clock = fakeClock{now: time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)}
 
 	c.Tick(context.Background())
@@ -74,6 +76,7 @@ func TestDispatchDoesNotTransitionAlreadyStartedIssue(t *testing.T) {
 	agent := &fakeAgent{events: completedEvents}
 	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{}, 1)}
 	c := testCoordinator(s, tracker, agent, ws)
+	defer assertInvariants(t, c)
 
 	c.Tick(context.Background())
 	<-ws.after
@@ -97,6 +100,7 @@ func TestDispatchTransitionFailureDoesNotBlockOrDoubleDispatch(t *testing.T) {
 	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{}, 1)}
 	var logs bytes.Buffer
 	c := New(tracker, agent, ws, func() config.Settings { return s }, slog.New(slog.NewJSONHandler(&logs, nil)))
+	defer assertInvariants(t, c)
 	c.clock = fakeClock{now: time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)}
 
 	c.Tick(context.Background())

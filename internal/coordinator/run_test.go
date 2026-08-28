@@ -29,6 +29,7 @@ func TestPromptRenderedDebugRecordCarriesByteCountsNotText(t *testing.T) {
 	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{}, 1)}
 	var logs bytes.Buffer
 	c := New(&fakeTracker{issue: issue}, agent, ws, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	defer assertInvariants(t, c)
 	c.Tick(context.Background())
 	<-ws.after
 	if err := c.Shutdown(context.Background()); err != nil {
@@ -119,6 +120,7 @@ func TestADispatchedPromptNamesTheToolsItsOwnBackendWillServe(t *testing.T) {
 	agent := &fakeAgent{events: completedEvents}
 	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{})}
 	c := New(&fakeTracker{issue: testIssue()}, agent, ws, func() config.Settings { return w.Config }, nil)
+	defer assertInvariants(t, c)
 	c.Tick(context.Background())
 	<-ws.after
 	if err := c.Shutdown(context.Background()); err != nil {
@@ -154,6 +156,7 @@ func TestReconciliationCancellationDoesNotRetry(t *testing.T) {
 	agent := &fakeAgent{events: func() <-chan domain.Event { return block }, started: make(chan struct{}, 1)}
 	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{}, 1)}
 	c := testCoordinator(w.Config, tracker, agent, ws)
+	defer assertInvariants(t, c)
 	timer := &fakeTimer{}
 	c.timer = timer
 
@@ -189,9 +192,8 @@ func TestReconcileRefreshFailureLogsWarnOnlyWhenNotCancelled(t *testing.T) {
 		var logs bytes.Buffer
 		tracker := &fakeTracker{issue: issue, getIssuesErr: refreshErr}
 		c := New(tracker, &fakeAgent{}, &fakeWorkspace{}, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&logs, nil)))
-		c.mu.Lock()
-		c.running[issue.ID] = &running{issue: issue}
-		c.mu.Unlock()
+		defer assertInvariants(t, c)
+		c.seedRunning(issue, &running{issue: issue})
 
 		if err := c.reconcile(context.Background()); err == nil {
 			t.Fatal("expected reconcile to surface the refresh failure")
@@ -205,9 +207,8 @@ func TestReconcileRefreshFailureLogsWarnOnlyWhenNotCancelled(t *testing.T) {
 		var logs bytes.Buffer
 		tracker := &fakeTracker{issue: issue, getIssuesErr: refreshErr}
 		c := New(tracker, &fakeAgent{}, &fakeWorkspace{}, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&logs, nil)))
-		c.mu.Lock()
-		c.running[issue.ID] = &running{issue: issue}
-		c.mu.Unlock()
+		defer assertInvariants(t, c)
+		c.seedRunning(issue, &running{issue: issue})
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 
@@ -230,6 +231,7 @@ func TestLaunchReservationPreventsOversubscriptionBeforeSessionStart(t *testing.
 	block := make(chan domain.Event)
 	agent := &fakeAgent{events: func() <-chan domain.Event { return block }, started: make(chan struct{}, 1)}
 	c := testCoordinator(w.Config, &fakeTracker{issue: first}, agent, ws)
+	defer assertInvariants(t, c)
 
 	if !c.claim(first, w.Config) || !c.launch(context.Background(), first, 0) {
 		t.Fatal("first launch was not admitted")
@@ -255,6 +257,7 @@ func TestStalledRunCancelsAndSchedulesRetry(t *testing.T) {
 	agent := &fakeAgent{events: func() <-chan domain.Event { return block }, started: make(chan struct{}, 1)}
 	ws := &fakeWorkspace{after: make(chan struct{}, 1)}
 	c := testCoordinator(w.Config, tracker, agent, ws)
+	defer assertInvariants(t, c)
 	clock := &mutableClock{now: time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)}
 	c.clock = clock
 	timer := &fakeTimer{signal: make(chan struct{}, 1)}
@@ -272,9 +275,7 @@ func TestStalledRunCancelsAndSchedulesRetry(t *testing.T) {
 	if starts != 1 || cancels != 1 {
 		t.Fatalf("starts=%d cancels=%d, want stalled session cancelled once", starts, cancels)
 	}
-	c.mu.Lock()
-	retry := c.retries[issue.ID]
-	c.mu.Unlock()
+	retry, _ := c.armedRetry(issue.ID)
 	if retry.reason != "stalled" || retry.attempt != 1 {
 		t.Fatalf("retry=%+v", retry)
 	}
@@ -298,6 +299,7 @@ func TestStallBudgetIsResolvedUnderTheRunsBackendNotTheConfiguredOne(t *testing.
 	agent := &fakeAgent{events: func() <-chan domain.Event { return block }, started: make(chan struct{}, 1)}
 	ws := &fakeWorkspace{after: make(chan struct{}, 1)}
 	c := New(tracker, agent, ws, func() config.Settings { return current }, nil)
+	defer assertInvariants(t, c)
 	clock := &mutableClock{now: time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)}
 	c.clock = clock
 	timer := &fakeTimer{signal: make(chan struct{}, 1)}
@@ -335,9 +337,7 @@ func TestStallBudgetIsResolvedUnderTheRunsBackendNotTheConfiguredOne(t *testing.
 	if starts != 1 || cancels != 1 {
 		t.Fatalf("starts=%d cancels=%d, want the stalled session cancelled once", starts, cancels)
 	}
-	c.mu.Lock()
-	retry := c.retries[issue.ID]
-	c.mu.Unlock()
+	retry, _ := c.armedRetry(issue.ID)
 	if retry.reason != "stalled" {
 		t.Fatalf("retry=%+v, want a stalled retry", retry)
 	}
@@ -359,6 +359,7 @@ func TestReconciliationRefreshesStateCapacityForLaterAdmissions(t *testing.T) {
 	agent := &fakeAgent{events: func() <-chan domain.Event { return block }, started: make(chan struct{}, 2)}
 	ws := &fakeWorkspace{after: make(chan struct{}, 2)}
 	c := testCoordinator(w.Config, tracker, agent, ws)
+	defer assertInvariants(t, c)
 
 	c.Tick(context.Background())
 	<-agent.started
@@ -369,9 +370,7 @@ func TestReconciliationRefreshesStateCapacityForLaterAdmissions(t *testing.T) {
 	c.Tick(context.Background())
 	<-agent.started
 
-	c.mu.Lock()
-	state := c.admitted[first.ID]
-	c.mu.Unlock()
+	state := c.admittedState(first.ID)
 	if state != "doing" {
 		t.Fatalf("first admitted state=%q, want refreshed doing", state)
 	}

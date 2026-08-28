@@ -64,7 +64,7 @@ func findLine(t *testing.T, output, marker string) string {
 
 // waitForRunning blocks until identifier appears in c's running snapshot.
 // agent.started only confirms Start was called; the launch goroutine still
-// needs to record the session in c.running afterward, and a test that
+// needs to record the session on the issue's state record afterward, and a test that
 // advances the clock and re-ticks before that happens will see reconcile
 // find no running sessions at all, so a stall or eligibility change it
 // expects to observe is silently missed and any following blocking receive
@@ -104,9 +104,7 @@ func waitForRelease(t *testing.T, c *Coordinator, id string) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
 	for {
-		c.mu.Lock()
-		claimed, running := c.claimed[id], len(c.running)
-		c.mu.Unlock()
+		claimed, running := c.claimHeld(id), c.runningCount()
 		if !claimed && running == 0 {
 			return
 		}

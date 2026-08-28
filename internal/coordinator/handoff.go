@@ -14,7 +14,8 @@ import (
 // memory is live and an external automation that reverts the handoff (the
 // PMR-63 In Review -> In Progress flap) is observed and logged rather than
 // silently re-dispatched with no trace. Healthy handoffs that stay in review
-// are swept out after this window, so the map never grows unbounded.
+// are swept out after this window, so the coordinator's per-issue records
+// never grow unbounded.
 const handoffObservationFloor = 2 * time.Minute
 
 // handoffObservation is the coordinator's memory of one host-driven transition
@@ -36,7 +37,7 @@ func (c *Coordinator) noteHandoffObservation(issue domain.Issue, s config.Settin
 		return
 	}
 	c.mu.Lock()
-	c.handoffs[issue.ID] = handoffObservation{state: handoff, at: now}
+	c.ensureStateLocked(issue.ID).handoff = &handoffObservation{state: handoff, at: now}
 	c.mu.Unlock()
 }
 
@@ -54,9 +55,13 @@ func (c *Coordinator) notePostHandoffStateChange(i domain.Issue, s config.Settin
 		return
 	}
 	c.mu.Lock()
-	observation, ok := c.handoffs[i.ID]
+	var observation handoffObservation
+	st := c.stateLocked(i.ID)
+	ok := st != nil && st.handoff != nil
 	if ok {
-		delete(c.handoffs, i.ID)
+		observation = *st.handoff
+		st.handoff = nil
+		c.pruneLocked(i.ID)
 	}
 	c.mu.Unlock()
 	if !ok || config.Norm(i.State) == observation.state {
@@ -151,16 +156,18 @@ func reworkCandidates(s config.Settings) []string {
 // sweepHandoffObservations discards handoff memories older than the retention
 // window (max of the floor and two poll intervals, so a poll always runs while
 // a memory is live). A healthy handoff that stays in review is never reverted
-// and so is only ever cleared here, keeping the map bounded.
+// and so is only ever cleared here, which is what keeps the per-issue records
+// bounded.
 func (c *Coordinator) sweepHandoffObservations(now time.Time, s config.Settings) {
 	ttl := handoffObservationFloor
 	if window := 2 * s.Polling.Interval; window > ttl {
 		ttl = window
 	}
 	c.mu.Lock()
-	for id, observation := range c.handoffs {
-		if now.Sub(observation.at) > ttl {
-			delete(c.handoffs, id)
+	for id, st := range c.states {
+		if st.handoff != nil && now.Sub(st.handoff.at) > ttl {
+			st.handoff = nil
+			c.pruneLocked(id)
 		}
 	}
 	c.mu.Unlock()

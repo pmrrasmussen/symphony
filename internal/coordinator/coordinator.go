@@ -53,57 +53,29 @@ type Coordinator struct {
 	// scheduling goroutines that read it need no lock of their own.
 	forget domain.IssueForgetter
 
-	mu         sync.Mutex
-	running    map[string]*running
-	claimed    map[string]bool
-	claimState map[string]string
-	// admitted contains work that has reserved an orchestrator slot. Unlike a
-	// claim, it deliberately excludes delayed retry timers: a timer still owns
-	// its issue to prevent duplicate dispatch, but it must not idle a worker
-	// slot while it waits.
-	admitted map[string]string
-	retries  map[string]retryState
-	// handoffs records issues Symphony itself drove into the configured review
-	// handoff state, keyed by issue ID, so the poll loop can recognize and log
-	// an external actor (for example Linear's native GitHub PR automation)
-	// reverting that handoff to an active state instead of silently
-	// re-dispatching it. It is in-process only and discarded safely on restart.
-	handoffs map[string]handoffObservation
-	// landingWaits counts consecutive non-terminal landing waits for a claimed
-	// issue. It escalates the delayed landing redispatch so a gate that never
-	// settles (a genuinely long check run, or a required_checks name that does
-	// not match any GitHub job) backs off toward agent.max_retry_backoff_ms
-	// instead of respawning a session at the GitHub poll cadence forever. It is
-	// cleared with the claim, so any other landing outcome resets it (PMR-78).
-	landingWaits map[string]int
-	// landingEscalated records, per claimed issue, whether the "landing wait
-	// retry scheduled" log has already been raised to Warn once landingWaits
-	// crossed the point where landingRetryDelay's backoff saturates at
-	// agent.max_retry_backoff_ms (see landingWaitEscalated). It keeps that
-	// escalation a one-time signal -- naming a stuck landing once it stops
-	// being distinguishable from a slow one -- rather than a Warn on every
-	// subsequent poll-cadence wait. Cleared with the claim alongside
-	// landingWaits (PMR-116).
-	landingEscalated map[string]bool
-	// waiting records a Todo issue that is sitting idle for a reason that earns
-	// neither a claim nor a retry timer, so no other tracking remembers it
-	// (PMR-139, PMR-152): a candidate rejected only for capacity, or one held
-	// ineligible by an open blocker relation, is re-evaluated fresh from
-	// ListCandidates on the next poll, with nothing else tracking it in the
-	// interim. It is keyed by issue ID and cleared the moment the issue is no
-	// longer seen in either state -- admitted, unblocked, turned ineligible for
-	// some other reason, or dropped from the tracker's candidate list.
-	waiting map[string]waitingState
-	// waitingEscalated marks, per waiting issue, that the "still waiting" Warn
-	// has already fired once, mirroring landingEscalated: an issue that stays
-	// stuck keeps logging Info only on the poll it first entered (or changed
-	// reason for) the waiting set, not a Warn every poll.
-	waitingEscalated map[string]bool
-	nextRetry        uint64
-	stopping         bool
-	ctx              context.Context
-	cancel           context.CancelFunc
-	wg               sync.WaitGroup
+	mu sync.Mutex
+	// states is the coordinator's single per-issue record, keyed by issue ID.
+	// Everything it knows about an issue lives in one owned value, so the
+	// relations between a claim, its reservation, its run, its retry timer and
+	// its waiting or handoff memory are properties of that value rather than
+	// rules re-applied at each call site (PMR-123). An entry exists only while
+	// it remembers something; see issueState and pruneLocked.
+	states map[string]*issueState
+	// admittedCount and admittedByState are the reservation tallies kept in
+	// step with states, so both halves of the capacity check --
+	// agent.max_concurrent_agents and the per-state limit -- are O(1) reads
+	// that cannot drift from the records they describe.
+	admittedCount   int
+	admittedByState map[string]int
+	// nextRetry and nextReservation mint the generations that make a retry
+	// timer and an orchestrator reservation identifiable by their owner rather
+	// than by the slot they happen to occupy.
+	nextRetry       uint64
+	nextReservation uint64
+	stopping        bool
+	ctx             context.Context
+	cancel          context.CancelFunc
+	wg              sync.WaitGroup
 }
 
 func New(t domain.Tracker, a domain.AgentBackend, w domain.WorkspaceExecutor, settings func() config.Settings, logger *slog.Logger) *Coordinator {
@@ -113,11 +85,7 @@ func New(t domain.Tracker, a domain.AgentBackend, w domain.WorkspaceExecutor, se
 	return &Coordinator{
 		tracker: t, agent: a, workspaces: w, settings: settings,
 		timer: realTimer{}, clock: realClock{}, log: observability.FromSlog(logger),
-		running: map[string]*running{}, claimed: map[string]bool{},
-		claimState: map[string]string{}, admitted: map[string]string{}, retries: map[string]retryState{},
-		handoffs: map[string]handoffObservation{}, landingWaits: map[string]int{},
-		landingEscalated: map[string]bool{},
-		waiting:          map[string]waitingState{}, waitingEscalated: map[string]bool{},
+		states: map[string]*issueState{}, admittedByState: map[string]int{},
 	}
 }
 
@@ -166,27 +134,23 @@ func (c *Coordinator) Shutdown(ctx context.Context) error {
 	if c.cancel != nil {
 		c.cancel()
 	}
-	runs := make([]*running, 0, len(c.running))
-	for _, r := range c.running {
-		if r.stopped == "" {
+	runs := make([]*running, 0, len(c.states))
+	for id, st := range c.states {
+		if r := st.run; r != nil && r.stopped == "" {
 			r.stopped = stopShutdown
 			r.cancel()
 			runs = append(runs, r)
 		}
-	}
-	for id, retry := range c.retries {
-		if retry.timer != nil {
-			retry.timer.Stop()
+		// A pending retry owns nothing but its claim, so shutdown drops the
+		// whole claim with it; a running issue keeps its claim until its own
+		// worker goroutine releases it. Waiting memory describes an unclaimed
+		// candidate and is simply forgotten.
+		if st.retry != nil {
+			c.releaseLocked(id)
 		}
-		delete(c.retries, id)
-		delete(c.claimed, id)
-		delete(c.claimState, id)
-		delete(c.landingWaits, id)
-		delete(c.landingEscalated, id)
-	}
-	for id := range c.waiting {
-		delete(c.waiting, id)
-		delete(c.waitingEscalated, id)
+		st.waiting = nil
+		st.waitingEscalated = false
+		c.pruneLocked(id)
 	}
 	c.mu.Unlock()
 	c.cancelAll(ctx, runs)

@@ -58,44 +58,45 @@ func pollDelay(interval time.Duration, err error) time.Duration {
 // separately can stay truthful.
 func (c *Coordinator) scheduleRetry(ctx context.Context, i domain.Issue, ws domain.Workspace, attempt int, kind retryKind, reason string, delay time.Duration) bool {
 	c.mu.Lock()
-	if c.stopping || !c.claimed[i.ID] {
+	st := c.claimedStateLocked(i.ID)
+	if c.stopping || st == nil {
 		c.mu.Unlock()
 		return false
 	}
-	if previous, ok := c.retries[i.ID]; ok && previous.timer != nil {
-		previous.timer.Stop()
+	if st.retry != nil && st.retry.timer != nil {
+		st.retry.timer.Stop()
 	}
 	c.nextRetry++
 	generation := c.nextRetry
-	state := retryState{ctx: ctx, issue: i, workspace: ws, attempt: attempt, kind: kind, reason: reason, due: c.clock.Now().Add(delay), generation: generation}
-	c.retries[i.ID] = state
+	due := c.clock.Now().Add(delay)
+	st.retry = &retryState{ctx: ctx, issue: i, workspace: ws, attempt: attempt, kind: kind, reason: reason, due: due, generation: generation}
 	c.mu.Unlock()
 	handle := c.timer.AfterFunc(delay, func() { c.runRetry(i.ID, generation) })
 	c.mu.Lock()
-	current, ok := c.retries[i.ID]
-	if ok && current.generation == generation {
-		current.timer = handle
-		c.retries[i.ID] = current
+	if current := c.stateLocked(i.ID); current != nil && current.retry != nil && current.retry.generation == generation {
+		current.retry.timer = handle
 	} else if handle != nil {
 		handle.Stop()
 	}
 	c.mu.Unlock()
-	c.log.Info("agent retry scheduled", "issue_id", i.ID, "issue_identifier", i.Identifier, "retry_kind", kind, "reason", reason, "attempt", attempt, "due", state.due)
+	c.log.Info("agent retry scheduled", "issue_id", i.ID, "issue_identifier", i.Identifier, "retry_kind", kind, "reason", reason, "attempt", attempt, "due", due)
 	return true
 }
 
 func (c *Coordinator) runRetry(id string, generation uint64) {
 	c.mu.Lock()
-	retry, ok := c.retries[id]
+	st := c.stateLocked(id)
+	armed := st != nil && st.retry != nil
 	stopping := c.stopping
-	if !ok || retry.generation != generation || stopping {
-		c.mu.Unlock()
-		if ok && stopping {
-			c.release(id)
+	if !armed || st.retry.generation != generation || stopping {
+		if armed && stopping {
+			c.releaseLocked(id)
 		}
+		c.mu.Unlock()
 		return // a stopped or superseded timer is stale
 	}
-	delete(c.retries, id)
+	retry := *st.retry
+	st.retry = nil
 	c.mu.Unlock()
 	ctx := retry.ctx
 	if managed := c.context(); managed != nil {
@@ -113,9 +114,7 @@ func (c *Coordinator) runRetry(id string, generation uint64) {
 			// A stale tracker read is no more an agent failure than the wait
 			// itself: keep the attempt (it feeds the rendered prompt) and the
 			// landing cadence, exactly like the slot-contention branch below.
-			c.mu.Lock()
-			waits := c.landingWaits[id]
-			c.mu.Unlock()
+			waits := c.landingWaitsFor(id)
 			c.scheduleRetry(ctx, retry.issue, retry.workspace, retry.attempt, retryLanding, "retry_refresh", landingRetryDelay(s, waits))
 			return
 		}
@@ -151,9 +150,7 @@ func (c *Coordinator) runRetry(id string, generation uint64) {
 		// itself: keep the attempt (it feeds the rendered prompt) and the
 		// landing cadence, so a queued landing never polls GitHub faster than
 		// the configured interval (PMR-78).
-		c.mu.Lock()
-		waits := c.landingWaits[id]
-		c.mu.Unlock()
+		waits := c.landingWaitsFor(id)
 		c.scheduleRetry(ctx, issue, retry.workspace, retry.attempt, retryLanding, "landing_slot_unavailable", landingRetryDelay(s, waits))
 		return
 	}
@@ -169,8 +166,8 @@ func (c *Coordinator) runRetry(id string, generation uint64) {
 
 func (c *Coordinator) stopRun(id string, reason stopReason) bool {
 	c.mu.Lock()
-	r, ok := c.running[id]
-	if !ok || r.stopped != "" {
+	r := c.runLocked(id)
+	if r == nil || r.stopped != "" {
 		c.mu.Unlock()
 		return false
 	}
@@ -211,26 +208,6 @@ func (c *Coordinator) cancelSession(parent context.Context, session domain.Agent
 	case <-ctx.Done():
 		c.log.Warn("agent cancellation timed out", "session_id", session.ID)
 	}
-}
-
-func (c *Coordinator) release(id string) {
-	c.mu.Lock()
-	if retry, ok := c.retries[id]; ok && retry.timer != nil {
-		retry.timer.Stop()
-	}
-	delete(c.claimed, id)
-	delete(c.claimState, id)
-	delete(c.admitted, id)
-	delete(c.retries, id)
-	delete(c.landingWaits, id)
-	delete(c.landingEscalated, id)
-	c.mu.Unlock()
-}
-
-func (c *Coordinator) unreserve(id string) {
-	c.mu.Lock()
-	delete(c.admitted, id)
-	c.mu.Unlock()
 }
 
 func backoff(a int, max time.Duration) time.Duration {

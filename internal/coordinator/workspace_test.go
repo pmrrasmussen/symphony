@@ -63,6 +63,7 @@ func TestRunEndCleanupSurvivesConcurrentReconciliationCancellation(t *testing.T)
 	gate := make(chan struct{})
 	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{}, 1), cleanupStarted: make(chan struct{}, 1), cleanupGate: gate}
 	c := New(tracker, agent, ws, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&log, nil)))
+	defer assertInvariants(t, c)
 	c.clock = fakeClock{now: time.Date(2026, 8, 26, 7, 37, 0, 0, time.UTC)}
 	c.timer = &fakeTimer{}
 
@@ -118,6 +119,7 @@ func TestRunEndCleanupFailureIsNotActionableWhenReconciliationSucceeds(t *testin
 		cleanupErr:     errors.New("refusing to remove Git workspace whose HEAD c6e8a98 differs from recorded base commit 54bccf5; merged landing could not be verified"),
 	}
 	c := New(tracker, agent, ws, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&log, nil)))
+	defer assertInvariants(t, c)
 	c.clock = fakeClock{now: time.Date(2026, 8, 26, 7, 41, 0, 0, time.UTC)}
 	c.timer = &fakeTimer{}
 
@@ -172,6 +174,7 @@ func TestRunEndCleanupFailureStaysActionableForANonTerminalStopReason(t *testing
 				cleanupErr: errors.New("refusing to remove Git workspace whose HEAD c6e8a98 differs from recorded base commit 54bccf5; merged landing could not be verified"),
 			}
 			c := New(&fakeTracker{issue: issue}, &fakeAgent{}, ws, func() config.Settings { return testSettings(t).Config }, slog.New(slog.NewJSONHandler(&log, nil)))
+			defer assertInvariants(t, c)
 			r := &running{issue: issue, stopped: reason}
 
 			c.cleanupWorkspaceAtRunEnd(context.Background(), r, issue)
@@ -201,6 +204,7 @@ func TestTerminalIssueIsForgottenByTheHostIntegration(t *testing.T) {
 	agent := &fakeAgent{events: completedEvents}
 	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{}, 1), cleaned: make(chan struct{}, 1)}
 	c := testCoordinator(w.Config, tracker, agent, ws)
+	defer assertInvariants(t, c)
 	forgetter := &stubForgetter{}
 	c.SetIssueForgetter(forgetter)
 
@@ -220,6 +224,7 @@ func TestActiveIssueIsNotForgotten(t *testing.T) {
 	agent := &fakeAgent{events: completedEvents}
 	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{}, 1)}
 	c := testCoordinator(w.Config, &fakeTracker{issue: issue}, agent, ws)
+	defer assertInvariants(t, c)
 	forgetter := &stubForgetter{}
 	c.SetIssueForgetter(forgetter)
 

@@ -29,15 +29,14 @@ func TestHandoffRunRecordsObservationForRevertDetection(t *testing.T) {
 	agent := &fakeAgent{events: completedEvents}
 	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{}, 1)}
 	c := testCoordinator(w.Config, tracker, agent, ws)
+	defer assertInvariants(t, c)
 
 	c.Tick(context.Background())
 	<-ws.after
 
 	deadline := time.Now().Add(time.Second)
 	for {
-		c.mu.Lock()
-		observation, ok := c.handoffs[issue.ID]
-		c.mu.Unlock()
+		observation, ok := c.handoffMemory(issue.ID)
 		if ok && observation.state == "in review" {
 			break
 		}
@@ -68,6 +67,7 @@ func TestExternalHandoffRevertIsObservedAtPoll(t *testing.T) {
 	tracker := &fakeTracker{issue: reverted}
 	var logs bytes.Buffer
 	c := New(tracker, &fakeAgent{}, &fakeWorkspace{}, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&logs, nil)))
+	defer assertInvariants(t, c)
 	c.clock = fakeClock{now: time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)}
 
 	// Pre-claim the reverted issue so the poll does not also launch a run, then
@@ -88,9 +88,7 @@ func TestExternalHandoffRevertIsObservedAtPoll(t *testing.T) {
 		!strings.Contains(output, `"issue_identifier":"ENG-1"`) {
 		t.Fatalf("external handoff revert was not logged from the poll loop: %s", output)
 	}
-	c.mu.Lock()
-	_, still := c.handoffs[reverted.ID]
-	c.mu.Unlock()
+	_, still := c.handoffMemory(reverted.ID)
 	if still {
 		t.Fatal("handoff observation was not consumed after the revert was logged")
 	}
@@ -117,22 +115,19 @@ func TestHealthyHandoffIsSweptWithoutExternalRevertLog(t *testing.T) {
 	var logs bytes.Buffer
 	clock := &mutableClock{now: time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)}
 	c := New(tracker, &fakeAgent{}, &fakeWorkspace{}, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&logs, nil)))
+	defer assertInvariants(t, c)
 	c.clock = clock
 	c.noteHandoffObservation(domain.Issue{ID: "id", Identifier: "ENG-1", State: "In Review"}, w.Config, clock.Now())
 
 	c.Tick(context.Background())
-	c.mu.Lock()
-	_, present := c.handoffs["id"]
-	c.mu.Unlock()
+	_, present := c.handoffMemory("id")
 	if !present {
 		t.Fatal("handoff memory was dropped inside the retention window")
 	}
 
 	clock.set(clock.now.Add(3 * time.Minute))
 	c.Tick(context.Background())
-	c.mu.Lock()
-	_, stillThere := c.handoffs["id"]
-	c.mu.Unlock()
+	_, stillThere := c.handoffMemory("id")
 	if stillThere {
 		t.Fatal("stale handoff memory was not swept after the retention window")
 	}
@@ -236,6 +231,7 @@ func TestPostHandoffStateChangeIsClassified(t *testing.T) {
 			tracker := &fakeTracker{issue: moved}
 			var logs bytes.Buffer
 			c := New(tracker, &fakeAgent{}, &fakeWorkspace{}, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&logs, nil)))
+			defer assertInvariants(t, c)
 			c.clock = fakeClock{now: time.Date(2026, 8, 25, 12, 0, 0, 0, time.UTC)}
 
 			// Pre-claim so the poll only classifies the change instead of also

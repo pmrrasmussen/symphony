@@ -17,6 +17,7 @@ func TestStartSchedulesRateLimitRecoveryWithInjectedTimer(t *testing.T) {
 	w.Config.Polling.Interval = 30 * time.Second
 	tracker := &rateLimitPollTracker{}
 	c := testCoordinator(w.Config, tracker, &fakeAgent{}, &fakeWorkspace{})
+	defer assertInvariants(t, c)
 	timer := &fakeTimer{signal: make(chan struct{}, 2)}
 	c.timer = timer
 	ctx, cancel := context.WithCancel(context.Background())
@@ -49,6 +50,7 @@ func TestRetryRechecksCurrentIssueEligibility(t *testing.T) {
 	agent := &fakeAgent{events: closedEvents}
 	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{}, 1)}
 	c := testCoordinator(w.Config, tracker, agent, ws)
+	defer assertInvariants(t, c)
 	timer := &fakeTimer{signal: make(chan struct{}, 1)}
 	c.timer = timer
 
@@ -76,6 +78,7 @@ func TestStoppedRetryCallbackCannotReclaimIssue(t *testing.T) {
 	agent := &fakeAgent{events: completedEvents}
 	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{}, 1)}
 	c := testCoordinator(w.Config, &fakeTracker{issue: issue}, agent, ws)
+	defer assertInvariants(t, c)
 	timer := &fakeTimer{}
 	c.timer = timer
 	if !c.claim(issue, w.Config) {
@@ -98,6 +101,7 @@ func TestShutdownCancellationDoesNotRetry(t *testing.T) {
 	agent := &fakeAgent{events: func() <-chan domain.Event { return block }, started: make(chan struct{}, 1)}
 	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{}, 1)}
 	c := testCoordinator(w.Config, &fakeTracker{issue: issue}, agent, ws)
+	defer assertInvariants(t, c)
 	timer := &fakeTimer{}
 	c.timer = timer
 
@@ -123,6 +127,7 @@ func TestQueuedRetryDoesNotConsumeAnOrchestratorSlot(t *testing.T) {
 	agent := &fakeAgent{events: func() <-chan domain.Event { return block }, started: make(chan struct{}, 1)}
 	ws := &fakeWorkspace{after: make(chan struct{}, 1)}
 	c := testCoordinator(w.Config, tracker, agent, ws)
+	defer assertInvariants(t, c)
 	timer := &fakeTimer{}
 	c.timer = timer
 
@@ -160,6 +165,7 @@ func TestRetryAtCapacityRequeuesOnFixedCadence(t *testing.T) {
 	agent := &fakeAgent{events: func() <-chan domain.Event { return block }, started: make(chan struct{}, 1)}
 	ws := &fakeWorkspace{after: make(chan struct{}, 1)}
 	c := testCoordinator(w.Config, tracker, agent, ws)
+	defer assertInvariants(t, c)
 	timer := &fakeTimer{}
 	c.timer = timer
 
@@ -173,9 +179,7 @@ func TestRetryAtCapacityRequeuesOnFixedCadence(t *testing.T) {
 	<-agent.started
 	timer.fire(0)
 
-	c.mu.Lock()
-	retry := c.retries[retrying.ID]
-	c.mu.Unlock()
+	retry, _ := c.armedRetry(retrying.ID)
 	if retry.reason != "agent_slot_unavailable" || retry.attempt != 1 {
 		t.Fatalf("retry=%+v, want attempt unchanged and reason agent_slot_unavailable", retry)
 	}
@@ -208,6 +212,7 @@ func TestRetryAtCapacityNeverAbandons(t *testing.T) {
 	ws := &fakeWorkspace{after: make(chan struct{}, 1)}
 	var log syncBuffer
 	c := New(tracker, agent, ws, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&log, nil)))
+	defer assertInvariants(t, c)
 	c.clock = fakeClock{now: time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)}
 	timer := &fakeTimer{}
 	c.timer = timer
@@ -226,10 +231,8 @@ func TestRetryAtCapacityNeverAbandons(t *testing.T) {
 		timer.fire(i)
 	}
 
-	c.mu.Lock()
-	claimed := c.claimed[retrying.ID]
-	retry, stillRetrying := c.retries[retrying.ID]
-	c.mu.Unlock()
+	claimed := c.claimHeld(retrying.ID)
+	retry, stillRetrying := c.armedRetry(retrying.ID)
 	if !claimed || !stillRetrying {
 		t.Fatal("contended slot abandoned the retry before a real dispatch failure ever occurred")
 	}
@@ -254,6 +257,7 @@ func TestRetryRefreshFailureIncrementsAttemptAndRetries(t *testing.T) {
 	issue := testIssue()
 	tracker := &issueMapTracker{issues: map[string]domain.Issue{issue.ID: issue}, getErr: errors.New("temporary tracker failure")}
 	c := testCoordinator(w.Config, tracker, &fakeAgent{}, &fakeWorkspace{})
+	defer assertInvariants(t, c)
 	timer := &fakeTimer{}
 	c.timer = timer
 
@@ -263,9 +267,7 @@ func TestRetryRefreshFailureIncrementsAttemptAndRetries(t *testing.T) {
 	c.scheduleRetry(context.Background(), issue, domain.Workspace{}, 1, retryAgent, "test", time.Second)
 	timer.fire(0)
 
-	c.mu.Lock()
-	retry := c.retries[issue.ID]
-	c.mu.Unlock()
+	retry, _ := c.armedRetry(issue.ID)
 	if retry.reason != "retry_refresh" || retry.attempt != 2 {
 		t.Fatalf("retry=%+v", retry)
 	}
@@ -295,6 +297,7 @@ func TestRetryRefreshFailureNeverAbandonsIssue(t *testing.T) {
 	tracker := &issueMapTracker{issues: map[string]domain.Issue{issue.ID: issue}, getErr: errors.New("temporary tracker failure")}
 	var log syncBuffer
 	c := New(tracker, &fakeAgent{}, &fakeWorkspace{}, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&log, nil)))
+	defer assertInvariants(t, c)
 	c.clock = fakeClock{now: time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)}
 	timer := &fakeTimer{}
 	c.timer = timer
@@ -309,10 +312,8 @@ func TestRetryRefreshFailureNeverAbandonsIssue(t *testing.T) {
 		timer.fire(i)
 	}
 
-	c.mu.Lock()
-	claimed := c.claimed[issue.ID]
-	retry, stillRetrying := c.retries[issue.ID]
-	c.mu.Unlock()
+	claimed := c.claimHeld(issue.ID)
+	retry, stillRetrying := c.armedRetry(issue.ID)
 	if !claimed || !stillRetrying {
 		t.Fatal("retry_refresh abandoned the issue before any classified failure occurred")
 	}
