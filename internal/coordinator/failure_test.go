@@ -26,6 +26,7 @@ func TestPermanentDispatchFailureStopsAtMaxAttempts(t *testing.T) {
 	agent := &fakeAgent{startErr: errors.New("agent binary not found")}
 	ws := &fakeWorkspace{after: make(chan struct{}, 4)}
 	c := New(&fakeTracker{issue: issue}, agent, ws, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&log, nil)))
+	defer assertInvariants(t, c)
 	c.clock = fakeClock{now: time.Date(2026, 8, 26, 9, 41, 0, 0, time.UTC)}
 	timer := &fakeTimer{signal: make(chan struct{}, 4)}
 	c.timer = timer
@@ -47,11 +48,10 @@ func TestPermanentDispatchFailureStopsAtMaxAttempts(t *testing.T) {
 	if timer.scheduled() != 2 {
 		t.Fatalf("armed %d retries, want one fewer than max_attempts", timer.scheduled())
 	}
-	c.mu.Lock()
-	claimed, retries, admitted := c.claimed[issue.ID], len(c.retries), len(c.admitted)
-	c.mu.Unlock()
-	if claimed || retries != 0 || admitted != 0 {
-		t.Fatalf("claimed=%v retries=%d admitted=%d, want the abandoned dispatch to hold nothing", claimed, retries, admitted)
+	_, retrying := c.armedRetry(issue.ID)
+	claimed, admitted := c.claimHeld(issue.ID), c.admittedTotal()
+	if claimed || retrying || admitted != 0 {
+		t.Fatalf("claimed=%v retrying=%v admitted=%d, want the abandoned dispatch to hold nothing", claimed, retrying, admitted)
 	}
 	record := waitForSubstring(t, &log, `"msg":"dispatch abandoned after max attempts"`, time.Second)
 	for _, want := range []string{`"level":"ERROR"`, `"operation":"dispatch_abandoned"`, `"issue_identifier":"ENG-1"`, `"reason":"session_start"`, `"attempt":3`, `"max_attempts":3`} {
@@ -95,6 +95,7 @@ func TestUnclassifiedAgentEventNeverAbandonsIssue(t *testing.T) {
 	agent := &fakeAgent{events: failedEvents("model reported a failure")}
 	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{}, 8)}
 	c := New(&fakeTracker{issue: issue}, agent, ws, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&log, nil)))
+	defer assertInvariants(t, c)
 	c.clock = fakeClock{now: time.Date(2026, 8, 26, 9, 41, 0, 0, time.UTC)}
 	timer := &fakeTimer{signal: make(chan struct{}, 8)}
 	c.timer = timer
@@ -113,10 +114,8 @@ func TestUnclassifiedAgentEventNeverAbandonsIssue(t *testing.T) {
 	if starts, _, _ := agent.counts(); starts != repeats+1 {
 		t.Fatalf("starts=%d, want one dispatch per fire plus the initial one", starts)
 	}
-	c.mu.Lock()
-	claimed := c.claimed[issue.ID]
-	retry, stillRetrying := c.retries[issue.ID]
-	c.mu.Unlock()
+	claimed := c.claimHeld(issue.ID)
+	retry, stillRetrying := c.armedRetry(issue.ID)
 	if !claimed || !stillRetrying {
 		t.Fatal("an unclassified agent_event abandoned the issue before any classified failure occurred")
 	}
@@ -151,6 +150,7 @@ func TestClosedEventStreamNeverAbandonsIssue(t *testing.T) {
 	issue := testIssue()
 	var log syncBuffer
 	c := New(&fakeTracker{issue: issue}, &fakeAgent{}, &fakeWorkspace{}, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&log, nil)))
+	defer assertInvariants(t, c)
 	c.timer = &fakeTimer{}
 	if !c.claim(issue, w.Config) {
 		t.Fatal("issue was not claimed")
@@ -160,9 +160,7 @@ func TestClosedEventStreamNeverAbandonsIssue(t *testing.T) {
 	const repeats = 6 // well past max_attempts=2, which a host-generated cause must never consume
 	for i := 0; i < repeats; i++ {
 		c.finishFailure(context.Background(), issue, attempt, agentFailureReason(errStreamClosed), errStreamClosed)
-		c.mu.Lock()
-		retry, stillRetrying := c.retries[issue.ID]
-		c.mu.Unlock()
+		retry, stillRetrying := c.armedRetry(issue.ID)
 		if !stillRetrying {
 			t.Fatalf("stream_closed abandoned the issue on repeat %d", i)
 		}
@@ -199,6 +197,7 @@ func TestRateLimitedEventNeverAbandonsIssueAndIgnoresOrdinaryBackoff(t *testing.
 	issue := testIssue()
 	var log syncBuffer
 	c := New(&fakeTracker{issue: issue}, &fakeAgent{}, &fakeWorkspace{}, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&log, nil)))
+	defer assertInvariants(t, c)
 	timer := &fakeTimer{}
 	c.timer = timer
 	if !c.claim(issue, w.Config) {
@@ -211,9 +210,7 @@ func TestRateLimitedEventNeverAbandonsIssueAndIgnoresOrdinaryBackoff(t *testing.
 	const repeats = 6 // well past max_attempts=2, which a systemic quota rejection must never consume
 	for i := 0; i < repeats; i++ {
 		c.finishFailure(context.Background(), issue, attempt, agentFailureReason(err), err)
-		c.mu.Lock()
-		retry, stillRetrying := c.retries[issue.ID]
-		c.mu.Unlock()
+		retry, stillRetrying := c.armedRetry(issue.ID)
 		if !stillRetrying {
 			t.Fatalf("a rate-limited rejection abandoned the issue on repeat %d", i)
 		}
@@ -254,6 +251,7 @@ func TestRateLimitedEventWithNoResetFloorsWellAboveMaxRetryBackoff(t *testing.T)
 	issue := testIssue()
 	var log syncBuffer
 	c := New(&fakeTracker{issue: issue}, &fakeAgent{}, &fakeWorkspace{}, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&log, nil)))
+	defer assertInvariants(t, c)
 	timer := &fakeTimer{}
 	c.timer = timer
 	if !c.claim(issue, w.Config) {
@@ -291,6 +289,7 @@ func TestPostTurnRefreshFailureNeverAbandonsIssue(t *testing.T) {
 	issue := testIssue()
 	var log syncBuffer
 	c := New(&fakeTracker{issue: issue}, &fakeAgent{}, &fakeWorkspace{}, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&log, nil)))
+	defer assertInvariants(t, c)
 	c.timer = &fakeTimer{}
 	if !c.claim(issue, w.Config) {
 		t.Fatal("issue was not claimed")
@@ -301,9 +300,7 @@ func TestPostTurnRefreshFailureNeverAbandonsIssue(t *testing.T) {
 	const repeats = 6 // well past max_attempts=2, which a Linear-infrastructure cause must never consume
 	for i := 0; i < repeats; i++ {
 		c.finishFailure(context.Background(), issue, attempt, agentFailureReason(refreshErr), refreshErr)
-		c.mu.Lock()
-		retry, stillRetrying := c.retries[issue.ID]
-		c.mu.Unlock()
+		retry, stillRetrying := c.armedRetry(issue.ID)
 		if !stillRetrying {
 			t.Fatalf("issue_refresh abandoned the issue on repeat %d", i)
 		}
@@ -337,6 +334,7 @@ func TestContinuationFailureNeverAbandonsIssue(t *testing.T) {
 	issue := testIssue()
 	var log syncBuffer
 	c := New(&fakeTracker{issue: issue}, &fakeAgent{}, &fakeWorkspace{}, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&log, nil)))
+	defer assertInvariants(t, c)
 	c.timer = &fakeTimer{}
 	if !c.claim(issue, w.Config) {
 		t.Fatal("issue was not claimed")
@@ -347,9 +345,7 @@ func TestContinuationFailureNeverAbandonsIssue(t *testing.T) {
 	const repeats = 6 // well past max_attempts=2, which a backend-adapter cause must never consume
 	for i := 0; i < repeats; i++ {
 		c.finishFailure(context.Background(), issue, attempt, agentFailureReason(continueErr), continueErr)
-		c.mu.Lock()
-		retry, stillRetrying := c.retries[issue.ID]
-		c.mu.Unlock()
+		retry, stillRetrying := c.armedRetry(issue.ID)
 		if !stillRetrying {
 			t.Fatalf("session_continue abandoned the issue on repeat %d", i)
 		}
@@ -386,15 +382,14 @@ func TestRateLimitedEventEndsTheRunAndSchedulesFromTheReportedResetTime(t *testi
 	agent := &fakeAgent{events: rateLimitedEvents(resetIn)}
 	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{}, 1)}
 	c := New(&fakeTracker{issue: issue}, agent, ws, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&log, nil)))
+	defer assertInvariants(t, c)
 	timer := &fakeTimer{signal: make(chan struct{}, 1)}
 	c.timer = timer
 
 	c.Tick(context.Background())
 	<-timer.signal
 
-	c.mu.Lock()
-	retry := c.retries[issue.ID]
-	c.mu.Unlock()
+	retry, _ := c.armedRetry(issue.ID)
 	if retry.kind != retryAgent || retry.reason != "agent_rate_limited" || retry.attempt != 1 {
 		t.Fatalf("retry=%+v, want agent_rate_limited", retry)
 	}

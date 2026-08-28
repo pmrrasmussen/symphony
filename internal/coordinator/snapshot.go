@@ -101,24 +101,26 @@ func (c *Coordinator) Snapshot() Snapshot {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	now := c.clock.Now()
-	snapshot := Snapshot{Claimed: len(c.claimed), Running: make([]RunningSnapshot, 0, len(c.running)), Retrying: make([]RetrySnapshot, 0, len(c.retries)), Waiting: make([]WaitingSnapshot, 0, len(c.waiting)), Stopping: c.stopping}
-	for _, run := range c.running {
-		item := snapshotOutstanding(run.outstanding, now)
-		snapshot.Running = append(snapshot.Running, RunningSnapshot{IssueIdentifier: run.issue.Identifier, IssueState: run.issue.State, SessionID: run.session.ID, ThreadID: run.session.ThreadID, TurnID: run.session.TurnID, Attempt: run.run.Attempt, TurnCount: run.run.TurnCount, StartedAt: run.run.StartedAt, LastEventAt: run.last, Usage: run.run.Usage, RateLimit: copyRateLimit(run.rateLimit), OutstandingOperation: item})
-	}
-	for _, retry := range c.retries {
-		snapshot.Retrying = append(snapshot.Retrying, RetrySnapshot{IssueIdentifier: retry.issue.Identifier, Attempt: retry.attempt, Kind: string(retry.kind), Reason: retry.reason, WaitAttempt: c.landingWaits[retry.issue.ID], Due: retry.due})
-	}
-	for _, wait := range c.waiting {
-		age := now.Sub(wait.since).Milliseconds()
-		if age < 0 {
-			age = 0
+	snapshot := Snapshot{Claimed: c.claimedCountLocked(), Running: make([]RunningSnapshot, 0, len(c.states)), Retrying: make([]RetrySnapshot, 0, len(c.states)), Waiting: make([]WaitingSnapshot, 0, len(c.states)), Stopping: c.stopping}
+	for _, st := range c.states {
+		if run := st.run; run != nil {
+			item := snapshotOutstanding(run.outstanding, now)
+			snapshot.Running = append(snapshot.Running, RunningSnapshot{IssueIdentifier: run.issue.Identifier, IssueState: run.issue.State, SessionID: run.session.ID, ThreadID: run.session.ThreadID, TurnID: run.session.TurnID, Attempt: run.run.Attempt, TurnCount: run.run.TurnCount, StartedAt: run.run.StartedAt, LastEventAt: run.last, Usage: run.run.Usage, RateLimit: copyRateLimit(run.rateLimit), OutstandingOperation: item})
 		}
-		var blockedBy []string
-		if len(wait.blockedBy) > 0 {
-			blockedBy = append([]string(nil), wait.blockedBy...)
+		if retry := st.retry; retry != nil {
+			snapshot.Retrying = append(snapshot.Retrying, RetrySnapshot{IssueIdentifier: retry.issue.Identifier, Attempt: retry.attempt, Kind: string(retry.kind), Reason: retry.reason, WaitAttempt: st.landingWaits, Due: retry.due})
 		}
-		snapshot.Waiting = append(snapshot.Waiting, WaitingSnapshot{IssueIdentifier: wait.issue.Identifier, IssueState: wait.issue.State, Reason: wait.reason, BlockedBy: blockedBy, Since: wait.since, WaitingMS: age})
+		if wait := st.waiting; wait != nil {
+			age := now.Sub(wait.since).Milliseconds()
+			if age < 0 {
+				age = 0
+			}
+			var blockedBy []string
+			if len(wait.blockedBy) > 0 {
+				blockedBy = append([]string(nil), wait.blockedBy...)
+			}
+			snapshot.Waiting = append(snapshot.Waiting, WaitingSnapshot{IssueIdentifier: wait.issue.Identifier, IssueState: wait.issue.State, Reason: wait.reason, BlockedBy: blockedBy, Since: wait.since, WaitingMS: age})
+		}
 	}
 	sort.Slice(snapshot.Running, func(i, j int) bool { return snapshot.Running[i].IssueIdentifier < snapshot.Running[j].IssueIdentifier })
 	sort.Slice(snapshot.Retrying, func(i, j int) bool {

@@ -27,6 +27,7 @@ func TestObservabilityNormalizesEventsAndProtectsSensitiveMessages(t *testing.T)
 	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{})}
 	var logs bytes.Buffer
 	c := New(&fakeTracker{issue: issue}, agent, ws, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&logs, nil)))
+	defer assertInvariants(t, c)
 	c.Tick(context.Background())
 	<-ws.after
 	if err := c.Shutdown(context.Background()); err != nil {
@@ -56,6 +57,7 @@ func TestEmptyRateLimitSnapshotIsOmittedFromTheLog(t *testing.T) {
 	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{})}
 	var logs bytes.Buffer
 	c := New(&fakeTracker{issue: issue}, agent, ws, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&logs, nil)))
+	defer assertInvariants(t, c)
 	c.Tick(context.Background())
 	<-ws.after
 	if err := c.Shutdown(context.Background()); err != nil {
@@ -79,6 +81,7 @@ func TestGenericProgressEventsAreDebugOnlyAndCoalesceRepeats(t *testing.T) {
 	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{})}
 	var infoLogs, debugLogs bytes.Buffer
 	c := New(&fakeTracker{issue: issue}, agent, ws, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&infoLogs, nil)))
+	defer assertInvariants(t, c)
 	c.Tick(context.Background())
 	<-ws.after
 	if err := c.Shutdown(context.Background()); err != nil {
@@ -119,6 +122,7 @@ func TestHeartbeatAndStallRecordOutstandingOperation(t *testing.T) {
 	ws := &fakeWorkspace{after: make(chan struct{}, 1)}
 	logs := &syncBuffer{}
 	c := New(tracker, agent, ws, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	defer assertInvariants(t, c)
 	clock := &mutableClock{now: time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)}
 	c.clock = clock
 	timer := &fakeTimer{signal: make(chan struct{}, 1)}
@@ -168,6 +172,7 @@ func TestNewDebugRecordsNeverCarryToolInputsOrSecrets(t *testing.T) {
 	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{})}
 	var logs bytes.Buffer
 	c := New(tracker, agent, ws, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	defer assertInvariants(t, c)
 	c.Tick(context.Background())
 	<-ws.after
 	if err := c.Shutdown(context.Background()); err != nil {
@@ -206,6 +211,7 @@ func TestCapabilityToolCallIsIdentifiableByNameInTheDebugLog(t *testing.T) {
 	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{})}
 	var logs bytes.Buffer
 	c := New(&fakeTracker{issue: issue}, agent, ws, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	defer assertInvariants(t, c)
 	c.Tick(context.Background())
 	<-ws.after
 	if err := c.Shutdown(context.Background()); err != nil {
@@ -240,6 +246,7 @@ func TestUpdateUsageAuthoritativeReplacesInflatedProvisionalPeak(t *testing.T) {
 	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{})}
 	var logs bytes.Buffer
 	c := New(&fakeTracker{issue: issue}, agent, ws, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&logs, nil)))
+	defer assertInvariants(t, c)
 	c.Tick(context.Background())
 	<-ws.after
 	if err := c.Shutdown(context.Background()); err != nil {
@@ -274,6 +281,7 @@ func TestUpdateUsageNonAuthoritativeNotificationsAccumulate(t *testing.T) {
 	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{})}
 	var logs bytes.Buffer
 	c := New(&fakeTracker{issue: issue}, agent, ws, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&logs, nil)))
+	defer assertInvariants(t, c)
 	c.Tick(context.Background())
 	<-ws.after
 	if err := c.Shutdown(context.Background()); err != nil {
@@ -301,15 +309,14 @@ func TestEventFailedStaysAgentEventAndPassesThroughObservabilityText(t *testing.
 	agent := &fakeAgent{events: failedEvents("claude turn failed: token=super-secret-value unspecified")}
 	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{}, 1)}
 	c := New(&fakeTracker{issue: issue}, agent, ws, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&log, nil)))
+	defer assertInvariants(t, c)
 	timer := &fakeTimer{signal: make(chan struct{}, 1)}
 	c.timer = timer
 
 	c.Tick(context.Background())
 	<-timer.signal
 
-	c.mu.Lock()
-	retry := c.retries[issue.ID]
-	c.mu.Unlock()
+	retry, _ := c.armedRetry(issue.ID)
 	if retry.kind != retryAgent || retry.reason != "agent_event" || retry.attempt != 1 {
 		t.Fatalf("retry=%+v, want agent_event", retry)
 	}
@@ -337,6 +344,7 @@ func TestRateLimitStatusUsesFixedLogVocabulary(t *testing.T) {
 	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{})}
 	var logs bytes.Buffer
 	c := New(&fakeTracker{issue: issue}, agent, ws, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&logs, nil)))
+	defer assertInvariants(t, c)
 	c.Tick(context.Background())
 	<-ws.after
 	if err := c.Shutdown(context.Background()); err != nil {

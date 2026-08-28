@@ -60,9 +60,11 @@ func (c *Coordinator) reconcile(ctx context.Context) error {
 		issue domain.Issue
 	}
 	c.mu.Lock()
-	runs := make([]runRef, 0, len(c.running))
-	for _, r := range c.running {
-		runs = append(runs, runRef{r: r, issue: r.issue})
+	runs := make([]runRef, 0, len(c.states))
+	for _, st := range c.states {
+		if st.run != nil {
+			runs = append(runs, runRef{r: st.run, issue: st.run.issue})
+		}
 	}
 	c.mu.Unlock()
 	if len(runs) == 0 {
@@ -136,6 +138,16 @@ func (c *Coordinator) reconcile(ctx context.Context) error {
 // launch reserves capacity before starting asynchronous preparation. This
 // closes the gap where several goroutines could otherwise all observe room
 // before any of them had inserted a backend session into running.
+//
+// The reservation ownership rule (PMR-121): the goroutine below owns exactly
+// the reservation reserveLocked minted for it, identified by `reservation`,
+// and every release names that generation. So each exit releases the slot the
+// moment this launch stops needing it -- which is what keeps a failure or
+// landing-wait redispatch from idling a worker slot behind its timer -- while
+// the deferred backstop covers the exits that do not, and neither can free a
+// slot a later dispatch of the same issue has already taken. Exactly one
+// release per reservation: the first call that matches wins and the rest are
+// no-ops.
 func (c *Coordinator) launch(parent context.Context, i domain.Issue, attempt int) bool {
 	s := c.settings()
 	c.mu.Lock()
@@ -144,7 +156,8 @@ func (c *Coordinator) launch(parent context.Context, i domain.Issue, attempt int
 		c.release(i.ID)
 		return false
 	}
-	if !c.reserveLocked(i, s) {
+	reservation := c.reserveLocked(i, s)
+	if reservation == 0 {
 		c.mu.Unlock()
 		return false
 	}
@@ -152,20 +165,20 @@ func (c *Coordinator) launch(parent context.Context, i domain.Issue, attempt int
 	c.mu.Unlock()
 	go func() {
 		defer c.wg.Done()
-		defer c.unreserve(i.ID)
+		defer c.unreserve(i.ID, reservation)
 		ctx, cancel := context.WithCancel(parent)
 		defer cancel()
 		c.log.Debug("workspace preparation started", "issue_id", i.ID, "issue_identifier", i.Identifier, "attempt", attempt)
 		ws, err := c.workspaces.Prepare(ctx, i)
 		if err != nil {
-			c.unreserve(i.ID)
+			c.unreserve(i.ID, reservation)
 			c.finishFailure(parent, i, attempt, "workspace_prepare", err)
 			return
 		}
 		c.log.Debug("workspace prepared", "issue_id", i.ID, "issue_identifier", i.Identifier, "attempt", attempt, "created", ws.CreatedNow)
 		if err = c.workspaces.BeforeRun(ctx, ws, i); err != nil {
 			c.workspaces.AfterRun(context.Background(), ws, i)
-			c.unreserve(i.ID)
+			c.unreserve(i.ID, reservation)
 			c.finishFailure(parent, i, attempt, "before_run", err)
 			return
 		}
@@ -182,7 +195,7 @@ func (c *Coordinator) launch(parent context.Context, i domain.Issue, attempt int
 		prompt, deliveryBytes, err := render(s, i, attempt, launch.Backend)
 		if err != nil {
 			c.workspaces.AfterRun(context.Background(), ws, i)
-			c.unreserve(i.ID)
+			c.unreserve(i.ID, reservation)
 			c.finishFailure(parent, i, attempt, "prompt_render", err)
 			return
 		}
@@ -193,7 +206,7 @@ func (c *Coordinator) launch(parent context.Context, i domain.Issue, attempt int
 		session, events, err := c.agent.Start(ctx, domain.AgentRequest{Issue: i, Backend: launch.Backend, Model: launch.Model, Workspace: ws.Path, GitMetadataRoots: ws.GitMetadataRoots, Prompt: prompt, Command: launch.Command, ApprovalPolicy: launch.ApprovalPolicy, ThreadSandbox: launch.ThreadSandbox, TurnSandboxPolicy: launch.TurnSandboxPolicy, TurnTimeout: launch.TurnTimeout, ReadTimeout: launch.ReadTimeout, StartTimeout: launch.StartTimeout})
 		if err != nil {
 			c.workspaces.AfterRun(context.Background(), ws, i)
-			c.unreserve(i.ID)
+			c.unreserve(i.ID, reservation)
 			c.finishFailure(parent, i, attempt, "session_start", err)
 			return
 		}
@@ -216,11 +229,14 @@ func (c *Coordinator) launch(parent context.Context, i domain.Issue, attempt int
 			c.release(i.ID)
 			return
 		}
-		c.running[i.ID] = r
+		c.ensureStateLocked(i.ID).run = r
 		c.mu.Unlock()
 		ended, _, consumeErr := c.runTurns(ctx, r, events, s)
 		c.mu.Lock()
-		delete(c.running, i.ID)
+		if st := c.stateLocked(i.ID); st != nil && st.run == r {
+			st.run = nil
+			c.pruneLocked(i.ID)
+		}
 		stopped := r.stopped
 		completionAllowed := ended && !c.stopping && stopped == "" && parent.Err() == nil
 		c.mu.Unlock()
@@ -251,14 +267,14 @@ func (c *Coordinator) launch(parent context.Context, i domain.Issue, attempt int
 		if stopped != "" || ctx.Err() != nil {
 			c.log.Info("agent run cancelled", "issue_id", i.ID, "issue_identifier", i.Identifier, "session_id", session.ID, "reason", cancellationReason(stopped, ctx))
 			if stopped == stopStalled {
-				c.unreserve(i.ID)
+				c.unreserve(i.ID, reservation)
 				c.finishFailure(parent, i, attempt, "stalled", context.DeadlineExceeded)
 				return
 			}
 			c.release(i.ID)
 			return
 		}
-		c.unreserve(i.ID)
+		c.unreserve(i.ID, reservation)
 		if wait, ok := landingWait(consumeErr); ok {
 			c.finishLandingWait(parent, i, attempt, wait.reason)
 			return
@@ -300,15 +316,15 @@ func (c *Coordinator) transitionToStarted(ctx context.Context, i domain.Issue, s
 func (c *Coordinator) refreshRunIssue(r *running, fresh domain.Issue) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.running[fresh.ID] != r || r.stopped != "" {
+	st := c.stateLocked(fresh.ID)
+	if st == nil || st.run != r || r.stopped != "" {
 		return
 	}
 	r.issue = fresh
-	state := config.Norm(fresh.State)
-	c.claimState[fresh.ID] = state
-	if _, admitted := c.admitted[fresh.ID]; admitted {
-		c.admitted[fresh.ID] = state
-	}
+	// One record, so the claim's state and the state its reservation is
+	// counted under move together by construction; setClaimStateLocked carries
+	// the per-state tally with them.
+	c.setClaimStateLocked(st, config.Norm(fresh.State))
 }
 
 // render returns the prompt sent to the agent along with the byte length of

@@ -156,6 +156,7 @@ func TestLocalWorkspaceActiveTurnLimitRemainsEligibleAfterRestart(t *testing.T) 
 	local := localworkspace.New(func() config.Settings { return settings })
 	workspaces := &observingLocalWorkspace{local: local, afterRun: make(chan struct{}, 2)}
 	coordinator := New(tracker, agent, workspaces, func() config.Settings { return settings }, nil)
+	defer assertInvariants(t, coordinator)
 	canonicalRoot, err := filepath.EvalSymlinks(root)
 	if err != nil {
 		t.Fatalf("canonicalize workspace root: %v", err)
@@ -186,6 +187,7 @@ func TestLocalWorkspaceActiveTurnLimitRemainsEligibleAfterRestart(t *testing.T) 
 	// Restarting with the exact same active issue must dispatch it again because
 	// turn-limit exhaustion keeps active work eligible for a future run.
 	restarted := New(tracker, agent, workspaces, func() config.Settings { return settings }, nil)
+	defer assertInvariants(t, restarted)
 	restarted.Tick(context.Background())
 	<-agent.requests
 	if err := restarted.Shutdown(context.Background()); err != nil {
@@ -204,6 +206,7 @@ func TestLocalWorkspaceRemainsEligibleAfterTurnLimitExhaustion(t *testing.T) {
 	local := localworkspace.New(func() config.Settings { return settings })
 	workspaces := &observingLocalWorkspace{local: local, afterRun: make(chan struct{}, 1)}
 	coordinator := New(tracker, agent, workspaces, func() config.Settings { return settings }, nil)
+	defer assertInvariants(t, coordinator)
 	timer := &fakeTimer{signal: make(chan struct{}, 2)}
 	coordinator.timer = timer
 
@@ -244,6 +247,7 @@ func TestCorruptLocalCompletionStateNeverStartsAgent(t *testing.T) {
 	tracker := &lifecycleTracker{issue: issue}
 	agent := &lifecycleAgent{requests: make(chan domain.AgentRequest, 1)}
 	coordinator := New(tracker, agent, local, func() config.Settings { return settings }, nil)
+	defer assertInvariants(t, coordinator)
 	coordinator.Tick(context.Background())
 	// Prepare deliberately schedules a retry when it sees the corrupt marker.
 	// Stop that background retry before TempDir cleanup removes its workspace.
@@ -269,6 +273,7 @@ func TestLocalWorkspaceActiveRunShutdownCancelsAndDoesNotRetry(t *testing.T) {
 	local := localworkspace.New(func() config.Settings { return settings })
 	workspaces := &observingLocalWorkspace{local: local, afterRun: make(chan struct{}, 1)}
 	coordinator := New(tracker, agent, workspaces, func() config.Settings { return settings }, nil)
+	defer assertInvariants(t, coordinator)
 	canonicalRoot, err := filepath.EvalSymlinks(root)
 	if err != nil {
 		t.Fatalf("canonicalize workspace root: %v", err)
@@ -288,11 +293,9 @@ func TestLocalWorkspaceActiveRunShutdownCancelsAndDoesNotRetry(t *testing.T) {
 	if starts, cancels, _ := agent.counts(); starts != 1 || cancels != 1 {
 		t.Fatalf("shutdown starts=%d cancels=%d, want 1 each", starts, cancels)
 	}
-	coordinator.mu.Lock()
-	retries, claims := len(coordinator.retries), len(coordinator.claimed)
-	coordinator.mu.Unlock()
-	if retries != 0 || claims != 0 {
-		t.Fatalf("shutdown retained retries=%d claims=%d", retries, claims)
+	snapshot := coordinator.Snapshot()
+	if len(snapshot.Retrying) != 0 || snapshot.Claimed != 0 {
+		t.Fatalf("shutdown retained retries=%d claims=%d", len(snapshot.Retrying), snapshot.Claimed)
 	}
 }
 
@@ -364,6 +367,7 @@ func TestTerminalReconciliationRemovesOnlyVerifiedLandedWorktrees(t *testing.T) 
 			workspaces := &observingLocalWorkspace{local: local, afterRun: make(chan struct{}, 1)}
 			logs := &syncBuffer{}
 			c := New(tracker, agent, workspaces, func() config.Settings { return settings }, slog.New(slog.NewJSONHandler(logs, nil)))
+			defer assertInvariants(t, c)
 
 			c.Tick(context.Background())
 			request := <-agent.requests

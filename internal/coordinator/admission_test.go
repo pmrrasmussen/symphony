@@ -99,6 +99,7 @@ func TestPollSummaryReportsNoCandidatesAtDebugLevel(t *testing.T) {
 	tracker := &issueMapTracker{issues: map[string]domain.Issue{}}
 	var logs bytes.Buffer
 	c := New(tracker, &fakeAgent{}, &fakeWorkspace{}, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	defer assertInvariants(t, c)
 	c.Tick(context.Background())
 	output := logs.String()
 	if !strings.Contains(output, `"msg":"poll summary"`) || !strings.Contains(output, `"candidates":0`) || !strings.Contains(output, `"eligible":0`) || !strings.Contains(output, `"admitted":0`) {
@@ -117,6 +118,7 @@ func TestPollSummaryCategorizesRejectionsAndOmitsAtInfoLevel(t *testing.T) {
 	ws := &fakeWorkspace{after: make(chan struct{}, 1)}
 	var infoLogs, debugLogs bytes.Buffer
 	c := New(tracker, agent, ws, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&infoLogs, nil)))
+	defer assertInvariants(t, c)
 	timer := &fakeTimer{signal: make(chan struct{}, 1)}
 	c.timer = timer
 	if !c.claim(claimed, w.Config) {
@@ -140,6 +142,7 @@ func TestPollSummaryCategorizesRejectionsAndOmitsAtInfoLevel(t *testing.T) {
 	agent2 := &fakeAgent{events: closedEvents}
 	ws2 := &fakeWorkspace{after: make(chan struct{}, 1)}
 	c2 := New(tracker2, agent2, ws2, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&debugLogs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	defer assertInvariants(t, c2)
 	timer2 := &fakeTimer{signal: make(chan struct{}, 1)}
 	c2.timer = timer2
 	if !c2.claim(claimed2, w.Config) {
@@ -176,6 +179,7 @@ func TestPollRejectionNamesTheBlockingIssue(t *testing.T) {
 	tracker := &issueMapTracker{candidates: []domain.Issue{blocked}, issues: map[string]domain.Issue{blocked.ID: blocked}}
 	var logs bytes.Buffer
 	c := New(tracker, &fakeAgent{}, &fakeWorkspace{}, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	defer assertInvariants(t, c)
 	c.Tick(context.Background())
 	output := logs.String()
 	if !strings.Contains(output, `"blocked_by_relation":1`) {
@@ -200,10 +204,8 @@ func TestPollSummaryNeverCarriesIssueIdentifiers(t *testing.T) {
 	tracker := &issueMapTracker{candidates: []domain.Issue{queued}, issues: map[string]domain.Issue{occupying.ID: occupying, queued.ID: queued}}
 	var logs bytes.Buffer
 	c := New(tracker, &fakeAgent{}, &fakeWorkspace{}, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
-	c.mu.Lock()
-	c.claimed[occupying.ID] = true
-	c.admitted[occupying.ID] = config.Norm(occupying.State)
-	c.mu.Unlock()
+	defer assertInvariants(t, c)
+	c.occupySlot(occupying)
 
 	c.Tick(context.Background())
 
@@ -274,6 +276,7 @@ func TestClaimPreventsDuplicateConcurrentLaunches(t *testing.T) {
 	agent := &fakeAgent{events: func() <-chan domain.Event { return block }, started: make(chan struct{}, 1)}
 	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{}, 1)}
 	c := testCoordinator(w.Config, &fakeTracker{issue: issue}, agent, ws)
+	defer assertInvariants(t, c)
 
 	c.Tick(context.Background())
 	<-agent.started

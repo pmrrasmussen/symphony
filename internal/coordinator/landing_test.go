@@ -28,6 +28,7 @@ func TestLandingWaitEndsRunWithoutTurnsAndSchedulesBoundedLandingRetry(t *testin
 	agent := &fakeAgent{events: landingWaitingEvents}
 	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{}, 1)}
 	c := New(&fakeTracker{issue: issue}, agent, ws, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&log, nil)))
+	defer assertInvariants(t, c)
 	c.clock = fakeClock{now: time.Date(2026, 8, 25, 9, 41, 0, 0, time.UTC)}
 	timer := &fakeTimer{signal: make(chan struct{}, 1)}
 	c.timer = timer
@@ -40,10 +41,8 @@ func TestLandingWaitEndsRunWithoutTurnsAndSchedulesBoundedLandingRetry(t *testin
 	if starts != 1 || continues != 0 || cancels != 1 {
 		t.Fatalf("starts=%d continues=%d cancels=%d, want one start, no continuation turn, one cancel", starts, continues, cancels)
 	}
-	c.mu.Lock()
-	retry := c.retries[issue.ID]
-	claimed, admitted, running := c.claimed[issue.ID], len(c.admitted), len(c.running)
-	c.mu.Unlock()
+	retry, _ := c.armedRetry(issue.ID)
+	claimed, admitted, running := c.claimHeld(issue.ID), c.admittedTotal(), c.runningCount()
 	if retry.kind != retryLanding || retry.reason != "landing_waiting" || retry.attempt != 0 {
 		t.Fatalf("retry=%+v, want an unescalated landing retry", retry)
 	}
@@ -82,6 +81,7 @@ func TestLandingWaitRedispatchesWithEscalatingDelay(t *testing.T) {
 	agent := &fakeAgent{events: landingWaitingEvents}
 	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{}, 4)}
 	c := New(&fakeTracker{issue: issue}, agent, ws, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&log, nil)))
+	defer assertInvariants(t, c)
 	c.clock = fakeClock{now: time.Date(2026, 8, 25, 9, 41, 0, 0, time.UTC)}
 	timer := &fakeTimer{signal: make(chan struct{}, 4)}
 	c.timer = timer
@@ -99,10 +99,8 @@ func TestLandingWaitRedispatchesWithEscalatingDelay(t *testing.T) {
 	if starts != 2 || continues != 0 || cancels != 2 {
 		t.Fatalf("starts=%d continues=%d cancels=%d, want two dispatches, no continuation turn, one cancel each", starts, continues, cancels)
 	}
-	c.mu.Lock()
-	retry, ok := c.retries[issue.ID]
-	waits, claimed, admitted := c.landingWaits[issue.ID], c.claimed[issue.ID], len(c.admitted)
-	c.mu.Unlock()
+	retry, ok := c.armedRetry(issue.ID)
+	waits, claimed, admitted := c.landingWaitsFor(issue.ID), c.claimHeld(issue.ID), c.admittedTotal()
 	if !ok || retry.kind != retryLanding || retry.reason != "landing_waiting" || retry.attempt != 0 {
 		t.Fatalf("retry=%+v ok=%v, want a second landing retry on the same attempt", retry, ok)
 	}
@@ -122,9 +120,7 @@ func TestLandingWaitRedispatchesWithEscalatingDelay(t *testing.T) {
 	if err := c.Shutdown(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	c.mu.Lock()
-	leaked, leakedWaits := c.claimed[issue.ID], len(c.landingWaits)
-	c.mu.Unlock()
+	leaked, leakedWaits := c.claimHeld(issue.ID), c.landingWaitRecords()
 	if leaked || leakedWaits != 0 {
 		t.Fatalf("shutdown leaked claim=%v landing waits=%d", leaked, leakedWaits)
 	}
@@ -145,6 +141,7 @@ func TestCapacityBlockedLandingRetryKeepsItsCadence(t *testing.T) {
 	agent := &fakeAgent{events: landingWaitingEvents}
 	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{}, 4)}
 	c := testCoordinator(w.Config, &fakeTracker{issue: issue}, agent, ws)
+	defer assertInvariants(t, c)
 	timer := &fakeTimer{signal: make(chan struct{}, 4)}
 	c.timer = timer
 
@@ -153,17 +150,13 @@ func TestCapacityBlockedLandingRetryKeepsItsCadence(t *testing.T) {
 	<-timer.signal
 
 	// Another issue takes the only orchestrator slot before the timer fires.
-	c.mu.Lock()
-	c.admitted["other"] = "todo"
-	c.mu.Unlock()
+	c.occupySlot(domain.Issue{ID: "other", State: "Todo"})
 
 	timer.fire(0)
 	<-timer.signal
 
-	c.mu.Lock()
-	retry := c.retries[issue.ID]
-	claimed := c.claimed[issue.ID]
-	c.mu.Unlock()
+	retry, _ := c.armedRetry(issue.ID)
+	claimed := c.claimHeld(issue.ID)
 	if !claimed {
 		t.Fatal("capacity-blocked landing retry dropped its claim")
 	}
@@ -197,6 +190,7 @@ func TestLandingWaitRedispatchesPastMaxAttempts(t *testing.T) {
 	agent := &fakeAgent{events: landingWaitingEvents}
 	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{}, 4)}
 	c := New(&fakeTracker{issue: issue}, agent, ws, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&log, nil)))
+	defer assertInvariants(t, c)
 	c.clock = fakeClock{now: time.Date(2026, 8, 26, 9, 41, 0, 0, time.UTC)}
 	timer := &fakeTimer{signal: make(chan struct{}, 4)}
 	c.timer = timer
@@ -213,10 +207,8 @@ func TestLandingWaitRedispatchesPastMaxAttempts(t *testing.T) {
 	if starts, _, _ := agent.counts(); starts != 3 {
 		t.Fatalf("starts=%d, want landing to keep redispatching past max_attempts", starts)
 	}
-	c.mu.Lock()
-	retry, ok := c.retries[issue.ID]
-	claimed, waits := c.claimed[issue.ID], c.landingWaits[issue.ID]
-	c.mu.Unlock()
+	retry, ok := c.armedRetry(issue.ID)
+	claimed, waits := c.claimHeld(issue.ID), c.landingWaitsFor(issue.ID)
 	if !ok || retry.kind != retryLanding || retry.attempt != 0 {
 		t.Fatalf("retry=%+v ok=%v, want a further landing retry on the same attempt", retry, ok)
 	}
@@ -310,10 +302,9 @@ func TestLandingWaitLogEscalatesOnceThenStaysAtInfo(t *testing.T) {
 	issue := testIssue()
 	var log syncBuffer
 	c := New(&fakeTracker{issue: issue}, &fakeAgent{}, &fakeWorkspace{}, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&log, nil)))
+	defer assertInvariants(t, c)
 	c.timer = &fakeTimer{}
-	c.mu.Lock()
-	c.claimed[issue.ID] = true
-	c.mu.Unlock()
+	c.seedClaim(issue)
 
 	const consecutiveWaits = 5
 	for i := 0; i < consecutiveWaits; i++ {
@@ -355,6 +346,7 @@ func TestLandingRetryRefreshFailureIgnoresMaxAttempts(t *testing.T) {
 	issue := testIssue()
 	tracker := &issueMapTracker{issues: map[string]domain.Issue{issue.ID: issue}, getErr: errors.New("temporary tracker failure")}
 	c := testCoordinator(w.Config, tracker, &fakeAgent{}, &fakeWorkspace{})
+	defer assertInvariants(t, c)
 	timer := &fakeTimer{}
 	c.timer = timer
 
@@ -364,10 +356,8 @@ func TestLandingRetryRefreshFailureIgnoresMaxAttempts(t *testing.T) {
 	c.scheduleRetry(context.Background(), issue, domain.Workspace{}, 3, retryLanding, "landing_waiting", time.Second)
 	timer.fire(0)
 
-	c.mu.Lock()
-	retry, ok := c.retries[issue.ID]
-	claimed := c.claimed[issue.ID]
-	c.mu.Unlock()
+	retry, ok := c.armedRetry(issue.ID)
+	claimed := c.claimHeld(issue.ID)
 	if !claimed {
 		t.Fatal("landing retry refresh failure dropped its claim below max_attempts=1")
 	}
