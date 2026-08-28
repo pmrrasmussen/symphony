@@ -15,6 +15,7 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -259,6 +260,88 @@ func TestPrepareUsesRefreshedOriginMainWithoutChangingSourceCheckout(t *testing.
 	if err != nil || !found || state.BaseCommit != remoteMain {
 		t.Fatalf("workspace state=%+v found=%t err=%v, want base commit %s", state, found, err, remoteMain)
 	}
+}
+
+// TestPrepareSerializesConcurrentBaseRefFetches asserts two workspaces
+// created concurrently from one source repository never fetch the shared
+// refs/remotes/origin/<base> at the same time, and that both preparations
+// succeed. Without serialization, refs/remotes/origin/<base> and packed-refs
+// live in the shared Git common directory rather than in either workspace, so
+// two concurrent fetches can race that repository-wide ref and fail with
+// "cannot lock ref ...: is at ... but expected ..." -- mirroring
+// internal/github's TestRefreshBaseRefSerializesConcurrentFetches for the
+// same invariant (PMR-162).
+func TestPrepareSerializesConcurrentBaseRefFetches(t *testing.T) {
+	source := newGitRepository(t)
+	markDir := t.TempDir()
+	installOverlapTrackingGit(t, markDir)
+
+	root := filepath.Join(t.TempDir(), "workspaces")
+	s := config.Settings{Workspace: config.Workspace{Root: root, SourceRoot: source}}
+	l := New(func() config.Settings { return s })
+
+	issues := []domain.Issue{{ID: "issue-1", Identifier: "PMR-1"}, {ID: "issue-2", Identifier: "PMR-2"}}
+	errs := make([]error, len(issues))
+	var wg sync.WaitGroup
+	wg.Add(len(issues))
+	for i, issue := range issues {
+		i, issue := i, issue
+		go func() {
+			defer wg.Done()
+			_, errs[i] = l.Prepare(context.Background(), issue)
+		}()
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("Prepare(%d) = %v, want both concurrent preparations to succeed", i, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(markDir, "overlap")); !os.IsNotExist(err) {
+		t.Fatal("two base-ref fetches overlapped; addWorktree must serialize them")
+	}
+}
+
+// installOverlapTrackingGit prepends a fake "git" to PATH that, for every
+// invocation whose arguments include the "fetch" subcommand, holds a marker
+// open for a short, deliberate window before delegating to the real git
+// binary, then records to markDir/overlap if it ever saw another fetch's
+// marker still open. Two goroutines calling addWorktree at once are actually
+// likely to overlap in that window absent serialization.
+func installOverlapTrackingGit(t *testing.T, markDir string) {
+	t.Helper()
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PMR162_MARK_DIR", markDir)
+	t.Setenv("PMR162_REAL_GIT", realGit)
+	binDir := t.TempDir()
+	script := `#!/bin/sh
+is_fetch=0
+for a in "$@"; do
+	if [ "$a" = "fetch" ]; then
+		is_fetch=1
+		break
+	fi
+done
+if [ "$is_fetch" = "1" ]; then
+	marker="$PMR162_MARK_DIR/active-$$"
+	mkdir "$marker"
+	count=$(ls "$PMR162_MARK_DIR" | grep -c '^active-')
+	if [ "$count" -gt 1 ]; then
+		: > "$PMR162_MARK_DIR/overlap"
+	fi
+	sleep 0.3
+	rmdir "$marker"
+fi
+exec "$PMR162_REAL_GIT" "$@"
+`
+	path := filepath.Join(binDir, "git")
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 }
 
 // TestPrepareFetchesConfiguredBaseBranchNotMain asserts a non-"main"
