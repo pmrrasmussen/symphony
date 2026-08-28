@@ -39,7 +39,7 @@ separately.)
 
 `operation: landing_refused` additionally carries `reason`: the exact hard
 gate that refused `github_land_pr`, so an operator can tell which one fired
-without reading `internal/github/lifecycle.go` (PMR-159). It is always one of
+without reading `internal/github/land.go` (PMR-159). It is always one of
 a fixed, bounded set of host-authored strings — never a provider response
 body, model output, or credential — the same guarantee `landing_waiting`'s own
 `reason` already carries (see below): `github pull request for this issue is
