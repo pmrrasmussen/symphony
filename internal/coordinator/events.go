@@ -262,10 +262,10 @@ func (c *Coordinator) logItemEvent(r *running, event domain.Event, attrs []any) 
 // different backends (PMR-153):
 //
 //   - Cumulative, monotonically increasing sources (authoritative == false;
-//     Codex's turn/completed notifications, and Claude's mid-turn provisional
-//     estimate) are merged with a component-wise maximum, which makes
-//     repeated or reordered notifications idempotent without ever reporting a
-//     figure lower than one already seen.
+//     Codex's thread/tokenUsage/updated notifications, and Claude's mid-turn
+//     provisional estimate) are merged with a component-wise maximum, which
+//     makes repeated or reordered notifications idempotent without ever
+//     reporting a figure lower than one already seen.
 //   - Authoritative sources (authoritative == true; today, only Claude's
 //     end-of-turn result) replace the recorded total outright. A max() here
 //     would be wrong: the CLI's own turn total is the settled truth for that

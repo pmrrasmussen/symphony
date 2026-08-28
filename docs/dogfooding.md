@@ -81,7 +81,7 @@ front-matter deltas:
 | --- | --- | --- | --- |
 | `polling.interval_ms` | `30000` | `5000` | operator responsiveness. Each tick costs two Linear requests while agents run, so roughly 1440/hour against a 1500/hour key. A 429 degrades into backoff, not failure. |
 | `hooks.before_run` | absent | `git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main \|\| true` | `internal/workspace` fetches only when a worktree is *created*, so a reused worktree can hold an `origin/main` many merges old (PMR-135). It has to be host-side: an agent's sandbox cannot write `refs/remotes`. The `\|\| true` is load-bearing -- a `before_run` failure is fatal to the dispatch, and an offline host must still dispatch. |
-| `agent.backend` | absent (defaults `codex`) | `claude` | both backends are proven end to end. Claude is the day-to-day default only because in-flight cost telemetry works there; a Codex run reports `{0,0,0}` for its whole life (PMR-155). |
+| `agent.backend` | absent (defaults `codex`) | `claude` | both backends are proven end to end. This overlay chose Claude while in-flight cost telemetry worked only there; PMR-155 closed that gap for Codex too, so the choice is no longer load-bearing. |
 | `claude:` block | absent | `command: claude`, `model: claude-sonnet-5`, `turn_timeout_ms: 1800000`, `stall_timeout_ms: 300000` | required once `backend: claude` is selected. |
 
 ```sh

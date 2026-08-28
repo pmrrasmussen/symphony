@@ -245,6 +245,7 @@ type client struct {
 	exited              chan struct{}
 	finishOnce          sync.Once
 	killOnce            sync.Once
+	usageMissOnce       sync.Once
 }
 
 type callResult struct {
@@ -598,11 +599,12 @@ func (c *client) handle(x rpc) {
 		c.emitItemEvent(method, x.Params)
 		return
 	}
+	if method == "thread/tokenUsage/updated" {
+		c.emitTokenUsage(x.Params)
+		return
+	}
 	if method == "turn/completed" {
 		c.finalizeLanding()
-		if usage := usageFrom(x.Params); usage != (domain.Usage{}) {
-			c.emit(domain.Event{Kind: domain.EventUsage, At: time.Now(), Usage: usage})
-		}
 		c.emit(domain.Event{Kind: domain.EventCompleted, At: time.Now()})
 		return
 	}
@@ -890,28 +892,72 @@ func asID(v any) (int, bool) {
 	}
 	return int(x), true
 }
-func usageFrom(raw json.RawMessage) domain.Usage {
-	var value any
-	if json.Unmarshal(raw, &value) != nil {
-		return domain.Usage{}
+
+// tokenUsageBreakdown is the app-server's own TokenUsageBreakdown, confirmed
+// against codex-cli 0.149.1's generated protocol schema (`codex app-server
+// generate-json-schema`): cachedInputTokens, cacheWriteInputTokens,
+// inputTokens, outputTokens, reasoningOutputTokens, and totalTokens are its
+// complete, required field set. Folding the cache and reasoning components
+// into InputTokens/OutputTokens mirrors how the Claude backend folds its own
+// cache tokens into input (claude/events.go's usage.totals): both are tokens
+// the model actually processed, just billed under a component domain.Usage
+// has no field of its own for.
+type tokenUsageBreakdown struct {
+	CachedInputTokens     int64 `json:"cachedInputTokens"`
+	CacheWriteInputTokens int64 `json:"cacheWriteInputTokens"`
+	InputTokens           int64 `json:"inputTokens"`
+	OutputTokens          int64 `json:"outputTokens"`
+	ReasoningOutputTokens int64 `json:"reasoningOutputTokens"`
+	TotalTokens           int64 `json:"totalTokens"`
+}
+
+func (b tokenUsageBreakdown) totals() domain.Usage {
+	return domain.Usage{
+		InputTokens:  b.InputTokens + b.CachedInputTokens + b.CacheWriteInputTokens,
+		OutputTokens: b.OutputTokens + b.ReasoningOutputTokens,
+		TotalTokens:  b.TotalTokens,
 	}
-	var find func(any) domain.Usage
-	find = func(v any) domain.Usage {
-		m, ok := v.(map[string]any)
-		if !ok {
-			return domain.Usage{}
-		}
-		get := func(k string) int64 { n, _ := m[k].(float64); return int64(n) }
-		u := domain.Usage{InputTokens: get("inputTokens"), OutputTokens: get("outputTokens"), TotalTokens: get("totalTokens")}
-		if u != (domain.Usage{}) {
-			return u
-		}
-		for _, child := range m {
-			if found := find(child); found != (domain.Usage{}) {
-				return found
-			}
-		}
-		return domain.Usage{}
+}
+
+// emitTokenUsage decodes one thread/tokenUsage/updated notification -- the
+// app-server's *only* notification that carries usage. Neither turn/completed
+// nor any item notification has a usage field: Turn, the payload
+// turn/completed itself carries, has none at all, confirmed against the same
+// generated schema that gives tokenUsageBreakdown its field names above. The
+// notification's total is the thread's own running sum across every turn so
+// far -- monotonically increasing by construction -- which is why it is
+// reported non-authoritative: the coordinator folds repeated or reordered
+// figures with a component-wise maximum (PMR-153), and that merge is exactly
+// what a monotonic running total wants.
+//
+// Reporting from this notification rather than only at turn/completed is
+// also what makes cancellation harmless: Symphony's own publish flow ends a
+// successful run by cancelling the session the moment the landing capability
+// resolves, which kills the app-server before it ever reaches turn/completed
+// (PMR-155). This notification arrives during the turn, so whatever usage the
+// CLI already reported survives a cancellation that pre-empts the turn's own
+// end.
+func (c *client) emitTokenUsage(raw json.RawMessage) {
+	var notification struct {
+		TokenUsage struct {
+			Total tokenUsageBreakdown `json:"total"`
+		} `json:"tokenUsage"`
 	}
-	return find(value)
+	if err := json.Unmarshal(raw, &notification); err != nil {
+		return
+	}
+	usage := notification.TokenUsage.Total.totals()
+	if usage == (domain.Usage{}) {
+		// A silent zero here is indistinguishable from a run that genuinely
+		// spent nothing -- which is how a broken extraction went unnoticed for
+		// the whole life of the Codex backend (PMR-155). One diagnostic per
+		// session is enough to make a schema change or an empty payload
+		// visible without flooding a log a chatty notification stream already
+		// fills.
+		c.usageMissOnce.Do(func() {
+			c.diagnostic("codex thread/tokenUsage/updated reported no usage")
+		})
+		return
+	}
+	c.emit(domain.Event{Kind: domain.EventUsage, At: time.Now(), Usage: usage})
 }
