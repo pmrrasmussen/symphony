@@ -865,9 +865,10 @@ func drain(r io.Reader, report func(string)) error {
 		if err != nil && !errors.Is(err, io.EOF) {
 			return err
 		}
+		message := strings.TrimSuffix(strings.TrimSuffix(string(line), "\n"), "\r")
 		if oversized {
-			report("stderr diagnostic exceeded limit")
-		} else if message := strings.TrimSuffix(strings.TrimSuffix(string(line), "\n"), "\r"); message != "" {
+			report(message + "…[truncated]")
+		} else if message != "" {
 			report(message)
 		}
 		line = line[:0]

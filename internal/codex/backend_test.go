@@ -411,8 +411,37 @@ func TestDrainContinuesAfterOversizedDiagnostic(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(messages) != 2 || messages[0] != "stderr diagnostic exceeded limit" || !strings.Contains(messages[1], "[REDACTED]") || strings.Contains(messages[1], "secret-value") {
+	if len(messages) != 2 {
 		t.Fatalf("messages=%q", messages)
+	}
+	if !strings.HasPrefix(messages[0], strings.Repeat("x", 10)) || !strings.Contains(messages[0], "…[truncated]") {
+		t.Fatalf("oversized message not bounded and marked truncated: %q", messages[0])
+	}
+	if !strings.Contains(messages[1], "[REDACTED]") || strings.Contains(messages[1], "secret-value") {
+		t.Fatalf("messages=%q", messages)
+	}
+}
+
+func TestDrainOversizedLineIsMaskedForCredentials(t *testing.T) {
+	var messages []string
+	longSecretLine := "token=secret-value " + strings.Repeat("x", observability.MaxDiagnosticBytes*3)
+	err := drain(strings.NewReader(longSecretLine+"\n"), func(message string) {
+		messages = append(messages, observability.Text(message))
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(messages) != 1 {
+		t.Fatalf("messages=%q", messages)
+	}
+	if strings.Contains(messages[0], "secret-value") {
+		t.Fatalf("credential leaked in oversized diagnostic: %q", messages[0])
+	}
+	if !strings.Contains(messages[0], "[REDACTED]") {
+		t.Fatalf("expected masked token in oversized diagnostic: %q", messages[0])
+	}
+	if !strings.Contains(messages[0], "…[truncated]") {
+		t.Fatalf("expected truncation marker in oversized diagnostic: %q", messages[0])
 	}
 }
 
