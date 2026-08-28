@@ -112,9 +112,11 @@ type linearLifecycle interface {
 	ReconcileMerged(context.Context, string) (bool, error)
 	// EnsureMergeState, RefuseLanding, and CompleteLanding back the
 	// github_land_pr capability (PMR-37). See internal/linear.HandoffSession
-	// for their exact scope and idempotency guarantees.
+	// for their exact scope and idempotency guarantees. RefuseLanding's reason
+	// is the fixed or repository-config derived gate string the caller refused
+	// landing for, recorded on the transition log record (PMR-159).
 	EnsureMergeState(context.Context, string) error
-	RefuseLanding(context.Context, string) (bool, error)
+	RefuseLanding(ctx context.Context, mergeState, reason string) (bool, error)
 	CompleteLanding(context.Context, string) (bool, error)
 	// LandComment adds a bounded, host-generated audit comment to the bound
 	// issue (pushed commit SHAs during a fix turn, and the last failed gate
@@ -839,7 +841,7 @@ func (s *Session) completeLanding(ctx context.Context, pr pull) (LandResult, err
 func (s *Session) refuse(ctx context.Context, reason string) (LandResult, error) {
 	s.deferredFired = true
 	s.waitingOutcome = false
-	if _, err := s.linear.RefuseLanding(ctx, s.settings.MergeState); err != nil {
+	if _, err := s.linear.RefuseLanding(ctx, s.settings.MergeState, reason); err != nil {
 		s.manager.logger.Warn("GitHub land Merging fallback transition failed", "issue_id", s.issue.ID, "issue_identifier", s.issue.Identifier, "reason", reason, "error", observability.Text(err.Error()))
 	}
 	return LandResult{}, errors.New(reason)
@@ -874,7 +876,7 @@ func (s *Session) fireDeferredRefusal(ctx context.Context) {
 		return
 	}
 	s.deferredFired = true
-	if _, err := s.linear.RefuseLanding(ctx, s.settings.MergeState); err != nil {
+	if _, err := s.linear.RefuseLanding(ctx, s.settings.MergeState, s.lastFailedGate); err != nil {
 		s.manager.logger.Warn("GitHub land deferred Merging fallback transition failed", "issue_id", s.issue.ID, "issue_identifier", s.issue.Identifier, "error", observability.Text(err.Error()))
 	}
 	if err := s.linear.LandComment(ctx, landingRefusalComment(s.lastFailedGate)); err != nil {
