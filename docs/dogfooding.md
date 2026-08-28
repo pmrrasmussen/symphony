@@ -66,6 +66,14 @@ worktree head diverged from the published pull request`, and so on -- see
 [observability.md](observability.md)), so which gate fired is answered by that
 one record instead of by reading `internal/github/lifecycle.go` (PMR-159).
 
+A `github_publish_pr` refusal is diagnosed the same way: the warn-level
+`"msg":"GitHub publish refused"` record with `operation: publish_refused`
+carries the exact gate as `reason`, so a run that spends its whole turn budget
+retrying the same unrecoverable refusal (for example a push a repository-level
+branch or workflow-scope restriction will never let through) still leaves a
+host-side trace of why -- including, for the push gate specifically, the
+underlying `git push` error as `push_error` (PMR-163).
+
 ## 3. `WORKFLOW.local.md`: the one untracked file
 
 `WORKFLOW.md` is committed policy. `WORKFLOW.local.md` is an **untracked

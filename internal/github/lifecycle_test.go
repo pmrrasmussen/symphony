@@ -810,10 +810,13 @@ func (g originGit) Run(ctx context.Context, dir string, args, env []string) (str
 // failingGit fails exactly the one git invocation whose full argument list
 // matches failArgs, and otherwise delegates to fakeGit's defaults. It lets a
 // single table of Publish refusal causes pin an exact message per underlying
-// git failure without a bespoke fake type per case.
+// git failure without a bespoke fake type per case. message defaults to
+// "boom" when unset, so existing callers that only care that the call failed
+// need not name one.
 type failingGit struct {
 	*fakeGit
 	failArgs []string
+	message  string
 }
 
 func (g *failingGit) Run(ctx context.Context, dir string, args, env []string) (string, error) {
@@ -826,7 +829,11 @@ func (g *failingGit) Run(ctx context.Context, dir string, args, env []string) (s
 			}
 		}
 		if match {
-			return "", errors.New("boom")
+			message := g.message
+			if message == "" {
+				message = "boom"
+			}
+			return "", errors.New(message)
 		}
 	}
 	return g.fakeGit.Run(ctx, dir, args, env)
@@ -923,6 +930,176 @@ func TestPublishRefusalCausesAreDistinctAgentActionableMessages(t *testing.T) {
 		}
 		seen[test] = true
 	}
+}
+
+// TestPublishRefusalLogsAWarnRecordNamingTheGate pins PMR-163: before this, a
+// publish refusal produced no host-side record at all, so a run that spent an
+// entire turn budget hitting the same refusal repeatedly left no trace of why.
+// Every one of Publish's eight refusal paths must log exactly one Warn
+// "GitHub publish refused" record naming the gate that fired -- distinctly
+// enough that, for example, the stale-base ancestor gate and a dirty worktree
+// are never confused for one another -- so a newly added, silent gate fails
+// this test rather than shipping unnoticed.
+func TestPublishRefusalLogsAWarnRecordNamingTheGate(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		base       *fakeGit
+		wrap       func(*fakeGit) gitRunner
+		activeErr  error
+		prExists   bool
+		wantReason string
+	}{
+		{
+			name:       "stale issue",
+			base:       &fakeGit{},
+			activeErr:  errors.New("issue is no longer active"),
+			wantReason: "issue is no longer active",
+		},
+		{
+			name:       "origin mismatch",
+			base:       &fakeGit{},
+			wrap:       func(g *fakeGit) gitRunner { return originGit{fakeGit: g, origin: "git@github.com:someone/other.git"} },
+			wantReason: "github publish worktree origin does not match the configured repository",
+		},
+		{
+			name:       "dirty worktree",
+			base:       &fakeGit{dirty: true},
+			wantReason: "github publish requires a clean worktree",
+		},
+		{
+			name:       "no committed HEAD",
+			base:       &fakeGit{},
+			wrap:       func(g *fakeGit) gitRunner { return &failingGit{fakeGit: g, failArgs: []string{"rev-parse", "HEAD"}} },
+			wantReason: "github publish requires a committed HEAD",
+		},
+		{
+			name:       "no committed changes",
+			base:       &fakeGit{noChange: true},
+			wantReason: "github publish requires committed changes",
+		},
+		{
+			name: "stale base ancestor gate",
+			base: &fakeGit{},
+			wrap: func(g *fakeGit) gitRunner {
+				return &failingGit{fakeGit: g, failArgs: []string{"merge-base", "--is-ancestor", "base", "head"}}
+			},
+			wantReason: "github publish HEAD is not based on the configured base branch",
+		},
+		{
+			name: "remote head not fetched",
+			base: &fakeGit{},
+			wrap: func(g *fakeGit) gitRunner {
+				return &failingGit{fakeGit: g, failArgs: []string{"cat-file", "-e", "sha1^{commit}"}}
+			},
+			prExists:   true,
+			wantReason: "github publish remote branch symphony/pmr-27 has a head commit this worktree has not fetched",
+		},
+		{
+			name: "push failure",
+			base: &fakeGit{},
+			wrap: func(g *fakeGit) gitRunner {
+				return &failingGit{fakeGit: g, failArgs: []string{"push", "https://github.com/owner/repo.git", "HEAD:refs/heads/symphony/pmr-27"}}
+			},
+			wantReason: "github publish could not push branch symphony/pmr-27",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var log bytes.Buffer
+			api, linear := newAPI(t), &fakeLinear{activeErr: test.activeErr}
+			api.prExists = test.prExists
+			_, session := testSession(t, api, test.base, linear, &log)
+			if test.wrap != nil {
+				session.manager.git = test.wrap(test.base)
+			}
+			if _, err := session.Publish(context.Background(), testInput()); err == nil {
+				t.Fatal("unsafe publish succeeded")
+			}
+			output := log.String()
+			if strings.Count(output, `"msg":"GitHub publish refused"`) != 1 {
+				t.Fatalf("expected exactly one publish refusal record, got: %s", output)
+			}
+			if !strings.Contains(output, `"operation":"publish_refused"`) {
+				t.Fatalf("refusal record missing operation: %s", output)
+			}
+			if !strings.Contains(output, `"issue_identifier":"PMR-27"`) || !strings.Contains(output, `"branch":"symphony/pmr-27"`) {
+				t.Fatalf("refusal record missing issue/branch: %s", output)
+			}
+			if !strings.Contains(output, test.wantReason) {
+				t.Fatalf("refusal record missing reason %q: %s", test.wantReason, output)
+			}
+		})
+	}
+}
+
+// TestPublishRefusalPushGateRecordCarriesTheUnderlyingGitError pins the live
+// PMR-124 case: GitHub's own push rejection text -- for example its "without
+// `workflow` scope" message -- is the entire diagnosis for an unrecoverable
+// push, and discarding it in favor of only the fixed hint left an operator to
+// reconstruct it by hand. The refusal record must carry that underlying error
+// (bounded through observability.Text like every other diagnostic), while the
+// agent-facing error stays the fixed, generic hint: the agent cannot act on
+// provider-shaped text any more precisely than on the hint, and the raw text
+// is not vetted for what an agent should read.
+func TestPublishRefusalPushGateRecordCarriesTheUnderlyingGitError(t *testing.T) {
+	var log bytes.Buffer
+	api, linear := newAPI(t), &fakeLinear{}
+	base := &fakeGit{}
+	const pushErr = "refusing to allow a Personal Access Token to create or update workflow `.github/workflows/ci.yml` without `workflow` scope"
+	git := &failingGit{fakeGit: base, failArgs: []string{"push", "https://github.com/owner/repo.git", "HEAD:refs/heads/symphony/pmr-27"}, message: pushErr}
+	_, session := testSession(t, api, base, linear, &log)
+	session.manager.git = git
+	_, err := session.Publish(context.Background(), testInput())
+	if err == nil || strings.Contains(err.Error(), pushErr) {
+		t.Fatalf("agent-facing push error = %v, want only the fixed hint", err)
+	}
+	output := log.String()
+	if !strings.Contains(output, `"push_error"`) || !strings.Contains(output, pushErr) {
+		t.Fatalf("refusal record missing the underlying git push error: %s", output)
+	}
+	if !strings.Contains(output, "could not push branch symphony/pmr-27") {
+		t.Fatalf("refusal record missing the fixed hint alongside the git error: %s", output)
+	}
+}
+
+// TestPublishRefusalRecordNeverCarriesProviderOrCredentialText asserts the
+// refusal record itself is bounded and scrubbed exactly like every other
+// diagnostic in this package (observability.Text): a credential-shaped
+// EnsureActive error is redacted rather than logged verbatim, and the push
+// gate's now-attached underlying git error still cannot smuggle a credential
+// through even though it is otherwise logged in full.
+func TestPublishRefusalRecordNeverCarriesProviderOrCredentialText(t *testing.T) {
+	t.Run("EnsureActive error", func(t *testing.T) {
+		var log bytes.Buffer
+		api := newAPI(t)
+		linear := &fakeLinear{activeErr: errors.New("linear request failed: token=leaked-credential-value")}
+		_, session := testSession(t, api, &fakeGit{}, linear, &log)
+		if _, err := session.Publish(context.Background(), testInput()); err == nil {
+			t.Fatal("unsafe publish succeeded")
+		}
+		output := log.String()
+		if strings.Contains(output, "leaked-credential-value") {
+			t.Fatalf("refusal record leaked a credential-shaped value: %s", output)
+		}
+		if !strings.Contains(output, "[REDACTED]") {
+			t.Fatalf("refusal record did not redact the credential assignment: %s", output)
+		}
+	})
+
+	t.Run("push gate error", func(t *testing.T) {
+		var log bytes.Buffer
+		api, linear := newAPI(t), &fakeLinear{}
+		base := &fakeGit{}
+		git := &failingGit{fakeGit: base, failArgs: []string{"push", "https://github.com/owner/repo.git", "HEAD:refs/heads/symphony/pmr-27"}, message: "remote rejected: authorization: bearer leaked-push-credential"}
+		_, session := testSession(t, api, base, linear, &log)
+		session.manager.git = git
+		if _, err := session.Publish(context.Background(), testInput()); err == nil {
+			t.Fatal("unsafe publish succeeded")
+		}
+		output := log.String()
+		if strings.Contains(output, "leaked-push-credential") {
+			t.Fatalf("refusal record leaked a credential-shaped push error: %s", output)
+		}
+	})
 }
 
 // TestPublishForwardedFailuresAtEveryCallSiteCarryNoProviderOrWireDecodedText

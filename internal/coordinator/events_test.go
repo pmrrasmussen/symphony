@@ -184,6 +184,39 @@ func TestNewDebugRecordsNeverCarryToolInputsOrSecrets(t *testing.T) {
 	}
 }
 
+// TestCapabilityToolCallIsIdentifiableByNameInTheDebugLog pins PMR-163: an
+// operator debugging a run that spent its turn budget calling one bound
+// capability repeatedly must be able to name which one from the debug log
+// alone, rather than seeing only a generic "toolCall"/"mcpToolCall" item
+// type. internal/claude already carries the CLI's own MCP-framed tool name
+// onto domain.Event.ToolName for every item it emits (see
+// internal/claude.TestMCPCapabilityToolCallIsIdentifiableByNameInTheEvent);
+// this pins the other half, that this coordinator's existing item_name
+// attribute (internal/coordinator/events.go) surfaces it once it arrives.
+func TestCapabilityToolCallIsIdentifiableByNameInTheDebugLog(t *testing.T) {
+	w := testSettings(t)
+	issue := testIssue()
+	const capabilityTool = "mcp__symphony__github_publish_pr"
+	events := make(chan domain.Event, 3)
+	events <- domain.Event{Kind: domain.EventItem, ItemID: "call-1", ItemType: "mcpToolCall", ToolName: capabilityTool, Outcome: domain.ItemStarted}
+	events <- domain.Event{Kind: domain.EventItem, ItemID: "call-1", ItemType: "mcpToolCall", ToolName: capabilityTool, Outcome: domain.ItemCompleted, DurationMs: 5}
+	events <- domain.Event{Kind: domain.EventCompleted}
+	close(events)
+	agent := &fakeAgent{events: func() <-chan domain.Event { return events }}
+	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{})}
+	var logs bytes.Buffer
+	c := New(&fakeTracker{issue: issue}, agent, ws, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	c.Tick(context.Background())
+	<-ws.after
+	if err := c.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	output := logs.String()
+	if !strings.Contains(output, `"msg":"agent item event"`) || !strings.Contains(output, `"item_name":"`+capabilityTool+`"`) {
+		t.Fatalf("capability call not identifiable by name in the debug log: %s", output)
+	}
+}
+
 // TestUpdateUsageAuthoritativeReplacesInflatedProvisionalPeak pins the fix for
 // PMR-153: Claude's mid-turn provisional figure is this host's own running
 // sum of per-API-call deltas, not the CLI's turn total, so it can overshoot

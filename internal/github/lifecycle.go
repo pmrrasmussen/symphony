@@ -52,13 +52,21 @@ type gitRunner interface {
 
 type execGit struct{}
 
+// Run returns the real git output as the error's text on failure, rather than
+// a generic placeholder: Publish's push gate is the one caller that surfaces
+// this detail, and only to the host log (via observability.Text), never to
+// the agent -- see the comment on Publish's push failure below.
 func (execGit) Run(ctx context.Context, dir string, args, extraEnv []string) (string, error) {
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(), extraEnv...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return "", errors.New("git operation failed")
+		detail := strings.TrimSpace(string(out))
+		if detail == "" {
+			detail = err.Error()
+		}
+		return "", errors.New(detail)
 	}
 	return strings.TrimSpace(string(out)), nil
 }
@@ -362,6 +370,30 @@ func (s *Session) RefreshBaseRef(ctx context.Context) (string, error) {
 	return base, nil
 }
 
+// logPublishRefused records a Warn-level entry for a github_publish_pr
+// refusal, naming the fixed gate reason (or, for EnsureActive, the Linear
+// error it returned) an operator can otherwise learn only by rediscovering it
+// by hand: before this, a refusal here produced no host-side record at all, so
+// a run that consumed its whole turn budget hitting the same refusal repeatedly
+// left no trace of why (PMR-163). head is the worktree HEAD when the gate that
+// refused had already resolved one, empty otherwise; extra is appended
+// verbatim, so a caller passes only fixed keys and observability-bounded
+// values, exactly like every other diagnostic in this package.
+func (s *Session) logPublishRefused(reason, head string, extra ...any) {
+	attrs := []any{
+		"operation", observability.OperationPublishRefused,
+		"issue_id", s.issue.ID,
+		"issue_identifier", s.issue.Identifier,
+		"branch", s.branch,
+		"reason", observability.Text(reason),
+	}
+	if head != "" {
+		attrs = append(attrs, "head", shortSHA(head))
+	}
+	attrs = append(attrs, extra...)
+	s.manager.logger.Warn("GitHub publish refused", attrs...)
+}
+
 // Publish verifies a clean committed worktree, publishes only HEAD to the
 // deterministic issue branch, creates/reuses its PR with the canonical
 // structured body, and performs the bound Linear link/review handoff.
@@ -369,26 +401,37 @@ func (s *Session) Publish(ctx context.Context, input PublishInput) (Result, erro
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.linear.EnsureActive(ctx); err != nil {
+		s.logPublishRefused(err.Error(), "")
 		return Result{}, err
 	}
 	origin, err := s.manager.git.Run(ctx, s.workspace, []string{"remote", "get-url", "origin"}, nil)
 	if err != nil || !matchesRepository(origin, s.settings.Owner, s.settings.Repository) {
-		return Result{}, errors.New("github publish worktree origin does not match the configured repository")
+		reason := "github publish worktree origin does not match the configured repository"
+		s.logPublishRefused(reason, "")
+		return Result{}, errors.New(reason)
 	}
 	status, err := s.manager.git.Run(ctx, s.workspace, []string{"status", "--porcelain"}, nil)
 	if err != nil || status != "" {
-		return Result{}, errors.New("github publish requires a clean worktree")
+		reason := "github publish requires a clean worktree"
+		s.logPublishRefused(reason, "")
+		return Result{}, errors.New(reason)
 	}
 	head, err := s.manager.git.Run(ctx, s.workspace, []string{"rev-parse", "HEAD"}, nil)
 	if err != nil {
-		return Result{}, errors.New("github publish requires a committed HEAD")
+		reason := "github publish requires a committed HEAD"
+		s.logPublishRefused(reason, "")
+		return Result{}, errors.New(reason)
 	}
 	base, err := s.manager.git.Run(ctx, s.workspace, []string{"rev-parse", "refs/remotes/origin/" + s.settings.BaseBranch}, nil)
 	if err != nil || head == base {
-		return Result{}, errors.New("github publish requires committed changes")
+		reason := "github publish requires committed changes"
+		s.logPublishRefused(reason, head)
+		return Result{}, errors.New(reason)
 	}
 	if _, err := s.manager.git.Run(ctx, s.workspace, []string{"merge-base", "--is-ancestor", base, head}, nil); err != nil {
-		return Result{}, errors.New("github publish HEAD is not based on the configured base branch")
+		reason := "github publish HEAD is not based on the configured base branch"
+		s.logPublishRefused(reason, head)
+		return Result{}, errors.New(reason)
 	}
 	existing, found, err := s.manager.findPull(ctx, s.settings, s.branch)
 	if err != nil {
@@ -404,7 +447,9 @@ func (s *Session) Publish(ctx context.Context, input PublishInput) (Result, erro
 			// having established it would hand the agent an instruction that
 			// cannot resolve the divergence, so this case is refused with a
 			// cause that stops at what is actually known instead.
-			return Result{}, errors.New("github publish remote branch " + s.branch + " has a head commit this worktree has not fetched, so the cause of the divergence cannot be established here")
+			reason := "github publish remote branch " + s.branch + " has a head commit this worktree has not fetched, so the cause of the divergence cannot be established here"
+			s.logPublishRefused(reason, head)
+			return Result{}, errors.New(reason)
 		}
 		// A published pull request's remote head that HEAD no longer descends
 		// from means this worktree rebased instead of merging: a plain push
@@ -427,14 +472,20 @@ func (s *Session) Publish(ctx context.Context, input PublishInput) (Result, erro
 	}
 	pushArgs = append(pushArgs, remote, "HEAD:refs/heads/"+s.branch)
 	if _, err := s.manager.git.Run(ctx, s.workspace, pushArgs, env); err != nil {
-		// execGit.Run discards the underlying git output, so this is never
-		// provider text; it is host-authored precisely because the generic
-		// "git operation failed" this replaces gave the agent nothing to act
-		// on. Every cause diagnosable ahead of the push (dirty worktree, stale
-		// base, non-fast-forward) was already refused above, so what reaches
-		// here is the remainder: a transient or remote-side rejection retrying
-		// may clear, or a repository push restriction retrying will not.
-		return Result{}, errors.New("github publish could not push branch " + s.branch + " to the configured repository; retry once, and if it persists check the repository's push permissions and branch protection rules")
+		// The agent-facing message stays this fixed, host-authored hint rather
+		// than the raw git/GitHub text: every cause diagnosable ahead of the
+		// push (dirty worktree, stale base, non-fast-forward) was already
+		// refused above, so what reaches here is the remainder -- a transient
+		// or remote-side rejection retrying may clear, or a repository push
+		// restriction retrying will not -- and the agent cannot act on
+		// provider-shaped text any more precisely than on this hint. The real
+		// git error (for example GitHub's own "without `workflow` scope"
+		// rejection, PMR-163) is not discarded, though: it is attached to the
+		// refusal log record below via push_error, so an operator reads the
+		// actual diagnosis instead of reconstructing it by hand.
+		reason := "github publish could not push branch " + s.branch + " to the configured repository; retry once, and if it persists check the repository's push permissions and branch protection rules"
+		s.logPublishRefused(reason, head, "push_error", observability.Text(err.Error()))
+		return Result{}, errors.New(reason)
 	}
 	s.manager.logger.Info("GitHub issue branch published", "issue_id", s.issue.ID, "issue_identifier", s.issue.Identifier, "repository", s.settings.Owner+"/"+s.settings.Repository, "branch", s.branch)
 	body := canonicalBody(input, s.issue.URL)

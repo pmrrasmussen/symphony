@@ -26,6 +26,12 @@ const (
 	// OperationLandingRefused is the landing fallback applied when a
 	// github_land_pr attempt hits a hard gate (merge state -> handoff state).
 	OperationLandingRefused Operation = "landing_refused"
+	// OperationPublishRefused names a github_publish_pr call that a fixed,
+	// host-checked gate refused before publishing anything. Unlike the landing
+	// operations above it names no tracker edge -- a refused publish leaves the
+	// issue exactly where it was -- so it is logged directly by
+	// internal/github rather than through a Linear transition record (PMR-163).
+	OperationPublishRefused Operation = "publish_refused"
 	// OperationLandingCompleted is the terminal edge after a successful merge.
 	OperationLandingCompleted Operation = "landing_completed"
 	// OperationMergeReconciled is the terminal edge for a pull request GitHub
@@ -81,6 +87,7 @@ var known = map[Operation]bool{
 	OperationTransition:           true,
 	OperationHandoff:              true,
 	OperationLandingRefused:       true,
+	OperationPublishRefused:       true,
 	OperationLandingCompleted:     true,
 	OperationMergeReconciled:      true,
 	OperationReviewCompleted:      true,
