@@ -192,6 +192,47 @@ func TestStartRunsATurnAndNormalizesItsLifecycle(t *testing.T) {
 	}
 }
 
+// TestMCPCapabilityToolCallIsIdentifiableByNameInTheEvent pins PMR-163: an
+// operator debugging a run that spent its turn budget on one bound capability
+// (for example github_publish_pr) must be able to tell which capability was
+// called from the log alone, not only that "a toolCall" happened. This backend
+// already carries the CLI's own MCP-framed tool name onto ToolName for every
+// item it emits (permission_denied, tool_use, and tool_result alike); this
+// pins that guarantee for a bound capability specifically, whose ToolName the
+// coordinator's "agent item event" debug record surfaces as item_name
+// (internal/coordinator/events.go) once it reaches here.
+func TestMCPCapabilityToolCallIsIdentifiableByNameInTheEvent(t *testing.T) {
+	capabilityTool := mcpToolName("github_publish_pr")
+	dir := t.TempDir()
+	script := writeFakeClaude(t, dir, "cat <<'EOF'\n"+
+		initLine(dir, allCodingTools)+"\n"+
+		`{"type":"assistant","message":{"content":[{"type":"tool_use","id":"call-1","name":"`+capabilityTool+`"}]}}`+"\n"+
+		`{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"call-1","is_error":false}]}}`+"\n"+
+		resultLine(false, "")+"\n"+
+		"EOF\n")
+
+	backend := New(settingsFunc())
+	_, events, err := backend.Start(context.Background(), request(t, dir, script))
+	if err != nil {
+		t.Fatal(err)
+	}
+	collected := drain(t, events)
+
+	var startedItem domain.Event
+	found := false
+	for _, event := range collected {
+		if event.Kind == domain.EventItem && event.Outcome == domain.ItemStarted {
+			startedItem, found = event, true
+		}
+	}
+	if !found {
+		t.Fatalf("no started item event: %v", kinds(collected))
+	}
+	if startedItem.ItemType != "mcpToolCall" || startedItem.ToolName != capabilityTool {
+		t.Fatalf("capability call classification = %+v, want item_type=mcpToolCall tool_name=%q", startedItem, capabilityTool)
+	}
+}
+
 // TestASandboxDeniedLoopbackBindIsReportedAsADiagnostic covers the failure mode
 // this backend cannot otherwise distinguish from a real test regression: a
 // failed Bash call whose own output shows the sandbox refused a loopback

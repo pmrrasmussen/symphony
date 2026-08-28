@@ -52,10 +52,50 @@ published pull request`, `github land active issue is no longer in the
 configured Merging state`, `github land configured base branch changed before
 landing`, `github merge request was not accepted`, `github returned a pull
 request without a head commit`, `github land could not update stale pull
-request branch`, and `github returned an invalid pull request after branch
-update`. The same reason also lands on the deferred refusal fired after a
+request branch`, `github returned an invalid pull request after branch
+update`, and `github land could not push branch <branch> to the configured
+repository; retry once, and if it persists check the repository's push
+permissions and branch protection rules` (the stale-branch push-before-land
+gate). The same reason also lands on the deferred refusal fired after a
 bounded-fix session exhausts its retry attempts (`fireDeferredRefusal`), not
 only on an immediate hard-gate refusal.
+
+That last gate additionally logs a warn-level `"msg":"GitHub land could not
+push branch"` record carrying `push_error`: the underlying `git push` failure
+text, exactly like `github_publish_pr`'s own push gate below. Widening
+`execGit.Run` to return real git/GitHub output made this caller's error stop
+being the placeholder text it used to be too, so it is logged host-side and
+never forwarded to the agent (PMR-163).
+
+A `github_publish_pr` refusal gets the equivalent record, one level earlier in
+the lifecycle: before any push, pull request creation, or Linear handoff has
+happened, so it is not itself a tracker edge and is logged directly rather than
+through `"msg":"Linear transition"`. Every one of Publish's eight refusal gates
+logs a warn-level `"msg":"GitHub publish refused"` with `operation:
+publish_refused`, the `reason` that fired, the issue (`issue_id`/
+`issue_identifier`), the `branch`, and -- once the worktree HEAD is known -- a
+`head` short SHA. `reason` is one of: whatever `EnsureActive` returned (the
+issue is no longer active), `github publish worktree origin does not match the
+configured repository`, `github publish requires a clean worktree`, `github
+publish requires a committed HEAD`, `github publish requires committed
+changes`, `github publish HEAD is not based on the configured base branch`,
+`github publish remote branch <branch> has a head commit this worktree has not
+fetched, so the cause of the divergence cannot be established here`, and
+`github publish could not push branch <branch> to the configured repository;
+retry once, and if it persists check the repository's push permissions and
+branch protection rules`. That last one -- the push gate -- additionally
+carries `push_error`: the underlying `git push` failure text (for example
+GitHub's own `without \`workflow\` scope` rejection when a repository-scoped
+token lacks permission to touch `.github/workflows/**`), which is the actual
+diagnosis for a push failure that cannot be attributed to any of the earlier,
+locally-checked gates. The agent itself still only ever sees the fixed hint,
+never `push_error`'s raw text; both `reason` and `push_error` are bounded and
+scrubbed through `internal/observability.Text` like every other diagnostic, so
+neither can carry a provider response body or a credential (PMR-163). Before
+this, a publish refusal logged nothing at all: a run that spent its entire
+turn budget retrying the same unrecoverable refusal (most sharply, a push a
+repository's branch protection or token scope will never let through) ended in
+`turn_limit_exhausted` with no host-side record of why.
 
 Symphony also logs state changes it did **not** perform. The poll loop
 remembers each issue it drove into the review `handoff_state`, and if such an
