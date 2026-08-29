@@ -2,6 +2,8 @@ package coordinator
 
 import (
 	"bytes"
+	"context"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -29,6 +31,44 @@ func (s *syncBuffer) String() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.buf.String()
+}
+
+// logGate is a slog.Handler that blocks whichever goroutine emits one chosen
+// record until the test releases it. One tick is a single synchronous call, so
+// this is how a test observes coordinator state at a fixed point *inside* it --
+// after a candidate has been claimed, before the tick reaches updateWaiting --
+// rather than only at the ends.
+type logGate struct {
+	message, identifier string
+	reached, release    chan struct{}
+	once                sync.Once
+}
+
+func newLogGate(message, identifier string) *logGate {
+	return &logGate{message: message, identifier: identifier, reached: make(chan struct{}), release: make(chan struct{})}
+}
+
+func (*logGate) Enabled(context.Context, slog.Level) bool { return true }
+func (g *logGate) WithAttrs([]slog.Attr) slog.Handler     { return g }
+func (g *logGate) WithGroup(string) slog.Handler          { return g }
+
+func (g *logGate) Handle(_ context.Context, record slog.Record) error {
+	if record.Message != g.message {
+		return nil
+	}
+	matched := false
+	record.Attrs(func(attr slog.Attr) bool {
+		matched = matched || (attr.Key == "issue_identifier" && attr.Value.String() == g.identifier)
+		return true
+	})
+	if !matched {
+		return nil
+	}
+	g.once.Do(func() {
+		close(g.reached)
+		<-g.release
+	})
+	return nil
 }
 
 func waitForSubstring(t *testing.T, buf *syncBuffer, substr string, timeout time.Duration) string {

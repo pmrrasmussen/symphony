@@ -68,7 +68,10 @@ type RetrySnapshot struct {
 	// "landing" retry. It is the operator's "this landing is stuck" signal:
 	// the agent attempt deliberately stays put for a non-failure, so a climbing
 	// wait count (and the growing delay it drives) is what distinguishes a slow
-	// check run from a gate that will never settle (PMR-78).
+	// check run from a gate that will never settle (PMR-78). It is reported for
+	// that kind alone: an "agent" retry is not waiting on a landing gate, so the
+	// count says nothing about it, and reporting the claim's leftover figure
+	// there was stale noise a reader could only misread (PMR-189).
 	WaitAttempt int       `json:"wait_attempt,omitempty"`
 	Due         time.Time `json:"due_at"`
 	// IssueUsage is what the issue has already spent across this episode's
@@ -120,7 +123,11 @@ func (c *Coordinator) Snapshot() Snapshot {
 			snapshot.Running = append(snapshot.Running, RunningSnapshot{IssueIdentifier: run.issue.Identifier, IssueState: run.issue.State, SessionID: run.session.ID, ThreadID: run.session.ThreadID, TurnID: run.session.TurnID, Attempt: run.run.Attempt, TurnCount: run.run.TurnCount, StartedAt: run.run.StartedAt, LastEventAt: run.last, Usage: run.run.Usage, IssueUsage: st.usage, RateLimit: copyRateLimit(run.rateLimit), OutstandingOperation: item})
 		}
 		if retry := st.retry; retry != nil {
-			snapshot.Retrying = append(snapshot.Retrying, RetrySnapshot{IssueIdentifier: retry.issue.Identifier, Attempt: retry.attempt, Kind: string(retry.kind), Reason: retry.reason, WaitAttempt: st.landingWaits, Due: retry.due, IssueUsage: st.usage})
+			entry := RetrySnapshot{IssueIdentifier: retry.issue.Identifier, Attempt: retry.attempt, Kind: string(retry.kind), Reason: retry.reason, Due: retry.due, IssueUsage: st.usage}
+			if retry.kind == retryLanding {
+				entry.WaitAttempt = st.landingWaits
+			}
+			snapshot.Retrying = append(snapshot.Retrying, entry)
 		}
 		if wait := st.waiting; wait != nil {
 			age := now.Sub(wait.since).Milliseconds()

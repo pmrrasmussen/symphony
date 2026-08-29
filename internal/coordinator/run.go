@@ -122,8 +122,11 @@ func (c *Coordinator) reconcile(ctx context.Context) error {
 		if !known {
 			// A run whose backend this configuration cannot describe has no
 			// policy to apply. Say so: silently treating the zero budget as
-			// "no stall timeout" would leave the run unsupervised.
-			c.log.Warn("agent backend policy unavailable", "issue_identifier", r.issue.Identifier, "agent_backend", r.backend)
+			// "no stall timeout" would leave the run unsupervised. The
+			// identifier comes from run.issue, the copy taken under c.mu above,
+			// like every other read on this path: r.issue itself is written by
+			// refreshRunIssue under the lock this loop does not hold.
+			c.log.Warn("agent backend policy unavailable", "issue_identifier", run.issue.Identifier, "agent_backend", r.backend)
 		}
 		if reason == "" && known && launch.StallTimeout > 0 && now.Sub(last) > launch.StallTimeout {
 			reason = stopStalled

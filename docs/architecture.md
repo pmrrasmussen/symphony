@@ -245,7 +245,10 @@ duplicate-prevention claim. That delay starts at `github.poll_interval_ms` and
 escalates with the number of consecutive waits toward
 `agent.max_retry_backoff_ms`, so an unsettling gate degrades to a slow poll
 rather than a permanent per-interval respawn; the wait count is reset with the
-claim and surfaced as `wait_attempt`. A redispatch that finds the state's
+claim, and by a genuine failure under that claim, so the waits it escalates on
+are consecutive ones rather than every wait of the episode (a systemic failure
+resets nothing: it says as little about the landing gate as it does about the
+issue's work). It is surfaced as `wait_attempt`. A redispatch that finds the state's
 concurrency limit taken keeps that same cadence and attempt instead of
 escalating as a failure would. A terminal result -- merged, already merged, or a
 completed reconciliation -- ends the run the same way and closes

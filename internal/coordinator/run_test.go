@@ -346,6 +346,54 @@ func TestStallBudgetIsResolvedUnderTheRunsBackendNotTheConfiguredOne(t *testing.
 	}
 }
 
+// TestUnknownBackendWarningReadsTheIssueCopyTakenUnderTheLock pins the read
+// that made reconcile's unknown-backend warning a data race (PMR-189): it took
+// the identifier from the live *running record while the worker goroutine
+// writes that field through refreshRunIssue under c.mu, which reconcile no
+// longer holds by then. Every other read on this path uses the run.issue copy
+// taken under the lock, and this test is meaningful only under -race, where
+// reverting the warning to r.issue reports the write/read pair below.
+func TestUnknownBackendWarningReadsTheIssueCopyTakenUnderTheLock(t *testing.T) {
+	w := testSettings(t)
+	issue := testIssue()
+	var logs syncBuffer
+	c := New(&fakeTracker{issue: issue}, &fakeAgent{}, &fakeWorkspace{}, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&logs, nil)))
+	defer assertInvariants(t, c)
+	c.clock = fakeClock{now: time.Date(2026, 8, 29, 9, 41, 0, 0, time.UTC)}
+	// A backend this configuration cannot describe is what reaches the warning
+	// at all; the run is seeded because only its record matters here, not the
+	// session that would otherwise have to be alive to hold it.
+	r := &running{issue: issue, backend: "retired-backend", session: domain.AgentSession{ID: "t-u"}, last: c.clock.Now(), cancel: func() {}}
+	c.seedRunning(issue, r)
+	// Two identifiers, so every refresh actually rewrites the field the warning
+	// reads rather than storing the same bytes back.
+	renamed := issue
+	renamed.Identifier = "ENG-RENAMED"
+
+	const rounds = 500
+	refreshed := make(chan struct{})
+	go func() {
+		defer close(refreshed)
+		for i := 0; i < rounds; i++ {
+			fresh := issue
+			if i%2 == 0 {
+				fresh = renamed
+			}
+			c.refreshRunIssue(r, fresh)
+		}
+	}()
+	for i := 0; i < rounds; i++ {
+		if err := c.reconcile(context.Background()); err != nil {
+			t.Fatalf("reconcile: %v", err)
+		}
+	}
+	<-refreshed
+
+	if !strings.Contains(logs.String(), `"msg":"agent backend policy unavailable"`) {
+		t.Fatalf("the unknown-backend warning never fired, so nothing was pinned: %s", logs.String())
+	}
+}
+
 func TestReconciliationRefreshesStateCapacityForLaterAdmissions(t *testing.T) {
 	w := testSettings(t)
 	w.Config.Agent.MaxConcurrent = 2

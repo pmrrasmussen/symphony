@@ -58,8 +58,17 @@ type issueState struct {
 	// the delayed landing redispatch so a gate that never settles (a genuinely
 	// long check run, or a required_checks name that does not match any GitHub
 	// job) backs off toward agent.max_retry_backoff_ms instead of respawning a
-	// session at the GitHub poll cadence forever. It is cleared with the claim,
-	// so any other landing outcome resets it (PMR-78).
+	// session at the GitHub poll cadence forever (PMR-78).
+	//
+	// Consecutive is meant literally, so two outcomes reset it: the release that
+	// ends the claim, and a genuine failure under that claim. The failure needs
+	// its own reset because finishFailure keeps the claim through scheduleRetry,
+	// so the count would otherwise survive an interleaved failure -- inflating
+	// landingRetryDelay's escalation and firing the stuck-landing Warn for waits
+	// that were never consecutive (PMR-189). A systemic failure resets neither
+	// this nor systemicFailures below: it names a host or backend boundary, and
+	// is no more evidence that the landing gate has settled than that the outage
+	// has.
 	landingWaits int
 	// landingEscalated records whether the "landing wait retry scheduled" log
 	// has already been raised to Warn once landingWaits crossed the point where
@@ -184,14 +193,18 @@ func (c *Coordinator) landingWaitsFor(id string) int {
 	return 0
 }
 
-// recordSystemicFailure folds one classified retryAgent failure into the
-// issue's consecutive-systemic-failure streak and returns that streak, which is
-// zero for a genuine failure: a failure the issue itself is answerable for ends
-// the streak, because whatever host or backend boundary preceded it has plainly
-// stopped stopping the work. Like the landing-wait accounting the streak
-// belongs to the claim it was observed under, so an issue that no longer holds
-// one records nothing -- and scheduleRetry declines its redispatch anyway.
-func (c *Coordinator) recordSystemicFailure(id string, systemic bool) int {
+// recordFailureOutcome folds one classified retryAgent failure into the two
+// streaks a failure ends, and returns the consecutive-systemic-failure streak,
+// which is zero for a genuine failure. A failure the issue itself is answerable
+// for ends both: the systemic streak, because whatever host or backend boundary
+// preceded it has plainly stopped stopping the work, and the consecutive
+// landing waits, because the run that just failed did something other than wait
+// (PMR-189). A systemic reason ends neither, for the one reason it holds the
+// attempt fixed too -- it says nothing about this issue's work. Like the
+// landing-wait accounting both streaks belong to the claim they were observed
+// under, so an issue that no longer holds one records nothing -- and
+// scheduleRetry declines its redispatch anyway.
+func (c *Coordinator) recordFailureOutcome(id string, systemic bool) int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	st := c.claimedStateLocked(id)
@@ -200,6 +213,8 @@ func (c *Coordinator) recordSystemicFailure(id string, systemic bool) int {
 	}
 	if !systemic {
 		st.systemicFailures = 0
+		st.landingWaits = 0
+		st.landingEscalated = false
 		return 0
 	}
 	st.systemicFailures++

@@ -62,7 +62,9 @@ func (c *Coordinator) finishFailure(ctx context.Context, i domain.Issue, attempt
 // moves, and reports whether its reason was systemic: next is the attempt the
 // redispatch runs under, and escalation is the count backoff keys its delay to.
 // For an issue-attributable failure they are the one escalated attempt they
-// have always been.
+// have always been. recordFailureOutcome, which supplies the second, also ends
+// the two streaks such a failure ends: the consecutive systemic failures, and
+// the consecutive landing waits.
 //
 // A systemic reason splits them (PMR-179). It names a boundary the host or a
 // shared backend crossed and says nothing about this issue's work (see
@@ -79,7 +81,7 @@ func (c *Coordinator) finishFailure(ctx context.Context, i domain.Issue, attempt
 // the streak is worth to an operator reading the retry warnings.
 func (c *Coordinator) failureCounters(id string, attempt int, reason string) (next, escalation int, systemic bool) {
 	systemic = systemicFailureReasons[reason]
-	streak := c.recordSystemicFailure(id, systemic)
+	streak := c.recordFailureOutcome(id, systemic)
 	if systemic {
 		return attempt, streak, true
 	}
