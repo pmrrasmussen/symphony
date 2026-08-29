@@ -29,6 +29,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/pmrrasmussen/symphony/internal/agentstream"
 	"github.com/pmrrasmussen/symphony/internal/capability"
 	"github.com/pmrrasmussen/symphony/internal/config"
 	"github.com/pmrrasmussen/symphony/internal/domain"
@@ -36,11 +37,6 @@ import (
 	"github.com/pmrrasmussen/symphony/internal/linear"
 	"github.com/pmrrasmussen/symphony/internal/mcpbridge"
 )
-
-// maxLine bounds one stdout line. A single assistant message or tool result is
-// one line and is routinely large, so an oversized line is normal traffic here
-// and is skipped rather than failing the run.
-const maxLine = 8 << 20
 
 // eventBuffer leaves room for the terminal event even when a consumer stops
 // reading: the coordinator returns as soon as it sees a terminal event, so a
@@ -362,7 +358,7 @@ func (b *Backend) forget(id string) {
 //     race the handshake, and losing that race is not an error the child
 //     reports: it is a server stuck at "pending", which verifyInit then refuses.
 func (b *Backend) run(ctx context.Context, s *session, r domain.AgentRequest, resume bool) (<-chan domain.Event, error) {
-	events := &sink{events: make(chan domain.Event, eventBuffer)}
+	events := agentstream.NewSink(eventBuffer)
 	retired := s.retireEndpoint(nil)
 	endpoint, held, err := b.bindEndpoint(s, events)
 	if err != nil {
@@ -408,7 +404,7 @@ func (b *Backend) run(ctx context.Context, s *session, r domain.AgentRequest, re
 	// still see it.
 	reportRetirement(events, retired)
 	go t.stream(s, r, turnNumber)
-	return t.sink.events, nil
+	return t.sink.Events(), nil
 }
 
 // newSessionID mints the UUID the CLI is told to use. Assigning it means the

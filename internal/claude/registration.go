@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/pmrrasmussen/symphony/internal/agentstream"
 	"github.com/pmrrasmussen/symphony/internal/domain"
 	"github.com/pmrrasmussen/symphony/internal/mcpbridge"
 )
@@ -57,11 +58,11 @@ func (g *registration) revoke(ctx context.Context) (bool, error) {
 // result, so the endpoint's no-logging doctrine survives reporting them -- and
 // not reporting them is worse than the risk: nothing in mcpbridge logs, so an
 // invariant the code knowingly gave up on would otherwise be invisible.
-func reportRetirement(events *sink, expired error) {
+func reportRetirement(events *agentstream.Sink, expired error) {
 	if expired == nil {
 		return
 	}
-	events.emit(domain.Event{Kind: domain.EventDiagnostic, At: time.Now(),
+	events.Emit(domain.Event{Kind: domain.EventDiagnostic, At: time.Now(),
 		Message: "claude capability endpoint revocation: " + expired.Error()})
 }
 
@@ -141,11 +142,11 @@ func (s *session) retireEndpoint(only *registration) error {
 // is told the endpoint exists: with nothing advertised the returned
 // capabilityEndpoint is nil, so no --mcp-config is rendered and no token reaches
 // the child, and the registration is unreachable by construction.
-func (b *Backend) bindEndpoint(s *session, events *sink) (*capabilityEndpoint, *registration, error) {
+func (b *Backend) bindEndpoint(s *session, events *agentstream.Sink) (*capabilityEndpoint, *registration, error) {
 	if b.endpoint == nil {
 		return nil, nil, nil
 	}
-	bridge, err := b.endpoint.Register(s.ctx, s.registry, events.emit)
+	bridge, err := b.endpoint.Register(s.ctx, s.registry, events.Emit)
 	if err != nil {
 		return nil, nil, fmt.Errorf("register claude capability endpoint: %w", err)
 	}

@@ -4,10 +4,13 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/pmrrasmussen/symphony/internal/agentstream"
 	"github.com/pmrrasmussen/symphony/internal/domain"
 	"github.com/pmrrasmussen/symphony/internal/observability"
 	"github.com/pmrrasmussen/symphony/internal/procgroup"
@@ -20,7 +23,7 @@ func (t *turn) stream(s *session, r domain.AgentRequest, turnNumber int) {
 	// The channel is closed by the sink, from inside the sink's own mutex, so
 	// there is no ordering here to get wrong and no window in which an emit can
 	// find the channel closed. Closing it here instead would reintroduce one.
-	defer t.sink.close()
+	defer t.sink.Close()
 	defer close(t.exited)
 	// Retiring this turn's endpoint registration is deferred after both of those
 	// so it runs before them. Before the stream closes, because the revocation
@@ -47,7 +50,7 @@ func (t *turn) stream(s *session, r domain.AgentRequest, turnNumber int) {
 		s.mu.Unlock()
 	}()
 
-	emit := t.sink.emit
+	emit := t.sink.Emit
 	pending := map[string]pendingCall{}
 
 	// The turn budget is enforced here rather than by the context, so the
@@ -72,7 +75,7 @@ func (t *turn) stream(s *session, r domain.AgentRequest, turnNumber int) {
 		stderr.readFrom(t.stderr)
 	}()
 
-	lines := newLineReader(t.stdout)
+	lines := agentstream.NewLineReader(t.stdout)
 	var initVerified bool
 	var readErr error
 	// turnUsage sums the Anthropic API usage of every assistant message seen so
@@ -81,7 +84,7 @@ func (t *turn) stream(s *session, r domain.AgentRequest, turnNumber int) {
 	// because the timeout above killed it first.
 	var turnUsage domain.Usage
 	for {
-		line, skipped, err := lines.next()
+		line, skipped, err := lines.Next()
 		if err != nil {
 			if !errors.Is(err, io.EOF) {
 				readErr = err
@@ -111,7 +114,7 @@ func (t *turn) stream(s *session, r domain.AgentRequest, turnNumber int) {
 					// Two refused init lines can arrive in a single read, and
 					// killing the child does not discard what is already
 					// buffered, so the latch is what keeps this to one failure.
-					t.sink.emitTerminal(domain.Event{Kind: domain.EventFailed, At: time.Now(), Message: refusal})
+					t.sink.EmitTerminal(domain.Event{Kind: domain.EventFailed, At: time.Now(), Message: refusal})
 					t.kill()
 					continue
 				}
@@ -217,7 +220,7 @@ func (t *turn) stream(s *session, r domain.AgentRequest, turnNumber int) {
 				// for the result event the CLI still sends a moment later,
 				// stops it from spending any more of a launch already denied
 				// (PMR-131).
-				t.sink.emitTerminal(domain.Event{
+				t.sink.EmitTerminal(domain.Event{
 					Kind: domain.EventRateLimited, At: time.Now(),
 					Message:         "claude reported a rate limit: " + statusCategory + " (" + observability.Text(rateLimitType) + ")",
 					RateLimitStatus: statusCategory,
@@ -237,7 +240,7 @@ func (t *turn) stream(s *session, r domain.AgentRequest, turnNumber int) {
 				})
 			}
 		case "result":
-			if t.sink.settled() {
+			if t.sink.Settled() {
 				// Something already ended this turn -- a refused init, or a
 				// terminal event raised off this loop. Reporting the result too
 				// would emit a second terminal event and misreport the reason.
@@ -267,17 +270,17 @@ func (t *turn) stream(s *session, r domain.AgentRequest, turnNumber int) {
 			if event.IsError {
 				// is_error is the authoritative failure signal: an
 				// authentication failure arrives with subtype "success".
-				t.sink.emitTerminal(domain.Event{Kind: domain.EventFailed, At: time.Now(),
+				t.sink.EmitTerminal(domain.Event{Kind: domain.EventFailed, At: time.Now(),
 					Message: "claude turn failed: " + observability.Text(firstNonEmpty(event.TerminalReason, event.APIErrorStatus, event.StopReason, "unspecified"))})
 				continue
 			}
 			if !initVerified {
 				// A turn that never announced its policy is not a turn whose
 				// boundary is known.
-				t.sink.emitTerminal(domain.Event{Kind: domain.EventFailed, At: time.Now(), Message: "claude session refused: no init event was reported"})
+				t.sink.EmitTerminal(domain.Event{Kind: domain.EventFailed, At: time.Now(), Message: "claude session refused: no init event was reported"})
 				continue
 			}
-			t.sink.emitTerminal(domain.Event{Kind: domain.EventCompleted, At: time.Now()})
+			t.sink.EmitTerminal(domain.Event{Kind: domain.EventCompleted, At: time.Now()})
 		}
 	}
 	<-stderrDone
@@ -300,17 +303,17 @@ func (t *turn) stream(s *session, r domain.AgentRequest, turnNumber int) {
 
 	// The loop ended without a terminal event, so this is the last chance to
 	// report why -- unless this turn's outcome was already reported elsewhere.
-	if t.sink.settled() {
+	if t.sink.Settled() {
 		return
 	}
 	select {
 	case <-timedOut:
-		t.sink.emitTerminal(domain.Event{Kind: domain.EventFailed, At: time.Now(), Message: "claude turn timeout"})
+		t.sink.EmitTerminal(domain.Event{Kind: domain.EventFailed, At: time.Now(), Message: "claude turn timeout"})
 		return
 	default:
 	}
 	if t.cancelled() {
-		t.sink.emitTerminal(domain.Event{Kind: domain.EventFailed, At: time.Now(), Message: "claude turn cancelled"})
+		t.sink.EmitTerminal(domain.Event{Kind: domain.EventFailed, At: time.Now(), Message: "claude turn cancelled"})
 		return
 	}
 	if tail := t.withoutEndpoint(stderr.text()); tail != "" {
@@ -318,11 +321,11 @@ func (t *turn) stream(s *session, r domain.AgentRequest, turnNumber int) {
 	}
 	switch {
 	case readErr != nil:
-		t.sink.emitTerminal(domain.Event{Kind: domain.EventFailed, At: time.Now(), Message: "claude stdout read failed"})
+		t.sink.EmitTerminal(domain.Event{Kind: domain.EventFailed, At: time.Now(), Message: "claude stdout read failed"})
 	case waitErr != nil:
-		t.sink.emitTerminal(domain.Event{Kind: domain.EventFailed, At: time.Now(), Message: "claude exited without completing the turn: " + exitText(waitErr)})
+		t.sink.EmitTerminal(domain.Event{Kind: domain.EventFailed, At: time.Now(), Message: "claude exited without completing the turn: " + exitText(waitErr)})
 	default:
-		t.sink.emitTerminal(domain.Event{Kind: domain.EventFailed, At: time.Now(), Message: "claude exited without reporting a result"})
+		t.sink.EmitTerminal(domain.Event{Kind: domain.EventFailed, At: time.Now(), Message: "claude exited without reporting a result"})
 	}
 }
 
@@ -346,4 +349,47 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+// exitText reports an exit status without the child's own output.
+func exitText(err error) string {
+	var exit *exec.ExitError
+	if errors.As(err, &exit) {
+		return "exit status " + strconv.Itoa(exit.ExitCode())
+	}
+	return "process error"
+}
+
+// boundedTail keeps only the last bounded, redacted slice of stderr, so a noisy
+// child cannot flood a log and no unbounded child output is retained.
+type boundedTail struct {
+	mu   sync.Mutex
+	tail []byte
+}
+
+func (b *boundedTail) readFrom(r io.Reader) {
+	buf := make([]byte, 4<<10)
+	for {
+		n, err := r.Read(buf)
+		if n > 0 {
+			b.mu.Lock()
+			b.tail = append(b.tail, buf[:n]...)
+			if len(b.tail) > observability.MaxDiagnosticBytes {
+				b.tail = b.tail[len(b.tail)-observability.MaxDiagnosticBytes:]
+			}
+			b.mu.Unlock()
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
+func (b *boundedTail) text() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if len(b.tail) == 0 {
+		return ""
+	}
+	return observability.Text(string(b.tail))
 }

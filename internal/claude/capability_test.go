@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pmrrasmussen/symphony/internal/agentstream"
 	"github.com/pmrrasmussen/symphony/internal/capability"
 	"github.com/pmrrasmussen/symphony/internal/config"
 	"github.com/pmrrasmussen/symphony/internal/domain"
@@ -1230,14 +1231,14 @@ func TestAnExpiredRevocationReachesTheNextTurnsStream(t *testing.T) {
 // helper both retirement sites use, including the one inside stream's defers,
 // which cannot be reached with a substituted registration.
 func TestReportRetirementIsSilentOnASuccessfulRevocation(t *testing.T) {
-	events := &sink{events: make(chan domain.Event, eventBuffer)}
+	events := agentstream.NewSink(eventBuffer)
 	reportRetirement(events, nil)
-	if len(events.events) != 0 {
-		t.Fatalf("a clean revocation reported %d events", len(events.events))
+	if len(events.Events()) != 0 {
+		t.Fatalf("a clean revocation reported %d events", len(events.Events()))
 	}
 	reportRetirement(events, mcpbridge.ErrFinalizerExpired)
-	events.close()
-	collected := drain(t, events.events)
+	events.Close()
+	collected := drain(t, events.Events())
 	if len(collected) != 1 || collected[0].Kind != domain.EventDiagnostic {
 		t.Fatalf("collected=%v", kinds(collected))
 	}

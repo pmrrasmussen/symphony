@@ -20,6 +20,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pmrrasmussen/symphony/internal/agentstream"
 	"github.com/pmrrasmussen/symphony/internal/agenttest"
 	"github.com/pmrrasmussen/symphony/internal/capability"
 	"github.com/pmrrasmussen/symphony/internal/config"
@@ -117,8 +118,8 @@ printf '%s\n' 'token=do-not-log-this' >&2
 
 func TestReadRoutesServerRequestBeforeCollidingResponseID(t *testing.T) {
 	responses := make(chan callResult, 1)
-	events := make(chan domain.Event, 32)
-	c := &client{pending: map[int]chan callResult{1: responses}, active: events, activeReady: true, done: make(chan struct{})}
+	c, events := streamingClient()
+	c.pending[1] = responses
 	input := strings.NewReader("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"account/rateLimits/updated\",\"params\":{\"remaining\":9}}\n" +
 		"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\n")
 	if err := c.read(input); err != nil {
@@ -129,7 +130,7 @@ func TestReadRoutesServerRequestBeforeCollidingResponseID(t *testing.T) {
 		t.Fatalf("response=%+v", result)
 	}
 	select {
-	case event := <-events:
+	case event := <-events.Events():
 		if event.Kind != domain.EventRateLimit {
 			t.Fatalf("event=%+v", event)
 		}
@@ -139,8 +140,7 @@ func TestReadRoutesServerRequestBeforeCollidingResponseID(t *testing.T) {
 }
 
 func TestItemLifecycleClassifiesSafeFieldsWithoutParsingCommandOrArguments(t *testing.T) {
-	events := make(chan domain.Event, 8)
-	c := &client{pending: map[int]chan callResult{}, active: events, activeReady: true, done: make(chan struct{})}
+	c, events := streamingClient()
 	input := strings.NewReader(
 		`{"jsonrpc":"2.0","method":"item/started","params":{"threadId":"thread-1","turnId":"turn-1","startedAtMs":1,"item":{"id":"item-1","type":"commandExecution","status":"inProgress","cwd":"/work","commandActions":[],"command":["bash","-lc","token=do-not-log-this"]}}}` + "\n" +
 			`{"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"thread-1","turnId":"turn-1","completedAtMs":2,"item":{"id":"item-1","type":"commandExecution","status":"failed","cwd":"/work","commandActions":[],"command":["bash","-lc","token=do-not-log-this"],"durationMs":250,"aggregatedOutput":"secret-output-value"}}}` + "\n" +
@@ -150,9 +150,9 @@ func TestItemLifecycleClassifiesSafeFieldsWithoutParsingCommandOrArguments(t *te
 	if err := c.read(input); err != nil {
 		t.Fatal(err)
 	}
-	close(events)
+	events.Close()
 	var seen []domain.Event
-	for event := range events {
+	for event := range events.Events() {
 		seen = append(seen, event)
 	}
 	if len(seen) != 4 {
@@ -188,8 +188,7 @@ func TestItemLifecycleClassifiesSafeFieldsWithoutParsingCommandOrArguments(t *te
 // breaks this test instead of silently zeroing every Codex run's usage the
 // way turn/completed's non-existent "usage" field did (PMR-155).
 func TestThreadTokenUsageUpdatedFoldsCacheAndReasoningTokens(t *testing.T) {
-	events := make(chan domain.Event, 4)
-	c := &client{pending: map[int]chan callResult{}, active: events, activeReady: true, done: make(chan struct{})}
+	c, events := streamingClient()
 	input := strings.NewReader(
 		`{"jsonrpc":"2.0","method":"thread/tokenUsage/updated","params":{"threadId":"thread-1","turnId":"turn-1","tokenUsage":{"last":{"cachedInputTokens":2,"cacheWriteInputTokens":1,"inputTokens":4,"outputTokens":6,"reasoningOutputTokens":3,"totalTokens":16},"total":{"cachedInputTokens":2,"cacheWriteInputTokens":1,"inputTokens":4,"outputTokens":6,"reasoningOutputTokens":3,"totalTokens":16},"modelContextWindow":128000}}}` + "\n",
 	)
@@ -197,7 +196,7 @@ func TestThreadTokenUsageUpdatedFoldsCacheAndReasoningTokens(t *testing.T) {
 		t.Fatal(err)
 	}
 	select {
-	case event := <-events:
+	case event := <-events.Events():
 		if event.Kind != domain.EventUsage || event.UsageAuthoritative {
 			t.Fatalf("event=%+v", event)
 		}
@@ -277,14 +276,51 @@ func TestCallPrefersDeliveredResponseWhenProcessExitIsReady(t *testing.T) {
 	}
 }
 
-func TestReadClassifiesMalformedAndOversizedStdout(t *testing.T) {
-	c := bareClient(nopWriteCloser{Writer: io.Discard})
-	if err := c.read(strings.NewReader("not-json\n")); err == nil || !strings.Contains(err.Error(), "malformed app-server message") {
-		t.Fatalf("malformed error=%v", err)
+// TestAnOversizedNotificationDoesNotEndTheSession is the whole of PMR-192. One
+// item/completed carrying a command's aggregated output can exceed any line
+// bound, and the scanner this loop used made that permanently fatal: the read
+// returned, the client aborted, and a run that was progressing ended as "codex
+// stdout scanner failed". The oversized line is skipped instead, the
+// notifications around it are still classified, and the run continues.
+func TestAnOversizedNotificationDoesNotEndTheSession(t *testing.T) {
+	c, events := streamingClient()
+	oversized := `{"jsonrpc":"2.0","method":"item/completed","params":{"item":{"id":"item-1","type":"commandExecution","status":"completed","output":"` +
+		strings.Repeat("x", agentstream.MaxLine) + `"}}}`
+	input := strings.NewReader(
+		"not json at all\n" +
+			oversized + "\n" +
+			`{"jsonrpc":"2.0","method":"item/completed","params":{"item":{"id":"item-2","type":"commandExecution","status":"completed"}}}` + "\n")
+	if err := c.read(input); err != nil {
+		t.Fatalf("read ended the session: %v", err)
 	}
-	oversized := strings.NewReader(strings.Repeat("x", (1<<20)+1))
-	if err := c.read(oversized); err == nil || !strings.Contains(err.Error(), "stdout scanner failed") {
-		t.Fatalf("scanner error=%v", err)
+	var items, diagnostics []domain.Event
+	events.Close()
+	for event := range events.Events() {
+		switch event.Kind {
+		case domain.EventItem:
+			items = append(items, event)
+		case domain.EventDiagnostic:
+			diagnostics = append(diagnostics, event)
+		}
+	}
+	if len(items) != 1 || items[0].ItemID != "item-2" {
+		t.Fatalf("items=%+v", items)
+	}
+	// Both skips are reported once per session, not once per line: the flood
+	// this tolerates is exactly what must not reach a log.
+	if len(diagnostics) != 1 || !strings.Contains(diagnostics[0].Message, "skipped an unreadable") {
+		t.Fatalf("diagnostics=%+v", diagnostics)
+	}
+}
+
+// TestAResponseNamingNoPendingCallIsSkipped covers the other line this loop
+// cannot use. It answers nothing this client is waiting for -- a call that has
+// already timed out and removed itself, say -- so it is skipped like any other,
+// rather than ending a session that has moved on.
+func TestAResponseNamingNoPendingCallIsSkipped(t *testing.T) {
+	c, _ := streamingClient()
+	if err := c.read(strings.NewReader("{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"ok\":true}}\n")); err != nil {
+		t.Fatalf("read ended the session: %v", err)
 	}
 }
 
@@ -336,11 +372,8 @@ func TestMalformedResultFailsAllPendingRequests(t *testing.T) {
 }
 
 func TestFinishFailsPendingAndDeliversTerminalIntoFullBuffer(t *testing.T) {
-	c := bareClient(nopWriteCloser{Writer: io.Discard})
-	events := make(chan domain.Event, 32)
-	c.active = events
+	c, events := streamingClient()
 	c.activeDone = make(chan struct{})
-	c.activeReady = true
 	pending := make(chan callResult, 1)
 	c.pending[1] = pending
 	for i := 0; i < 100; i++ {
@@ -352,33 +385,36 @@ func TestFinishFailsPendingAndDeliversTerminalIntoFullBuffer(t *testing.T) {
 	}
 	var last domain.Event
 	count := 0
-	for event := range events {
+	for event := range events.Events() {
 		last = event
 		count++
 	}
-	if count != 32 || last.Kind != domain.EventFailed || !strings.Contains(last.Message, "process exit") {
-		t.Fatalf("event count=%d last=%+v", count, last)
+	// Progress is dropped near the top of the buffer so the outcome always
+	// fits; what must never happen is a blocking send, which would leak the
+	// emitting goroutine and hang this test rather than fail it.
+	if count != eventBuffer-agentstream.ReservedTerminalSlots+1 {
+		t.Fatalf("event count=%d", count)
+	}
+	if last.Kind != domain.EventFailed || !strings.Contains(last.Message, "process exit") {
+		t.Fatalf("last=%+v", last)
 	}
 }
 
 func TestFinishDefersTerminalUntilTurnActivation(t *testing.T) {
-	c := bareClient(nopWriteCloser{Writer: io.Discard})
-	events := make(chan domain.Event, 32)
-	c.active = events
-	c.activeDone = make(chan struct{})
+	c, events := heldClient()
 	c.finish(errors.New("codex process exited immediately after turn start"))
 	select {
-	case _, ok := <-events:
+	case _, ok := <-events.Events():
 		if !ok {
-			t.Fatal("pre-ready event stream closed before session activation")
+			t.Fatal("held event stream closed before session activation")
 		}
-		t.Fatal("pre-ready event stream emitted before session activation")
+		t.Fatal("held event stream emitted before session activation")
 	default:
 	}
 	session := domain.AgentSession{ID: "thread-turn", ThreadID: "thread", TurnID: "turn"}
 	c.activate(events, session, 123)
 	var kinds []domain.EventKind
-	for event := range events {
+	for event := range events.Events() {
 		kinds = append(kinds, event.Kind)
 	}
 	if len(kinds) != 2 || kinds[0] != domain.EventSessionStarted || kinds[1] != domain.EventFailed {
@@ -387,16 +423,13 @@ func TestFinishDefersTerminalUntilTurnActivation(t *testing.T) {
 }
 
 func TestCompletedBeforeProcessExitRemainsTerminal(t *testing.T) {
-	c := bareClient(nopWriteCloser{Writer: io.Discard})
-	events := make(chan domain.Event, 32)
-	c.active = events
-	c.activeDone = make(chan struct{})
+	c, events := heldClient()
 	c.emit(domain.Event{Kind: domain.EventCompleted})
 	c.finish(errors.New("codex process exited after completion"))
 	session := domain.AgentSession{ID: "thread-turn", ThreadID: "thread", TurnID: "turn"}
 	c.activate(events, session, 123)
 	var kinds []domain.EventKind
-	for event := range events {
+	for event := range events.Events() {
 		kinds = append(kinds, event.Kind)
 	}
 	if len(kinds) != 2 || kinds[0] != domain.EventSessionStarted || kinds[1] != domain.EventCompleted {
@@ -693,13 +726,14 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{}}'
 	}
 }
 
-// TestTurnStartFailureForceClosesActiveChannelBeforeActivation covers the
-// first of turn()'s two forceCloseActive call sites: the app-server process
-// exits with turn/start outstanding (an abort mid-turn), which fails that
-// pending call before activate() ever ran. forceCloseActive must still detach
-// and close the turn's channels, and turn() must report the failure without
-// ever handing back an events channel nobody can drain.
-func TestTurnStartFailureForceClosesActiveChannelBeforeActivation(t *testing.T) {
+// TestTurnStartFailureClosesTheHeldStreamBeforeActivation covers the first of
+// turn()'s two closeActive call sites: the app-server process exits with
+// turn/start outstanding (an abort mid-turn), which fails that pending call
+// before activate() ever ran. closeActive must still detach the turn -- closing
+// a sink that is still holding what it never got to deliver -- and turn() must
+// report the failure without ever handing back an events channel nobody can
+// drain.
+func TestTurnStartFailureClosesTheHeldStreamBeforeActivation(t *testing.T) {
 	dir := t.TempDir()
 	script := writeAppServer(t, dir, `
 IFS= read -r line
@@ -734,21 +768,21 @@ exit 0
 		t.Fatalf("turn error=%v, want the aborted process reported", turnErr)
 	}
 	if events != nil {
-		t.Fatal("a forced-closed turn must not hand back an events channel")
+		t.Fatal("a closed turn must not hand back an events channel")
 	}
 	c.mu.Lock()
-	active, activeDone, activeReady := c.active, c.activeDone, c.activeReady
+	active, activeDone := c.active, c.activeDone
 	c.mu.Unlock()
-	if active != nil || activeDone != nil || activeReady {
-		t.Fatalf("forceCloseActive did not detach the turn's channels: active=%v activeDone=%v activeReady=%v", active, activeDone, activeReady)
+	if active != nil || activeDone != nil {
+		t.Fatalf("closeActive did not detach the turn: active=%v activeDone=%v", active, activeDone)
 	}
 }
 
-// TestMalformedTurnStartResponseForceClosesActiveChannelBeforeActivation
-// covers turn()'s second forceCloseActive call site: a turn/start response
-// that answers but omits turn.id, the teardown-before-the-stream-is-ready
-// case, since activate() never runs on this path either.
-func TestMalformedTurnStartResponseForceClosesActiveChannelBeforeActivation(t *testing.T) {
+// TestMalformedTurnStartResponseClosesTheHeldStreamBeforeActivation covers
+// turn()'s second closeActive call site: a turn/start response that answers but
+// omits turn.id, the teardown-before-the-stream-is-activated case, since
+// activate() never runs on this path either.
+func TestMalformedTurnStartResponseClosesTheHeldStreamBeforeActivation(t *testing.T) {
 	dir := t.TempDir()
 	script := writeAppServer(t, dir, `
 IFS= read -r line
@@ -783,13 +817,13 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{}}'
 		t.Fatalf("turn error=%v, want the malformed response reported", turnErr)
 	}
 	if events != nil {
-		t.Fatal("a forced-closed turn must not hand back an events channel")
+		t.Fatal("a closed turn must not hand back an events channel")
 	}
 	c.mu.Lock()
-	active, activeDone, activeReady := c.active, c.activeDone, c.activeReady
+	active, activeDone := c.active, c.activeDone
 	c.mu.Unlock()
-	if active != nil || activeDone != nil || activeReady {
-		t.Fatalf("forceCloseActive did not detach the turn's channels: active=%v activeDone=%v activeReady=%v", active, activeDone, activeReady)
+	if active != nil || activeDone != nil {
+		t.Fatalf("closeActive did not detach the turn: active=%v activeDone=%v", active, activeDone)
 	}
 }
 
@@ -1579,6 +1613,24 @@ func (responseThenExitWriteCloser) Close() error { return nil }
 
 func bareClient(in io.WriteCloser) *client {
 	return &client{in: in, timer: realTimer{}, pending: map[int]chan callResult{}, done: make(chan struct{})}
+}
+
+// streamingClient is a client whose turn is already streaming: an activated sink
+// of the size a real turn gets, and nothing else a read loop needs.
+func streamingClient() (*client, *agentstream.Sink) {
+	c := bareClient(nopWriteCloser{Writer: io.Discard})
+	c.active = agentstream.NewSink(eventBuffer)
+	return c, c.active
+}
+
+// heldClient is a client whose turn exists but whose session identity does not
+// yet, which is the window turn/start is outstanding in: everything emitted is
+// held until activate opens the stream with that identity.
+func heldClient() (*client, *agentstream.Sink) {
+	c := bareClient(nopWriteCloser{Writer: io.Discard})
+	c.active = agentstream.NewHeldSink(eventBuffer)
+	c.activeDone = make(chan struct{})
+	return c, c.active
 }
 
 // timedBackend is a backend whose every session bound -- the handshake and
