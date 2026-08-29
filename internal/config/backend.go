@@ -250,6 +250,13 @@ func sandboxPolicy(codex map[string]any, threadSandbox string) (any, error) {
 	return policy, nil
 }
 
+// codexKeys is the complete set of codex block keys, refused if unknown for the
+// same reason claudeKeys are: `stall_timout_ms` would otherwise load clean and
+// run the session on the 300s default. An unknown *top-level* workflow key is
+// still an extension key kept in Workflow.Raw, but inside a block this package
+// validates in full there is nothing an unknown key can be except a typo.
+var codexKeys = []string{"command", "approval_policy", "thread_sandbox", "turn_sandbox_policy", "turn_timeout_ms", "read_timeout_ms", "start_timeout_ms", "stall_timeout_ms"}
+
 // decodeCodex validates the codex: block: the launch command, approval
 // policy, thread sandbox mode, optional per-turn sandbox policy override, and
 // the four launch timeouts.
@@ -257,6 +264,11 @@ func decodeCodex(raw map[string]any) (Codex, error) {
 	codex, err := object(raw, "codex")
 	if err != nil {
 		return Codex{}, err
+	}
+	for key := range codex {
+		if !contains(codexKeys, key) {
+			return Codex{}, fmt.Errorf("invalid configuration: unknown codex field %q", key)
+		}
 	}
 	command, err := stringDefault(codex, "command", "codex app-server")
 	if err != nil {

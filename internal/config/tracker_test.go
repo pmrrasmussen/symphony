@@ -27,6 +27,44 @@ func TestLoadPreservesLinearStateFilterSpelling(t *testing.T) {
 	}
 }
 
+// TestActiveAndTerminalStatesMustBeDisjoint covers PMR-178's second gap. The
+// coordinator matches both lists with config.Norm, so the overlap this refuses
+// is the one that predicate sees: case and surrounding whitespace do not make
+// two spellings of one state distinct.
+func TestActiveAndTerminalStatesMustBeDisjoint(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "WORKFLOW.md")
+	load := func(t *testing.T, tracker string) error {
+		t.Helper()
+		content := "---\ntracker: {kind: linear, " + tracker + "}\n---\nprompt"
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		_, err := Load(path, "")
+		return err
+	}
+
+	for _, test := range []struct{ tracker, active, terminal string }{
+		{tracker: "active_states: [Todo, Done], terminal_states: [Done, Canceled]", active: "Done", terminal: "Done"},
+		{tracker: "active_states: [Todo, done], terminal_states: [Done]", active: "done", terminal: "Done"},
+		// stringList already trims, so the reported spelling is the trimmed one.
+		{tracker: `active_states: [Todo, " Merging "], terminal_states: [MERGING]`, active: "Merging", terminal: "MERGING"},
+	} {
+		err := load(t, test.tracker)
+		if err == nil {
+			t.Fatalf("overlapping states were accepted: %s", test.tracker)
+		}
+		// Both spellings must appear: with only one, an operator cannot tell
+		// which of the two lists to edit.
+		if !strings.Contains(err.Error(), fmt.Sprintf("%q", test.active)) || !strings.Contains(err.Error(), fmt.Sprintf("%q", test.terminal)) {
+			t.Fatalf("error %q does not name both %q and %q", err, test.active, test.terminal)
+		}
+	}
+
+	if err := load(t, "active_states: [Todo, In Progress, Rework, Merging], terminal_states: [Done, Canceled]"); err != nil {
+		t.Fatalf("disjoint lifecycle states must load: %v", err)
+	}
+}
+
 func TestRequiredLabelsPreserveNormalizedBlankValues(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "WORKFLOW.md")
 	content := "---\ntracker: {kind: linear, required_labels: [ Ready, '  ' ], active_states: [Todo], terminal_states: [Done]}\n---\nprompt"

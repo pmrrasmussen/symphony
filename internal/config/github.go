@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"net/url"
+	"sort"
 	"strings"
 	"time"
 )
@@ -18,9 +19,50 @@ func githubBlock(raw map[string]any) (map[string]any, bool) {
 	return github, objectValid
 }
 
-func decodeGitHub(raw map[string]any, objectValid bool, base string, sources *sourceSnapshot) GitHub {
-	if raw == nil || !objectValid {
-		return GitHub{}
+// githubDisabledWarning names the fields that forced a present github: block to
+// decode disabled. Disabling stays silent to the run itself -- worktrees are cut
+// from the workspace default branch and the agent is told delivery is manual --
+// so the operator learns which field did it from Settings.Warnings and
+// preflight, rather than from a pull request opened off the wrong base
+// (PMR-178).
+func githubDisabledWarning(fields ...string) []string {
+	sort.Strings(fields)
+	return []string{"github integration is disabled and delivery falls back to manual: invalid or missing " + strings.Join(fields, ", ")}
+}
+
+// validBaseBranch accepts the branch names Git and the GitHub API accept as a
+// pull request base. Unlike an owner or a repository, each a single path
+// segment, a branch name may contain slashes: release/1.0 is legal, and holding
+// base_branch to the owner/repository rule instead disabled the whole
+// integration for it and cut every worktree from main (PMR-178). The rules
+// below are git-check-ref-format's, applied to the refs/heads/<value> this name
+// expands to.
+func validBaseBranch(value string) bool {
+	if value == "" || strings.HasSuffix(value, ".") || strings.Contains(value, "..") || strings.Contains(value, "@{") {
+		return false
+	}
+	if strings.ContainsAny(value, "\\ ~^:?*[") || strings.ContainsFunc(value, func(r rune) bool { return r < 0x20 || r == 0x7f }) {
+		return false
+	}
+	// An empty component rejects a leading, trailing, or doubled slash; the other
+	// two are Git's own per-component rules.
+	for _, component := range strings.Split(value, "/") {
+		if component == "" || strings.HasPrefix(component, ".") || strings.HasSuffix(component, ".lock") {
+			return false
+		}
+	}
+	return true
+}
+
+// decodeGitHub decodes the github: block, returning the warnings a present but
+// disabled block must surface alongside it. An absent block warns about
+// nothing: not configuring the integration is a supported choice.
+func decodeGitHub(raw map[string]any, objectValid bool, base string, sources *sourceSnapshot) (GitHub, []string) {
+	if !objectValid {
+		return GitHub{}, githubDisabledWarning("github")
+	}
+	if raw == nil {
+		return GitHub{}, nil
 	}
 	read := func(key string) (string, bool) {
 		value, exists := raw[key]
@@ -30,7 +72,10 @@ func decodeGitHub(raw map[string]any, objectValid bool, base string, sources *so
 	owner, ownerOK := read("owner")
 	repository, repositoryOK := read("repository")
 	baseBranch, baseOK := read("base_branch")
-	if !baseOK || baseBranch == "" {
+	// An absent or blank base_branch means main. A present non-string value is
+	// left invalid rather than defaulted, so it disables the integration with a
+	// warning naming the field instead of quietly basing every worktree on main.
+	if _, exists := raw["base_branch"]; !exists || (baseOK && baseBranch == "") {
 		baseBranch, baseOK = "main", true
 	}
 	endpoint, endpointOK := read("endpoint")
@@ -41,40 +86,65 @@ func decodeGitHub(raw map[string]any, objectValid bool, base string, sources *so
 	if _, exists := raw["poll_interval_ms"]; !exists {
 		pollMS, pollOK = 30_000, true
 	}
+	// tokenField follows the token to whichever key supplied it, so an empty
+	// credential file is reported as github.token_file rather than sending the
+	// operator to a github.token they never wrote.
 	token, tokenOK := read("token")
+	tokenField := "github.token"
 	if file, exists := raw["token_file"]; exists {
+		tokenField = "github.token_file"
 		path, ok := file.(string)
 		if !ok {
-			return GitHub{}
+			return GitHub{}, githubDisabledWarning("github.token_file")
 		}
 		expanded, err := sources.expand(path, "github.token_file")
 		if err != nil || strings.TrimSpace(expanded) == "" {
-			return GitHub{}
+			return GitHub{}, githubDisabledWarning("github.token_file")
 		}
 		content, err := sources.readFile(normalizePath(expanded, base))
 		if err != nil {
-			return GitHub{}
+			return GitHub{}, githubDisabledWarning("github.token_file")
 		}
 		token, tokenOK = strings.TrimSpace(string(content)), true
 	} else if tokenOK && strings.HasPrefix(token, "$") {
 		resolved, err := sources.expand(token, "github.token")
 		if err != nil {
-			return GitHub{}
+			return GitHub{}, githubDisabledWarning("github.token")
 		}
 		token = strings.TrimSpace(resolved)
 	} else if tokenOK {
-		return GitHub{}
+		return GitHub{}, githubDisabledWarning("github.token")
 	}
 	endpointURL, err := url.Parse(endpoint)
 	endpointValid := err == nil && endpointURL.Host != "" && (endpointURL.Scheme == "https" || endpointURL.Scheme == "http" && isLocalConfigHost(endpointURL.Hostname()))
+	// owner and repository are single path segments of a GitHub URL, so a slash
+	// in either is a mistake; base_branch has its own rule above.
 	validName := func(value string) bool {
 		return value != "" && !strings.ContainsAny(value, "/\\\r\n\t ") && value != "." && value != ".."
 	}
-	enabled := ownerOK && repositoryOK && baseOK && endpointOK && pollOK && tokenOK && validName(owner) && validName(repository) && validName(baseBranch) && token != "" && pollMS > 0 && endpointValid
-	if !enabled {
-		return GitHub{}
+	var invalid []string
+	if !ownerOK || !validName(owner) {
+		invalid = append(invalid, "github.owner")
 	}
-	return GitHub{Enabled: true, Owner: owner, Repository: repository, BaseBranch: baseBranch, Token: token, Endpoint: strings.TrimRight(endpoint, "/"), PollInterval: time.Duration(pollMS) * time.Millisecond}
+	if !repositoryOK || !validName(repository) {
+		invalid = append(invalid, "github.repository")
+	}
+	if !baseOK || !validBaseBranch(baseBranch) {
+		invalid = append(invalid, "github.base_branch")
+	}
+	if !endpointOK || !endpointValid {
+		invalid = append(invalid, "github.endpoint")
+	}
+	if !pollOK || pollMS <= 0 {
+		invalid = append(invalid, "github.poll_interval_ms")
+	}
+	if !tokenOK || token == "" {
+		invalid = append(invalid, tokenField)
+	}
+	if len(invalid) > 0 {
+		return GitHub{}, githubDisabledWarning(invalid...)
+	}
+	return GitHub{Enabled: true, Owner: owner, Repository: repository, BaseBranch: baseBranch, Token: token, Endpoint: strings.TrimRight(endpoint, "/"), PollInterval: time.Duration(pollMS) * time.Millisecond}, nil
 }
 
 func isLocalConfigHost(host string) bool {

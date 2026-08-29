@@ -81,6 +81,12 @@ tracker:
   # human-controlled and is never dispatched. Configure Rework and Merging as
   # Started states in this project's Linear team before enabling them here;
   # until then, keep only [Todo, In Progress] active.
+  #
+  # The two lists must be disjoint, compared without regard to case or
+  # surrounding whitespace, and a state named in both fails validation. The
+  # scheduler tests them independently, so an overlapping state would be a
+  # dispatch candidate and a stop-and-clean-up target at once, and the two
+  # would take turns acting on the same issue on every poll.
   active_states: [Todo, In Progress, Rework, Merging]
   terminal_states: [Done, Canceled]
 polling:
@@ -142,6 +148,9 @@ agent:
   # escalate the attempt, and keeps the bounded-delay redispatch described under
   # github.poll_interval_ms below. Defaults to 5; must be a positive integer.
   max_attempts: 5
+# Read only when agent.backend selects codex. Unknown keys inside it are
+# refused rather than ignored, exactly as in the claude: block below, so a
+# misspelled field cannot leave a default silently in place.
 codex:
   # A shell command: it runs through `bash -c`, so quoting, expansion, and
   # operators all work here. That shell is not a login shell, so ~/.bash_profile
@@ -275,10 +284,15 @@ codex:
 # that GitHub disabled the Checks permission for fine-grained tokens, which the
 # required-checks gate depends on -- see docs/dogfooding.md before choosing a
 # token type. Invalid or incomplete settings here disable the capabilities and
-# preserve the manual delivery path, except where noted below.
+# preserve the manual delivery path, except where noted below. Disabling that
+# way is not silent: a present but unusable block adds a warning naming every
+# offending field, which `--dry-run` reports as its own check.
 # github:
 #   owner: your-github-owner
 #   repository: your-repository
+#   # Any branch name Git accepts, slashes included: release/1.0 is valid here
+#   # even though a slash in owner or repository above is not. Omit it for
+#   # main. Worktrees are cut from this branch and pull requests target it.
 #   base_branch: main
 #   token_file: $SYMPHONY_GITHUB_TOKEN_FILE
 #   # Alternatively: token: $SYMPHONY_GITHUB_TOKEN

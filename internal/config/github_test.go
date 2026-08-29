@@ -63,6 +63,126 @@ func TestInvalidGitHubConfigurationStaysDisabledWithoutAffectingWorkflow(t *test
 	}
 }
 
+// TestBaseBranchAcceptsSlashesAndIsValidatedApartFromOwnerAndRepository covers
+// PMR-178's first gap. owner and repository are single path segments, so a
+// slash in either is a mistake; a branch name is not, and holding base_branch
+// to the same rule silently disabled the integration for release/1.0 and then
+// cut every worktree from main.
+func TestBaseBranchAcceptsSlashesAndIsValidatedApartFromOwnerAndRepository(t *testing.T) {
+	t.Setenv("PMR178_GITHUB_TOKEN", "github-secret")
+	path := filepath.Join(t.TempDir(), "WORKFLOW.md")
+	load := func(t *testing.T, baseBranch string) Settings {
+		t.Helper()
+		github := "github: {owner: pmrrasmussen, repository: symphony, token: $PMR178_GITHUB_TOKEN"
+		if baseBranch != "" {
+			github += ", base_branch: " + baseBranch
+		}
+		content := "---\ntracker: {kind: linear, active_states: [Todo], terminal_states: [Done]}\n" + github + "}\n---\nprompt"
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		w, err := Load(path, "")
+		if err != nil {
+			t.Fatalf("an invalid github block must never fail the load: %v", err)
+		}
+		return w.Config
+	}
+
+	for _, branch := range []string{"main", "release/1.0", "feature/team/nested-name", "v1.2.3"} {
+		settings := load(t, branch)
+		if !settings.GitHub.Enabled || settings.GitHub.BaseBranch != branch {
+			t.Fatalf("legal base branch %q: github=%+v", branch, settings.GitHub)
+		}
+		if len(settings.Warnings) != 0 {
+			t.Fatalf("legal base branch %q warned: %q", branch, settings.Warnings)
+		}
+	}
+
+	// Names Git itself refuses as refs/heads/<value> still disable the
+	// integration -- but now they say so.
+	for _, branch := range []string{"/leading", "trailing/", "double//slash", "'has space'", "'.hidden'", "'a..b'", "'ends.'", "'caret^'", "'ref@{0}'", "'work.lock'", "'[bracket]'", "12"} {
+		settings := load(t, branch)
+		if settings.GitHub.Enabled {
+			t.Fatalf("illegal base branch %q was accepted: %+v", branch, settings.GitHub)
+		}
+		if len(settings.Warnings) != 1 || !strings.Contains(settings.Warnings[0], "github.base_branch") {
+			t.Fatalf("illegal base branch %q warnings=%q", branch, settings.Warnings)
+		}
+	}
+}
+
+// TestADisabledGitHubBlockWarnsNamingTheOffendingField keeps the fallback to
+// manual delivery from being silent. Preflight emits one check per
+// Settings.Warnings entry, so naming the field here is what an operator sees
+// under --dry-run.
+func TestADisabledGitHubBlockWarnsNamingTheOffendingField(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "WORKFLOW.md")
+	blank := filepath.Join(dir, "blank-token")
+	if err := os.WriteFile(blank, []byte("  \n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		github string
+		fields []string
+	}{
+		{github: "github: []", fields: []string{"github"}},
+		{github: "github: {owner: owner, repository: repo, token: $UNSET_PMR178_TOKEN}", fields: []string{"github.token"}},
+		{github: "github: {owner: owner, repository: repo, token: literal-secret}", fields: []string{"github.token"}},
+		{github: "github: {owner: owner, repository: repo, token_file: /nonexistent/pmr178}", fields: []string{"github.token_file"}},
+		// A readable but blank credential file must name token_file, not the
+		// github.token the operator never wrote.
+		{github: "github: {owner: owner, repository: repo, token_file: blank-token}", fields: []string{"github.token_file"}},
+		{github: "github: {owner: '../owner', repository: repo}", fields: []string{"github.owner", "github.token"}},
+		{github: "github: {owner: owner/nested, repository: 'repo space', base_branch: 'bad branch'}", fields: []string{"github.base_branch", "github.owner", "github.repository", "github.token"}},
+		{github: "github: {owner: owner, repository: repo, endpoint: 'http://example.com', poll_interval_ms: 0}", fields: []string{"github.endpoint", "github.poll_interval_ms", "github.token"}},
+	} {
+		t.Run(test.github, func(t *testing.T) {
+			content := "---\ntracker: {kind: linear, active_states: [Todo], terminal_states: [Done]}\n" + test.github + "\n---\nmanual"
+			if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			w, err := Load(path, "")
+			if err != nil {
+				t.Fatalf("optional invalid config affected workflow: %v", err)
+			}
+			if w.Config.GitHub.Enabled {
+				t.Fatalf("github=%+v", w.Config.GitHub)
+			}
+			if len(w.Config.Warnings) != 1 {
+				t.Fatalf("warnings=%q", w.Config.Warnings)
+			}
+			warning := w.Config.Warnings[0]
+			if !strings.Contains(warning, "disabled") || !strings.Contains(warning, "manual") {
+				t.Fatalf("warning does not state the consequence: %q", warning)
+			}
+			for _, field := range test.fields {
+				if !strings.Contains(warning, field) {
+					t.Fatalf("warning %q omits %q", warning, field)
+				}
+			}
+			// The warning names fields, never values: a token that failed to
+			// resolve must not be echoed into logs or the status file.
+			if strings.Contains(warning, "literal-secret") {
+				t.Fatalf("warning exposed a configured secret: %q", warning)
+			}
+		})
+	}
+
+	// An absent github block is a supported choice, not a misconfiguration.
+	content := "---\ntracker: {kind: linear, active_states: [Todo], terminal_states: [Done]}\n---\nmanual"
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	w, err := Load(path, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w.Config.GitHub.Enabled || len(w.Config.Warnings) != 0 {
+		t.Fatalf("an absent github block warned: %+v %q", w.Config.GitHub, w.Config.Warnings)
+	}
+}
+
 // TestGitHubLandingPolicyIsStrictAndFailsClosed exercises the PMR-37
 // github.merge_state/merge_method/required_checks fields. Unlike the rest of
 // the github: block (which silently disables on any invalid value), these
