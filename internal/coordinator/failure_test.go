@@ -76,9 +76,9 @@ func TestPermanentDispatchFailureStopsAtMaxAttempts(t *testing.T) {
 // TestUnclassifiedAgentEventNeverAbandonsIssue covers the correction from
 // review round 3: agentFailureReason's fallback, "agent_event", means the
 // coordinator does not know why a run ended. That is not the deterministic,
-// classified failure the ceiling was built for, so it must keep climbing the
-// ordinary escalating backoff ladder without ever arming abandonment,
-// however many times it repeats -- unlike workspace_prepare, before_run,
+// classified failure the ceiling was built for, so it must keep retrying
+// without ever arming abandonment, however many times it repeats, and since
+// PMR-179 without spending an attempt either -- unlike workspace_prepare, before_run,
 // prompt_render, and session_start, which are issue-attributable and still
 // consume the ceiling. See systemicFailureReasons for the three PMR-115
 // added alongside it (stream_closed, issue_refresh, session_continue), and
@@ -122,8 +122,8 @@ func TestUnclassifiedAgentEventNeverAbandonsIssue(t *testing.T) {
 	if retry.reason != "agent_event" {
 		t.Fatalf("reason=%q, want agent_event", retry.reason)
 	}
-	if retry.attempt <= w.Config.Agent.MaxAttempts {
-		t.Fatalf("attempt=%d, want it to keep climbing the ordinary ladder past max_attempts", retry.attempt)
+	if retry.attempt != 0 {
+		t.Fatalf("attempt=%d, want the first attempt held fixed across every systemic repeat", retry.attempt)
 	}
 	if strings.Contains(log.String(), `"msg":"dispatch abandoned after max attempts"`) {
 		t.Fatalf("an unclassified agent_event armed an abandonment record: %s", log.String())
@@ -137,8 +137,8 @@ func TestUnclassifiedAgentEventNeverAbandonsIssue(t *testing.T) {
 // systemicFailureReasons for "stream_closed": by construction (see
 // errStreamClosed) it is never a repository- or issue-specific outcome, only
 // ever a host bug in the coordinator's own event plumbing, so -- like
-// agent_event -- it must keep climbing the ordinary escalating backoff
-// ladder without ever arming abandonment, however many times it repeats. It
+// agent_event -- it must keep retrying without arming abandonment and without
+// spending an attempt (PMR-179), however many times it repeats. It
 // drives finishFailure directly, the same way TestRetryAtCapacityNeverAbandons
 // drives scheduleRetry directly, rather than replaying a full dispatch for
 // every repeat: the reason and the ceiling interaction are what is under
@@ -170,8 +170,8 @@ func TestClosedEventStreamNeverAbandonsIssue(t *testing.T) {
 		attempt = retry.attempt
 	}
 
-	if attempt <= w.Config.Agent.MaxAttempts {
-		t.Fatalf("attempt=%d, want it to keep climbing the ordinary ladder past max_attempts", attempt)
+	if attempt != 0 {
+		t.Fatalf("attempt=%d, want the first attempt held fixed across every repeat", attempt)
 	}
 	if strings.Contains(log.String(), `"msg":"dispatch abandoned after max attempts"`) {
 		t.Fatalf("a closed event stream armed an abandonment record: %s", log.String())
@@ -184,9 +184,9 @@ func TestClosedEventStreamNeverAbandonsIssue(t *testing.T) {
 // TestRateLimitedEventNeverAbandonsIssueAndIgnoresOrdinaryBackoff covers
 // PMR-131: a Claude quota rejection says nothing about this issue's own
 // work, so -- like stream_closed, issue_refresh, retry_refresh, and
-// session_continue -- it must keep retrying past agent.max_attempts without
-// ever arming abandonment. It must also never fall back onto the ordinary
-// attempt-keyed backoff(next, max_retry_backoff) ladder: every repeat here
+// session_continue -- it must keep retrying without ever arming abandonment
+// or spending an attempt. It must also never fall back onto the ordinary
+// escalating backoff(escalation, max_retry_backoff) ladder: every repeat here
 // carries the same reported reset time, so a delay that escalated with the
 // attempt count (the ladder's own shape) would prove the ladder was still in
 // play, exactly the bug this test exists to catch.
@@ -220,8 +220,8 @@ func TestRateLimitedEventNeverAbandonsIssueAndIgnoresOrdinaryBackoff(t *testing.
 		attempt = retry.attempt
 	}
 
-	if attempt <= w.Config.Agent.MaxAttempts {
-		t.Fatalf("attempt=%d, want it to keep climbing past max_attempts", attempt)
+	if attempt != 0 {
+		t.Fatalf("attempt=%d, want the first attempt held fixed across every repeat", attempt)
 	}
 	if strings.Contains(log.String(), `"msg":"dispatch abandoned after max attempts"`) {
 		t.Fatalf("a rate-limited rejection armed an abandonment record: %s", log.String())
@@ -275,8 +275,9 @@ func TestRateLimitedEventWithNoResetFloorsWellAboveMaxRetryBackoff(t *testing.T)
 // TestPostTurnRefreshFailureNeverAbandonsIssue is the ceiling-interaction
 // test review round 4 asked for: PMR-115's confirmed-live failure mode -- a
 // Linear timeout on the post-turn GetIssues refresh -- is this codebase's
-// shared tracker infrastructure, not this issue, so repeating it past
-// agent.max_attempts must keep retrying rather than abandon the issue (see
+// shared tracker infrastructure, not this issue, so repeating it more times
+// than agent.max_attempts must keep retrying rather than abandon the issue,
+// and must leave its attempt budget untouched (see
 // systemicFailureReasons). It drives finishFailure directly rather than
 // replaying a full dispatch (see TestClosedEventStreamNeverAbandonsIssue):
 // a permanently failing tracker would also fail runRetry's own pre-dispatch
@@ -310,8 +311,8 @@ func TestPostTurnRefreshFailureNeverAbandonsIssue(t *testing.T) {
 		attempt = retry.attempt
 	}
 
-	if attempt <= w.Config.Agent.MaxAttempts {
-		t.Fatalf("attempt=%d, want it to keep climbing the ordinary ladder past max_attempts", attempt)
+	if attempt != 0 {
+		t.Fatalf("attempt=%d, want the first attempt held fixed across every repeat", attempt)
 	}
 	if strings.Contains(log.String(), `"msg":"dispatch abandoned after max attempts"`) {
 		t.Fatalf("issue_refresh armed an abandonment record: %s", log.String())
@@ -355,11 +356,86 @@ func TestContinuationFailureNeverAbandonsIssue(t *testing.T) {
 		attempt = retry.attempt
 	}
 
-	if attempt <= w.Config.Agent.MaxAttempts {
-		t.Fatalf("attempt=%d, want it to keep climbing the ordinary ladder past max_attempts", attempt)
+	if attempt != 0 {
+		t.Fatalf("attempt=%d, want the first attempt held fixed across every repeat", attempt)
 	}
 	if strings.Contains(log.String(), `"msg":"dispatch abandoned after max attempts"`) {
 		t.Fatalf("session_continue armed an abandonment record: %s", log.String())
+	}
+	if err := c.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestSystemicFailuresLeaveTheGenuineRetryBudgetIntact is PMR-179's failure
+// scenario end to end. A Claude quota wall produces far more rejections than
+// agent.max_attempts (PMR-131 observed 203), and every one of them was exempt
+// from abandonment but still escalated the attempt counter -- so when the quota
+// reopened, the issue's first genuine failure arrived already past the ceiling
+// and abandoned the dispatch on the spot, with zero real retries and every
+// backoff along the way already saturated. Both halves are pinned here: the
+// wall must leave the budget untouched, and the genuine failures after it must
+// then get the full ladder, delay included, before the ceiling fires.
+func TestSystemicFailuresLeaveTheGenuineRetryBudgetIntact(t *testing.T) {
+	w := testSettings(t)
+	w.Config.Agent.MaxAttempts = 3
+	w.Config.Agent.MaxRetryBackoff = time.Minute
+	issue := testIssue()
+	var log syncBuffer
+	c := New(&fakeTracker{issue: issue}, &fakeAgent{}, &fakeWorkspace{}, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&log, nil)))
+	defer assertInvariants(t, c)
+	timer := &fakeTimer{}
+	c.timer = timer
+	if !c.claim(issue, w.Config) {
+		t.Fatal("issue was not claimed")
+	}
+
+	quota := rateLimitedError{retryAfter: time.Hour}
+	attempt := 0
+	const wall = 8 // a quota wall is bounded by nothing the issue does, so it runs well past max_attempts=3
+	for i := 0; i < wall; i++ {
+		c.finishFailure(context.Background(), issue, attempt, agentFailureReason(quota), quota)
+		retry, stillRetrying := c.armedRetry(issue.ID)
+		if !stillRetrying {
+			t.Fatalf("the quota wall abandoned the issue on rejection %d", i)
+		}
+		attempt = retry.attempt
+	}
+	if attempt != 0 {
+		t.Fatalf("attempt=%d after %d systemic rejections, want the issue's budget untouched", attempt, wall)
+	}
+
+	// The quota reopens: every failure from here is the issue's own, so it gets
+	// exactly max_attempts dispatches -- max_attempts-1 further retries, then
+	// the abandonment -- and its delays start from the ladder's first rung
+	// rather than the ceiling the wall would have driven them to.
+	blocked := blockedError{category: "agent_reported"}
+	wantDelays := []time.Duration{10 * time.Second, 20 * time.Second}
+	for i := 1; i < w.Config.Agent.MaxAttempts; i++ {
+		c.finishFailure(context.Background(), issue, attempt, agentFailureReason(blocked), blocked)
+		retry, stillRetrying := c.armedRetry(issue.ID)
+		if !stillRetrying {
+			t.Fatalf("genuine failure %d of max_attempts=%d abandoned the issue early", i, w.Config.Agent.MaxAttempts)
+		}
+		if retry.attempt != i {
+			t.Fatalf("attempt=%d after genuine failure %d, want one rung per genuine failure", retry.attempt, i)
+		}
+		if got := timer.delays[wall+i-1]; got != wantDelays[i-1] {
+			t.Fatalf("genuine retry %d delay=%s, want %s -- the ladder did not restart after the wall", i, got, wantDelays[i-1])
+		}
+		attempt = retry.attempt
+	}
+
+	c.finishFailure(context.Background(), issue, attempt, agentFailureReason(blocked), blocked)
+	if _, stillRetrying := c.armedRetry(issue.ID); stillRetrying {
+		t.Fatal("max_attempts genuine failures did not end the dispatch")
+	}
+	if c.claimHeld(issue.ID) {
+		t.Fatal("the abandoned dispatch kept its claim")
+	}
+	record := waitForSubstring(t, &log, `"msg":"dispatch abandoned after max attempts"`, time.Second)
+	if !strings.Contains(record, `"attempt":3`) {
+		t.Fatalf("abandonment record did not count only the genuine failures: %s", record)
 	}
 	if err := c.Shutdown(context.Background()); err != nil {
 		t.Fatal(err)
@@ -390,7 +466,9 @@ func TestRateLimitedEventEndsTheRunAndSchedulesFromTheReportedResetTime(t *testi
 	<-timer.signal
 
 	retry, _ := c.armedRetry(issue.ID)
-	if retry.kind != retryAgent || retry.reason != "agent_rate_limited" || retry.attempt != 1 {
+	// A quota wall is systemic, so the redispatch repeats attempt 0 rather
+	// than spending one of the issue's own attempts (PMR-179).
+	if retry.kind != retryAgent || retry.reason != "agent_rate_limited" || retry.attempt != 0 {
 		t.Fatalf("retry=%+v, want agent_rate_limited", retry)
 	}
 	if len(timer.delays) != 1 || timer.delays[0] != resetIn {

@@ -69,6 +69,15 @@ type issueState struct {
 	// one -- rather than a Warn on every subsequent poll-cadence wait. Cleared
 	// with the claim alongside landingWaits (PMR-116).
 	landingEscalated bool
+	// systemicFailures counts the issue's consecutive failures whose reason was
+	// systemic (see systemicFailureReasons). Those failures deliberately hold
+	// the attempt counter fixed, so this is the only counter left that climbs
+	// during a sustained outage: it keys the retry backoff in their place and is
+	// the operator-visible measure of how long the outage has been repeating. A
+	// genuine, issue-attributable failure resets it -- it is a streak, not a
+	// total -- and it is cleared with the claim alongside landingWaits
+	// (PMR-179).
+	systemicFailures int
 	// usage is every token this issue has spent across the attempts of the
 	// dispatch episode it is currently claimed under, including the attempt in
 	// flight. Both figures are kept because both are questions an operator
@@ -112,8 +121,9 @@ type issueState struct {
 
 // stateLive reports whether a record still remembers anything. The claim group
 // is covered by claimed alone -- reservation, retry, landingWaits,
-// landingEscalated, and usage exist only under a claim, and run is checked
-// separately only because it is dropped a moment before the claim it belongs to.
+// landingEscalated, systemicFailures, and usage exist only under a claim, and
+// run is checked separately only because it is dropped a moment before the
+// claim it belongs to.
 func (s *issueState) stateLive() bool {
 	return s.claimed || s.run != nil || s.handoff != nil || s.waiting != nil
 }
@@ -172,6 +182,28 @@ func (c *Coordinator) landingWaitsFor(id string) int {
 		return st.landingWaits
 	}
 	return 0
+}
+
+// recordSystemicFailure folds one classified retryAgent failure into the
+// issue's consecutive-systemic-failure streak and returns that streak, which is
+// zero for a genuine failure: a failure the issue itself is answerable for ends
+// the streak, because whatever host or backend boundary preceded it has plainly
+// stopped stopping the work. Like the landing-wait accounting the streak
+// belongs to the claim it was observed under, so an issue that no longer holds
+// one records nothing -- and scheduleRetry declines its redispatch anyway.
+func (c *Coordinator) recordSystemicFailure(id string, systemic bool) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	st := c.claimedStateLocked(id)
+	if st == nil {
+		return 0
+	}
+	if !systemic {
+		st.systemicFailures = 0
+		return 0
+	}
+	st.systemicFailures++
+	return st.systemicFailures
 }
 
 // addIssueUsageLocked folds one run's change in recorded usage into its
@@ -324,6 +356,7 @@ func (c *Coordinator) releaseLocked(id string) {
 	st.state = ""
 	st.landingWaits = 0
 	st.landingEscalated = false
+	st.systemicFailures = 0
 	// The accumulated cost goes with the episode that spent it: a later
 	// dispatch of the same issue is a new episode, starting from attempt one
 	// and from zero tokens.

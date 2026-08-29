@@ -318,7 +318,9 @@ func TestEventFailedStaysAgentEventAndPassesThroughObservabilityText(t *testing.
 	<-timer.signal
 
 	retry, _ := c.armedRetry(issue.ID)
-	if retry.kind != retryAgent || retry.reason != "agent_event" || retry.attempt != 1 {
+	// The attempt stays at the failed launch's own number: "agent_event" is
+	// systemic, so it does not spend the issue's attempt budget (PMR-179).
+	if retry.kind != retryAgent || retry.reason != "agent_event" || retry.attempt != 0 {
 		t.Fatalf("retry=%+v, want agent_event", retry)
 	}
 	records := log.String()

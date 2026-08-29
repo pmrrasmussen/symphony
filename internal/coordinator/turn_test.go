@@ -296,7 +296,9 @@ func TestBoundedRunContinuationFailureStopsSessionAndUsesFailureRetry(t *testing
 		t.Fatalf("failed continuation markers=%d, want 0", marks)
 	}
 	retry, _ := c.armedRetry(issue.ID)
-	if retry.kind != retryAgent || retry.reason != "session_continue" || retry.attempt != 1 {
+	// "session_continue" is systemic, so the redispatch repeats the same
+	// attempt rather than spending one of the issue's own (PMR-179).
+	if retry.kind != retryAgent || retry.reason != "session_continue" || retry.attempt != 0 {
 		t.Fatalf("failed continuation retry=%+v", retry)
 	}
 	if records := log.String(); !strings.Contains(records, "continuation unavailable") {
@@ -320,7 +322,9 @@ func TestClosedEventStreamSchedulesDeterministicAgentRetry(t *testing.T) {
 		t.Fatalf("retries=%v", timer.delays)
 	}
 	retry, _ := c.armedRetry(issue.ID)
-	if retry.kind != retryAgent || retry.reason != "stream_closed" || retry.attempt != 1 {
+	// "stream_closed" is systemic, so the attempt is unchanged (PMR-179); the
+	// 10s delay above is the first rung of the systemic streak's own ladder.
+	if retry.kind != retryAgent || retry.reason != "stream_closed" || retry.attempt != 0 {
 		t.Fatalf("retry=%+v", retry)
 	}
 }
@@ -329,13 +333,16 @@ func TestClosedEventStreamSchedulesDeterministicAgentRetry(t *testing.T) {
 // a tracker error from runTurns' post-turn GetIssues -- confirmed live as a
 // Linear request timeout following a turn the agent completed successfully
 // -- is named "issue_refresh" rather than collapsing into "agent_event", and
-// the underlying tracker error text is not discarded.
+// the underlying tracker error text is not discarded. The live error text is
+// used verbatim here for a second reason (PMR-179): the run's own status is
+// classified from the typed error, so a tracker error that happens to say
+// "timeout" is recorded as the failure it is and not as an agent timeout.
 func TestPostTurnRefreshFailureSchedulesDistinctAgentRetry(t *testing.T) {
 	w := testSettings(t)
 	issue := testIssue()
 	var log syncBuffer
 	agent := &fakeAgent{events: completedEvents}
-	tracker := &fakeTracker{issue: issue, getErr: errors.New("linear tracker_request: Linear request failed")}
+	tracker := &fakeTracker{issue: issue, getErr: errors.New("linear tracker_request: Linear request failed: context deadline exceeded (Client.Timeout exceeded while awaiting headers)")}
 	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{}, 1)}
 	c := New(tracker, agent, ws, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&log, nil)))
 	defer assertInvariants(t, c)
@@ -346,11 +353,17 @@ func TestPostTurnRefreshFailureSchedulesDistinctAgentRetry(t *testing.T) {
 	<-timer.signal
 
 	retry, _ := c.armedRetry(issue.ID)
-	if retry.kind != retryAgent || retry.reason != "issue_refresh" || retry.attempt != 1 {
+	// "issue_refresh" is systemic: the tracker being unreachable is not an
+	// attempt at this issue's work, so the attempt is unchanged (PMR-179).
+	if retry.kind != retryAgent || retry.reason != "issue_refresh" || retry.attempt != 0 {
 		t.Fatalf("retry=%+v", retry)
 	}
-	if records := log.String(); !strings.Contains(records, "linear tracker_request: Linear request failed") {
+	records := log.String()
+	if !strings.Contains(records, "linear tracker_request: Linear request failed") {
 		t.Fatalf("post-turn refresh failure dropped the tracker error: %s", records)
+	}
+	if !strings.Contains(records, `"msg":"agent logical run finished","issue_id":"id","issue_identifier":"ENG-1","session_id":"t-u","status":"failed"`) {
+		t.Fatalf("a tracker error whose text says timeout was recorded as something other than a failure: %s", records)
 	}
 }
 

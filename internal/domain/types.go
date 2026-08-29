@@ -155,9 +155,13 @@ const (
 	RunSucceeded RunStatus = "succeeded"
 	RunFailed    RunStatus = "failed"
 	RunCanceled  RunStatus = "canceled"
-	RunTimedOut  RunStatus = "timed_out"
-	RunStalled   RunStatus = "stalled"
-	RunBlocked   RunStatus = "blocked"
+	// RunStalled is the one timeout-shaped outcome a run has: the coordinator's
+	// own idle watchdog stopping a session that went quiet. There is deliberately
+	// no separate "timed out" status, because nothing else times a run out --
+	// the one that existed was reached only by matching "timeout" in an error's
+	// text, which labelled a tracker outage an agent timeout (PMR-179).
+	RunStalled RunStatus = "stalled"
+	RunBlocked RunStatus = "blocked"
 	// RunWaiting is a run that ended on a non-terminal host gate outside the
 	// agent's control (a landing wait). It is deliberately not a failure: the
 	// coordinator redispatches the same attempt after a bounded delay.
