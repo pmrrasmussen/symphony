@@ -332,6 +332,71 @@ func TestLandingWaitLogEscalatesOnceThenStaysAtInfo(t *testing.T) {
 	}
 }
 
+// TestLandingWaitCountResetsOnAnInterleavedFailure pins landingWaits to the
+// "consecutive" its whole escalation is built on (PMR-189). A landing run that
+// fails rather than waits goes through finishFailure -> scheduleRetry, which
+// keeps the claim the count is stored under, so before this the count survived
+// an interleaved failure: the redispatch ladder climbed, and the stuck-landing
+// Warn fired, on waits that were never consecutive.
+func TestLandingWaitCountResetsOnAnInterleavedFailure(t *testing.T) {
+	w := testSettings(t)
+	w.Config.Agent.MaxAttempts = 10
+	w.Config.Agent.MaxRetryBackoff = 10 * time.Minute
+	// A poll interval below the first backoff step, so the ladder is visible in
+	// the delays rather than being flattened onto the floor.
+	w.Config.GitHub.PollInterval = 5 * time.Second
+	issue := testIssue()
+	var log syncBuffer
+	c := New(&fakeTracker{issue: issue}, &fakeAgent{}, &fakeWorkspace{}, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&log, nil)))
+	defer assertInvariants(t, c)
+	timer := &fakeTimer{}
+	c.timer = timer
+	c.seedClaim(issue)
+
+	ctx := context.Background()
+	c.finishLandingWait(ctx, issue, 0, "required checks are pending")
+	c.finishLandingWait(ctx, issue, 0, "required checks are pending")
+	if waits := c.landingWaitsFor(issue.ID); waits != 2 {
+		t.Fatalf("waits=%d after two consecutive waits, want 2", waits)
+	}
+
+	// The failure keeps its claim -- which is exactly why the count could
+	// outlive it -- so the reset asserted below cannot be coming from a release.
+	c.finishFailure(ctx, issue, 0, "turn_limit_exhausted", turnLimitError{limit: 1})
+	waits, claimed := c.landingWaitsFor(issue.ID), c.claimHeld(issue.ID)
+	if waits != 0 || !claimed {
+		t.Fatalf("waits=%d claimed=%v after an interleaved failure, want the count reset under a still-held claim", waits, claimed)
+	}
+
+	c.finishLandingWait(ctx, issue, 1, "required checks are pending")
+	if waits := c.landingWaitsFor(issue.ID); waits != 1 {
+		t.Fatalf("waits=%d after the failure, want the streak restarted at one", waits)
+	}
+	// The delays are what the count is for: the wait after the failure starts
+	// the ladder again instead of continuing it at a third consecutive wait.
+	want := []time.Duration{10 * time.Second, 20 * time.Second, 10 * time.Second, 10 * time.Second}
+	if len(timer.delays) != len(want) {
+		t.Fatalf("delays=%v, want %v", timer.delays, want)
+	}
+	for i, delay := range want {
+		if timer.delays[i] != delay {
+			t.Fatalf("delays=%v, want %v", timer.delays, want)
+		}
+	}
+	var last string
+	for _, line := range strings.Split(strings.TrimSpace(log.String()), "\n") {
+		if strings.Contains(line, `"msg":"landing wait retry scheduled"`) {
+			last = line
+		}
+	}
+	if !strings.Contains(last, `"wait_attempt":1`) {
+		t.Fatalf("the wait after the failure was reported as a continuing streak: %s", last)
+	}
+	if err := c.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // TestLandingRetryRefreshFailureIgnoresMaxAttempts pins the same exemption
 // TestLandingWaitRedispatchesPastMaxAttempts pins for the wait itself: a
 // landing retry that fails to refresh its issue is still not an agent

@@ -66,6 +66,63 @@ func TestWaitingIssueAppearsInSnapshotUntilAdmitted(t *testing.T) {
 	<-ws.after
 }
 
+// TestMidTickSnapshotNeverShowsAnIssueWaitingAndRunning pins the overlap
+// Snapshot.Waiting promises never happens, at the one moment it could: claim
+// itself drops the waiting memory, instead of leaving it to updateWaiting at
+// the end of the tick, so a snapshot taken while the launch goroutine has
+// already installed the session cannot report the same issue in both sets
+// (PMR-189). The tick is held inside the *second* candidate's "issue claimed"
+// record, which is after the first candidate was claimed and launched and
+// before updateWaiting runs at all.
+func TestMidTickSnapshotNeverShowsAnIssueWaitingAndRunning(t *testing.T) {
+	w := testSettings(t)
+	w.Config.Agent.MaxConcurrent = 2
+	// sortIssues orders the poll by identifier, so ENG-1 is claimed and launched
+	// first and ENG-2's claim record is the gate.
+	queued := testIssue()
+	queued.ID, queued.Identifier = "queued", "ENG-1"
+	later := testIssue()
+	later.ID, later.Identifier = "later", "ENG-2"
+	tracker := &issueMapTracker{candidates: []domain.Issue{queued, later}, issues: map[string]domain.Issue{queued.ID: queued, later.ID: later}}
+	block := make(chan domain.Event)
+	agent := &fakeAgent{events: func() <-chan domain.Event { return block }}
+	ws := &fakeWorkspace{after: make(chan struct{}, 2)}
+	gate := newLogGate("issue claimed", later.Identifier)
+	c := New(tracker, agent, ws, func() config.Settings { return w.Config }, slog.New(gate))
+	defer assertInvariants(t, c)
+	c.clock = fakeClock{now: time.Date(2026, 8, 29, 9, 41, 0, 0, time.UTC)}
+	c.timer = &fakeTimer{}
+
+	// An earlier poll left the issue waiting for capacity, which is the only way
+	// it carries waiting memory into the poll that admits it.
+	c.updateWaiting(map[string]waitingCandidate{queued.ID: {issue: queued, reason: waitReasonAtCapacity}}, c.clock.Now(), w.Config)
+	if snapshot := c.Snapshot(); len(snapshot.Waiting) != 1 || snapshot.Waiting[0].IssueIdentifier != queued.Identifier {
+		t.Fatalf("waiting=%+v, want the queued issue before the poll that admits it", snapshot.Waiting)
+	}
+
+	ticked := make(chan struct{})
+	go func() { defer close(ticked); c.Tick(context.Background()) }()
+	<-gate.reached
+	waitForRunning(t, c, queued.Identifier)
+	snapshot := c.Snapshot()
+	close(gate.release)
+	<-ticked
+
+	if len(snapshot.Running) != 1 || snapshot.Running[0].IssueIdentifier != queued.Identifier {
+		t.Fatalf("running=%+v, want the admitted issue mid-tick", snapshot.Running)
+	}
+	for _, entry := range snapshot.Waiting {
+		if entry.IssueIdentifier == queued.Identifier {
+			t.Fatalf("mid-tick snapshot reported %s as waiting and running at once: waiting=%+v running=%+v", entry.IssueIdentifier, snapshot.Waiting, snapshot.Running)
+		}
+	}
+	if err := c.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	<-ws.after
+	<-ws.after
+}
+
 // TestWaitingListNeverDuplicatesARunningOrRetryingIssue guards the PMR-139
 // acceptance criterion that the waiting list never grows a second entry for
 // an issue already visible in Running or Retrying: admissionRejectReason

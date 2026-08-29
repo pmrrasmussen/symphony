@@ -332,8 +332,9 @@ when the redispatch had to queue behind the state's concurrency limit. The
 `wait_attempt` count is the "this landing is stuck" signal — the agent `attempt`
 deliberately stays put for a non-failure, while consecutive waits escalate
 `delay_ms` from `github.poll_interval_ms` toward `agent.max_retry_backoff_ms`
-and also appear as `wait_attempt` in the coordinator snapshot's `retrying`
-entries. The run itself finishes as
+and also appear as `wait_attempt` on the coordinator snapshot's `landing`
+`retrying` entries — and only those, since an `agent` retry is not waiting on a
+gate for the count to describe. The run itself finishes as
 `"status":"waiting"` in `"msg":"agent logical run finished"` — deliberately
 distinct from the `blocked`/`failed` statuses and from an agent failure's
 warn-level `"msg":"agent run retry scheduled"` (`reason: turn_limit_exhausted`

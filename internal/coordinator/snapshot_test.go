@@ -76,6 +76,48 @@ func TestRunningSnapshotUsageIsLiveAndSurvivesFailure(t *testing.T) {
 	}
 }
 
+// TestRetrySnapshotReportsWaitAttemptForLandingRetriesOnly pins both halves of
+// the wait count's reporting rule (PMR-189). The landing retry the count
+// actually describes reports it; an agent-kind retry never does, because there
+// it is the claim's leftover figure about a gate that entry is not waiting on
+// -- stale noise in the one field an operator reads as "this landing is stuck".
+// A systemic failure is what arms an agent retry with the count still standing:
+// it names a host or backend boundary rather than this issue's work, so unlike
+// a genuine failure it leaves the landing streak (and the attempt) alone.
+func TestRetrySnapshotReportsWaitAttemptForLandingRetriesOnly(t *testing.T) {
+	w := testSettings(t)
+	w.Config.Agent.MaxRetryBackoff = 10 * time.Minute
+	w.Config.GitHub.PollInterval = 5 * time.Second
+	issue := testIssue()
+	var logs bytes.Buffer
+	c := New(&fakeTracker{issue: issue}, &fakeAgent{}, &fakeWorkspace{}, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&logs, nil)))
+	defer assertInvariants(t, c)
+	c.timer = &fakeTimer{}
+	c.seedClaim(issue)
+
+	ctx := context.Background()
+	c.finishLandingWait(ctx, issue, 0, "required checks are pending")
+	c.finishLandingWait(ctx, issue, 0, "required checks are pending")
+	if snapshot := c.Snapshot(); len(snapshot.Retrying) != 1 || snapshot.Retrying[0].Kind != string(retryLanding) || snapshot.Retrying[0].WaitAttempt != 2 {
+		t.Fatalf("retrying=%+v, want the landing retry reporting both waits", snapshot.Retrying)
+	}
+
+	c.finishFailure(ctx, issue, 0, "stream_closed", errStreamClosed)
+	snapshot := c.Snapshot()
+	if len(snapshot.Retrying) != 1 || snapshot.Retrying[0].Kind != string(retryAgent) {
+		t.Fatalf("retrying=%+v, want the systemic failure's agent retry", snapshot.Retrying)
+	}
+	if snapshot.Retrying[0].WaitAttempt != 0 {
+		t.Fatalf("agent retry reported wait_attempt=%d, want none: the landing wait count says nothing about it", snapshot.Retrying[0].WaitAttempt)
+	}
+	if waits := c.landingWaitsFor(issue.ID); waits != 2 {
+		t.Fatalf("waits=%d, want a systemic failure to leave the landing streak it says nothing about alone", waits)
+	}
+	if err := c.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestSnapshotCopiesOnlySafeOperationalMetadata(t *testing.T) {
 	c := New(&fakeTracker{}, &fakeAgent{}, &fakeWorkspace{}, func() config.Settings { return config.Settings{} }, nil)
 	defer assertInvariants(t, c)

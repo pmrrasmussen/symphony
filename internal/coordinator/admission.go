@@ -318,6 +318,14 @@ func (c *Coordinator) claim(i domain.Issue, s config.Settings) bool {
 	// A claimed issue is being actively worked; any prior handoff memory is
 	// stale (the poll loop already reported an external revert before this).
 	st.handoff = nil
+	// The waiting memory goes with it, for the same reason and one tick sooner
+	// than updateWaiting would drop it: an issue this poll just admitted is no
+	// longer waiting for capacity or a blocker. Leaving it to the end of the
+	// tick would let a Snapshot taken while the launch goroutine is installing
+	// the session report one issue as both Waiting and Running -- the overlap
+	// Snapshot.Waiting promises never happens (PMR-189).
+	st.waiting = nil
+	st.waitingEscalated = false
 	c.mu.Unlock()
 	c.log.Debug("issue claimed", "issue_id", i.ID, "issue_identifier", i.Identifier, "state", config.Norm(i.State))
 	return true
