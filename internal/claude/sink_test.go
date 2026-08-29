@@ -61,7 +61,7 @@ func TestEmitsFromOtherGoroutinesSurviveTheTurnShutdown(t *testing.T) {
 					return
 				default:
 				}
-				live.sink.emit(domain.Event{Kind: domain.EventDiagnostic, At: time.Now(), Message: "out of band"})
+				live.sink.Emit(domain.Event{Kind: domain.EventDiagnostic, At: time.Now(), Message: "out of band"})
 			}
 		}()
 	}
@@ -73,8 +73,8 @@ func TestEmitsFromOtherGoroutinesSurviveTheTurnShutdown(t *testing.T) {
 
 	// drain returned, so the channel is closed: these two emits are certainly
 	// post-close rather than incidentally so, and must be dropped.
-	live.sink.emit(domain.Event{Kind: domain.EventDiagnostic, At: time.Now(), Message: "after close"})
-	if live.sink.emitTerminal(domain.Event{Kind: domain.EventFailed, At: time.Now(), Message: "after close"}) {
+	live.sink.Emit(domain.Event{Kind: domain.EventDiagnostic, At: time.Now(), Message: "after close"})
+	if live.sink.EmitTerminal(domain.Event{Kind: domain.EventFailed, At: time.Now(), Message: "after close"}) {
 		t.Fatal("an outcome was accepted after the stream closed")
 	}
 	if _, open := <-events; open {
@@ -119,7 +119,7 @@ func TestATerminalEventClaimedOffTheReadLoopSuppressesTheResult(t *testing.T) {
 		// and emitting are one operation, so an out-of-band outcome cannot settle
 		// the turn and then fail to deliver -- which would close the stream with
 		// no outcome at all and lose the reason entirely.
-		if !live.sink.emitTerminal(domain.Event{Kind: domain.EventLandingResolved, At: time.Now(), Message: "landed out of band"}) {
+		if !live.sink.EmitTerminal(domain.Event{Kind: domain.EventLandingResolved, At: time.Now(), Message: "landed out of band"}) {
 			t.Fatal("the turn was already settled before anything ended it")
 		}
 		openGate(t, dir)
@@ -131,45 +131,6 @@ func TestATerminalEventClaimedOffTheReadLoopSuppressesTheResult(t *testing.T) {
 	}
 	if terminals[0].Kind != domain.EventLandingResolved || terminals[0].Message != "landed out of band" {
 		t.Fatalf("terminal event=%+v", terminals[0])
-	}
-}
-
-// TestTheSinkReservesRoomForTheTerminalEvent pins the buffer policy the sink
-// inherited: a consumer stops reading at the terminal event, so progress is
-// dropped near the top of the buffer, the terminal event still fits, and no emit
-// ever blocks -- a blocked emit would leak the stream goroutine and orphan the
-// child, so this test hangs rather than fails if one ever does.
-func TestTheSinkReservesRoomForTheTerminalEvent(t *testing.T) {
-	s := &sink{events: make(chan domain.Event, eventBuffer)}
-	for i := 0; i < 4*eventBuffer; i++ {
-		s.emit(domain.Event{Kind: domain.EventDiagnostic})
-	}
-	if len(s.events) != eventBuffer-reservedTerminalSlots {
-		t.Fatalf("buffered %d progress events, want %d", len(s.events), eventBuffer-reservedTerminalSlots)
-	}
-	if !s.emitTerminal(domain.Event{Kind: domain.EventCompleted}) {
-		t.Fatal("the terminal event did not fit the room reserved for it")
-	}
-	// One outcome per turn, by whichever route it is offered.
-	if s.emitTerminal(domain.Event{Kind: domain.EventFailed}) {
-		t.Fatal("a second outcome was accepted")
-	}
-	s.emit(domain.Event{Kind: domain.EventFailed})
-	buffered := len(s.events)
-
-	// Dropping post-close emits must not disturb what the consumer has yet to
-	// read, so the buffer is checked after the close as well.
-	s.close()
-	s.emit(domain.Event{Kind: domain.EventDiagnostic})
-	if s.emitTerminal(domain.Event{Kind: domain.EventFailed}) {
-		t.Fatal("an outcome was accepted after the sink closed")
-	}
-	collected := drain(t, s.events)
-	if len(collected) != buffered || len(collected) != eventBuffer-reservedTerminalSlots+1 {
-		t.Fatalf("collected %d events, buffered %d: %v", len(collected), buffered, kinds(collected))
-	}
-	if last := lastKind(t, collected); last.Kind != domain.EventCompleted {
-		t.Fatalf("the terminal event did not fit: %v", kinds(collected))
 	}
 }
 

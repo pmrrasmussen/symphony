@@ -9,6 +9,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/pmrrasmussen/symphony/internal/agentstream"
 	"github.com/pmrrasmussen/symphony/internal/domain"
 	"github.com/pmrrasmussen/symphony/internal/procgroup"
 )
@@ -43,7 +44,7 @@ type turn struct {
 	// not the only thing that can have something to report about a turn, and it is
 	// built before the turn so the capability endpoint can be given it before the
 	// child that reaches that endpoint exists.
-	sink *sink
+	sink *agentstream.Sink
 
 	// contract is what this turn was launched under, carried so verifyInit checks
 	// the echo against the argument vector that produced it. See launchContract.
@@ -61,7 +62,7 @@ type turn struct {
 }
 
 // spawn starts the CLI with the prompt on stdin and a scrubbed environment.
-func spawn(ctx context.Context, r domain.AgentRequest, contract launchContract, environment []string, events *sink, endpoint *capabilityEndpoint, timer Timer) (*turn, error) {
+func spawn(ctx context.Context, r domain.AgentRequest, contract launchContract, environment []string, events *agentstream.Sink, endpoint *capabilityEndpoint, timer Timer) (*turn, error) {
 	command := strings.TrimSpace(r.Command)
 	if command == "" {
 		command = "claude"

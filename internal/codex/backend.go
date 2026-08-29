@@ -3,6 +3,7 @@ package codex
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -16,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/pmrrasmussen/symphony/internal/agentstream"
 	"github.com/pmrrasmussen/symphony/internal/capability"
 	"github.com/pmrrasmussen/symphony/internal/config"
 	"github.com/pmrrasmussen/symphony/internal/domain"
@@ -68,6 +70,12 @@ const finalizeBudget = 5 * time.Second
 // on the read loop, which is the goroutine the call is running on, so it cannot
 // observe an invocation in flight at all.
 const invocationDrain = 2 * time.Minute
+
+// eventBuffer sizes one turn's event stream. The sink keeps room in it for the
+// turn's outcome even when a consumer stops reading: the coordinator returns as
+// soon as it sees a terminal event, so a blocking send afterwards would leak the
+// sending goroutine and orphan the child.
+const eventBuffer = 32
 
 // New builds a Codex backend. secretNames are extra environment variable names
 // this child may not inherit, on top of everything hostenv.Filter blocks for
@@ -247,17 +255,20 @@ type client struct {
 	writeMu             sync.Mutex
 	next                int
 	pending             map[int]chan callResult
-	active              chan domain.Event
-	activeDone          chan struct{}
-	diagnostics         []domain.Event
-	activeReady         bool
-	pendingEvents       []domain.Event
-	pendingTerminal     *domain.Event
-	done                chan struct{}
-	exited              chan struct{}
-	finishOnce          sync.Once
-	killOnce            sync.Once
-	usageMissOnce       sync.Once
+	// active is the running turn's event stream, held until its session identity
+	// is known and released by activate; activeDone closes when that turn ends.
+	// Both are nil between turns, which is when diagnostics collects what a
+	// diagnostic has to say with no stream to say it on -- the next turn opens
+	// with them.
+	active        *agentstream.Sink
+	activeDone    chan struct{}
+	diagnostics   []domain.Event
+	done          chan struct{}
+	exited        chan struct{}
+	finishOnce    sync.Once
+	killOnce      sync.Once
+	usageMissOnce sync.Once
+	skipOnce      sync.Once
 	// inFlight is set while a dispatched capability call is running, and idle
 	// wakes whatever is draining it. See drainInvocation. The channel is
 	// buffered, so a call that finishes with nobody waiting does not block.
@@ -385,14 +396,14 @@ func localCommitSandbox(r domain.AgentRequest) any {
 	if !ok || policy["type"] != "workspaceWrite" {
 		return r.TurnSandboxPolicy
 	}
-	copy := make(map[string]any, len(policy)+1)
+	extended := make(map[string]any, len(policy)+1)
 	for key, value := range policy {
-		copy[key] = value
+		extended[key] = value
 	}
 	var roots []string
-	if configured, ok := copy["writableRoots"].([]string); ok {
+	if configured, ok := extended["writableRoots"].([]string); ok {
 		roots = append(roots, configured...)
-	} else if configured, ok := copy["writableRoots"].([]any); ok {
+	} else if configured, ok := extended["writableRoots"].([]any); ok {
 		for _, value := range configured {
 			if path, ok := value.(string); ok && strings.TrimSpace(path) != "" {
 				roots = append(roots, path)
@@ -400,8 +411,8 @@ func localCommitSandbox(r domain.AgentRequest) any {
 		}
 	}
 	roots = append(roots, grants...)
-	copy["writableRoots"] = uniquePaths(roots)
-	return copy
+	extended["writableRoots"] = uniquePaths(roots)
+	return extended
 }
 
 func uniquePaths(paths []string) []string {
@@ -461,7 +472,10 @@ func (c *client) callWithTimeout(ctx context.Context, method string, params any,
 		return nil, err
 	case <-ctx.Done():
 		c.removePending(id)
-		err := fmt.Errorf("codex %s timed out: %w", method, ctx.Err())
+		// Not a timeout: this is the caller's own context ending, which is how a
+		// shutdown reaches a call in flight. Reporting it as one sent an operator
+		// looking for a hung app-server after every clean stop.
+		err := fmt.Errorf("codex %s cancelled: %w", method, ctx.Err())
 		c.abort(err)
 		return nil, err
 	case <-c.done:
@@ -513,23 +527,29 @@ func (c *client) turn(ctx context.Context, thread, prompt string, r domain.Agent
 	if r.TurnSandboxPolicy != nil {
 		params["sandboxPolicy"] = r.TurnSandboxPolicy
 	}
-	events := make(chan domain.Event, 32)
+	// The sink is held rather than delivering, because this turn's stream has to
+	// open with a session identity turn/start has not reported yet. Everything
+	// this turn can already say -- what the previous turn's end left for it, and
+	// whatever arrives while the call is outstanding, up to and including the
+	// turn's outcome -- is emitted into it meanwhile and delivered by activate.
+	events := agentstream.NewHeldSink(eventBuffer)
 	c.mu.Lock()
 	c.active = events
 	c.activeDone = make(chan struct{})
-	c.activeReady = false
-	c.pendingEvents = append(c.pendingEvents, c.diagnostics...)
+	for _, event := range c.diagnostics {
+		events.Emit(event)
+	}
 	c.diagnostics = nil
 	turnDone := c.activeDone
 	c.mu.Unlock()
 	res, err := c.call(ctx, "turn/start", params)
 	if err != nil {
-		c.forceCloseActive()
+		c.closeActive()
 		return domain.AgentSession{}, nil, err
 	}
 	turn, ok := nestedString(res, "turn", "id")
 	if !ok {
-		c.forceCloseActive()
+		c.closeActive()
 		return domain.AgentSession{}, nil, errors.New("codex malformed turn/start response")
 	}
 	s := domain.AgentSession{ID: thread + "-" + turn, ThreadID: thread, TurnID: turn}
@@ -563,35 +583,65 @@ func (c *client) turn(ctx context.Context, thread, prompt string, r domain.Agent
 			stop()
 		}()
 	}
-	return s, events, nil
+	return s, events.Events(), nil
 }
-func (c *client) activate(events chan domain.Event, s domain.AgentSession, pid int) {
+
+// activate opens this turn's stream with the session identity the app-server
+// just reported and releases everything held behind it. An outcome that arrived
+// while the turn was still held is delivered here too, and ends the stream here:
+// detaching when it was claimed would have closed the channel before the
+// session-started event ever reached it.
+func (c *client) activate(events *agentstream.Sink, s domain.AgentSession, pid int) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.activeReady = true
-	pending := c.pendingEvents
-	c.pendingEvents = nil
-	pendingTerminal := c.pendingTerminal
-	c.pendingTerminal = nil
-	events <- domain.Event{Kind: domain.EventSessionStarted, At: time.Now(), SessionID: s.ID, ThreadID: s.ThreadID, TurnID: s.TurnID, PID: pid}
-	for _, event := range pending {
-		if len(events) < cap(events)-1 {
-			events <- event
-		}
-	}
-	if pendingTerminal != nil {
-		events <- *pendingTerminal
+	if events.Activate(domain.Event{Kind: domain.EventSessionStarted, At: time.Now(), SessionID: s.ID, ThreadID: s.ThreadID, TurnID: s.TurnID, PID: pid}) {
 		c.detachActiveLocked()
 	}
 }
+
+// read decodes the app-server's stdout until it ends.
+//
+// A line this loop cannot use is skipped rather than ending the session. The
+// stream is one line per message and a single item/completed can carry a whole
+// command's aggregated output, so an oversized line is ordinary traffic here --
+// and ending the read on one both kills a run that was progressing and, if the
+// loop stopped consuming, would block the child on a full pipe. The exception is
+// a message this client is the other half of: a response that names a pending
+// call but carries neither result nor error is that call's answer, and is failed
+// rather than skipped, so the call reports the protocol violation instead of
+// waiting out its timeout.
+//
+// Tolerating a line cannot strand a waiter, and that is not luck: a capability
+// call is dispatched inline from this loop, so no call is ever in flight while
+// this loop is deciding what to do with a line, and the drain that waits for one
+// has nothing to wait for here (see drainInvocation). What remains observable is
+// an error return, which aborts the client and is what releases every pending
+// call -- so every path out of here either continues the loop or ends the run.
 func (c *client) read(r io.Reader) error {
-	scan := bufio.NewScanner(r)
-	buf := make([]byte, 0, 64<<10)
-	scan.Buffer(buf, 1<<20)
-	for scan.Scan() {
+	lines := agentstream.NewLineReader(r)
+	for {
+		line, skipped, err := lines.Next()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			return fmt.Errorf("codex stdout read failed: %w", err)
+		}
+		if skipped {
+			// An oversized response cannot be told from an oversized
+			// notification -- the id was discarded with the rest of the line --
+			// so a call whose answer this was is left to its own read timeout.
+			c.skippedLine()
+			continue
+		}
+		line = bytes.TrimSpace(line)
+		if len(line) == 0 {
+			continue
+		}
 		var x rpc
-		if err := json.Unmarshal(scan.Bytes(), &x); err != nil {
-			return fmt.Errorf("codex malformed app-server message: %w", err)
+		if err := json.Unmarshal(line, &x); err != nil {
+			c.skippedLine()
+			continue
 		}
 		// A method always identifies a server request/notification. Responses
 		// have no method, so a server request may safely reuse a pending ID.
@@ -615,14 +665,23 @@ func (c *client) read(r io.Reader) error {
 					continue
 				}
 			}
-			return errors.New("codex malformed response: unknown or invalid id")
+			// A response naming no pending call answers nothing this client is
+			// waiting for, so it is skipped like any other unusable line.
+			c.skippedLine()
+			continue
 		}
 		c.handle(x)
 	}
-	if err := scan.Err(); err != nil {
-		return fmt.Errorf("codex stdout scanner failed: %w", err)
-	}
-	return nil
+}
+
+// skippedLine reports the first unusable app-server line of the session and
+// nothing after it. One diagnostic is enough to make a protocol change or a
+// truncating child visible; repeating it would flood a log with exactly the
+// output the skip exists to tolerate.
+func (c *client) skippedLine() {
+	c.skipOnce.Do(func() {
+		c.diagnostic("codex skipped an unreadable app-server line")
+	})
 }
 func (c *client) handle(x rpc) {
 	method := x.Method
@@ -853,35 +912,32 @@ func (c *client) sendServerResponse(id, result any) bool {
 	}
 	return true
 }
+
+// emit routes one event to whatever can carry it. The client's lock is held
+// across the sink's own call, so the turn's outcome and the detach that ends its
+// stream are one step with respect to activate: nothing can be emitted between
+// them, and neither can run twice.
 func (c *client) emit(e domain.Event) {
 	c.mu.Lock()
-	ch := c.active
-	if ch != nil {
-		if !c.activeReady {
-			if e.Kind.Terminal() && c.pendingTerminal == nil {
-				copy := e
-				c.pendingTerminal = &copy
-			} else if c.pendingTerminal == nil && len(c.pendingEvents) < cap(ch)-2 {
-				c.pendingEvents = append(c.pendingEvents, e)
-			}
-			c.mu.Unlock()
-			return
+	defer c.mu.Unlock()
+	events := c.active
+	if events == nil {
+		// Between turns there is no stream. A diagnostic is worth keeping for
+		// the next one; ordinary progress about a turn that has ended is not.
+		if e.Kind == domain.EventDiagnostic && len(c.diagnostics) < 16 {
+			c.diagnostics = append(c.diagnostics, e)
 		}
-		if e.Kind.Terminal() {
-			// Non-terminal sends reserve one slot, so terminal delivery cannot
-			// block even when the consumer falls behind.
-			ch <- e
-			c.detachActiveLocked()
-			c.mu.Unlock()
-			return
-		}
-		if len(ch) < cap(ch)-1 {
-			ch <- e
-		}
-	} else if e.Kind == domain.EventDiagnostic && len(c.diagnostics) < 16 {
-		c.diagnostics = append(c.diagnostics, e)
+		return
 	}
-	c.mu.Unlock()
+	if !e.Kind.Terminal() {
+		events.Emit(e)
+		return
+	}
+	// An outcome claimed while the turn is still held has not been delivered
+	// yet, and activate is what delivers it and ends the stream then.
+	if events.EmitTerminal(e) && events.Activated() {
+		c.detachActiveLocked()
+	}
 }
 func (c *client) closeActive() {
 	c.mu.Lock()
@@ -889,25 +945,16 @@ func (c *client) closeActive() {
 	c.detachActiveLocked()
 }
 func (c *client) detachActiveLocked() {
-	ch := c.active
+	events := c.active
 	done := c.activeDone
 	c.active = nil
 	c.activeDone = nil
-	c.activeReady = false
-	c.pendingEvents = nil
-	c.pendingTerminal = nil
-	if ch != nil {
-		close(ch)
+	if events != nil {
+		events.Close()
 	}
 	if done != nil {
 		close(done)
 	}
-}
-func (c *client) forceCloseActive() {
-	c.mu.Lock()
-	c.activeReady = true
-	c.mu.Unlock()
-	c.closeActive()
 }
 func (c *client) finish(err error) {
 	c.finishOnce.Do(func() {
