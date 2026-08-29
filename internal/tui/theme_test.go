@@ -14,13 +14,19 @@ func TestWindowKeepsTheSelectionVisible(t *testing.T) {
 	items := []string{"a", "b", "c", "d", "e"}
 	// A marker on a row the user cannot see would be worse than a short list,
 	// so the window follows the selection rather than pinning to the top.
-	shown, hidden := window(items, 4, 3)
-	if strings.Join(shown, "") != "de" || hidden != 3 {
-		t.Fatalf("shown=%v hidden=%d, want [d e] and 3", shown, hidden)
+	shown, start, hidden := window(items, 4, 3)
+	if strings.Join(shown, "") != "de" || start != 3 || hidden != 3 {
+		t.Fatalf("shown=%v start=%d hidden=%d, want [d e], 3 and 3", shown, start, hidden)
 	}
-	shown, hidden = window(items, 0, 3)
-	if strings.Join(shown, "") != "ab" || hidden != 3 {
-		t.Fatalf("shown=%v hidden=%d, want [a b] and 3", shown, hidden)
+	shown, start, hidden = window(items, 0, 3)
+	if strings.Join(shown, "") != "ab" || start != 0 || hidden != 3 {
+		t.Fatalf("shown=%v start=%d hidden=%d, want [a b], 0 and 3", shown, start, hidden)
+	}
+	// An unclipped window starts where the slice does, so a caller that rebases
+	// a position on start leaves it untouched.
+	shown, start, hidden = window(items, 4, 0)
+	if strings.Join(shown, "") != "abcde" || start != 0 || hidden != 0 {
+		t.Fatalf("shown=%v start=%d hidden=%d, want the whole slice, 0 and 0", shown, start, hidden)
 	}
 }
 

@@ -264,32 +264,46 @@ func (t theme) frame(header, main, status, hints string) string {
 }
 
 // window returns the run of items that fits in limit rows, positioned so that
-// index stays visible, and reports how many it left out. This is not scrolling:
-// no offset is retained between frames. It only guarantees that the row the
-// user has selected is one they can see.
-func window[T any](items []T, index, limit int) ([]T, int) {
+// index stays visible, and reports where that run starts and how many items it
+// left out. This is not scrolling: no offset is retained between frames. It
+// only guarantees that the row the user has selected is one they can see.
+//
+// start is what a caller needs to place anything it draws per row: its loop
+// index counts the returned run, and every position it holds — the selection
+// above all — counts the whole slice (PMR-188).
+func window[T any](items []T, index, limit int) (shown []T, start, hidden int) {
 	if limit <= 0 || len(items) <= limit {
-		return items, 0
+		return items, 0, 0
 	}
 	if limit == 1 {
-		return nil, len(items)
+		return nil, 0, len(items)
 	}
 	// One row of the budget goes to the line that reports the remainder.
 	size := limit - 1
-	start := 0
+	start = 0
 	if index >= size {
 		start = index - size + 1
 	}
-	return items[start : start+size], len(items) - size
+	return items[start : start+size], start, len(items) - size
 }
 
-// more reports what clamp dropped. Silent truncation would read as a complete
-// screen, which is the one thing an operator view must never do.
-func (t theme) more(hidden int) string {
-	if hidden <= 0 {
+// more reports what clamp dropped, and on which side of the rows on screen.
+// Silent truncation would read as a complete screen, which is the one thing an
+// operator view must never do — and a single count rendered under the table
+// read as if every dropped row were below it, which stops being true the moment
+// the window follows the selection down the list.
+func (t theme) more(above, below int) string {
+	marks := make([]string, 0, 2)
+	if above > 0 {
+		marks = append(marks, fmt.Sprintf("▴ %d above", above))
+	}
+	if below > 0 {
+		marks = append(marks, fmt.Sprintf("▾ %d below", below))
+	}
+	if len(marks) == 0 {
 		return ""
 	}
-	return t.muted.Render(fmt.Sprintf("+%d more", hidden))
+	return t.muted.Render(strings.Join(marks, " · "))
 }
 
 // tooSmall reports whether the window is below the size any honest layout
