@@ -41,6 +41,36 @@ func TestCodexStartTimeoutDefaultsGenerouslyAndParsesIndependently(t *testing.T)
 	}
 }
 
+// TestUnknownCodexFieldIsRefusedLikeAnUnknownClaudeField pins the half of the
+// unknown-key rule that codex was missing: `stall_timout_ms` used to load
+// clean and run every session on the 300s default (PMR-178). Every key
+// decodeCodex reads is checked here too, so the whitelist cannot fall behind
+// the decoder and start rejecting a field the block actually supports.
+func TestUnknownCodexFieldIsRefusedLikeAnUnknownClaudeField(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "WORKFLOW.md")
+	load := func(t *testing.T, codex string) error {
+		t.Helper()
+		content := "---\ntracker: {kind: linear, active_states: [Todo], terminal_states: [Done]}\ncodex: " + codex + "\n---\nprompt"
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		_, err := Load(path, "")
+		return err
+	}
+
+	for _, typo := range []string{"stall_timout_ms: 5000", "commnad: codex app-server", "thread_sanbox: read-only"} {
+		key := strings.SplitN(typo, ":", 2)[0]
+		if err := load(t, "{"+typo+"}"); err == nil || !strings.Contains(err.Error(), `unknown codex field "`+key+`"`) {
+			t.Fatalf("typo %q err=%v", typo, err)
+		}
+	}
+
+	full := "{command: codex app-server, approval_policy: never, thread_sandbox: workspace-write, turn_sandbox_policy: {type: workspaceWrite, networkAccess: true}, turn_timeout_ms: 1000, read_timeout_ms: 2000, start_timeout_ms: 3000, stall_timeout_ms: 4000}"
+	if err := load(t, full); err != nil {
+		t.Fatalf("every supported codex key must stay accepted: %v", err)
+	}
+}
+
 func TestRepositoryWorkflowGrantsLoopbackWithinWorkspaceWrite(t *testing.T) {
 	dir := t.TempDir()
 	for variable, name := range map[string]string{"SYMPHONY_LINEAR_API_KEY_FILE": "linear-key", "SYMPHONY_GITHUB_TOKEN_FILE": "github-token"} {

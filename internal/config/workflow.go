@@ -154,7 +154,9 @@ func decode(raw map[string]any, base, path, logRoot string, sources *sourceSnaps
 	if err != nil {
 		return Settings{}, err
 	}
-	githubSettings := applyLandingPolicy(decodeGitHub(github, githubObjectValid, base, sources), landing)
+	decodedGitHub, githubWarnings := decodeGitHub(github, githubObjectValid, base, sources)
+	warnings = append(warnings, githubWarnings...)
+	githubSettings := applyLandingPolicy(decodedGitHub, landing)
 	if githubSettings.MergeState != "" && !githubSettings.Enabled {
 		return Settings{}, errors.New("invalid configuration: github.merge_state requires a fully configured github integration")
 	}
@@ -189,6 +191,20 @@ func validateSettings(s Settings) (Settings, error) {
 	}
 	if len(s.Tracker.ActiveStates) == 0 || len(s.Tracker.TerminalStates) == 0 {
 		return s, errors.New("invalid configuration: tracker active_states and terminal_states are required")
+	}
+	// The coordinator's admission check reads the two lists through independent
+	// predicates (active and issueTerminal), so a state named in both makes one
+	// issue a dispatch candidate and a terminal stop-and-clean-up target at the
+	// same time, and the two act on it in turn on every poll. Neither predicate
+	// can resolve that on its own, so the overlap is refused here -- compared
+	// through the same Norm both of them match with, so what is refused is
+	// exactly what they would collide over.
+	for _, active := range s.Tracker.ActiveStates {
+		for _, terminal := range s.Tracker.TerminalStates {
+			if Norm(active) == Norm(terminal) {
+				return s, fmt.Errorf("invalid configuration: tracker active_states %q and terminal_states %q name the same state; the two lists must be disjoint", active, terminal)
+			}
+		}
 	}
 	if s.Polling.Interval <= 0 || s.Hooks.Timeout <= 0 || s.Agent.MaxConcurrent <= 0 || s.Agent.MaxTurns <= 0 || s.Agent.MaxAttempts <= 0 || s.Agent.MaxRetryBackoff <= 0 {
 		return s, errors.New("invalid configuration: non-positive duration or agent limit")
