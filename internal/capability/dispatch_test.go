@@ -285,18 +285,68 @@ func TestAFailedInvocationIsFinishedWithTheProvidersOwnOutcome(t *testing.T) {
 // TestAnUnencodableResultIsRefusedAndReportedAsFailed keeps a started call from
 // being left outstanding forever when the payload cannot be marshalled: the
 // coordinator tracks a started record as this run's outstanding operation until
-// its finish arrives.
+// its finish arrives. The refusal is deliberately not the unknown-capability
+// one -- the invocation already ran, so telling the model the tool does not
+// exist would invite another route to work that has already happened -- and the
+// terminal outcome is still emitted, so a landing that merged still ends the run
+// (PMR-186).
 func TestAnUnencodableResultIsRefusedAndReportedAsFailed(t *testing.T) {
 	var records recorder
-	Dispatch(context.Background(), stubResolver{NameGitHubPRContext: runs(NameGitHubPRContext, true, func(context.Context) (Result, *Failure) {
-		return Result{Success: true, Payload: map[string]any{"unencodable": make(chan int)}}, nil
-	})}, records.transport(), NameGitHubPRContext, json.RawMessage(`{}`))
+	Dispatch(context.Background(), stubResolver{NameGitHubLandPR: runs(NameGitHubLandPR, true, func(context.Context) (Result, *Failure) {
+		return Result{Success: true, Payload: map[string]any{"unencodable": make(chan int)},
+			Terminal: domain.EventLandingResolved, Reason: "merged"}, nil
+	})}, records.transport(), NameGitHubLandPR, json.RawMessage(`{}`))
 	items := records.items()
 	if len(items) != 2 || items[1].Outcome != domain.ItemFailed {
 		t.Fatalf("item records = %+v, want the call finished as failed", items)
 	}
+	if message := records.refusal(t); message == "Unsupported client-side tool." || !strings.Contains(message, "already happened") {
+		t.Fatalf("refusal = %q, want one that does not deny a tool the model just ran", message)
+	}
+	want := "item:started,item:failed,respond,emit:landing_resolved"
+	if got := strings.Join(records.steps, ","); got != want {
+		t.Fatalf("dispatch order = %s, want %s: an unencodable payload must not swallow the terminal outcome", got, want)
+	}
+}
+
+// TestAbsentNullAndEmptyArgumentsAllReachAZeroArgumentCapability pins the
+// normalization both transports now share. Both wire protocols declare the
+// argument object optional, and the registry's zero-argument decoder accepts
+// only an empty object, so an omitted or null field would refuse
+// github_pr_context, github_land_pr, and refresh_base_ref for good. It lived in
+// internal/mcpbridge alone and the Codex adapter had already drifted (PMR-186),
+// which is the kind of divergence this dispatch exists to make impossible.
+//
+// The decoder under test is decodeNoInput itself, not a stand-in, because what
+// is being pinned is the pair: what the dispatch normalizes and what the
+// registry accepts have to agree.
+func TestAbsentNullAndEmptyArgumentsAllReachAZeroArgumentCapability(t *testing.T) {
+	zeroArgument := stubCapability{name: NameGitHubPRContext, lifecycle: true,
+		prepare: func(arguments json.RawMessage) (Invocation, *Failure) {
+			if failure := decodeNoInput(arguments); failure != nil {
+				return nil, failure
+			}
+			return succeeds("context"), nil
+		}}
+	resolver := stubResolver{NameGitHubPRContext: zeroArgument}
+
+	for _, arguments := range []json.RawMessage{nil, json.RawMessage(""), json.RawMessage("null"), json.RawMessage("{}")} {
+		var records recorder
+		Dispatch(context.Background(), resolver, records.transport(), NameGitHubPRContext, arguments)
+		if len(records.outcomes) != 1 {
+			t.Fatalf("arguments %q produced %d responses", arguments, len(records.outcomes))
+		}
+		if outcome := records.outcomes[0]; outcome.Refusal != nil || !outcome.Success || string(outcome.Payload) != `"context"` {
+			t.Fatalf("arguments %q reached the capability as %+v, want the invocation to have run", arguments, outcome)
+		}
+	}
+
+	// The mapping is narrow: content of any kind is still the capability's to
+	// reject, so a zero-argument capability keeps refusing a field.
+	var records recorder
+	Dispatch(context.Background(), resolver, records.transport(), NameGitHubPRContext, json.RawMessage(`{"number":7}`))
 	if message := records.refusal(t); message != "Unsupported client-side tool." {
-		t.Fatalf("refusal = %q", message)
+		t.Fatalf("refusal = %q, want an argument list still refused by the capability", message)
 	}
 }
 

@@ -88,8 +88,11 @@ func unsupported() *Failure {
 }
 
 // decodeNoInput accepts only an empty JSON object, which is how every
-// zero-argument capability is declared. Anything else -- absent arguments, a
-// non-object, or any field at all -- is refused before the capability runs.
+// zero-argument capability is declared. Anything else -- a non-object, or any
+// field at all -- is refused before the capability runs. Absent arguments never
+// arrive here: both wire protocols declare the argument object optional, so
+// Dispatch maps an omitted or null one onto the empty object for either
+// transport before Prepare sees it (normalizeArguments).
 func decodeNoInput(arguments json.RawMessage) *Failure {
 	var fields map[string]json.RawMessage
 	if json.Unmarshal(arguments, &fields) != nil || len(fields) != 0 {

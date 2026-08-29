@@ -951,7 +951,7 @@ case "$line" in *'"success":false'*) ;; *) exit 26;; esac
 printf '%s\n' '{"jsonrpc":"2.0","id":105,"method":"item/tool/call","params":{"tool":"github_land_pr","arguments":{"reason":"nope"}}}'
 IFS= read -r line
 case "$line" in *'"success":false'*) ;; *) exit 27;; esac
-printf '%s\n' '{"jsonrpc":"2.0","id":106,"method":"item/tool/call","params":{"tool":"github_land_pr","arguments":{}}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":106,"method":"item/tool/call","params":{"tool":"github_land_pr"}}'
 IFS= read -r line
 case "$line" in *'"success":false'*) ;; *) exit 28;; esac
 printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{}}'
@@ -984,6 +984,12 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{}}'
 	// Only the two calls whose arguments validated reached an invocation; every
 	// other call above was refused before it, and a refusal that precedes a call
 	// is never reported as one.
+	//
+	// github_land_pr is called above with no "arguments" member at all, so its
+	// pair is also this transport's end of PMR-186: an app-server that omits the
+	// member reaches a zero-argument capability, where before the normalization
+	// moved into the shared dispatch it was refused as an unsupported tool and
+	// produced no records here.
 	for name := range reported {
 		if name != "github_pr_context" && name != "github_land_pr" {
 			t.Fatalf("a call that never reached an invocation was reported as %q: %+v", name, reported[name])
