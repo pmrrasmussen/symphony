@@ -296,6 +296,19 @@ also verifies the returned issue is parentless and matches that complete scope.
 Audit logs contain only originating/follow-up IDs and identifiers plus the
 bounded relation enum, never worker-supplied content or credentials.
 
+A refused call tells the agent why. The `handoff_request`, `handoff_scope`, and
+`invalid_tracker_config` categories are refusals of the request itself -- its
+arguments, a bound they exceeded, or a scope that no longer holds -- and every
+message under them is a fixed host-authored string, so the capability forwards
+it verbatim (`linear.Error.RefusesRequest`) exactly as the GitHub capabilities
+forward theirs. Every other category describes a round trip the agent cannot
+act on and keeps a generic refusal, which is also what keeps provider-derived
+text out of the reply. `title` is bounded at 255 code points and the rendered
+body -- description, the acceptance-criteria heading, and the criteria -- at
+20480. Both are counted in code points, the unit the advertised schema's
+`maxLength` counts, so a non-ASCII description that fits the advertised bounds
+is never refused by a byte bound the agent was not told about.
+
 The capability is for scope management: capture meaningful out-of-scope work,
 then continue the current issue. A human later decides whether and when the
 Backlog follow-up becomes dispatchable. Existing workflows using
