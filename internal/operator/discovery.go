@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -202,6 +203,87 @@ type Options struct {
 	Inspector       Inspector
 	SnapshotMaxAge  time.Duration
 	RecentLogLimit  int
+	// Preflight reuses each instance's validation result across sweeps. A nil
+	// cache validates on every sweep, which is what a one-shot caller wants; a
+	// repeating caller passes one so a sweep that changed nothing spawns no
+	// agent CLI.
+	Preflight *PreflightCache
+	// RefreshPreflight validates again even when the cache holds a current
+	// result. It is the operator's explicit refresh: logging an agent CLI in
+	// changes neither the plist nor the workflow, so nothing else would clear a
+	// stale authentication finding.
+	RefreshPreflight bool
+}
+
+// PreflightCache holds one preflight result per LaunchAgent, keyed by the
+// modification time and size of the two files that result is derived from: the
+// plist, which supplies the paths and environment, and the workflow it names.
+// The preflight is the one part of discovery that is not a read of local state
+// -- it execs the configured agent CLI to ask whether it holds a stored login,
+// which on macOS can block for seconds behind a keychain prompt -- so a
+// five-second refresh must not repeat it. A zero value is ready to use, and a
+// nil *PreflightCache is a cache that never hits.
+//
+// See docs/macos-services.md's "Status, logs, and the TUI" for what the timed
+// pass and the explicit refresh each cost an operator.
+type PreflightCache struct {
+	mu      sync.Mutex
+	entries map[string]preflightEntry
+}
+
+type preflightEntry struct {
+	stamp  preflightStamp
+	result preflight.Result
+}
+
+type preflightStamp struct {
+	plist    fileStamp
+	workflow fileStamp
+}
+
+// fileStamp is comparable, so two stamps are equal only when both files are in
+// the state they were validated in. A file that cannot be stat'ed stamps as
+// absent rather than as an error, which keeps a missing workflow cacheable.
+type fileStamp struct {
+	present bool
+	modTime time.Time
+	size    int64
+}
+
+func stampFile(path string) fileStamp {
+	info, err := os.Stat(path)
+	if err != nil {
+		return fileStamp{}
+	}
+	return fileStamp{present: true, modTime: info.ModTime(), size: info.Size()}
+}
+
+// result returns the cached validation for these paths, or runs and stores one.
+// run is deliberately called outside the lock: an overlapping sweep would
+// otherwise wait out a probe that is already blocked on a keychain prompt,
+// which is the hang this cache exists to keep off the refresh path. The cost of
+// that choice is at most one duplicated probe.
+func (c *PreflightCache) result(paths Paths, refresh bool, run func() preflight.Result) preflight.Result {
+	if c == nil {
+		return run()
+	}
+	stamp := preflightStamp{plist: stampFile(paths.Plist), workflow: stampFile(paths.Workflow)}
+	if !refresh {
+		c.mu.Lock()
+		entry, ok := c.entries[paths.Plist]
+		c.mu.Unlock()
+		if ok && entry.stamp == stamp {
+			return entry.result
+		}
+	}
+	result := run()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.entries == nil {
+		c.entries = make(map[string]preflightEntry)
+	}
+	c.entries[paths.Plist] = preflightEntry{stamp: stamp, result: result}
+	return result
 }
 
 // Discover inspects only convention-matching LaunchAgent files. It neither
@@ -286,7 +368,7 @@ func inspectCandidate(ctx context.Context, plistPath string, options Options) In
 	if instance.ID != "" {
 		instance.Launchd = options.Inspector.Launchd(ctx, instance.ID)
 	}
-	secretValues := inspectWorkflow(&instance, stringMap(values["EnvironmentVariables"]))
+	secretValues := inspectWorkflow(ctx, &instance, stringMap(values["EnvironmentVariables"]), options)
 	inspectRuntimeFiles(&instance, options.RecentLogLimit, secretValues)
 	return instance
 }
@@ -399,7 +481,7 @@ func splitFlag(flag string) (name, value string, found bool) {
 	return strings.Cut(flag, "=")
 }
 
-func inspectWorkflow(instance *Instance, environment map[string]string) []string {
+func inspectWorkflow(ctx context.Context, instance *Instance, environment map[string]string, options Options) []string {
 	workflow, err := config.LoadWithEnvironment(instance.Paths.Workflow, instance.Paths.LogsRoot, environment)
 	if err != nil {
 		add(instance, "workflow_invalid", SeverityError, err.Error())
@@ -430,7 +512,12 @@ func inspectWorkflow(instance *Instance, environment map[string]string) []string
 		instance.Config.ReadTimeout = launch.ReadTimeout
 		instance.Config.StartTimeout = launch.StartTimeout
 	}
-	for _, check := range preflight.RunWithEnvironment(context.Background(), instance.Paths.Workflow, instance.Paths.LogsRoot, instance.Paths.StatusFile, environment).Checks {
+	// The caller's context, not a background one: a sweep the operator has
+	// already walked away from must be able to take its probes down with it.
+	validation := options.Preflight.result(instance.Paths, options.RefreshPreflight, func() preflight.Result {
+		return preflight.RunWithEnvironment(ctx, instance.Paths.Workflow, instance.Paths.LogsRoot, instance.Paths.StatusFile, environment)
+	})
+	for _, check := range validation.Checks {
 		if check.Status == preflight.StatusPassed {
 			continue
 		}

@@ -226,7 +226,20 @@ LaunchAgents in `~/Library/LaunchAgents`, reads launchd state, each configured
 status snapshot, effective configuration, validation findings, and a bounded
 redacted log tail. In a terminal it repeats that scan every five seconds, and
 `r` repeats it on demand; each pass is an ordinary read of local files and
-launchd state. Redirected output prints plain frames and never polls. Close it
+launchd state.
+
+The validation findings are the one exception, and the timed pass does not pay
+for them twice. Producing them runs the same workflow validation `--dry-run`
+does, which includes asking the configured agent CLI whether it holds a stored
+login -- a subprocess that on macOS can sit for seconds behind a keychain
+prompt. The view therefore keeps each instance's findings until that instance's
+plist or workflow is modified, so a five-second pass that finds both unchanged
+spawns no agent CLI at all. `r` always validates again, which is how you clear a
+stale authentication finding after logging the CLI in: that changes neither
+file. A scheduled pass is skipped while the previous one is still running, so a
+slow instance delays the dashboard rather than accumulating passes behind it,
+and closing the view cancels a pass still in flight instead of leaving its
+probes behind. Redirected output prints plain frames and never polls. Close it
 whenever you like, with `q` or an interrupt: it does not start, stop,
 restart, pause, or otherwise affect repository services, requires no central
 registry, and has no connection to a Symphony daemon or to a remote Linear,

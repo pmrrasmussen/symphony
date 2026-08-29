@@ -152,6 +152,124 @@ func TestRefreshKeyRunsDiscoveryAsACommand(t *testing.T) {
 	}
 }
 
+// TestTickSkipsASweepThatIsStillInFlight covers the pile-up an unguarded timer
+// causes: a sweep slower than the refresh interval would otherwise have a
+// second, third, and fourth sweep started on top of it, each repeating the
+// probes the first is already stuck on.
+func TestTickSkipsASweepThatIsStillInFlight(t *testing.T) {
+	var calls int
+	discover := func(context.Context, operator.Options) ([]operator.Instance, error) {
+		calls++
+		return []operator.Instance{{ID: "alpha"}}, nil
+	}
+	view := newTestApp(nil, discover)
+	_, command := view.Update(tickMsg(time.Now()))
+	batch, ok := command().(tea.BatchMsg)
+	if !ok {
+		t.Fatalf("first tick produced %T, want a batch of discovery and the next tick", command())
+	}
+	if _, second := view.Update(tickMsg(time.Now())); second == nil {
+		t.Fatal("the skipped tick did not re-arm the timer")
+	}
+	if view.dispatched != 1 {
+		t.Fatalf("%d sweeps dispatched, want the second tick skipped while one was in flight", view.dispatched)
+	}
+	// Once the outstanding sweep lands, the next tick sweeps again.
+	view.Update(batch[0]())
+	if calls != 1 {
+		t.Fatalf("discovery calls=%d, want 1", calls)
+	}
+	if _, third := view.Update(tickMsg(time.Now())); third == nil {
+		t.Fatal("the tick after the sweep landed produced no command")
+	}
+	if view.dispatched != 2 {
+		t.Fatalf("%d sweeps dispatched after the first landed, want 2", view.dispatched)
+	}
+}
+
+// TestStaleSweepCannotOverwriteANewerFrame covers results arriving out of order,
+// which an explicit refresh over a slow timed sweep can produce. The older
+// result must be dropped rather than replace the frame and be stamped with the
+// time it happened to land.
+func TestStaleSweepCannotOverwriteANewerFrame(t *testing.T) {
+	results := [][]operator.Instance{{{ID: "old"}}, {{ID: "new-one"}, {ID: "new-two"}}}
+	var call int
+	discover := func(context.Context, operator.Options) ([]operator.Instance, error) {
+		instances := results[call]
+		call++
+		return instances, nil
+	}
+	view := newTestApp(nil, discover)
+	_, first := view.Update(tea.KeyPressMsg{Code: 'r', Text: "r"})
+	_, second := view.Update(tea.KeyPressMsg{Code: 'r', Text: "r"})
+	older, newer := first().(discoveredMsg), second().(discoveredMsg)
+	if older.sweep >= newer.sweep {
+		t.Fatalf("sweep stamps are not ordered: %d then %d", older.sweep, newer.sweep)
+	}
+	view.Update(newer)
+	updatedAt := view.model.updatedAt
+	view.Update(older)
+	if len(view.model.instances) != 2 || view.model.instances[0].ID != "new-one" {
+		t.Fatalf("the older sweep replaced the frame: %#v", view.model.instances)
+	}
+	if !view.model.updatedAt.Equal(updatedAt) {
+		t.Fatal("the older sweep restamped the frame as freshly read")
+	}
+}
+
+// TestOnlyAnExplicitRefreshReprobes pins which sweep pays for the agent CLI
+// probes: the timed one reuses the cache the view holds for its whole lifetime,
+// and only `r` asks for the probes again.
+func TestOnlyAnExplicitRefreshReprobes(t *testing.T) {
+	var seen []operator.Options
+	discover := func(_ context.Context, options operator.Options) ([]operator.Instance, error) {
+		seen = append(seen, options)
+		return nil, nil
+	}
+	view := newTestApp(nil, discover)
+	view.options = operator.Options{Preflight: &operator.PreflightCache{}}
+	_, tick := view.Update(tickMsg(time.Now()))
+	tick().(tea.BatchMsg)[0]()
+	view.Update(discoveredMsg{sweep: view.dispatched})
+	_, refresh := view.Update(tea.KeyPressMsg{Code: 'r', Text: "r"})
+	refresh()
+	if len(seen) != 2 {
+		t.Fatalf("%d sweeps ran, want the tick and the refresh", len(seen))
+	}
+	if seen[0].RefreshPreflight {
+		t.Fatal("the timed sweep asked for the agent CLI probes again")
+	}
+	if !seen[1].RefreshPreflight {
+		t.Fatal("the explicit refresh did not ask for the agent CLI probes again")
+	}
+	if seen[0].Preflight == nil || seen[0].Preflight != seen[1].Preflight {
+		t.Fatalf("sweeps did not share one probe cache: %p and %p", seen[0].Preflight, seen[1].Preflight)
+	}
+}
+
+// TestRunCancelsSweepsOnItsWayOut covers the context discovery now threads into
+// the probes: a sweep outlives the view that dispatched it, and must be told the
+// view is gone rather than left holding a keychain prompt for nobody.
+func TestRunCancelsSweepsOnItsWayOut(t *testing.T) {
+	var sweepCtx context.Context
+	discover := func(ctx context.Context, options operator.Options) ([]operator.Instance, error) {
+		sweepCtx = ctx
+		if options.Preflight == nil {
+			t.Error("sweep ran without a probe cache")
+		}
+		return nil, nil
+	}
+	if err := Run(context.Background(), strings.NewReader("q\n"), &bytes.Buffer{}, discover); err != nil {
+		t.Fatal(err)
+	}
+	if sweepCtx == nil {
+		t.Fatal("no sweep ran")
+	}
+	if sweepCtx.Err() == nil {
+		t.Fatal("the view returned without cancelling its sweeps")
+	}
+}
+
 func TestWindowSizeIsRecordedForTheRenderer(t *testing.T) {
 	view := newTestApp(nil, nil)
 	if _, command := view.Update(tea.WindowSizeMsg{Width: 120, Height: 40}); command != nil {
