@@ -190,6 +190,11 @@ type apiFixture struct {
 
 	auth []string
 
+	// requireToken, when set, makes the fixture reject every request that does
+	// not present exactly that bearer token, the way GitHub rejects a revoked
+	// one. It lets a test rotate the credential underneath a live link.
+	requireToken string
+
 	// failMethod/failPath/failStatus/failBody let a test make exactly one
 	// endpoint respond with an arbitrary status and body instead of its usual
 	// handling, so a guard test can plant provider wire content in that body
@@ -311,6 +316,11 @@ func (f *apiFixture) serve(w http.ResponseWriter, r *http.Request) {
 	defer f.mu.Unlock()
 	f.auth = append(f.auth, r.Header.Get("Authorization"))
 	w.Header().Set("Content-Type", "application/json")
+	if f.requireToken != "" && r.Header.Get("Authorization") != "Bearer "+f.requireToken {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"message":"Bad credentials"}`))
+		return
+	}
 	if f.failStatus != 0 && r.Method == f.failMethod && r.URL.Path == f.failPath {
 		w.WriteHeader(f.failStatus)
 		_, _ = w.Write([]byte(f.failBody))
@@ -495,6 +505,37 @@ func testSession(t *testing.T, api *apiFixture, git *fakeGit, linear *fakeLinear
 	m.git = git
 	s := &Session{manager: m, settings: settings, issue: domain.Issue{ID: "issue-27", Identifier: "PMR-27", Title: "Lifecycle", URL: "https://linear.app/issue/PMR-27"}, workspace: t.TempDir(), branch: "symphony/pmr-27", linear: linear}
 	return m, s
+}
+
+// liveSettings is a rewritable configuration source standing in for the
+// daemon's reloading store, so a test can change configuration underneath a
+// manager mid-run the way a WORKFLOW.md reload or a credential rotation does.
+type liveSettings struct {
+	mu     sync.Mutex
+	github config.GitHub
+}
+
+func (s *liveSettings) get() config.Settings {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return config.Settings{GitHub: s.github}
+}
+
+func (s *liveSettings) update(mutate func(*config.GitHub)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	mutate(&s.github)
+}
+
+// testSessionWithLiveSettings builds the session testSession builds, over a
+// configuration source the test keeps a handle on. The session still freezes
+// the settings it publishes under, so a later update reaches only the manager.
+func testSessionWithLiveSettings(t *testing.T, api *apiFixture, linear *fakeLinear, log *bytes.Buffer) (*Manager, *Session, *liveSettings) {
+	t.Helper()
+	m, s := testSession(t, api, &fakeGit{}, linear, log)
+	live := &liveSettings{github: api.settings()}
+	m.settings = live.get
+	return m, s, live
 }
 
 func testInput() PublishInput {

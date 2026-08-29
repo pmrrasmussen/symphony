@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/pmrrasmussen/symphony/internal/config"
 	"github.com/pmrrasmussen/symphony/internal/observability"
 )
 
@@ -38,6 +39,27 @@ func (m *Manager) sweep(links []*link) {
 	}
 }
 
+// pollSettings resolves the configuration one poll of linked runs under. The
+// repository identity stays the snapshot taken at publication -- the link's
+// number names a pull request in that one repository and in no other -- but the
+// credential is re-read from m.settings, which is a live func precisely because
+// configuration changes under a process that runs for weeks. Polling with the
+// frozen token instead is not merely stale: a link is evicted only when polling
+// can learn nothing further, so a token rotated after publication would fail
+// every remaining poll of every un-settled link, once per tick forever, and
+// none of them would ever observe the merge that settles it (PMR-197).
+//
+// A live configuration that no longer describes this link's repository -- the
+// integration disabled, or repointed elsewhere -- carries no credential for the
+// pull request being polled, so the snapshot's own token remains the fallback.
+func (m *Manager) pollSettings(linked *link) config.GitHub {
+	s := linked.settings
+	if live := m.settings().GitHub; live.Enabled && live.Endpoint == s.Endpoint && live.Owner == s.Owner && live.Repository == s.Repository {
+		s.Token = live.Token
+	}
+	return s
+}
+
 func (m *Manager) pollOne(ctx context.Context, linked *link) {
 	m.mu.Lock()
 	if linked.settled {
@@ -45,7 +67,7 @@ func (m *Manager) pollOne(ctx context.Context, linked *link) {
 		return
 	}
 	m.mu.Unlock()
-	pr, err := m.getPull(ctx, linked.settings, linked.prNumber)
+	pr, err := m.getPull(ctx, m.pollSettings(linked), linked.prNumber)
 	if err != nil {
 		m.logger.Warn("GitHub pull request poll failed", "issue_id", linked.issueID, "issue_identifier", linked.identifier, "pr_number", linked.prNumber, "error", observability.Text(err.Error()))
 		return

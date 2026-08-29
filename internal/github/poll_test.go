@@ -193,6 +193,68 @@ func TestPollMergedReconcilesWithConfiguredMergeStateAndFailsClosedWithout(t *te
 	}
 }
 
+// TestPollAuthenticatesWithTheRotatedTokenNotThePublicationSnapshot pins
+// PMR-197. A link is evicted only when polling can learn nothing further, so it
+// routinely outlives the credential it was published under. Polling with the
+// frozen token would fail every remaining poll of every un-settled link once
+// per tick forever, and never observe the merge below that settles this one.
+func TestPollAuthenticatesWithTheRotatedTokenNotThePublicationSnapshot(t *testing.T) {
+	api, linear := newAPI(t), &fakeLinear{}
+	var logs bytes.Buffer
+	m, session, live := testSessionWithLiveSettings(t, api, linear, &logs)
+	if _, err := session.Publish(context.Background(), testInput()); err != nil {
+		t.Fatal(err)
+	}
+	// The credential rotates after publication: the token the link snapshotted
+	// is revoked, and the pull request merges while only the live one works.
+	api.mu.Lock()
+	api.requireToken, api.prMerged = "rotated-token", true
+	api.mu.Unlock()
+	live.update(func(g *config.GitHub) { g.Token = "rotated-token" })
+
+	m.Poll(context.Background())
+	if strings.Contains(logs.String(), "GitHub pull request poll failed") {
+		t.Fatalf("poll used the revoked snapshot credential: %s", logs.String())
+	}
+	if linear.reconciled != 1 || tracked(m) != 0 {
+		t.Fatalf("poll after rotation did not observe the merge: reconciliations=%d tracked=%d logs=%s", linear.reconciled, tracked(m), logs.String())
+	}
+	if strings.Contains(logs.String(), "rotated-token") {
+		t.Fatalf("logs exposed the rotated credential: %s", logs.String())
+	}
+}
+
+// The other half of that rule: a live configuration that stopped describing the
+// repository the link's pull request lives in holds no credential for it, so
+// the snapshot's own token is what the poll must keep presenting.
+func TestPollKeepsTheSnapshotTokenWhenConfigurationNoLongerDescribesTheRepository(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*config.GitHub)
+	}{
+		{name: "integration disabled", mutate: func(g *config.GitHub) { *g = config.GitHub{} }},
+		{name: "repointed at another repository", mutate: func(g *config.GitHub) { g.Repository, g.Token = "other", "other-repository-token" }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			api, linear := newAPI(t), &fakeLinear{}
+			var logs bytes.Buffer
+			m, session, live := testSessionWithLiveSettings(t, api, linear, &logs)
+			if _, err := session.Publish(context.Background(), testInput()); err != nil {
+				t.Fatal(err)
+			}
+			api.mu.Lock()
+			api.requireToken, api.prMerged = "private-token", true
+			api.mu.Unlock()
+			live.update(test.mutate)
+
+			m.Poll(context.Background())
+			if linear.reconciled != 1 || tracked(m) != 0 {
+				t.Fatalf("poll abandoned the snapshot credential: reconciliations=%d tracked=%d logs=%s", linear.reconciled, tracked(m), logs.String())
+			}
+		})
+	}
+}
+
 func TestPollStillOpenPullRequestDoesNotReconcileAndKeepsBeingPolled(t *testing.T) {
 	api, git, linear := newAPI(t), &fakeGit{}, &fakeLinear{}
 	m, session := testSession(t, api, git, linear, nil)
