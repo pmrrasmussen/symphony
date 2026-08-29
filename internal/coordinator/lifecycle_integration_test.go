@@ -142,10 +142,6 @@ func (w *observingLocalWorkspace) Cleanup(ctx context.Context, issue domain.Issu
 	return w.local.Cleanup(ctx, issue)
 }
 
-func (w *observingLocalWorkspace) Execute(ctx context.Context, workspace domain.Workspace, command string, args []string) ([]byte, error) {
-	return w.local.Execute(ctx, workspace, command, args)
-}
-
 func TestLocalWorkspaceActiveTurnLimitRemainsEligibleAfterRestart(t *testing.T) {
 	root := t.TempDir()
 	updated := time.Date(2026, time.July, 18, 12, 0, 0, 0, time.UTC)

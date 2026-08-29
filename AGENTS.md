@@ -35,7 +35,8 @@ handoff, rework, landing, and completion instructions. Read it, and
   rather than by waiting it out. Imported only by tests.
 - `internal/workspace` — local Git worktree lifecycle, ownership, and recovery,
   and the `WORKFLOW.md` hook runner: a hook is a child like an agent backend, so
-  it runs under the same filtered environment with no session matcher.
+  it runs under the same filtered environment with no session matcher, and so is
+  every host-side `git` this package and `internal/github` spawn.
 - `internal/domain` — the shared, provider-agnostic issue/agent/workspace types.
 - `internal/observability` — structured log redaction and level policy.
 - `internal/preflight` — the `--dry-run` side-effect-free validation path.

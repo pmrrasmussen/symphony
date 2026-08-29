@@ -21,6 +21,7 @@ func (l *Local) recoverPreparation(ctx context.Context, issue domain.Issue, path
 	if err != nil {
 		return err
 	}
+	settings := l.settings()
 	if filepath.Clean(path) != managedPath {
 		return errors.New("partial workspace is outside its owned managed path")
 	}
@@ -35,7 +36,7 @@ func (l *Local) recoverPreparation(ctx context.Context, issue domain.Issue, path
 				if _, sourceErr := os.Stat(state.SourceRoot); sourceErr != nil {
 					return errors.New("partial worktree identity is incomplete and its source repository is unavailable; manual recovery is required")
 				}
-				state.GitWorktreeDir, err = worktreeIdentity(ctx, path, state.GitCommonDir)
+				state.GitWorktreeDir, err = worktreeIdentity(ctx, settings, path, state.GitCommonDir)
 				if err != nil {
 					return err
 				}
@@ -48,14 +49,14 @@ func (l *Local) recoverPreparation(ctx context.Context, issue domain.Issue, path
 			}
 		}
 		if state.SourceRoot != "" {
-			available, availableErr := gitRepositoryAvailable(ctx, state)
+			available, availableErr := gitRepositoryAvailable(ctx, settings, state)
 			if availableErr != nil {
 				return availableErr
 			}
 			if available {
 				// Failure is recoverable below: removing the owned path followed by
 				// prune reconciles a stale registration left by Git.
-				_ = removeRecordedWorktree(ctx, state, path, true)
+				_ = removeRecordedWorktree(ctx, settings, state, path, true)
 			}
 		}
 		if _, err := os.Stat(path); err == nil {
@@ -69,12 +70,12 @@ func (l *Local) recoverPreparation(ctx context.Context, issue domain.Issue, path
 		return fmt.Errorf("inspect partial owned workspace: %w", statErr)
 	}
 	if state.SourceRoot != "" {
-		available, availableErr := gitRepositoryAvailable(ctx, state)
+		available, availableErr := gitRepositoryAvailable(ctx, settings, state)
 		if availableErr != nil {
 			return availableErr
 		}
 		if available {
-			if err := pruneRecordedWorktrees(ctx, state); err != nil {
+			if err := pruneRecordedWorktrees(ctx, settings, state); err != nil {
 				return err
 			}
 		}

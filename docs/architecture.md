@@ -329,14 +329,14 @@ function reads it, `hostenv.Filter`, so a name added or removed cannot apply to
 one child Symphony spawns and not another.
 
 "Child" here means every process Symphony starts, not only an agent backend.
-There are three: the Codex app-server, each Claude turn, and a `WORKFLOW.md`
+There are four: the Codex app-server, each Claude turn, a `WORKFLOW.md`
 workspace hook (`workspace.Local.hook` -- `after_create`, `before_run`,
-`after_run`, `before_remove`). The hook is the one that reads as an exception
-and is not: its script is repository-owned policy, but it runs in the agent's
-own worktree, so it can invoke anything the agent committed there, outside the
-agent sandbox. It ran with the daemon's complete environment until PMR-113,
+`after_run`, `before_remove`), and every host-side `git` Symphony itself runs
+(`internal/workspace`'s runners and `internal/github`'s `execGit`). The last two
+are the ones that read as exceptions and are not, each for its own reason, and
+each ran with the daemon's complete environment until the issue that named it --
 which is what a doctrine that enumerated only the backends could not make
-visible. Adding a fourth kind of child means adding it here too.
+visible. Adding a fifth kind of child means adding it here too.
 
 A caller filters the inherited environment through four filters, and each
 one exists because the others cannot cover it:
@@ -404,6 +404,34 @@ from settings alone, forgoing only a credential held by a live provider under a
 name and value no configuration mentions. Symphony adds `SYMPHONY_ISSUE_ID` and
 `SYMPHONY_ISSUE_IDENTIFIER` after filtering and blocks both names on the way in,
 so it is their only source.
+
+Git is a child on the same terms, and the least obvious one: it is Symphony's
+own program, invoked with Symphony's own arguments, so it reads as infrastructure
+rather than as something spawned. What makes it a child is where it runs and what
+it reads. Most of these invocations are `git -C <agent worktree>` -- the status
+and `rev-parse` cleanup inspects, the worktree removal, the PMR-65 integrity
+classifier, `internal/github`'s publish and landing gates -- and git resolves
+repository configuration from that worktree. The agent is granted
+`.git/worktrees/<name>` so it can commit (see "Workspace isolation and the
+sandbox boundary" below), and
+a source repository with `extensions.worktreeConfig` enabled -- which
+`git sparse-checkout` turns on by itself -- reads `config.worktree` from inside
+that grant, where `core.fsmonitor` names a program git then runs. That is
+PMR-113's hook hole one child over: agent-chosen code, executed host-side, in a
+process that inherited the daemon's environment. So every git this repository
+spawns sets `cmd.Env` from `hostenv.Filter` at its own exec site, and none reads
+the daemon's environment directly. It costs the authenticated paths nothing: git
+needs no *inherited* credential here, and the one operation that needs a
+credential at all -- the publish and landing push -- builds its own
+`http.extraheader` in `GIT_CONFIG_*` entries that are appended after filtering,
+like any other credential a caller hands over deliberately.
+
+For the same reason `domain.WorkspaceExecutor` has no general "run this command
+in the workspace" method. It carried one until PMR-175 -- unused, unfiltered, and
+with unbounded output -- and a method of that shape is a host-side child running
+in an agent-written working directory, so its first caller would have shipped the
+daemon's credentials there before anyone reviewed it. One is added back with the
+filter applied at the exec site, or not at all.
 
 No child Symphony spawns runs under a login shell: a hook takes `sh -c`, the
 Codex app-server `bash -c`, and each Claude turn is argv executed directly with

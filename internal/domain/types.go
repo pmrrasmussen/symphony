@@ -298,10 +298,17 @@ type IssueForgetter interface {
 	Forget(issueID string)
 }
 
+// WorkspaceExecutor is the workspace lifecycle the coordinator drives: prepare,
+// bracket each run, and clean up. It deliberately has no general "run this
+// command in the workspace" method. It carried one until PMR-175 -- with no
+// caller, no environment filter, and unbounded output -- and a method like that
+// is a host-side child running in an agent-written working directory, so its
+// first caller would have shipped the daemon's credentials there before anyone
+// reviewed it. A future caller adds it back with hostenv.Filter applied at the
+// exec site, the way workspace.hook and the package's git runners do.
 type WorkspaceExecutor interface {
 	Prepare(context.Context, Issue) (Workspace, error)
 	BeforeRun(context.Context, Workspace, Issue) error
 	AfterRun(context.Context, Workspace, Issue)
 	Cleanup(context.Context, Issue) (CleanupOutcome, error)
-	Execute(context.Context, Workspace, string, []string) ([]byte, error)
 }

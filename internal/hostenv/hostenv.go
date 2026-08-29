@@ -5,8 +5,8 @@
 // names, and it lives outside both backends because that policy is a property
 // of the trust boundary rather than of any one child. Every child that inherits
 // the daemon's environment -- the Codex app-server, each Claude turn, each
-// WORKFLOW.md workspace hook -- reaches it through Filter, so a filter cannot
-// hold for one child and not another.
+// WORKFLOW.md workspace hook, each host-side git -- reaches it through Filter,
+// so a filter cannot hold for one child and not another.
 //
 // It depends only on internal/config, so a caller with no session and no
 // capability registry -- a workspace hook -- can use it.

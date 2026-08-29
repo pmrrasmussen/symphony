@@ -206,7 +206,7 @@ func (l *Local) ensureState(ctx context.Context, ws domain.Workspace, issue doma
 		if state.SourceRoot == "" {
 			return errors.New("workspace became a Git repository without recorded source-worktree identity; manual recovery is required")
 		}
-		state.BaseCommit, err = gitHead(ctx, ws.Path)
+		state.BaseCommit, err = gitHead(ctx, l.settings(), ws.Path)
 		if err != nil {
 			return err
 		}

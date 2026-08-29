@@ -91,7 +91,7 @@ func New(settings func() config.Settings, logger *slog.Logger) *Manager {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Manager{settings: settings, client: &http.Client{Timeout: 30 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}, git: execGit{}, logger: logger, linked: map[string]*link{}}
+	return &Manager{settings: settings, client: &http.Client{Timeout: 30 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}, git: execGit{settings: settings}, logger: logger, linked: map[string]*link{}}
 }
 
 func (m *Manager) Enabled() bool { return m.settings().GitHub.Enabled }

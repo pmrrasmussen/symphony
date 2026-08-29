@@ -27,7 +27,7 @@ var reservedSecretEnvNames = []string{
 // The five names here are the fixed half of a four-part filter, and
 // docs/architecture.md's "The host credential filter" section is the one
 // description of the whole of it: what each part covers that the others cannot,
-// which of the three kinds of child forgoes which part, and which test proves
+// which of the four kinds of child forgoes which part, and which test proves
 // each. hostenv.Filter is the one implementation, so a name added or removed
 // here cannot apply to one child Symphony spawns and not another.
 func ReservedSecretEnvNames() []string { return append([]string(nil), reservedSecretEnvNames...) }

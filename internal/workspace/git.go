@@ -9,7 +9,30 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+
+	"github.com/pmrrasmussen/symphony/internal/config"
+	"github.com/pmrrasmussen/symphony/internal/hostenv"
 )
+
+// gitEnvironment is the environment every git subprocess this package spawns
+// runs with. Git is a child Symphony starts like any other, so it gets the same
+// filter rather than the daemon's environment whole (PMR-175): most of these
+// runners are `git -C <agent worktree>` over state the agent wrote, and git
+// reads repository configuration the agent can reach, so a host credential
+// inherited here is one an agent-influenced subprocess can be made to carry.
+// Git needs none: the one authenticated path Symphony has is
+// internal/github's push, which injects its own credential explicitly.
+//
+// These runners have no session, so they pass no capability.SecretMatcher and
+// get filters 1 through 3. settings is threaded to every one of them rather
+// than read here, so the filter is applied at the exec site and a runner cannot
+// acquire an unfiltered environment by being called from somewhere new.
+//
+// docs/architecture.md's "The host credential filter" section states why a
+// child that only reads local repository state is still a child.
+func gitEnvironment(settings config.Settings) []string {
+	return hostenv.Filter(os.Environ(), nil, settings, nil)
+}
 
 func isGitWorkspace(path string) (bool, error) {
 	_, err := os.Lstat(filepath.Join(path, ".git"))
@@ -22,8 +45,8 @@ func isGitWorkspace(path string) (bool, error) {
 	return true, nil
 }
 
-func gitHead(ctx context.Context, path string) (string, error) {
-	head, err := gitMetadata(ctx, path, "rev-parse", "--verify", "HEAD")
+func gitHead(ctx context.Context, settings config.Settings, path string) (string, error) {
+	head, err := gitMetadata(ctx, settings, path, "rev-parse", "--verify", "HEAD")
 	if err != nil {
 		return "", fmt.Errorf("read Git workspace HEAD: %w", err)
 	}
@@ -33,15 +56,15 @@ func gitHead(ctx context.Context, path string) (string, error) {
 	return head, nil
 }
 
-func ensureGitWorkspaceUnchanged(ctx context.Context, path, baseCommit string) error {
-	status, err := gitMetadataAllowEmpty(ctx, path, "status", "--porcelain=v1", "--untracked-files=all")
+func ensureGitWorkspaceUnchanged(ctx context.Context, settings config.Settings, path, baseCommit string) error {
+	status, err := gitMetadataAllowEmpty(ctx, settings, path, "status", "--porcelain=v1", "--untracked-files=all")
 	if err != nil {
 		return fmt.Errorf("inspect Git workspace changes: %w", err)
 	}
 	if strings.TrimSpace(status) != "" {
 		return errors.New("refusing to remove Git workspace with uncommitted or untracked changes")
 	}
-	head, err := gitHead(ctx, path)
+	head, err := gitHead(ctx, settings, path)
 	if err != nil {
 		return err
 	}
@@ -69,12 +92,12 @@ type gitSourceIdentity struct {
 	commonInode  uint64
 }
 
-func sourceIdentity(ctx context.Context, sourceRoot string) (gitSourceIdentity, error) {
-	top, err := gitMetadata(ctx, sourceRoot, "rev-parse", "--path-format=absolute", "--show-toplevel")
+func sourceIdentity(ctx context.Context, settings config.Settings, sourceRoot string) (gitSourceIdentity, error) {
+	top, err := gitMetadata(ctx, settings, sourceRoot, "rev-parse", "--path-format=absolute", "--show-toplevel")
 	if err != nil {
 		return gitSourceIdentity{}, fmt.Errorf("classify workspace source repository: %w", err)
 	}
-	common, err := gitMetadata(ctx, sourceRoot, "rev-parse", "--path-format=absolute", "--git-common-dir")
+	common, err := gitMetadata(ctx, settings, sourceRoot, "rev-parse", "--path-format=absolute", "--git-common-dir")
 	if err != nil {
 		return gitSourceIdentity{}, fmt.Errorf("classify workspace source Git directory: %w", err)
 	}
@@ -105,8 +128,8 @@ func directoryIdentity(path string) (uint64, uint64, error) {
 	return uint64(stat.Dev), uint64(stat.Ino), nil
 }
 
-func worktreeIdentity(ctx context.Context, path, expectedCommon string) (string, error) {
-	common, err := gitMetadata(ctx, path, "rev-parse", "--path-format=absolute", "--git-common-dir")
+func worktreeIdentity(ctx context.Context, settings config.Settings, path, expectedCommon string) (string, error) {
+	common, err := gitMetadata(ctx, settings, path, "rev-parse", "--path-format=absolute", "--git-common-dir")
 	if err != nil {
 		return "", fmt.Errorf("classify created worktree common directory: %w", err)
 	}
@@ -117,7 +140,7 @@ func worktreeIdentity(ctx context.Context, path, expectedCommon string) (string,
 	if common != expectedCommon {
 		return "", fmt.Errorf("created worktree belongs to Git directory %q, expected %q; manual recovery is required", common, expectedCommon)
 	}
-	gitDir, err := gitMetadata(ctx, path, "rev-parse", "--path-format=absolute", "--absolute-git-dir")
+	gitDir, err := gitMetadata(ctx, settings, path, "rev-parse", "--path-format=absolute", "--absolute-git-dir")
 	if err != nil {
 		return "", fmt.Errorf("classify created worktree Git directory: %w", err)
 	}
@@ -157,8 +180,8 @@ func validateWorktreeIdentity(path string, state workspaceState) error {
 	return nil
 }
 
-func gitMetadata(ctx context.Context, dir string, args ...string) (string, error) {
-	value, err := gitMetadataAllowEmpty(ctx, dir, args...)
+func gitMetadata(ctx context.Context, settings config.Settings, dir string, args ...string) (string, error) {
+	value, err := gitMetadataAllowEmpty(ctx, settings, dir, args...)
 	if err != nil {
 		return "", err
 	}
@@ -168,8 +191,9 @@ func gitMetadata(ctx context.Context, dir string, args ...string) (string, error
 	return value, nil
 }
 
-func gitMetadataAllowEmpty(ctx context.Context, dir string, args ...string) (string, error) {
+func gitMetadataAllowEmpty(ctx context.Context, settings config.Settings, dir string, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", dir}, args...)...)
+	cmd.Env = gitEnvironment(settings)
 	var stdout, stderr boundedBuffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -186,15 +210,15 @@ func gitMetadataAllowEmpty(ctx context.Context, dir string, args ...string) (str
 // from the branch github.base_branch actually names -- the same ref
 // Session.Publish's descendant check reads -- rather than a literal that
 // silently diverges from it (PMR-135).
-func (l *Local) addWorktree(ctx context.Context, sourceRoot, path, baseBranch string) error {
+func (l *Local) addWorktree(ctx context.Context, settings config.Settings, sourceRoot, path, baseBranch string) error {
 	if baseBranch == "" {
 		baseBranch = "main"
 	}
-	baseCommit, err := l.fetchBaseCommit(ctx, sourceRoot, baseBranch)
+	baseCommit, err := l.fetchBaseCommit(ctx, settings, sourceRoot, baseBranch)
 	if err != nil {
 		return err
 	}
-	if err := gitMutation(ctx, sourceRoot, "worktree", "add", "--detach", path, baseCommit); err != nil {
+	if err := gitMutation(ctx, settings, sourceRoot, "worktree", "add", "--detach", path, baseCommit); err != nil {
 		return fmt.Errorf("create workspace worktree: %w", err)
 	}
 	return nil
@@ -206,23 +230,23 @@ func (l *Local) addWorktree(ctx context.Context, sourceRoot, path, baseBranch st
 // one common directory, so without the lock two workspaces fetching the same
 // ref at once can lose a lock race on refs/remotes/origin/<baseBranch>, the
 // same hazard fetchMu's doc comment on the Local struct describes (PMR-162).
-func (l *Local) fetchBaseCommit(ctx context.Context, sourceRoot, baseBranch string) (string, error) {
+func (l *Local) fetchBaseCommit(ctx context.Context, settings config.Settings, sourceRoot, baseBranch string) (string, error) {
 	l.fetchMu.Lock()
 	defer l.fetchMu.Unlock()
 	refspec := "+refs/heads/" + baseBranch + ":refs/remotes/origin/" + baseBranch
-	if err := gitMutation(ctx, sourceRoot, "fetch", "--no-tags", "origin", refspec); err != nil {
+	if err := gitMutation(ctx, settings, sourceRoot, "fetch", "--no-tags", "origin", refspec); err != nil {
 		return "", fmt.Errorf("refresh origin/%s before creating workspace: %w", baseBranch, err)
 	}
-	baseCommit, err := gitMetadata(ctx, sourceRoot, "rev-parse", "--verify", "refs/remotes/origin/"+baseBranch+"^{commit}")
+	baseCommit, err := gitMetadata(ctx, settings, sourceRoot, "rev-parse", "--verify", "refs/remotes/origin/"+baseBranch+"^{commit}")
 	if err != nil {
 		return "", fmt.Errorf("resolve refreshed origin/%s commit: %w", baseBranch, err)
 	}
 	return baseCommit, nil
 }
 
-func gitRepositoryAvailable(ctx context.Context, state workspaceState) (bool, error) {
+func gitRepositoryAvailable(ctx context.Context, settings config.Settings, state workspaceState) (bool, error) {
 	if _, err := os.Stat(state.SourceRoot); err == nil {
-		identity, identityErr := sourceIdentity(ctx, state.SourceRoot)
+		identity, identityErr := sourceIdentity(ctx, settings, state.SourceRoot)
 		if identityErr != nil {
 			return false, fmt.Errorf("validate recorded source repository: %w; manual recovery is required", identityErr)
 		}
@@ -248,32 +272,32 @@ func gitRepositoryAvailable(ctx context.Context, state workspaceState) (bool, er
 	return false, nil
 }
 
-func removeRecordedWorktree(ctx context.Context, state workspaceState, path string, force bool) error {
+func removeRecordedWorktree(ctx context.Context, settings config.Settings, state workspaceState, path string, force bool) error {
 	args := []string{"worktree", "remove"}
 	if force {
 		args = append(args, "--force")
 	}
 	args = append(args, path)
-	if err := gitRecordedMutation(ctx, state, args...); err != nil {
+	if err := gitRecordedMutation(ctx, settings, state, args...); err != nil {
 		return fmt.Errorf("remove workspace worktree: %w", err)
 	}
 	return nil
 }
 
-func pruneRecordedWorktrees(ctx context.Context, state workspaceState) error {
-	if err := gitRecordedMutation(ctx, state, "worktree", "prune"); err != nil {
+func pruneRecordedWorktrees(ctx context.Context, settings config.Settings, state workspaceState) error {
+	if err := gitRecordedMutation(ctx, settings, state, "worktree", "prune"); err != nil {
 		return fmt.Errorf("prune workspace worktrees: %w", err)
 	}
 	return nil
 }
 
-func gitRecordedMutation(ctx context.Context, state workspaceState, args ...string) error {
+func gitRecordedMutation(ctx context.Context, settings config.Settings, state workspaceState, args ...string) error {
 	if _, err := os.Stat(state.SourceRoot); err == nil {
-		identity, identityErr := sourceIdentity(ctx, state.SourceRoot)
+		identity, identityErr := sourceIdentity(ctx, settings, state.SourceRoot)
 		if identityErr != nil || identity.sourceRoot != filepath.Clean(state.SourceRoot) || identity.commonDir != filepath.Clean(state.GitCommonDir) || identity.commonDevice != state.GitCommonDevice || identity.commonInode != state.GitCommonInode {
 			return errors.New("recorded source path no longer identifies the expected Git repository; manual recovery is required")
 		}
-		return gitMutation(ctx, state.SourceRoot, args...)
+		return gitMutation(ctx, settings, state.SourceRoot, args...)
 	} else if !os.IsNotExist(err) {
 		return fmt.Errorf("inspect recorded source repository: %w", err)
 	}
@@ -285,6 +309,7 @@ func gitRecordedMutation(ctx context.Context, state workspaceState, args ...stri
 		return errors.New("recorded Git common directory no longer identifies the expected repository; manual recovery is required")
 	}
 	cmd := exec.CommandContext(ctx, "git", append([]string{"--git-dir=" + state.GitCommonDir}, args...)...)
+	cmd.Env = gitEnvironment(settings)
 	var stdout, stderr boundedBuffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	if err := cmd.Run(); err != nil {
@@ -293,8 +318,9 @@ func gitRecordedMutation(ctx context.Context, state workspaceState, args ...stri
 	return nil
 }
 
-func gitMutation(ctx context.Context, sourceRoot string, args ...string) error {
+func gitMutation(ctx context.Context, settings config.Settings, sourceRoot string, args ...string) error {
 	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", sourceRoot}, args...)...)
+	cmd.Env = gitEnvironment(settings)
 	var stdout, stderr boundedBuffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	if err := cmd.Run(); err != nil {

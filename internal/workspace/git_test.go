@@ -2,9 +2,11 @@ package workspace
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -206,6 +208,142 @@ exec "$PMR162_REAL_GIT" "$@"
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+// TestNoHostCredentialReachesAWorkspaceGitChild is the git runners' share of the
+// guarantee config.ReservedSecretEnvNames documents, and the counterpart of
+// TestNoHostCredentialReachesAHook. Git is the fourth kind of child Symphony
+// spawns and, until PMR-175, the one that ran with the daemon's environment
+// whole: most of these runners are `git -C <agent worktree>` over state the
+// agent wrote, and git reads repository configuration the agent can reach --
+// core.fsmonitor in a per-worktree config, say -- so a host credential inherited
+// here is one an agent-influenced subprocess can be made to carry.
+//
+// It runs a real Prepare, AfterRun, and Cleanup rather than calling a runner
+// directly, because what is proven here is that the exec sites reach the filter
+// at all; what the filter then removes is proven once, over hostenv.Filter.
+// Between them those three reach every exec site in this package but one:
+// gitRecordedMutation's `--git-dir` fallback runs only once the recorded source
+// root is gone, and it sets cmd.Env from the same gitEnvironment as the sibling
+// branch three lines above it.
+//
+// The reserved names are written out rather than read from
+// config.ReservedSecretEnvNames, deliberately: a test that iterates the list
+// asserts nothing about its contents, and dropping an entry would leave it
+// green.
+func TestNoHostCredentialReachesAWorkspaceGitChild(t *testing.T) {
+	source := newGitRepository(t)
+	root := filepath.Join(t.TempDir(), "workspaces")
+	// Installed after the fixture repository is built, so the recording only ever
+	// holds the environment of a child this package spawned.
+	environment := recordGitChildEnvironments(t)
+
+	// Filter 1: the reserved names, whatever the workflow configures. Each value
+	// is unique and is matched by no other filter, so only the name can remove it.
+	reserved := map[string]string{
+		"LINEAR_API_KEY":               "reserved-linear-key-value",
+		"SYMPHONY_LINEAR_API_KEY_FILE": "/private/reserved-linear-key-path",
+		"GITHUB_TOKEN":                 "reserved-forge-token-value",
+		"SYMPHONY_GITHUB_TOKEN":        "reserved-symphony-forge-token-value",
+		"SYMPHONY_GITHUB_TOKEN_FILE":   "/private/reserved-forge-token-path",
+	}
+	for name, value := range reserved {
+		t.Setenv(name, value)
+	}
+	// Filter 2: a configured name, including the credential *file path* form no
+	// value filter can see. Filter 3: a configured credential inside the value of
+	// a variable no list mentions. Filter 4 has no case here: a git runner has no
+	// session to build a matcher from, which is the documented shape of this
+	// caller rather than a gap in the test.
+	t.Setenv("PMR175_CONFIGURED_NAME", "configured-name-value")
+	t.Setenv("PMR175_CONFIGURED_FILE", "/private/configured-key-path")
+	t.Setenv("PMR175_INHERITED_CONFIGURED", "Bearer configured-secret-value")
+	t.Setenv("PMR175_KEPT", "ordinary-value")
+
+	s := config.Settings{
+		Workspace:          config.Workspace{Root: root, SourceRoot: source},
+		HostSecretEnvNames: []string{"PMR175_CONFIGURED_NAME", "PMR175_CONFIGURED_FILE"},
+		HostSecretValues:   []string{"configured-secret-value"},
+	}
+	l := New(func() config.Settings { return s })
+	issue := domain.Issue{ID: "issue-175", Identifier: "PMR-175"}
+	ws, err := l.Prepare(context.Background(), issue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Move a source branch so AfterRun's integrity classifier has a change to
+	// classify: that is what reaches isAncestor and reachableFromRemote, the two
+	// runners a source repository nobody touched never invokes. The move itself
+	// runs git with an environment of its own, so this fixture step cannot put a
+	// reserved variable into the recording and mask a leak.
+	runGitWithoutHostEnvironment(t, source, "commit", "--allow-empty", "-m", "concurrent operator commit")
+	runGitWithoutHostEnvironment(t, source, "push", "origin", "main")
+	// AfterRun runs the integrity classifier over the source repository, and
+	// Cleanup the worktree inspection and removal.
+	l.AfterRun(context.Background(), ws, issue)
+	if _, err := l.Cleanup(context.Background(), issue); err != nil {
+		t.Fatal(err)
+	}
+	// Read before anything else in this test runs git again: from here on the
+	// recording would also hold this test process's own unfiltered environment.
+	data, err := os.ReadFile(environment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	children := string(data)
+	for name, value := range reserved {
+		if slices.Contains(hookEnvironmentNames(children), name) {
+			t.Fatalf("git child environment retained reserved variable %s", name)
+		}
+		if strings.Contains(children, value) {
+			t.Fatalf("git child environment retained the value of reserved variable %s", name)
+		}
+	}
+	for _, leaked := range []string{"configured-name-value", "/private/configured-key-path", "configured-secret-value"} {
+		if strings.Contains(children, leaked) {
+			t.Fatalf("git child environment retained %q", leaked)
+		}
+	}
+	// Without this the filter could pass by handing every git child an empty
+	// environment -- or by never being reached, if no child was recorded at all.
+	if !strings.Contains(children, "PMR175_KEPT=ordinary-value") {
+		t.Fatal("no git child inherited an unrelated variable; the recording proves nothing")
+	}
+}
+
+// recordGitChildEnvironments prepends a fake "git" to PATH that appends its own
+// environment to one file and then delegates to the real git binary, and returns
+// that file's path. The paths are written into the script rather than passed
+// through the environment, because the environment is what is under test: a
+// variable the filter removed cannot also be the shim's way of finding the real
+// git.
+func recordGitChildEnvironments(t *testing.T) string {
+	t.Helper()
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	environment := filepath.Join(t.TempDir(), "git-environments")
+	binDir := t.TempDir()
+	script := fmt.Sprintf("#!/bin/sh\n/usr/bin/env >> %q\nexec %q \"$@\"\n", environment, realGit)
+	if err := os.WriteFile(filepath.Join(binDir, "git"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	return environment
+}
+
+// runGitWithoutHostEnvironment runs one fixture git command with only the
+// variables git needs to run at all, so a test recording git child environments
+// can distinguish what this package's runners passed from what the test process
+// itself holds.
+func runGitWithoutHostEnvironment(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME")}
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git %s: %v: %s", strings.Join(args, " "), err, out)
+	}
 }
 
 // TestPrepareFetchesConfiguredBaseBranchNotMain asserts a non-"main"

@@ -497,9 +497,6 @@ func (f *fakeBoundaries) AfterRun(context.Context, domain.Workspace, domain.Issu
 func (*fakeBoundaries) Cleanup(context.Context, domain.Issue) (domain.CleanupOutcome, error) {
 	return domain.CleanupClean, errorsf("unexpected cleanup")
 }
-func (*fakeBoundaries) Execute(context.Context, domain.Workspace, string, []string) ([]byte, error) {
-	return nil, errorsf("unexpected command execution")
-}
 func (f *fakeBoundaries) Start(context.Context, domain.AgentRequest) (domain.AgentSession, <-chan domain.Event, error) {
 	f.mu.Lock()
 	f.starts++

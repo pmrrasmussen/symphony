@@ -63,9 +63,6 @@ func TestWorkspaceOperationsRejectSymlinkedWorkspace(t *testing.T) {
 		t.Fatalf("Prepare error = %v, want symlink rejection", err)
 	}
 	ws := domain.Workspace{Path: path, Key: Key(issue.Identifier)}
-	if _, err := l.Execute(context.Background(), ws, "true", nil); err == nil || !strings.Contains(err.Error(), "must not be a symlink") {
-		t.Fatalf("Execute error = %v, want symlink rejection", err)
-	}
 	if err := l.BeforeRun(context.Background(), ws, issue); err == nil || !strings.Contains(err.Error(), "must not be a symlink") {
 		t.Fatalf("BeforeRun error = %v, want symlink rejection", err)
 	}
