@@ -115,6 +115,37 @@ flag. Passing `--workflow` to `status` or `restart` still selects/validates
 against that specific path, and a mismatch is reported by name rather than
 silently resolved.
 
+Only `install` and `migrate` need the workflow file to exist, because only
+they read it. `status`, `restart`, and `uninstall` use the path to identify
+the installed instance, so a repository being decommissioned can have its
+`WORKFLOW.md` deleted and its service removed afterwards, in either order.
+
+### Pausing and resuming a service
+
+A plist on disk is not a registration. `launchctl bootout "gui/$(id -u)/<label>"`
+stops the daemon and leaves the managed plist exactly as it was, which is the
+supported way to pause one repository's service. Either `symphony service
+install` or `symphony service restart` brings it back: `install` re-registers
+an already-exact plist instead of reporting it unchanged, and `restart`
+bootstraps a registration launchd does not have before kickstarting it, since
+`kickstart` alone can only start a job launchd already knows about.
+
+Both act only on a *positively absent* registration -- launchd stating it has
+no such job. An observation that fails for some other reason says nothing
+about whether the daemon is running and is never treated as absence, so
+neither command restarts a service on an unanswered question.
+
+`service status` names that state in its own field, because the discovered
+`launchd`/`liveness` values cannot: a failed `launchctl print` reads as
+`stopped` whether the daemon crashed or was never registered.
+
+```json
+{"id": "com.pmrrasmussen.symphony.acme-api", "liveness": "stopped", "registration": "not_loaded"}
+```
+
+`registration` is `loaded`, `not_loaded`, or `unknown` for an observation that
+did not answer. Only `not_loaded` is what `install` or `restart` fixes.
+
 ## Credentials
 
 The workflow contains credential *references*, never secret values. Services

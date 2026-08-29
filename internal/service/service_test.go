@@ -92,6 +92,15 @@ func (r *fakeRunner) launchctl(args []string) ([]byte, error) {
 			lines = append(lines, "1234\t0\t"+label)
 		}
 		return []byte(strings.Join(lines, "\n") + "\n"), nil
+	case "kickstart":
+		// launchd can only start a job it has: kickstarting a service that was
+		// booted out fails exactly like print does, which is what makes a
+		// restart of an unloaded instance a dead end without a bootstrap.
+		label := serviceLabel(args[len(args)-1])
+		if !r.loaded[label] {
+			return []byte("Could not find service \"" + label + "\" in domain for user gui: 501"), errors.New("exit status 113")
+		}
+		return nil, nil
 	case "bootstrap":
 		r.loaded[strings.TrimSuffix(filepath.Base(args[len(args)-1]), ".plist")] = true
 		return nil, nil
@@ -139,14 +148,142 @@ func TestInstallIsIdempotentAndUsesRepositoryScopedPaths(t *testing.T) {
 	if err != nil || changed {
 		t.Fatalf("second install changed=%v err=%v", changed, err)
 	}
-	bootstrap := 0
-	for _, call := range runner.calls {
-		if strings.Contains(call, "launchctl bootstrap") {
-			bootstrap++
-		}
-	}
-	if bootstrap != 1 {
+	if bootstrap := countCalls(runner, "launchctl bootstrap"); bootstrap != 1 {
 		t.Fatalf("bootstrap calls=%d, calls=%v", bootstrap, runner.calls)
+	}
+}
+
+// TestInstallReloadsAnExactPlistLaunchdNoLongerHas guards PMR-187: an operator
+// who pauses the daemon with launchctl bootout leaves the managed plist
+// byte-for-byte correct, so byte equality alone reported "already installed"
+// and changed nothing while nothing was running. The plist is not rewritten;
+// only the registration is restored.
+func TestInstallReloadsAnExactPlistLaunchdNoLongerHas(t *testing.T) {
+	_, options, runner := serviceFixture(t)
+	instance, _, err := Install(context.Background(), options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(instance.PlistPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	delete(runner.loaded, instance.Label)
+	_, changed, err := Install(context.Background(), options)
+	if err != nil || !changed {
+		t.Fatalf("install over a booted-out service: changed=%v err=%v", changed, err)
+	}
+	if !runner.loaded[instance.Label] {
+		t.Fatalf("%s was not bootstrapped: calls=%v", instance.Label, runner.calls)
+	}
+	after, err := os.ReadFile(instance.PlistPath)
+	if err != nil || string(after) != string(before) {
+		t.Fatalf("unchanged plist was rewritten: %q err=%v", after, err)
+	}
+}
+
+// TestInstallLeavesAnUnverifiableRegistrationAlone keeps that recovery honest:
+// a launchd observation that failed for some other reason says nothing about
+// whether the daemon is running, so it must never provoke a restart.
+func TestInstallLeavesAnUnverifiableRegistrationAlone(t *testing.T) {
+	_, options, runner := serviceFixture(t)
+	instance, _, err := Install(context.Background(), options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner.printFail = map[string]bool{instance.Label: true}
+	_, changed, err := Install(context.Background(), options)
+	if err != nil || changed {
+		t.Fatalf("install with an unanswered launchd observation: changed=%v err=%v", changed, err)
+	}
+	if bootstrap := countCalls(runner, "launchctl bootstrap"); bootstrap != 1 {
+		t.Fatalf("bootstrap calls=%d, calls=%v", bootstrap, runner.calls)
+	}
+}
+
+// TestRestartBootstrapsABootedOutService is PMR-187's other recovery path:
+// kickstart can only start a job launchd already has, so before this a
+// deliberate launchctl bootout -- the command migrate's own error text
+// teaches -- had no Symphony command that could undo it.
+func TestRestartBootstrapsABootedOutService(t *testing.T) {
+	_, options, runner := serviceFixture(t)
+	instance, _, err := Install(context.Background(), options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	delete(runner.loaded, instance.Label)
+	if _, err := Restart(context.Background(), options); err != nil {
+		t.Fatalf("restart a booted-out service: %v", err)
+	}
+	if !runner.loaded[instance.Label] {
+		t.Fatalf("%s was not bootstrapped: calls=%v", instance.Label, runner.calls)
+	}
+	bootstrap, kickstart := lastCall(runner, "launchctl bootstrap"), lastCall(runner, "launchctl kickstart")
+	if bootstrap < 0 || kickstart < bootstrap {
+		t.Fatalf("restart did not bootstrap before kickstarting: calls=%v", runner.calls)
+	}
+}
+
+// TestStatusNamesTheLaunchdRegistration covers the state discovery cannot
+// report on its own: it reads any failed launchctl print as "not loaded", so
+// its stopped liveness cannot tell a crashed daemon from one launchd has no
+// registration for -- and only the second is what install or restart fixes.
+func TestStatusNamesTheLaunchdRegistration(t *testing.T) {
+	_, options, runner := serviceFixture(t)
+	instance, _, err := Install(context.Background(), options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	report, err := Status(context.Background(), options)
+	if err != nil || report.Registration != RegistrationLoaded {
+		t.Fatalf("registration = %q, err=%v", report.Registration, err)
+	}
+	if report.ID != instance.Label {
+		t.Fatalf("report describes %s, want %s", report.ID, instance.Label)
+	}
+	delete(runner.loaded, instance.Label)
+	if report, err = Status(context.Background(), options); err != nil || report.Registration != RegistrationNotLoaded {
+		t.Fatalf("registration after bootout = %q, err=%v", report.Registration, err)
+	}
+	runner.printFail = map[string]bool{instance.Label: true}
+	if report, err = Status(context.Background(), options); err != nil || report.Registration != RegistrationUnknown {
+		t.Fatalf("registration for an unanswered observation = %q, err=%v", report.Registration, err)
+	}
+}
+
+// TestManagingAnInstanceDoesNotNeedTheWorkflowFile guards PMR-187's second
+// dead end: decommissioning a repository deletes WORKFLOW.md while its
+// LaunchAgent keeps running, and the file had to be recreated purely to let
+// uninstall stat it. Only the commands that write a plist read the workflow;
+// selecting an installed instance needs the path, not the file.
+func TestManagingAnInstanceDoesNotNeedTheWorkflowFile(t *testing.T) {
+	dir, options, runner := serviceFixture(t)
+	instance, _, err := Install(context.Background(), options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(dir, "WORKFLOW.md")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Status(context.Background(), options); err != nil {
+		t.Fatalf("status without a workflow file: %v", err)
+	}
+	if _, err := Restart(context.Background(), options); err != nil {
+		t.Fatalf("restart without a workflow file: %v", err)
+	}
+	if _, err := Uninstall(context.Background(), options); err != nil {
+		t.Fatalf("uninstall without a workflow file: %v", err)
+	}
+	if _, err := os.Stat(instance.PlistPath); !os.IsNotExist(err) {
+		t.Fatalf("uninstall left the plist behind: %v", err)
+	}
+	if runner.loaded[instance.Label] {
+		t.Fatalf("uninstall left %s loaded", instance.Label)
+	}
+	// install still writes a plist, so it still requires the workflow it would
+	// point at.
+	if _, _, err := Install(context.Background(), options); err == nil || !strings.Contains(err.Error(), "WORKFLOW.md is unavailable") {
+		t.Fatalf("install without a workflow file: %v", err)
 	}
 }
 
@@ -433,6 +570,29 @@ func serviceFixture(t *testing.T) (string, Options, *fakeRunner) {
 	}
 	runner := &fakeRunner{root: dir}
 	return dir, Options{Repository: dir, Binary: binary, LaunchAgentsDir: launch, LinearKeyFile: key, Runner: runner}, runner
+}
+
+// countCalls and lastCall read the fake's call log: how often a command ran,
+// and where the last one sits, so an ordering between two of them is asserted
+// rather than assumed.
+func countCalls(runner *fakeRunner, command string) int {
+	count := 0
+	for _, call := range runner.calls {
+		if strings.Contains(call, command) {
+			count++
+		}
+	}
+	return count
+}
+
+func lastCall(runner *fakeRunner, command string) int {
+	index := -1
+	for i, call := range runner.calls {
+		if strings.Contains(call, command) {
+			index = i
+		}
+	}
+	return index
 }
 
 func fmtError(err error) string {

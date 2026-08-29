@@ -168,7 +168,7 @@ func (l legacyState) restore(ctx context.Context, runner Runner, cause error) er
 		return fmt.Errorf("migrate %s: %w (restoring %s failed: %v; its contents remain at %s)", l.label, cause, l.plist, err, l.backup)
 	}
 	if l.loaded {
-		if err := launchctl(ctx, runner, "bootstrap", "gui/"+fmt.Sprint(os.Getuid()), l.plist); err != nil {
+		if err := launchctl(ctx, runner, "bootstrap", userDomain(), l.plist); err != nil {
 			return fmt.Errorf("migrate %s: %w (restored the prior LaunchAgent %s but could not load it: %v; a copy remains at %s)", l.label, cause, l.plist, err, l.backup)
 		}
 	}
