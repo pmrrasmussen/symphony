@@ -58,7 +58,7 @@ func TestUnreserveReleasesOnlyTheReservationItOwns(t *testing.T) {
 	c := testCoordinator(w.Config, &fakeTracker{issue: issue}, &fakeAgent{}, &fakeWorkspace{})
 	defer assertInvariants(t, c)
 
-	if !c.claim(issue, w.Config) {
+	if !claims(c, issue, w.Config) {
 		t.Fatal("issue was not claimed")
 	}
 	c.mu.Lock()
@@ -88,7 +88,7 @@ func TestUnreserveReleasesOnlyTheReservationItOwns(t *testing.T) {
 	}
 	other := testIssue()
 	other.ID, other.Identifier = "other", "ENG-2"
-	if c.claim(other, w.Config) {
+	if claims(c, other, w.Config) {
 		t.Fatal("a stale release freed a slot the redispatch still owned, admitting one worker over max_concurrent_agents")
 	}
 

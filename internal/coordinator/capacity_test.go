@@ -125,9 +125,9 @@ func TestMidTickSnapshotNeverShowsAnIssueWaitingAndRunning(t *testing.T) {
 
 // TestWaitingListNeverDuplicatesARunningOrRetryingIssue guards the PMR-139
 // acceptance criterion that the waiting list never grows a second entry for
-// an issue already visible in Running or Retrying: admissionRejectReason
-// reports already_claimed for a claimed issue before it ever reaches the
-// at_capacity check that populates Waiting.
+// an issue already visible in Running or Retrying: claim reports
+// already_claimed for a claimed issue before it ever reaches the at_capacity
+// check that populates Waiting.
 func TestWaitingListNeverDuplicatesARunningOrRetryingIssue(t *testing.T) {
 	w := testSettings(t)
 	w.Config.Agent.MaxConcurrent = 1
@@ -372,7 +372,7 @@ func TestFourImplementationAndReworkIssuesRunConcurrently(t *testing.T) {
 	if admitted != 4 {
 		t.Fatalf("admitted=%d, want the global four-agent capacity fully occupied", admitted)
 	}
-	if c.claim(issues[4], w.Config) {
+	if claims(c, issues[4], w.Config) {
 		t.Fatal("a fifth implementation issue exceeded the global four-agent capacity")
 	}
 
@@ -435,7 +435,7 @@ func TestMergingAndUnrelatedImplementationRunConcurrentlyUnderByStateCapacity(t 
 
 	// A queued retry for a third, unrelated issue must not occupy a
 	// concurrency slot while it waits.
-	if !c.claim(retryable, w.Config) {
+	if !claims(c, retryable, w.Config) {
 		t.Fatal("retryable issue was not claimed")
 	}
 	c.scheduleRetry(context.Background(), retryable, domain.Workspace{}, 1, retryAgent, "test", time.Minute)
@@ -446,7 +446,7 @@ func TestMergingAndUnrelatedImplementationRunConcurrentlyUnderByStateCapacity(t 
 
 	// A second concurrent Merging issue is refused by the per-state cap even
 	// though overall capacity (2 of 4) still has room.
-	if c.claim(secondLanding, w.Config) {
+	if claims(c, secondLanding, w.Config) {
 		t.Fatal("a second concurrent Merging issue must be refused by max_concurrent_agents_by_state")
 	}
 

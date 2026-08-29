@@ -190,6 +190,13 @@ func testCoordinator(settings config.Settings, tracker domain.Tracker, agent dom
 	return c
 }
 
+// claims pre-claims an issue the way tick does, discarding the rejection
+// category tick uses only to categorize a poll rejection.
+func claims(c *Coordinator, i domain.Issue, s config.Settings) bool {
+	ok, _ := c.claim(i, s)
+	return ok
+}
+
 func testSettings(t *testing.T) config.Workflow {
 	t.Helper()
 	d := t.TempDir()

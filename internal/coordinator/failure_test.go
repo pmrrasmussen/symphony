@@ -208,7 +208,7 @@ func TestClosedEventStreamNeverAbandonsIssue(t *testing.T) {
 	c := New(&fakeTracker{issue: issue}, &fakeAgent{}, &fakeWorkspace{}, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&log, nil)))
 	defer assertInvariants(t, c)
 	c.timer = &fakeTimer{}
-	if !c.claim(issue, w.Config) {
+	if !claims(c, issue, w.Config) {
 		t.Fatal("issue was not claimed")
 	}
 
@@ -256,7 +256,7 @@ func TestRateLimitedEventNeverAbandonsIssueAndIgnoresOrdinaryBackoff(t *testing.
 	defer assertInvariants(t, c)
 	timer := &fakeTimer{}
 	c.timer = timer
-	if !c.claim(issue, w.Config) {
+	if !claims(c, issue, w.Config) {
 		t.Fatal("issue was not claimed")
 	}
 
@@ -310,7 +310,7 @@ func TestRateLimitedEventWithNoResetFloorsWellAboveMaxRetryBackoff(t *testing.T)
 	defer assertInvariants(t, c)
 	timer := &fakeTimer{}
 	c.timer = timer
-	if !c.claim(issue, w.Config) {
+	if !claims(c, issue, w.Config) {
 		t.Fatal("issue was not claimed")
 	}
 
@@ -348,7 +348,7 @@ func TestPostTurnRefreshFailureNeverAbandonsIssue(t *testing.T) {
 	c := New(&fakeTracker{issue: issue}, &fakeAgent{}, &fakeWorkspace{}, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&log, nil)))
 	defer assertInvariants(t, c)
 	c.timer = &fakeTimer{}
-	if !c.claim(issue, w.Config) {
+	if !claims(c, issue, w.Config) {
 		t.Fatal("issue was not claimed")
 	}
 
@@ -393,7 +393,7 @@ func TestContinuationFailureNeverAbandonsIssue(t *testing.T) {
 	c := New(&fakeTracker{issue: issue}, &fakeAgent{}, &fakeWorkspace{}, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&log, nil)))
 	defer assertInvariants(t, c)
 	c.timer = &fakeTimer{}
-	if !c.claim(issue, w.Config) {
+	if !claims(c, issue, w.Config) {
 		t.Fatal("issue was not claimed")
 	}
 
@@ -442,7 +442,7 @@ func TestSystemicFailuresLeaveTheGenuineRetryBudgetIntact(t *testing.T) {
 	defer assertInvariants(t, c)
 	timer := &fakeTimer{}
 	c.timer = timer
-	if !c.claim(issue, w.Config) {
+	if !claims(c, issue, w.Config) {
 		t.Fatal("issue was not claimed")
 	}
 

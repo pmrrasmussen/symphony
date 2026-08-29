@@ -94,6 +94,57 @@ func TestIneligibleReasonCategorizesEachRejection(t *testing.T) {
 	}
 }
 
+// TestClaimReportsTheAdmissionCheckThatRefused pins claim as the one
+// admission check: the categories the poll summary counts come from the same
+// acquisition of c.mu that reserves the slot, so there is no window in which a
+// refusal could be attributed to one cause and the reservation fail for
+// another (PMR-194).
+func TestClaimReportsTheAdmissionCheckThatRefused(t *testing.T) {
+	w := testSettings(t)
+	w.Config.Agent.MaxConcurrent = 1
+	issue := testIssue()
+
+	tests := []struct {
+		name   string
+		setup  func(*Coordinator)
+		ok     bool
+		reason string
+	}{
+		{name: "admitted", setup: func(*Coordinator) {}, ok: true},
+		{
+			name:   "stopping",
+			setup:  func(c *Coordinator) { c.mu.Lock(); c.stopping = true; c.mu.Unlock() },
+			reason: "stopping",
+		},
+		{
+			name:   "already claimed",
+			setup:  func(c *Coordinator) { c.seedClaim(issue) },
+			reason: "already_claimed",
+		},
+		{
+			name: "at capacity",
+			setup: func(c *Coordinator) {
+				occupying := testIssue()
+				occupying.ID, occupying.Identifier = "occupying", "ENG-OCCUPY"
+				c.occupySlot(occupying)
+			},
+			reason: "at_capacity",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			c := testCoordinator(w.Config, &fakeTracker{issue: issue}, &fakeAgent{}, &fakeWorkspace{})
+			test.setup(c)
+
+			ok, reason := c.claim(issue, w.Config)
+
+			if ok != test.ok || reason != test.reason {
+				t.Fatalf("claim=(%v, %q), want (%v, %q)", ok, reason, test.ok, test.reason)
+			}
+		})
+	}
+}
+
 func TestPollSummaryReportsNoCandidatesAtDebugLevel(t *testing.T) {
 	w := testSettings(t)
 	tracker := &issueMapTracker{issues: map[string]domain.Issue{}}
@@ -121,7 +172,7 @@ func TestPollSummaryCategorizesRejectionsAndOmitsAtInfoLevel(t *testing.T) {
 	defer assertInvariants(t, c)
 	timer := &fakeTimer{signal: make(chan struct{}, 1)}
 	c.timer = timer
-	if !c.claim(claimed, w.Config) {
+	if !claims(c, claimed, w.Config) {
 		t.Fatal("pre-claim failed")
 	}
 	c.Tick(context.Background())
@@ -145,7 +196,7 @@ func TestPollSummaryCategorizesRejectionsAndOmitsAtInfoLevel(t *testing.T) {
 	defer assertInvariants(t, c2)
 	timer2 := &fakeTimer{signal: make(chan struct{}, 1)}
 	c2.timer = timer2
-	if !c2.claim(claimed2, w.Config) {
+	if !claims(c2, claimed2, w.Config) {
 		t.Fatal("pre-claim failed")
 	}
 	c2.Tick(context.Background())
