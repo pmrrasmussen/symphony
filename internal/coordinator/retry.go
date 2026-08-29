@@ -168,6 +168,13 @@ func (c *Coordinator) runRetry(id string, generation uint64) {
 	c.scheduleRetry(ctx, issue, retry.workspace, retry.attempt, retryAgent, "agent_slot_unavailable", agentSlotRetryDelay(s))
 }
 
+// stopRun cancels a run and waits for its backend cancellation inline. Its
+// caller is usually reconcile, on the poll goroutine, so the wait is a cost that
+// pass pays: cancelSession bounds each call at 5s, and a pass that stops several
+// runs pays that per run before it polls again. Left as is: it is bounded and
+// its callers depend on the cancellation having been delivered by the time they
+// act on the stop, unlike the workspace cleanup a stopTerminal run also
+// triggers, which had no bound at all until PMR-180 gave it one.
 func (c *Coordinator) stopRun(id string, reason stopReason) bool {
 	c.mu.Lock()
 	r := c.runLocked(id)
