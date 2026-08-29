@@ -150,19 +150,52 @@ type checkRunsResponse struct {
 // commit. Both github_pr_context (bounded/redacted display) and
 // github_land_pr (exact-name required-check gating) build on this single
 // fetch.
+//
+// Both tables are paginated to their end rather than read one page deep.
+// GitHub defaults either endpoint to 30 items, and a required check sitting on
+// page 2 of a head commit's matrix jobs, bots, and scanners is indistinguishable
+// from one that never reported: landing would wait on it for the daemon's
+// lifetime while pointing the operator at a required_checks typo (PMR-190).
 func (m *Manager) fetchChecks(ctx context.Context, s config.GitHub, sha string) (combinedStatus, checkRunsResponse, error) {
 	if strings.TrimSpace(sha) == "" {
 		return combinedStatus{}, checkRunsResponse{}, errors.New("github pull request has no evaluated commit")
 	}
 	var combined combinedStatus
-	if err := m.request(ctx, s, http.MethodGet, fmt.Sprintf("/repos/%s/%s/commits/%s/status", s.Owner, s.Repository, sha), nil, &combined); err != nil {
+	first := true
+	complete, err := paginate(ctx, m, s, fmt.Sprintf("/repos/%s/%s/commits/%s/status?per_page=100", s.Owner, s.Repository, sha), func(page combinedStatus) {
+		// Only the first page's overall state is the commit's; later pages
+		// repeat it, but the field belongs to the collection, not the page.
+		if first {
+			combined.State = page.State
+			first = false
+		}
+		combined.Statuses = append(combined.Statuses, page.Statuses...)
+	})
+	if err != nil {
 		return combinedStatus{}, checkRunsResponse{}, err
 	}
+	m.warnIfCapped(complete, "commit statuses", sha)
 	var runsResponse checkRunsResponse
-	if err := m.request(ctx, s, http.MethodGet, fmt.Sprintf("/repos/%s/%s/commits/%s/check-runs", s.Owner, s.Repository, sha), nil, &runsResponse); err != nil {
+	complete, err = paginate(ctx, m, s, fmt.Sprintf("/repos/%s/%s/commits/%s/check-runs?per_page=100", s.Owner, s.Repository, sha), func(page checkRunsResponse) {
+		runsResponse.CheckRuns = append(runsResponse.CheckRuns, page.CheckRuns...)
+	})
+	if err != nil {
 		return combinedStatus{}, checkRunsResponse{}, err
 	}
+	m.warnIfCapped(complete, "check runs", sha)
 	return combined, runsResponse, nil
+}
+
+// warnIfCapped records the one case where a paginated gate input was read
+// short: the page cap stopped the walk, so a required check or a
+// changes-requested review beyond it is invisible to the gate. Nothing here
+// carries a provider payload -- only the fixed collection name and the commit
+// or pull request the read was for.
+func (m *Manager) warnIfCapped(complete bool, collection string, subject any) {
+	if complete {
+		return
+	}
+	m.logger.Warn("GitHub paginated read stopped at the page cap", "collection", collection, "subject", subject, "max_pages", maxPages)
 }
 
 // checks reads the combined commit status and check-run summary for the
@@ -190,8 +223,19 @@ func (m *Manager) checks(ctx context.Context, s config.GitHub, sha string) (Chec
 // reviews reads pull request reviews and computes the effective review state
 // from each reviewer's most recent state-bearing review, mirroring GitHub's own
 // approve/changes-requested precedence.
+//
+// The listing is oldest-first and paginated to its end, and every page is
+// accumulated before the fold below: a CHANGES_REQUESTED past the first page
+// is a gate the landing path must see, and a later page's APPROVED from the
+// same reviewer must still supersede an earlier page's CHANGES_REQUESTED
+// (PMR-174, PMR-190).
+//
+// The returned truncated flag is the excerpt cap, not a completeness signal --
+// it says only that the excerpts show the last contextMaxItems of a longer
+// listing. It is not a landing gate, and must never be treated as one: every
+// pull request with more than contextMaxItems reviews sets it.
 func (m *Manager) reviews(ctx context.Context, s config.GitHub, number int) (string, []ReviewExcerpt, bool, error) {
-	var raw []struct {
+	type review struct {
 		User struct {
 			Login string `json:"login"`
 		} `json:"user"`
@@ -199,9 +243,14 @@ func (m *Manager) reviews(ctx context.Context, s config.GitHub, number int) (str
 		Body        string `json:"body"`
 		SubmittedAt string `json:"submitted_at"`
 	}
-	if err := m.request(ctx, s, http.MethodGet, fmt.Sprintf("/repos/%s/%s/pulls/%d/reviews?per_page=100", s.Owner, s.Repository, number), nil, &raw); err != nil {
+	var raw []review
+	complete, err := paginate(ctx, m, s, fmt.Sprintf("/repos/%s/%s/pulls/%d/reviews?per_page=100", s.Owner, s.Repository, number), func(page []review) {
+		raw = append(raw, page...)
+	})
+	if err != nil {
 		return "", nil, false, err
 	}
+	m.warnIfCapped(complete, "pull request reviews", number)
 	// A reviewer's changes-requested stands until that same reviewer files a
 	// new state-bearing review; a COMMENTED (or unsubmitted PENDING) review
 	// carries no state and must not supersede it. DISMISSED is state-bearing
@@ -282,45 +331,69 @@ func (m *Manager) comments(ctx context.Context, s config.GitHub, number int) ([]
 // GraphQL API, the only surface that exposes thread resolution state. The
 // query is fixed; owner, repository, and number always come from the bound
 // session, never from tool input.
+//
+// It walks the connection's cursor to the end, bounded by maxPages. Unlike the
+// excerpt caps elsewhere in this file, the returned truncated flag is a genuine
+// completeness signal -- threads this call never saw -- computed against the
+// connection's own totalCount so a server that reports no next page but fewer
+// nodes than it counts is still reported short. github_land_pr waits on it
+// rather than merging past a hard gate it could not read (PMR-190).
 func (m *Manager) reviewThreads(ctx context.Context, s config.GitHub, number int) (unresolved, total int, truncated bool, err error) {
-	payload := map[string]any{
-		"query":     reviewThreadsQuery,
-		"variables": map[string]any{"owner": s.Owner, "repository": s.Repository, "number": number},
-	}
-	var response struct {
-		Data struct {
-			Repository struct {
-				PullRequest struct {
-					ReviewThreads struct {
-						TotalCount int `json:"totalCount"`
-						Nodes      []struct {
-							IsResolved bool `json:"isResolved"`
-						} `json:"nodes"`
-					} `json:"reviewThreads"`
-				} `json:"pullRequest"`
-			} `json:"repository"`
-		} `json:"data"`
-		Errors []struct {
-			Message string `json:"message"`
-		} `json:"errors"`
-	}
-	if err := m.request(ctx, s, http.MethodPost, "/graphql", payload, &response); err != nil {
-		return 0, 0, false, err
-	}
-	if len(response.Errors) > 0 {
-		return 0, 0, false, errors.New("github graphql request failed")
-	}
-	nodes := response.Data.Repository.PullRequest.ReviewThreads.Nodes
-	for _, node := range nodes {
-		if !node.IsResolved {
-			unresolved++
+	seen := 0
+	var cursor any
+	for page := 0; page < maxPages; page++ {
+		var response struct {
+			Data struct {
+				Repository struct {
+					PullRequest struct {
+						ReviewThreads struct {
+							TotalCount int `json:"totalCount"`
+							PageInfo   struct {
+								HasNextPage bool   `json:"hasNextPage"`
+								EndCursor   string `json:"endCursor"`
+							} `json:"pageInfo"`
+							Nodes []struct {
+								IsResolved bool `json:"isResolved"`
+							} `json:"nodes"`
+						} `json:"reviewThreads"`
+					} `json:"pullRequest"`
+				} `json:"repository"`
+			} `json:"data"`
+			Errors []struct {
+				Message string `json:"message"`
+			} `json:"errors"`
 		}
+		payload := map[string]any{
+			"query":     reviewThreadsQuery,
+			"variables": map[string]any{"owner": s.Owner, "repository": s.Repository, "number": number, "cursor": cursor},
+		}
+		if err := m.request(ctx, s, http.MethodPost, "/graphql", payload, &response); err != nil {
+			return 0, 0, false, err
+		}
+		if len(response.Errors) > 0 {
+			return 0, 0, false, errors.New("github graphql request failed")
+		}
+		threads := response.Data.Repository.PullRequest.ReviewThreads
+		for _, node := range threads.Nodes {
+			if !node.IsResolved {
+				unresolved++
+			}
+		}
+		seen += len(threads.Nodes)
+		total = threads.TotalCount
+		if !threads.PageInfo.HasNextPage || strings.TrimSpace(threads.PageInfo.EndCursor) == "" {
+			break
+		}
+		cursor = threads.PageInfo.EndCursor
 	}
-	total = response.Data.Repository.PullRequest.ReviewThreads.TotalCount
-	return unresolved, total, total > len(nodes), nil
+	if total > seen {
+		m.logger.Warn("GitHub review thread listing was incomplete", "pr_number", number, "threads_total", total, "threads_read", seen, "max_pages", maxPages)
+		return unresolved, total, true, nil
+	}
+	return unresolved, total, false, nil
 }
 
-const reviewThreadsQuery = `query($owner: String!, $repository: String!, $number: Int!) { repository(owner: $owner, name: $repository) { pullRequest(number: $number) { reviewThreads(first: 100) { totalCount nodes { isResolved } } } } }`
+const reviewThreadsQuery = `query($owner: String!, $repository: String!, $number: Int!, $cursor: String) { repository(owner: $owner, name: $repository) { pullRequest(number: $number) { reviewThreads(first: 100, after: $cursor) { totalCount pageInfo { hasNextPage endCursor } nodes { isResolved } } } } }`
 
 // boundedText trims and rune-caps a redacted excerpt so no single upstream
 // field can inflate the child-visible response.

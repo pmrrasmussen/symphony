@@ -19,6 +19,15 @@ import (
 
 const maxResponse = 1 << 20
 
+// maxPages bounds how many pages of one paginated GitHub collection a single
+// read may follow. At the per_page=100 every paginated caller asks for, the
+// cap is 1000 items -- far past any real pull request, so it is a runaway
+// guard rather than a working limit. It must stay a guard and not a silent
+// answer: a caller whose gate depends on completeness reports the shortfall
+// (see fetchChecks, reviews, and reviewThreads) instead of treating the
+// truncated page set as the whole collection.
+const maxPages = 10
+
 type gitRunner interface {
 	Run(context.Context, string, []string, []string) (string, error)
 }
@@ -253,17 +262,78 @@ func validPull(settings config.GitHub, branch string, pr pull) bool {
 }
 
 func (m *Manager) request(ctx context.Context, s config.GitHub, method, path string, body any, out any) error {
+	_, err := m.requestWithHeader(ctx, s, method, path, body, out)
+	return err
+}
+
+// paginate walks one GitHub collection across Link-header pages, decoding each
+// page into a fresh T and handing it to collect. It reports whether the
+// collection was read to its end: false means the page cap stopped the walk
+// with a rel="next" link still outstanding, so the collected items are a
+// prefix of the collection and not the whole of it.
+func paginate[T any](ctx context.Context, m *Manager, s config.GitHub, path string, collect func(T)) (bool, error) {
+	for page := 0; page < maxPages; page++ {
+		var decoded T
+		header, err := m.requestWithHeader(ctx, s, http.MethodGet, path, nil, &decoded)
+		if err != nil {
+			return false, err
+		}
+		collect(decoded)
+		path = nextPagePath(header, s.Endpoint)
+		if path == "" {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// nextPagePath returns the endpoint-relative path of the Link header's
+// rel="next" entry, or "" when there is none. A next URL that does not sit
+// under the configured endpoint is not followed: every request carries the
+// bearer token, so only the configured host may ever receive one.
+func nextPagePath(header http.Header, endpoint string) string {
+	prefix := strings.TrimSuffix(endpoint, "/")
+	for _, value := range header.Values("Link") {
+		for _, link := range strings.Split(value, ",") {
+			parts := strings.Split(link, ";")
+			if len(parts) < 2 {
+				continue
+			}
+			target := strings.TrimSpace(parts[0])
+			if !strings.HasPrefix(target, "<") || !strings.HasSuffix(target, ">") {
+				continue
+			}
+			isNext := false
+			for _, param := range parts[1:] {
+				if strings.EqualFold(strings.TrimSpace(param), `rel="next"`) {
+					isNext = true
+				}
+			}
+			if !isNext {
+				continue
+			}
+			target = strings.TrimSuffix(strings.TrimPrefix(target, "<"), ">")
+			if !strings.HasPrefix(target, prefix+"/") {
+				return ""
+			}
+			return strings.TrimPrefix(target, prefix)
+		}
+	}
+	return ""
+}
+
+func (m *Manager) requestWithHeader(ctx context.Context, s config.GitHub, method, path string, body any, out any) (http.Header, error) {
 	var reader io.Reader
 	if body != nil {
 		encoded, err := json.Marshal(body)
 		if err != nil {
-			return errors.New("encode github request")
+			return nil, errors.New("encode github request")
 		}
 		reader = bytes.NewReader(encoded)
 	}
 	req, err := http.NewRequestWithContext(ctx, method, s.Endpoint+path, reader)
 	if err != nil {
-		return errors.New("build github request")
+		return nil, errors.New("build github request")
 	}
 	req.Header.Set("Authorization", "Bearer "+s.Token)
 	req.Header.Set("Accept", "application/vnd.github+json")
@@ -273,19 +343,19 @@ func (m *Manager) request(ctx context.Context, s config.GitHub, method, path str
 	}
 	response, err := m.client.Do(req)
 	if err != nil {
-		return errors.New("github request failed")
+		return nil, errors.New("github request failed")
 	}
 	defer response.Body.Close()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return fmt.Errorf("github request failed with status %d", response.StatusCode)
+		return nil, fmt.Errorf("github request failed with status %d", response.StatusCode)
 	}
 	limited := io.LimitReader(response.Body, maxResponse+1)
 	data, err := io.ReadAll(limited)
 	if err != nil || len(data) > maxResponse {
-		return errors.New("github response was invalid")
+		return nil, errors.New("github response was invalid")
 	}
 	if out != nil && json.Unmarshal(data, out) != nil {
-		return errors.New("github response was invalid")
+		return nil, errors.New("github response was invalid")
 	}
-	return nil
+	return response.Header, nil
 }

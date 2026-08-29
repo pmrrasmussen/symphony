@@ -268,6 +268,18 @@ followed by `"msg":"landing wait retry scheduled"` (same `operation`, plus
 actually armed) and the ordinary `"msg":"agent retry scheduled"` record carrying
 `retry_kind: landing`.
 
+One wait `reason` is about the read rather than the pull request: `github
+review threads could not be read completely` means the bounded cursor walk over
+the review-thread connection ended with GitHub still counting more threads than
+it returned, so "no unresolved threads" was unproven and landing waited rather
+than merging past a gate it could not see. It is preceded by a warn-level
+`"msg":"GitHub review thread listing was incomplete"` carrying `pr_number`,
+`threads_total`, `threads_read`, and `max_pages`. The paginated REST reads
+(commit statuses, check runs, reviews) log the same shortfall as
+`"msg":"GitHub paginated read stopped at the page cap"` with `collection`,
+`subject`, and `max_pages`; both records carry only fixed collection names and
+the commit or pull request read, never a provider payload (PMR-190).
+
 That `reason` separates the two ways a required check can fail to be
 successful-yet. A name that never appears in either the combined-status or
 check-run table for the evaluated commit — a typo, a renamed CI job, or a

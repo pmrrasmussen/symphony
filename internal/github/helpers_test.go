@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -226,6 +227,14 @@ type apiFixture struct {
 	threadsTotal int
 	graphqlErr   bool
 
+	// pageSize > 0 makes the paginated REST collections (commit statuses,
+	// check runs, reviews) serve at most pageSize items per response with a
+	// rel="next" Link header, exactly as GitHub does, so a test can place a
+	// gate-relevant item past the first page (PMR-190). threadPageSize does
+	// the same for the GraphQL review-thread connection's cursor.
+	pageSize       int
+	threadPageSize int
+
 	// Landing (PMR-37) fixture state.
 	mergeable                 *bool
 	mergeableState            string
@@ -392,13 +401,15 @@ func (f *apiFixture) serve(w http.ResponseWriter, r *http.Request) {
 		encoded, _ := json.Marshal(map[string]any{"merged": true, "sha": f.prSHA, "message": "merged"})
 		_, _ = w.Write(encoded)
 	case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/commits/"+f.prSHA+"/status":
-		encoded, _ := json.Marshal(map[string]any{"state": f.overall, "statuses": f.statuses})
+		page := f.paginate(w, r, f.statuses)
+		encoded, _ := json.Marshal(map[string]any{"state": f.overall, "statuses": page})
 		_, _ = w.Write(encoded)
 	case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/commits/"+f.prSHA+"/check-runs":
-		encoded, _ := json.Marshal(map[string]any{"check_runs": f.checkRuns})
+		page := f.paginate(w, r, f.checkRuns)
+		encoded, _ := json.Marshal(map[string]any{"check_runs": page})
 		_, _ = w.Write(encoded)
 	case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/pulls/7/reviews":
-		encoded, _ := json.Marshal(f.reviews)
+		encoded, _ := json.Marshal(f.paginate(w, r, f.reviews))
 		_, _ = w.Write(encoded)
 	case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/issues/7/comments":
 		encoded, _ := json.Marshal(f.comments)
@@ -422,12 +433,55 @@ func (f *apiFixture) serve(w http.ResponseWriter, r *http.Request) {
 		if total == 0 {
 			total = len(f.threads)
 		}
-		encoded, _ := json.Marshal(map[string]any{"data": map[string]any{"repository": map[string]any{"pullRequest": map[string]any{"reviewThreads": map[string]any{"totalCount": total, "nodes": f.threads}}}}})
+		var request struct {
+			Variables struct {
+				Cursor string `json:"cursor"`
+			} `json:"variables"`
+		}
+		if json.NewDecoder(r.Body).Decode(&request) != nil {
+			f.t.Errorf("graphql body decode failed")
+		}
+		nodes, pageInfo := f.threadPage(request.Variables.Cursor)
+		encoded, _ := json.Marshal(map[string]any{"data": map[string]any{"repository": map[string]any{"pullRequest": map[string]any{"reviewThreads": map[string]any{"totalCount": total, "pageInfo": pageInfo, "nodes": nodes}}}}})
 		_, _ = w.Write(encoded)
 	default:
 		f.t.Errorf("unexpected GitHub request %s %s", r.Method, r.URL.String())
 		w.WriteHeader(http.StatusNotFound)
 	}
+}
+
+// paginate serves the page of items the request's page query parameter asks
+// for, setting the rel="next" Link header when more remain. pageSize == 0
+// keeps every item on one unpaginated page, which is what every test that
+// does not care about pagination gets.
+func (f *apiFixture) paginate(w http.ResponseWriter, r *http.Request, items []map[string]any) []map[string]any {
+	if f.pageSize <= 0 {
+		return items
+	}
+	page, err := strconv.Atoi(r.URL.Query().Get("page"))
+	if err != nil || page < 1 {
+		page = 1
+	}
+	start := min(len(items), (page-1)*f.pageSize)
+	end := min(len(items), start+f.pageSize)
+	if end < len(items) {
+		query := r.URL.Query()
+		query.Set("page", strconv.Itoa(page+1))
+		w.Header().Set("Link", fmt.Sprintf("<%s%s?%s>; rel=\"next\", <%s%s?page=99>; rel=\"last\"", f.server.URL, r.URL.Path, query.Encode(), f.server.URL, r.URL.Path))
+	}
+	return items[start:end]
+}
+
+// threadPage serves one page of the GraphQL review-thread connection, reading
+// the cursor as the index of the first thread the caller has not yet seen.
+func (f *apiFixture) threadPage(cursor string) ([]map[string]any, map[string]any) {
+	if f.threadPageSize <= 0 {
+		return f.threads, map[string]any{"hasNextPage": false, "endCursor": nil}
+	}
+	start, _ := strconv.Atoi(cursor)
+	start = min(len(f.threads), max(0, start))
+	end := min(len(f.threads), start+f.threadPageSize)
+	return f.threads[start:end], map[string]any{"hasNextPage": end < len(f.threads), "endCursor": strconv.Itoa(end)}
 }
 
 func testSession(t *testing.T, api *apiFixture, git *fakeGit, linear *fakeLinear, log *bytes.Buffer) (*Manager, *Session) {

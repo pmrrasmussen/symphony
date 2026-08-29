@@ -199,7 +199,10 @@ func (s *Session) Land(ctx context.Context) (LandResult, error) {
 
 	// Moving the issue to Merging is the human approval to land (see policy
 	// in the issue): no additional approving review is required here, only
-	// the absence of an effective changes-requested review.
+	// the absence of an effective changes-requested review. The discarded
+	// third return is the excerpt cap, not a completeness signal -- reviews
+	// itself paginates, and gating on that flag would park every pull request
+	// with more than contextMaxItems reviews in a permanent wait (PMR-190).
 	reviewState, _, _, err := s.manager.reviews(ctx, s.settings, fresh.Number)
 	if err != nil {
 		return LandResult{}, err
@@ -207,12 +210,21 @@ func (s *Session) Land(ctx context.Context) (LandResult, error) {
 	if reviewState == "changes_requested" {
 		return s.refuse(ctx, "github pull request has an effective changes-requested review")
 	}
-	unresolved, _, _, err := s.manager.reviewThreads(ctx, s.settings, fresh.Number)
+	unresolved, _, threadsTruncated, err := s.manager.reviewThreads(ctx, s.settings, fresh.Number)
 	if err != nil {
 		return LandResult{}, err
 	}
 	if unresolved > 0 {
 		return s.gate(ctx, "github pull request has unresolved review threads", true)
+	}
+	// Every thread this read did see is resolved, but it did not see them all,
+	// so "no unresolved threads" is unproven rather than true. Wait instead of
+	// merging past the gate: the thread listing is paginated to a bounded cap,
+	// which makes this reachable only for a pull request with more review
+	// threads than that cap can hold, and waiting keeps the issue in Merging
+	// for a human rather than landing on an unread gate (PMR-190).
+	if threadsTruncated {
+		return s.waiting(fresh.Number, fresh.URL, "github review threads could not be read completely"), nil
 	}
 	if fresh.Mergeable == nil {
 		return s.waiting(fresh.Number, fresh.URL, "github has not yet computed mergeability"), nil
