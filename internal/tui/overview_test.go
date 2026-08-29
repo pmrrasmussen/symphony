@@ -124,6 +124,47 @@ func TestStyledOverviewMarksSelectionAndShortensStale(t *testing.T) {
 	}
 }
 
+// TestStyledOverviewMarksSelectionInsideTheWindow pins PMR-188: with more
+// instances than rows, the marker was placed at a position counted in the whole
+// list rather than in the run on screen, so a selection below the fold drew no
+// marker at all — j/k looked dead, and s/c/v acted on a row the operator had no
+// way to name. The note under the table has to say which side the rest is on for
+// the same reason.
+func TestStyledOverviewMarksSelectionInsideTheWindow(t *testing.T) {
+	now := time.Date(2026, 8, 25, 12, 0, 0, 0, time.UTC)
+	instances := make([]operator.Instance, 0, 10)
+	for index := range 10 {
+		instances = append(instances, operator.Instance{ID: fmt.Sprintf("instance-%d", index), Liveness: operator.LivenessRunning})
+	}
+	for _, testCase := range []struct {
+		selected   int
+		wantMarked string
+		wantNote   string
+	}{
+		{selected: 9, wantMarked: "instance-9", wantNote: "▴ 6 above"},
+		{selected: 0, wantMarked: "instance-0", wantNote: "▾ 6 below"},
+		{selected: 5, wantMarked: "instance-5", wantNote: "▴ 2 above · ▾ 4 below"},
+	} {
+		// The declared minimum height leaves the table four instance rows.
+		model := styledFixture(instances, now)
+		model.height = minHeight
+		model.selected = testCase.selected
+		view := model.View(now)
+		marked := []string{}
+		for _, line := range strings.Split(view, "\n") {
+			if strings.Contains(line, "▸") {
+				marked = append(marked, line)
+			}
+		}
+		if len(marked) != 1 || !strings.Contains(marked[0], testCase.wantMarked) {
+			t.Fatalf("selection %d: marked rows %q, want exactly one on %s:\n%s", testCase.selected, marked, testCase.wantMarked, view)
+		}
+		if !strings.Contains(view, testCase.wantNote) {
+			t.Fatalf("selection %d: missing %q under the table:\n%s", testCase.selected, testCase.wantNote, view)
+		}
+	}
+}
+
 func TestNarrowWindowKeepsEveryColumnHeader(t *testing.T) {
 	now := time.Date(2026, 8, 25, 12, 0, 0, 0, time.UTC)
 	model := styledFixture([]operator.Instance{

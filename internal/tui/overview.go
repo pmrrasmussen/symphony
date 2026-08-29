@@ -67,8 +67,10 @@ func (m Model) overview(now time.Time, style theme) string {
 // identifier the room it needs to stay legible.
 //
 // rowBudget is how many instance rows may be drawn; each renderer subtracts its
-// own chrome from the frame's budget before calling.
-func (m Model) instanceRows(style theme, rowBudget int) (headers []string, rows [][]string, hidden int) {
+// own chrome from the frame's budget before calling. What the window left out is
+// reported per side, because the two are not interchangeable to a reader: the
+// note is drawn under the table, and rows dropped above it are not below it.
+func (m Model) instanceRows(style theme, rowBudget int) (headers []string, rows [][]string, above, below int) {
 	numeric := bandFor(style.width) != bandNarrow
 	headers = []string{"INSTANCE", "STATE"}
 	if numeric {
@@ -76,8 +78,12 @@ func (m Model) instanceRows(style theme, rowBudget int) (headers []string, rows 
 	}
 	headers = append(headers, "CHECKS")
 
-	shown, hidden := window(m.instances, m.selected, rowBudget)
-	selected := m.selected - (len(m.instances) - hidden - len(shown))
+	shown, start, hidden := window(m.instances, m.selected, rowBudget)
+	// The loop below indexes shown, so the selection has to be rebased onto it.
+	// Left in the whole slice's terms it points past the visible rows as soon as
+	// the window follows the selection down, and the frame then carries no marker
+	// at all: j/k read as dead keys and s/c/v act on a row nothing identifies.
+	selected := m.selected - start
 
 	nameWidth := 0
 	if style.width > 0 {
@@ -110,7 +116,7 @@ func (m Model) instanceRows(style theme, rowBudget int) (headers []string, rows 
 		}
 		rows = append(rows, append(row, style.checks(instance.Findings)))
 	}
-	return headers, rows, hidden
+	return headers, rows, start, hidden - start
 }
 
 // numericColumns are the row indexes to right-align, so magnitudes line up down
@@ -127,7 +133,7 @@ func numericColumns(style theme) []int {
 // literal string and had drifted one column out of step with its rows.
 func (m Model) instanceTable(style theme, budget int) string {
 	// The table spends three rows on its own border and header.
-	headers, rows, hidden := m.instanceRows(style, budget-3)
+	headers, rows, above, below := m.instanceRows(style, budget-3)
 	right := numericColumns(style)
 	rightward := make(map[int]bool, len(right))
 	for _, column := range right {
@@ -156,7 +162,7 @@ func (m Model) instanceTable(style theme, budget int) string {
 		// across the window and strands each number far from its header.
 		drawn = rendered.Width(style.width).Wrap(false).String()
 	}
-	if note := style.more(hidden); note != "" {
+	if note := style.more(above, below); note != "" {
 		return drawn + "\n" + note
 	}
 	return drawn
@@ -167,9 +173,9 @@ func (m Model) instanceTable(style theme, budget int) string {
 // divided column is the second border the clutter audit counts.
 func (m Model) instanceList(style theme, budget int) string {
 	// Without a border the list spends one row, on its header.
-	headers, rows, hidden := m.instanceRows(style, budget-1)
+	headers, rows, above, below := m.instanceRows(style, budget-1)
 	drawn := style.borderless(headers, rows, numericColumns(style)...)
-	if note := style.more(hidden); note != "" {
+	if note := style.more(above, below); note != "" {
 		return drawn + "\n" + note
 	}
 	return drawn

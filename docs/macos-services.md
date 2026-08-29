@@ -187,7 +187,8 @@ the window would be unreachable rather than merely off screen. `j` and `k` keep
 their one meaning throughout --
 they change which instance you are looking at, on the overview and on a detail
 page alike. An instance list longer than the window keeps the selected row
-visible and reports the rest as `+N more`. Setting `NO_COLOR` to a non-empty
+marked and visible, and reports the rest by side, as `▴ 6 above` or
+`▴ 2 above · ▾ 4 below`. Setting `NO_COLOR` to a non-empty
 value keeps the dashboard and gives up only hue: each state carries its own
 shape and word as well as its color. It scans convention-matching
 LaunchAgents in `~/Library/LaunchAgents`, reads launchd state, each configured
