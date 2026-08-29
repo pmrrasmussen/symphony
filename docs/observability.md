@@ -104,6 +104,22 @@ turn budget retrying the same unrecoverable refusal (most sharply, a push a
 repository's branch protection or token scope will never let through) ended in
 `turn_limit_exhausted` with no host-side record of why.
 
+Every failed GitHub HTTP call gets the same treatment one level lower, at the
+single chokepoint each REST request, GraphQL query, and paginated page goes
+through (`requestWithHeader`): a warn-level `"msg":"GitHub request failed"`
+record with the `method` and `path`, plus either `transport_error` (the
+`http.Client` failure — DNS, TLS, timeout) or the response `status` and a
+`response_excerpt` of the body. GitHub puts the reason in that body and nowhere
+else: `At least 1 approving review is required`, `Base branch was modified`, a
+rate-limit message. Discarding it left a merge-time 405 parking an issue in
+Merging with only `github request failed with status 405` in the log, retried
+until `max_attempts` abandoned it (PMR-184). Both fields are bounded and
+scrubbed through `internal/observability.Text`, and the caller-facing error
+strings are unchanged — `github request failed` and `github request failed with
+status <code>` — so no provider text reaches an agent. A failing paginated read
+abandons the collection on its first bad page, so one bad request is one record
+rather than one per remaining page.
+
 Symphony also logs state changes it did **not** perform. The poll loop
 remembers each issue it drove into the review `handoff_state`, and if such an
 issue later reappears as an active candidate it logs exactly one record for
