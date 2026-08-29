@@ -8,9 +8,15 @@ import (
 	"github.com/pmrrasmussen/symphony/internal/domain"
 )
 
-// workspaceCleanupTimeout bounds cleanupWorkspaceAtRunEnd's detached context
-// (PMR-130), so a wedged git invocation cannot hold its goroutine forever once
-// it no longer inherits the run's own cancellation.
+// workspaceCleanupTimeout bounds every cleanup attempt (PMR-130, PMR-180), so
+// a wedged git invocation cannot hold the goroutine that started it forever.
+// internal/workspace bounds its git subprocesses by the caller's context and
+// nothing else, and no caller here has a deadline of its own to lend: the
+// run-end attempt is deliberately detached from the run's cancellation, and the
+// two authoritative attempts run on contexts that outlive them -- the poll
+// loop's, which has no deadline at all, and a retry timer's. Reconciliation is
+// where an unbounded wait is most expensive, because polling, reconciliation,
+// and stall detection for every other issue are that one goroutine.
 const workspaceCleanupTimeout = 15 * time.Second
 
 // cleanupWorkspace releases what Symphony still holds for an issue it has just
@@ -31,9 +37,13 @@ const workspaceCleanupTimeout = 15 * time.Second
 // This form is for the one authoritative caller that holds no run: a landing
 // retry whose refresh found the issue already terminal. It races no other
 // attempt, because an armed retry timer and a live session are mutually
-// exclusive.
+// exclusive. A wedge here costs only that timer's goroutine rather than the
+// poll loop, but it is bounded the same way, because the context it inherits is
+// the coordinator's own and just as deadline-free.
 func (c *Coordinator) cleanupWorkspace(ctx context.Context, issue domain.Issue) {
-	c.finalizeWorkspace(ctx, issue, nil, false)
+	cctx, cancel := context.WithTimeout(ctx, c.cleanupTimeout)
+	defer cancel()
+	c.finalizeWorkspace(cctx, issue, nil, false)
 }
 
 // cleanupWorkspaceForRun is cleanupWorkspace for the poll loop's stopTerminal
@@ -42,8 +52,17 @@ func (c *Coordinator) cleanupWorkspace(ctx context.Context, issue domain.Issue) 
 // instead of two concurrent removals of a single worktree (PMR-160); see
 // running.cleanup. It stays authoritative: it runs on reconciliation's own live
 // context, and its failure is always reported at WARN.
+//
+// That context is the poll loop's, so it carries no deadline and cancels only
+// at shutdown. Reconciliation runs inline on the single goroutine that also
+// polls and detects stalls, so this attempt takes workspaceCleanupTimeout as
+// its own bound (PMR-180): without it, one hung git subprocess here stops
+// Symphony scheduling anything at all, for every issue, while the daemon still
+// looks alive.
 func (c *Coordinator) cleanupWorkspaceForRun(ctx context.Context, r *running, issue domain.Issue) {
-	c.finalizeWorkspace(ctx, issue, r, false)
+	cctx, cancel := context.WithTimeout(ctx, c.cleanupTimeout)
+	defer cancel()
+	c.finalizeWorkspace(cctx, issue, r, false)
 }
 
 // cleanupWorkspaceAtRunEnd releases a workspace from inside runTurns, at the
@@ -63,7 +82,7 @@ func (c *Coordinator) cleanupWorkspaceForRun(ctx context.Context, r *running, is
 // waits for this one through running.cleanup and only runs at all if this one
 // failed (PMR-160).
 func (c *Coordinator) cleanupWorkspaceAtRunEnd(ctx context.Context, r *running, issue domain.Issue) {
-	cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), workspaceCleanupTimeout)
+	cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.cleanupTimeout)
 	defer cancel()
 	c.finalizeWorkspace(cctx, issue, r, true)
 }
@@ -79,9 +98,10 @@ func (c *Coordinator) cleanupWorkspaceAtRunEnd(ctx context.Context, r *running, 
 // all. An attempt that failed leaves the workspace where it is, so the next
 // caller does run -- one attempt after another, never two at once, which is
 // what an operator's single "workspace cleanup" record per landing depends on.
-// Waiting is bounded because every attempt runs on a bounded context:
-// workspaceCleanupTimeout for the run-end caller, reconciliation's own poll
-// context for the authoritative one.
+// Waiting is bounded because every attempt runs on a context bounded by
+// workspaceCleanupTimeout, so the gate below -- a plain mutex, which no context
+// can interrupt once a caller is queued on it -- can only ever be held for one
+// such bound.
 func (c *Coordinator) finalizeWorkspace(ctx context.Context, issue domain.Issue, r *running, atRunEnd bool) {
 	if r != nil {
 		r.cleanup.Lock()

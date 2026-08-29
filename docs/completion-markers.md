@@ -95,6 +95,17 @@ when it squashes or rebases onto the base branch, so verified cleanup works
 under all three merge methods. The verification never merges,
 comments, or transitions anything.
 
+Every attempt is bounded at 15 seconds, on every path (PMR-180). The safety
+checks and the removal are `git` subprocesses, and a hung one — a stalled
+filesystem, a contended index lock — ends only when the caller's context does,
+which would otherwise hold whichever goroutine started the attempt for as long
+as the hang lasted. On the reconciliation path that goroutine is the poll loop
+itself, so a single wedged `git` would leave the daemon alive while it polled,
+reconciled, and stall-detected nothing for any issue. An attempt that hits the
+bound preserves the worktree and logs `status: failed` with `context deadline
+exceeded`, like any other attempt that could not reach a verdict, leaving the
+worktree for the run's own end-of-run attempt or a later startup sweep.
+
 A removal deletes the whole worktree directory, including files Git ignores.
 `git status` does not report them, so a `.gitignore`d local file in a
 verified-landed worktree does not survive cleanup. Before verified cleanup

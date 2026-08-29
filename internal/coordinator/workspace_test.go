@@ -355,6 +355,85 @@ func TestRunEndCleanupFailureStaysActionableForANonTerminalStopReason(t *testing
 	}
 }
 
+// TestReconcileCompletesDespiteAWedgedTerminalCleanup is PMR-180. Reconcile's
+// stopTerminal branch cleans up on the poll loop's own context, which has no
+// deadline, and internal/workspace bounds its git subprocesses by the caller's
+// context and nothing else. So one hung git call -- a filesystem hang, lock
+// contention -- used to freeze polling, reconciliation, and stall detection for
+// every other issue indefinitely, with the daemon still looking alive while it
+// scheduled nothing. The pass must instead give up on workspaceCleanupTimeout
+// and report the failure it gave up on.
+func TestReconcileCompletesDespiteAWedgedTerminalCleanup(t *testing.T) {
+	w := testSettings(t)
+	issue := testIssue()
+	terminal := issue
+	terminal.State = "Done"
+	terminal.Dispatchable = false
+	tracker := &fakeTracker{issue: issue}
+	tracker.setFresh(terminal)
+	var log syncBuffer
+	ws := &fakeWorkspace{cleanupWedged: true}
+	c := New(tracker, &fakeAgent{}, ws, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&log, nil)))
+	defer assertInvariants(t, c)
+	// The production bound is fifteen seconds; assert it by electing a short one
+	// rather than waiting that out. Only its presence is under test.
+	c.cleanupTimeout = 20 * time.Millisecond
+	r := &running{issue: issue, session: domain.AgentSession{ID: "s"}, last: c.clock.Now(), cancel: func() {}}
+	c.seedRunning(issue, r)
+
+	done := make(chan error, 1)
+	go func() { done <- c.reconcile(context.Background()) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("reconcile: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a wedged cleanup held the poll goroutine: reconcile never returned, so nothing else would be polled, reconciled, or found stalled")
+	}
+
+	lines := cleanupLogLines(log.String())
+	if len(lines) != 1 {
+		t.Fatalf("workspace cleanup records=%v, want exactly one", lines)
+	}
+	if !strings.Contains(lines[0], `"level":"WARN"`) || !strings.Contains(lines[0], `"status":"failed"`) {
+		t.Fatalf("an abandoned cleanup leaves a workspace behind and must say so: %s", lines[0])
+	}
+	if !strings.Contains(lines[0], context.DeadlineExceeded.Error()) {
+		t.Fatalf("cleanup record=%s, want the bound as the reason it gave up", lines[0])
+	}
+}
+
+// TestRetryCleanupIsBoundedForAWedgedWorkspace is the same bound on the lesser
+// call site: a landing retry whose refresh found the issue already terminal
+// (retry.go). A wedge there holds only that timer's goroutine, not the poll
+// loop, but the context it inherits is just as deadline-free, so the attempt
+// must still end on its own.
+func TestRetryCleanupIsBoundedForAWedgedWorkspace(t *testing.T) {
+	issue := testIssue()
+	var log syncBuffer
+	ws := &fakeWorkspace{cleanupWedged: true}
+	c := New(&fakeTracker{issue: issue}, &fakeAgent{}, ws, func() config.Settings { return testSettings(t).Config }, slog.New(slog.NewJSONHandler(&log, nil)))
+	defer assertInvariants(t, c)
+	c.cleanupTimeout = 20 * time.Millisecond
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		c.cleanupWorkspace(context.Background(), issue)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("a wedged cleanup held the retry goroutine forever")
+	}
+
+	lines := cleanupLogLines(log.String())
+	if len(lines) != 1 || !strings.Contains(lines[0], context.DeadlineExceeded.Error()) {
+		t.Fatalf("workspace cleanup records=%v, want one naming the bound it gave up on", lines)
+	}
+}
+
 func TestTerminalIssueIsForgottenByTheHostIntegration(t *testing.T) {
 	w := testSettings(t)
 	issue := testIssue()

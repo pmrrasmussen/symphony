@@ -242,6 +242,11 @@ type fakeWorkspace struct {
 	cleanupStarted chan struct{}
 	cleanupGate    <-chan struct{}
 	cleanupErr     error
+	// cleanupWedged stands in for the hazard workspaceCleanupTimeout exists for:
+	// a git subprocess that never returns, which internal/workspace ends only
+	// when the caller's context does. Every call blocks until its context is
+	// done, so a caller that passed an unbounded one blocks forever.
+	cleanupWedged bool
 	// cleanupsInFlight and cleanupOverlap record whether two Cleanup calls were
 	// ever in flight at once, which is the corruption PMR-160 fixed: two
 	// attempts removing one worktree, the loser reporting the winner's completed
@@ -288,12 +293,17 @@ func (f *fakeWorkspace) Cleanup(ctx context.Context, _ domain.Issue) (domain.Cle
 	started := f.cleanupStarted
 	gate := f.cleanupGate
 	err := f.cleanupErr
+	wedged := f.cleanupWedged
 	f.mu.Unlock()
 	defer func() {
 		f.mu.Lock()
 		f.cleanupsInFlight--
 		f.mu.Unlock()
 	}()
+	if wedged {
+		<-ctx.Done()
+		return domain.CleanupClean, ctx.Err()
+	}
 	if first {
 		if started != nil {
 			started <- struct{}{}

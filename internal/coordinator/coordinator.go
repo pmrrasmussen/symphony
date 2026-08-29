@@ -48,6 +48,12 @@ type Coordinator struct {
 	timer      Timer
 	clock      Clock
 	log        *observability.Logger
+	// cleanupTimeout bounds every workspace cleanup attempt; see
+	// workspaceCleanupTimeout, which is the only value production ever gives it.
+	// It is a field rather than a plain constant for the same reason Timer is a
+	// seam: a test asserts the bound by electing a short one and observing the
+	// caller return, not by waiting fifteen seconds out.
+	cleanupTimeout time.Duration
 	// forget is the optional host integration told that an issue is finished.
 	// It is installed once at startup, before Start, and never replaced, so the
 	// scheduling goroutines that read it need no lock of their own.
@@ -85,7 +91,8 @@ func New(t domain.Tracker, a domain.AgentBackend, w domain.WorkspaceExecutor, se
 	return &Coordinator{
 		tracker: t, agent: a, workspaces: w, settings: settings,
 		timer: realTimer{}, clock: realClock{}, log: observability.FromSlog(logger),
-		states: map[string]*issueState{}, admittedByState: map[string]int{},
+		cleanupTimeout: workspaceCleanupTimeout,
+		states:         map[string]*issueState{}, admittedByState: map[string]int{},
 	}
 }
 
