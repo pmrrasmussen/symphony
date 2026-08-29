@@ -26,7 +26,9 @@ import (
 // landing suite, which this file runs against a fixture of this transport's.
 // What is left here is this transport's own finalize trigger: capability-endpoint
 // registration retirement, which is what runs the finalizer, on each of the ways
-// a --print turn can end.
+// a --print turn can end -- and, because that same retirement is what drains an
+// invocation still in flight, where the drained call's outcome ranks against the
+// reason the turn would otherwise have reported (PMR-177).
 //
 // The rest of this package's turn-end coverage substitutes the registry, which
 // is what makes "the finalizer ran" observable at all. What that cannot say is
@@ -197,9 +199,72 @@ func TestTheHostSideLandingBehaviourHoldsOverThePrintStream(t *testing.T) {
 	agenttest.RunLandingSuite(t, landingBackend{})
 }
 
+// TestATimedOutTurnReportsADrainedLandingsOutcomeInsteadOfTheTimeout is PMR-177:
+// the turn budget expires while github_land_pr is mid-merge, and the merge
+// succeeds while the retirement that ends this turn is draining that invocation.
+//
+// Both terminal events are real, and which one holds the sink's single-terminal
+// latch decides what the coordinator records. The landing's has to win: it is
+// the run's actual outcome, and the timeout is only what to say when the drained
+// invocation produced no outcome at all. Retire after choosing the fallback and
+// the run is recorded as "agent failed: claude turn timeout" against a pull
+// request that merged, and the issue is redispatched into a landing attempt with
+// nothing left to land.
+//
+// The ordering here is exact rather than likely, in both places it has to be.
+// The merge is parked by the fixture, so the invocation is provably in flight
+// when the budget is elapsed; and the merge is released only once turn one's
+// token has stopped authenticating, which is the observable edge of a revocation
+// that has begun and not finished (the same edge
+// TestTheNextTurnCannotStartUntilThePreviousRegistrationIsFullyRetired waits on).
+// A timeout emitted before that retirement is therefore already latched by the
+// time the landing can resolve.
+func TestATimedOutTurnReportsADrainedLandingsOutcomeInsteadOfTheTimeout(t *testing.T) {
+	requireCurl(t)
+	dir := t.TempDir()
+	remote := agenttest.NewLandingRemote(t)
+	remote.ReadyToLand()
+	reached, release := remote.PauseAtMerge()
+	// The child holds the turn open, so the budget is the only thing that can
+	// end it -- and the landing call it made never comes back, because the
+	// timeout kills the child while the merge is still parked.
+	_, timer, _, events := landingSession(t, context.Background(), remote, dir, []bool{true}, turnHangs)
+	agenttest.Await(t, reached, "the landing never reached its merge")
+	// The child has certainly written its argument vector and environment by
+	// now: it made the landing call that is parked in the merge.
+	url, token := endpointFromChild(t, dir)
+
+	timer.Elapse(t, landingTurnBudget)
+	awaitRetiring(t, url, token, "the elapsed turn budget never began retiring the registration")
+	release()
+
+	collected := agenttest.DrainEvents(t, events)
+	outcome := collected[len(collected)-1]
+	if outcome.Kind != domain.EventLandingResolved {
+		t.Fatalf("the turn's outcome was %+v, want the drained landing's resolution", outcome)
+	}
+	// The budget really did expire, so the fallback it would have reported is
+	// latched out rather than merely reordered: one terminal event per turn.
+	for _, event := range collected {
+		if event.Kind == domain.EventFailed {
+			t.Fatalf("the turn also reported a failure: %+v", event)
+		}
+	}
+	transitions, comments, merges := remote.Observed()
+	if merges != 1 {
+		t.Fatalf("merges=%d, want exactly one", merges)
+	}
+	if len(transitions) != 1 || transitions[0] != "Done" {
+		t.Fatalf("Linear transitions=%v, want exactly one to Done", transitions)
+	}
+	if len(comments) != 0 {
+		t.Fatalf("the timed-out turn commented on a merged landing as a refusal: %v", comments)
+	}
+}
+
 // TestEveryTurnEndPathFiresTheDeferredLandingTransition is this transport's own
 // finalize trigger, and the coverage PMR-86 exists for. Here the finalizer runs
-// from registration retirement (see turn.stream's deferred retireEndpoint), so
+// from registration retirement (see turn.stream's call to turn.retire), so
 // every way a turn can end has to reach that retirement -- otherwise the issue
 // sits in Merging holding a state-aware capacity slot with nothing scheduled to
 // move it.

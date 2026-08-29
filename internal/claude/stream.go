@@ -29,10 +29,13 @@ func (t *turn) stream(s *session, r domain.AgentRequest, turnNumber int) {
 	// because that is what a hard Cancel waits on, so a Cancel that returns has
 	// either retired this registration itself or waited for this to.
 	//
-	// It retires only this turn's own registration: by now the session may
-	// already hold the next turn's, and revoking that one would strip a live
-	// turn of its authority mid-run.
-	defer func() { reportRetirement(t.sink, s.retireEndpoint(t.registration)) }()
+	// The post-loop code below normally retires it first, because the turn's own
+	// fallback outcome may not be chosen until the drain has finished, so this is
+	// the backstop for the paths that do not reach that call: a panic, and any
+	// early return a future edit adds. Retirement is idempotent and reports its
+	// outcome once, so running it twice is a no-op rather than a second
+	// diagnostic.
+	defer func() { t.retire(s) }()
 	// Once this turn is over it must stop being the session's live process, or a
 	// later cancellation would signal a process group whose pid has been reaped
 	// and possibly recycled.
@@ -282,6 +285,18 @@ func (t *turn) stream(s *session, r domain.AgentRequest, turnNumber int) {
 	// Kill the group again: the leader can exit while descendants still hold
 	// inherited pipes.
 	_ = procgroup.Kill(t.cmd)
+
+	// The endpoint is retired here, before this turn picks a reason of its own,
+	// and not left to the defer above. The revocation drains a capability
+	// invocation that is still running, and a landing's outcome is the whole
+	// turn's outcome: draining afterwards would leave the fallback below --
+	// "claude turn timeout" for a budget that expired while a landing was
+	// mid-merge -- holding the sink's single-terminal latch, and the merge that
+	// then succeeded would be reported as a failed run (PMR-177).
+	//
+	// A drained invocation therefore claims the latch first when it has an
+	// outcome, and everything from here on is what to say when it did not.
+	t.retire(s)
 
 	// The loop ended without a terminal event, so this is the last chance to
 	// report why -- unless this turn's outcome was already reported elsewhere.

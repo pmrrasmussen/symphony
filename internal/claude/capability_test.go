@@ -826,6 +826,23 @@ func endpointFromChild(t *testing.T, dir string) (string, string) {
 	return url, token
 }
 
+// awaitRetiring blocks until a turn's token stops authenticating, which is the
+// observable edge of a revocation that has begun and not finished: Revoke clears
+// the registration before it drains the invocation still in flight. It is how a
+// test orders itself against a drain it cannot see, and the deadline is a hang
+// guard rather than an assertion -- describe names what did not happen, so a
+// wedge is reported against the waiting test.
+func awaitRetiring(t *testing.T, url, token, describe string) {
+	t.Helper()
+	deadline := time.Now().Add(20 * time.Second)
+	for probeEndpoint(t, url, token) != http.StatusUnauthorized {
+		if time.Now().After(deadline) {
+			t.Fatalf("%s", describe)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 // probeEndpoint asks the endpoint whether a token still authorizes anything.
 func probeEndpoint(t *testing.T, url, token string) int {
 	t.Helper()
@@ -1108,13 +1125,7 @@ func TestTheNextTurnCannotStartUntilThePreviousRegistrationIsFullyRetired(t *tes
 	if err := os.WriteFile(filepath.Join(dir, "in-flight"), nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	deadline := time.Now().Add(20 * time.Second)
-	for probeEndpoint(t, url, token) != http.StatusUnauthorized {
-		if time.Now().After(deadline) {
-			t.Fatal("turn one's stream never began retiring its registration")
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	awaitRetiring(t, url, token, "turn one's stream never began retiring its registration")
 
 	continued := make(chan error, 1)
 	var second <-chan domain.Event

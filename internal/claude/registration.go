@@ -65,6 +65,18 @@ func reportRetirement(events *sink, expired error) {
 		Message: "claude capability endpoint revocation: " + expired.Error()})
 }
 
+// retire retires this turn's own registration and reports what the revocation
+// gave up on, if anything, to this turn's stream. It is idempotent: the
+// registration's latch performs the revocation once and tells only that caller
+// what happened, so the losing call reports nothing.
+//
+// It retires only this turn's own registration: by the time it runs the session
+// may already hold the next turn's, and revoking that one would strip a live
+// turn of its authority mid-run.
+func (t *turn) retire(s *session) {
+	reportRetirement(t.sink, s.retireEndpoint(t.registration))
+}
+
 // retireEndpoint revokes whatever registration the session currently holds and
 // reports the outcome, which is only ever non-nil when Revoke gave up on an
 // invariant it exists to hold: an invocation still in flight when the drain

@@ -56,6 +56,19 @@ type Backend struct {
 // look like they bind and do not.
 const finalizeBudget = 5 * time.Second
 
+// invocationDrain bounds how long a turn ending underneath a dispatched
+// capability call waits for that call, so the call's own outcome is the one this
+// turn reports (see drainInvocation). It matches mcpbridge.drainTimeout, which
+// bounds the identical wait on the Claude transport, and is generous for the
+// same reason: the longest capability is a landing, whose provider requests are
+// each bounded at 30 seconds plus a bounded Git push, and cutting the wait short
+// is what the drain exists to prevent.
+//
+// Only the turn budget waits this out. Every other way a turn ends here arrives
+// on the read loop, which is the goroutine the call is running on, so it cannot
+// observe an invocation in flight at all.
+const invocationDrain = 2 * time.Minute
+
 // New builds a Codex backend. secretNames are extra environment variable names
 // this child may not inherit, on top of everything hostenv.Filter blocks for
 // every child Symphony spawns.
@@ -245,6 +258,11 @@ type client struct {
 	finishOnce          sync.Once
 	killOnce            sync.Once
 	usageMissOnce       sync.Once
+	// inFlight is set while a dispatched capability call is running, and idle
+	// wakes whatever is draining it. See drainInvocation. The channel is
+	// buffered, so a call that finishes with nobody waiting does not block.
+	inFlight bool
+	idle     chan struct{}
 }
 
 type callResult struct {
@@ -299,7 +317,7 @@ func start(ctx context.Context, r domain.AgentRequest, environment []string, cap
 	}
 	cmd.Stdout = outWriter
 	cmd.Stderr = stderrWriter
-	c := &client{cmd: cmd, in: in, workspace: r.Workspace, approval: r.ApprovalPolicy, policy: r.TurnSandboxPolicy, readTimeout: r.ReadTimeout, startTimeout: r.StartTimeout, turnTimeout: r.TurnTimeout, timer: timer, ctx: ctx, capabilities: capabilities, pending: map[int]chan callResult{}, done: make(chan struct{}), exited: make(chan struct{})}
+	c := &client{cmd: cmd, in: in, workspace: r.Workspace, approval: r.ApprovalPolicy, policy: r.TurnSandboxPolicy, readTimeout: r.ReadTimeout, startTimeout: r.StartTimeout, turnTimeout: r.TurnTimeout, timer: timer, ctx: ctx, capabilities: capabilities, pending: map[int]chan callResult{}, idle: make(chan struct{}, 1), done: make(chan struct{}), exited: make(chan struct{})}
 	cmd.Cancel = func() error { return procgroup.Kill(c.cmd) }
 	if err := cmd.Start(); err != nil {
 		_ = out.Close()
@@ -522,6 +540,18 @@ func (c *client) turn(ctx context.Context, thread, prompt string, r domain.Agent
 	c.activate(events, s, pid)
 	if r.TurnTimeout > 0 {
 		stop := c.timer.AfterFunc(r.TurnTimeout, func() {
+			// A capability call still in flight owns this turn's outcome when it
+			// produces one -- a landing that merges while this budget expires is
+			// the run's real result -- and the first terminal event detaches the
+			// stream, so the budget must not claim it before that call has been
+			// answered (PMR-177).
+			//
+			// The kill waits for the same reason, and not only out of politeness:
+			// killing here closes the child's stdin, so the response to the call
+			// still running could not be written, and that write failure would
+			// abort the client and emit a terminal of its own -- ahead of the
+			// landing outcome, which dispatch emits only after it has responded.
+			c.drainInvocation()
 			c.emit(domain.Event{Kind: domain.EventFailed, At: time.Now(), Message: "Codex turn timeout"})
 			c.kill()
 		})
@@ -706,6 +736,12 @@ func (c *client) handleToolCall(x rpc) {
 		c.respondToCall(x.ID, capability.Outcome{Refusal: capability.Unsupported()})
 		return
 	}
+	// The call is marked in flight around the whole dispatch, not around the
+	// invocation, because what a drain waits for is the terminal event -- which
+	// dispatch emits last, after it has responded. Releasing any earlier would
+	// wake a drain that then races the outcome it was waiting for.
+	c.beginCall()
+	defer c.endCall()
 	capability.Dispatch(c.ctx, c.capabilities, capability.Transport{
 		// The protocol-assigned request ID: it is the app-server's own, not a
 		// value the model chose, and it is the identity the response is keyed to.
@@ -734,6 +770,55 @@ func (c *client) respondToCall(id any, outcome capability.Outcome) {
 
 func callIDText(id any) string {
 	return observability.Text(fmt.Sprint(id))
+}
+
+// beginCall and endCall bracket one dispatched capability call. A call is
+// dispatched inline from the read loop, so there is never a second one to
+// exclude and this is a marker rather than a gate -- what it exists for is
+// drainInvocation, which is the only reader.
+func (c *client) beginCall() {
+	c.mu.Lock()
+	c.inFlight = true
+	c.mu.Unlock()
+}
+
+func (c *client) endCall() {
+	c.mu.Lock()
+	c.inFlight = false
+	c.mu.Unlock()
+	select {
+	case c.idle <- struct{}{}:
+	default:
+	}
+}
+
+// drainInvocation waits for a dispatched capability call to finish, so a turn
+// ending underneath one reports that call's outcome rather than its own. It is
+// this transport's half of the guarantee the Claude transport gets from
+// mcpbridge.Registration.Revoke's drain, and it is bounded for the same reason:
+// a wedged provider call must not hold a finished turn open forever.
+//
+// An expired drain is reported, because it is the code giving up on that
+// guarantee: the outcome of the call still running is dropped as soon as the
+// caller's own terminal event detaches the stream, and nothing else would say so.
+func (c *client) drainInvocation() {
+	expired := make(chan struct{})
+	stop := c.timer.AfterFunc(invocationDrain, func() { close(expired) })
+	defer stop()
+	for {
+		c.mu.Lock()
+		busy := c.inFlight
+		c.mu.Unlock()
+		if !busy {
+			return
+		}
+		select {
+		case <-c.idle:
+		case <-expired:
+			c.diagnostic("codex capability invocation drain expired")
+			return
+		}
+	}
 }
 
 // finalizeLanding settles capability state that outlives a single call once this
