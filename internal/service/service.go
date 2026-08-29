@@ -97,7 +97,20 @@ func Install(ctx context.Context, options Options) (Instance, bool, error) {
 	}
 	old, err := os.ReadFile(d.PlistPath)
 	if err == nil && bytes.Equal(old, d.Content) {
-		return d.Instance, false, nil
+		// An exact plist is not a registration: an operator who paused the
+		// daemon with launchctl bootout leaves this file untouched, and until
+		// this path re-bootstrapped it the only way back was raw launchctl.
+		// Only a positive absence is acted on -- an observation that did not
+		// answer must not be read as "not loaded" and restarted from under a
+		// running daemon. The unchanged file is never rewritten here; reload
+		// restores it only if bootstrapping or starting fails.
+		if serviceLoadState(ctx, runner, d.Label) != loadNotFound {
+			return d.Instance, false, nil
+		}
+		if err := reload(ctx, runner, d, prior{Content: old}); err != nil {
+			return Instance{}, false, err
+		}
+		return d.Instance, true, nil
 	}
 	if err != nil && !os.IsNotExist(err) {
 		return Instance{}, false, fmt.Errorf("read existing LaunchAgent: %w", err)
@@ -117,21 +130,49 @@ func Install(ctx context.Context, options Options) (Instance, bool, error) {
 	return d.Instance, true, nil
 }
 
+// Registration names what launchd itself says about a managed service, which
+// the discovered instance cannot: discovery reads any failed print as "not
+// loaded", so its stopped liveness covers both a job that crashed and a job
+// launchd has never heard of. Only the second is fixed by installing or
+// restarting, so status reports it under its own name.
+type Registration string
+
+const (
+	RegistrationLoaded    Registration = "loaded"
+	RegistrationNotLoaded Registration = "not_loaded"
+	RegistrationUnknown   Registration = "unknown"
+)
+
+// Report is the discovered instance plus that registration. The instance is
+// embedded, so the JSON an operator reads keeps every field discovery
+// publishes and gains one.
+type Report struct {
+	operator.Instance
+	Registration Registration `json:"registration"`
+}
+
 // Status finds exactly one managed service for this repository. When
 // --workflow is not supplied, the installed instance's own recorded workflow
 // is authoritative, so status works regardless of which workflow file the
 // service was installed against.
-func Status(ctx context.Context, options Options) (operator.Instance, error) {
-	d, _, err := prepare(ctx, options, false)
+func Status(ctx context.Context, options Options) (Report, error) {
+	d, runner, err := prepare(ctx, options, false)
 	if err != nil {
-		return operator.Instance{}, err
+		return Report{}, err
 	}
-	return findManaged(ctx, options, d, options.Workflow == "")
+	selected, err := findManaged(ctx, options, d, options.Workflow == "")
+	if err != nil {
+		return Report{}, err
+	}
+	return Report{Instance: selected, Registration: registration(serviceLoadState(ctx, runner, selected.ID))}, nil
 }
 
-// Restart kickstarts only this repository's managed instance. As with
-// Status, an unsupplied --workflow defers to the workflow the instance was
-// actually installed with.
+// Restart returns this repository's managed instance to a running daemon from
+// either state it can be in: it bootstraps a registration launchd does not
+// have -- what an operator's own bootout leaves behind, and what kickstart
+// alone can only fail on -- before kickstarting it. As with Status, an
+// unsupplied --workflow defers to the workflow the instance was actually
+// installed with.
 func Restart(ctx context.Context, options Options) (Instance, error) {
 	d, runner, err := prepare(ctx, options, false)
 	if err != nil {
@@ -140,6 +181,13 @@ func Restart(ctx context.Context, options Options) (Instance, error) {
 	selected, err := findManaged(ctx, options, d, options.Workflow == "")
 	if err != nil {
 		return Instance{}, err
+	}
+	// Only a positive absence is bootstrapped. An observation that did not
+	// answer is left to kickstart, which reports launchd's own reason.
+	if serviceLoadState(ctx, runner, selected.ID) == loadNotFound {
+		if err := launchctl(ctx, runner, "bootstrap", userDomain(), selected.Paths.Plist); err != nil {
+			return Instance{}, fmt.Errorf("load %s: %w", selected.ID, err)
+		}
 	}
 	if err := launchctl(ctx, runner, "kickstart", "-k", launchService(selected.ID)); err != nil {
 		return Instance{}, fmt.Errorf("restart %s: %w", selected.ID, err)
@@ -189,8 +237,15 @@ func prepare(ctx context.Context, options Options, validate bool) (desired, Runn
 	if err != nil {
 		return desired{}, nil, fmt.Errorf("resolve workflow path: %w", err)
 	}
-	if info, err := os.Stat(workflow); err != nil || info.IsDir() {
-		return desired{}, nil, fmt.Errorf("WORKFLOW.md is unavailable: %s", workflow)
+	// Only the commands that write a plist need the workflow to exist; the
+	// path alone identifies the installed instance. Requiring the file here
+	// made a repository whose workflow was deleted unmanageable: status,
+	// restart, and uninstall all failed while the LaunchAgent kept running,
+	// and the file had to be recreated just to remove the service.
+	if validate {
+		if info, err := os.Stat(workflow); err != nil || info.IsDir() {
+			return desired{}, nil, fmt.Errorf("WORKFLOW.md is unavailable: %s", workflow)
+		}
 	}
 	name, owner, repo, err := instanceName(ctx, runner, repository, workflow, options.Name)
 	if err != nil {
@@ -717,7 +772,7 @@ func reload(ctx context.Context, runner Runner, d desired, previous prior) error
 	// already validated. If loading or starting the replacement fails, restore
 	// that prior registration before reporting the failed update.
 	_ = launchctl(ctx, runner, "bootout", service)
-	if err := launchctl(ctx, runner, "bootstrap", "gui/"+fmt.Sprint(os.Getuid()), d.PlistPath); err != nil {
+	if err := launchctl(ctx, runner, "bootstrap", userDomain(), d.PlistPath); err != nil {
 		return restoreAfterReloadFailure(ctx, runner, d, previous, "load", err)
 	}
 	if err := launchctl(ctx, runner, "kickstart", "-k", service); err != nil {
@@ -739,14 +794,28 @@ func restoreAfterReloadFailure(ctx context.Context, runner Runner, d desired, pr
 		return fmt.Errorf("%s %s: %w (restore prior plist: %v)", operation, d.Label, cause, err)
 	}
 	if previous.Restore && previous.Loaded {
-		if err := launchctl(ctx, runner, "bootstrap", "gui/"+fmt.Sprint(os.Getuid()), d.PlistPath); err != nil {
+		if err := launchctl(ctx, runner, "bootstrap", userDomain(), d.PlistPath); err != nil {
 			return fmt.Errorf("%s %s: %w (restore prior service: %v)", operation, d.Label, cause, err)
 		}
 	}
 	return fmt.Errorf("%s %s: %w", operation, d.Label, cause)
 }
 
-func launchService(label string) string { return "gui/" + fmt.Sprint(os.Getuid()) + "/" + label }
+// userDomain is the launchd domain every managed service is registered in;
+// launchService names one job inside it.
+func userDomain() string                { return "gui/" + fmt.Sprint(os.Getuid()) }
+func launchService(label string) string { return userDomain() + "/" + label }
+
+func registration(state loadState) Registration {
+	switch state {
+	case loadLoaded:
+		return RegistrationLoaded
+	case loadNotFound:
+		return RegistrationNotLoaded
+	default:
+		return RegistrationUnknown
+	}
+}
 
 func launchctl(ctx context.Context, runner Runner, args ...string) error {
 	out, err := runner.Run(ctx, "launchctl", args...)

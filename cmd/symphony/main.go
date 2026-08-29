@@ -325,12 +325,12 @@ func runService(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stdout, "backup", migration.Backup)
 		return 0
 	case "status":
-		instance, err := service.Status(ctx, options)
+		report, err := service.Status(ctx, options)
 		if err != nil {
 			fmt.Fprintln(stderr, "symphony service status:", err)
 			return 1
 		}
-		if err := json.NewEncoder(stdout).Encode(instance); err != nil {
+		if err := json.NewEncoder(stdout).Encode(report); err != nil {
 			fmt.Fprintln(stderr, "write service status:", err)
 			return 1
 		}
