@@ -41,7 +41,7 @@ func (c *Coordinator) finishFailure(ctx context.Context, i domain.Issue, attempt
 	if err != nil {
 		attrs = append(attrs, "error", err)
 	}
-	if c.attemptsExhausted(i, retryAgent, reason, next, s, attrs) {
+	if c.attemptsExhausted(i, reason, next, s, attrs) {
 		return
 	}
 	c.log.Warn("agent run retry scheduled", attrs...)
@@ -136,26 +136,33 @@ var systemicFailureReasons = map[string]bool{
 }
 
 // attemptsExhausted reports whether next has reached agent.max_attempts for a
-// retryAgent episode, abandoning the dispatch (and releasing its claim) if so.
-// Only retryAgent consumes the ceiling, and only on a genuine, classified
-// dispatch failure that is not systemic (see systemicFailureReasons). Since
-// PMR-179 a systemic failure no longer raises next either (see
-// failureCounters), which is the stronger half of that exemption -- it keeps
-// the budget intact rather than merely deferring the abandonment. The reason
-// gate stays because it, not the arithmetic, is where the rule is stated: a
-// systemic reason may never end a dispatch, whatever counter it arrives with. A
-// retryLanding redispatch — whether from finishLandingWait or either
-// escalation in runRetry — never raises its attempt counter, and neither does
-// a retryAgent episode that merely lost an orchestrator slot race (see
-// agentSlotRetryDelay). config rejects a non-positive max_attempts, so the
-// MaxAttempts <= 0 case only covers a hand-built Settings, which keeps the
-// pre-PMR-111 unbounded ladder rather than having a zero ceiling abandon
-// every first failure.
-func (c *Coordinator) attemptsExhausted(i domain.Issue, kind retryKind, reason string, next int, s config.Settings, attrs []any) bool {
-	if kind != retryAgent || systemicFailureReasons[reason] || s.Agent.MaxAttempts <= 0 || next < s.Agent.MaxAttempts {
+// dispatch episode, abandoning it (and releasing its claim) if so. The ceiling
+// is consumed only by a genuine, classified dispatch failure that is not
+// systemic (see systemicFailureReasons). Since PMR-179 a systemic failure no
+// longer raises next either (see failureCounters), which is the stronger half
+// of that exemption -- it keeps the budget intact rather than merely deferring
+// the abandonment. The reason gate stays because it, not the arithmetic, is
+// where the rule is stated: a systemic reason may never end a dispatch,
+// whatever counter it arrives with.
+//
+// finishFailure is the one caller, and it only ever schedules retryAgent, which
+// is why no retry kind is passed: a retryLanding redispatch -- whether from
+// finishLandingWait or either escalation in runRetry -- never raises its
+// attempt counter and so can never reach a ceiling, and neither does a
+// retryAgent episode that merely lost an orchestrator slot race (see
+// agentSlotRetryDelay). runRetry's failed pre-dispatch refresh used to call
+// this too, on a "retry_refresh" that is itself systemic, so the check could
+// never return true; it was removed in PMR-191 rather than left reading like a
+// bound that exists.
+//
+// config rejects a non-positive max_attempts, so the MaxAttempts <= 0 case only
+// covers a hand-built Settings, which keeps the pre-PMR-111 unbounded ladder
+// rather than having a zero ceiling abandon every first failure.
+func (c *Coordinator) attemptsExhausted(i domain.Issue, reason string, next int, s config.Settings, attrs []any) bool {
+	if systemicFailureReasons[reason] || s.Agent.MaxAttempts <= 0 || next < s.Agent.MaxAttempts {
 		return false
 	}
-	c.abandonDispatch(i, s.Agent.MaxAttempts, attrs)
+	c.abandonDispatch(i, s, attrs)
 	return true
 }
 
@@ -172,13 +179,107 @@ func (c *Coordinator) attemptsExhausted(i domain.Issue, kind retryKind, reason s
 // a wait is not an agent failure, does not escalate the attempt, and never
 // reaches here.
 //
+// Staying re-poll-able is not the same as being re-admissible at once, which is
+// what it used to mean: the release below was the whole of the give-up, so the
+// next poll started a fresh episode at attempt 0 and a permanently failing issue
+// spent max_attempts launches per poll interval, for good -- a faster cadence
+// than the backoff ceiling the episode had just climbed to. The cooldown is what
+// separates the two (PMR-191): the issue stays visible and is admitted again on
+// its own, but not before a window derived from the delays this coordinator
+// already schedules.
+//
 // docs/observability.md's "Abandoned dispatches" section states why each of those
-// three is a decision rather than an omission, and which of runRetry's
-// escalations can reach this check at all.
-func (c *Coordinator) abandonDispatch(i domain.Issue, maxAttempts int, attrs []any) {
-	attrs = append(attrs, "operation", observability.OperationDispatchAbandoned, "max_attempts", maxAttempts)
+// decisions is a decision rather than an omission, and what the cooldown is worth
+// to an operator reading the record.
+func (c *Coordinator) abandonDispatch(i domain.Issue, s config.Settings, attrs []any) {
+	window := abandonCooldownWindow(s)
+	attrs = append(attrs, "operation", observability.OperationDispatchAbandoned, "max_attempts", s.Agent.MaxAttempts, "cooldown_ms", window.Milliseconds())
+	// The record is written while the claim still stands, so an observer that
+	// sees the issue released has necessarily already seen the give-up that
+	// released it.
 	c.log.Error("dispatch abandoned after max attempts", attrs...)
-	c.release(i.ID)
+	c.startAbandonCooldown(i.ID, window)
+}
+
+// abandonCooldownMultiplier is how many times the longest delay the coordinator
+// already schedules -- the intra-episode backoff ceiling, or the poll interval
+// when that is longer -- an abandoned issue waits before a new episode may
+// start. Ten is the same order-of-magnitude step rateLimitRetryDelay takes above
+// the same ceiling, for the same reason: the next launch has to land well beyond
+// the ladder the episode just exhausted, or giving up would be followed by a
+// tighter relaunch cadence than the failures that provoked it. It stays a
+// bounded multiple rather than a permanent quarantine because a human fix -- an
+// edited hook, a corrected template -- must be picked up without a restart.
+const abandonCooldownMultiplier = 10
+
+// abandonCooldown is the coordinator's memory of one abandoned dispatch
+// episode: the moment the issue may be admitted again, and nothing else --
+// never issue content, and not the abandonment's own timestamp, which the error
+// record already carries with its window. Exactly like handoffObservation it
+// governs only a live process: a restart discards it and the issue is
+// admissible on the new process's first poll.
+type abandonCooldown struct {
+	until time.Time
+}
+
+// abandonCooldownWindow derives how long one abandoned issue stays out of the
+// admission set. There is no setting of its own: the two delays that already
+// describe how fast this instance may act on an issue are the backoff ceiling
+// an episode climbs to and the poll interval it would otherwise be re-admitted
+// at, so the window is a fixed multiple of whichever is longer. Deriving it
+// keeps the cooldown correct for a fast-polling instance and a slow one alike
+// without asking an operator to keep a third number in step with the other two.
+func abandonCooldownWindow(s config.Settings) time.Duration {
+	longest := s.Agent.MaxRetryBackoff
+	if s.Polling.Interval > longest {
+		longest = s.Polling.Interval
+	}
+	if longest <= 0 {
+		// config rejects a non-positive interval and backoff alike, so this covers
+		// only a hand-built Settings; it uses the same floor the retry paths do.
+		longest = defaultPollRetryDelay
+	}
+	return abandonCooldownMultiplier * longest
+}
+
+// startAbandonCooldown holds the issue out of admission for window and drops the
+// claim the abandoned episode held, in one critical section so no concurrent
+// poll can observe it released but not yet cooling. The order matters within it
+// too: the cooldown is recorded first, which is what keeps releaseLocked's
+// pruneLocked from deleting the record on its way out.
+func (c *Coordinator) startAbandonCooldown(id string, window time.Duration) {
+	until := c.clock.Now().Add(window)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.ensureStateLocked(id).cooldown = &abandonCooldown{until: until}
+	c.releaseLocked(id)
+}
+
+// cooldownActiveLocked reports whether an abandonment cooldown is still holding
+// the issue out of admission. It tests the deadline rather than the record's
+// presence, so a cooldown that elapsed since the last sweep admits the issue at
+// once instead of waiting a poll for the sweep to catch up. Callers must hold
+// c.mu.
+func (c *Coordinator) cooldownActiveLocked(id string, now time.Time) bool {
+	st := c.states[id]
+	return st != nil && st.cooldown != nil && now.Before(st.cooldown.until)
+}
+
+// sweepAbandonCooldowns discards elapsed cooldowns, so an issue that is never
+// polled again -- closed, deleted, or no longer a candidate -- leaves no record
+// behind and the per-issue records stay bounded, exactly as
+// sweepHandoffObservations keeps handoff memories bounded. It decides nothing:
+// admission tests the deadline itself (see cooldownActiveLocked), so a sweep
+// that has not run yet cannot hold an issue back.
+func (c *Coordinator) sweepAbandonCooldowns(now time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for id, st := range c.states {
+		if st.cooldown != nil && !now.Before(st.cooldown.until) {
+			st.cooldown = nil
+			c.pruneLocked(id)
+		}
+	}
 }
 
 // finishLandingWait ends a run whose landing capability reported a

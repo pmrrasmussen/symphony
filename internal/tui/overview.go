@@ -231,11 +231,18 @@ func (m Model) writeStatus(b *strings.Builder, instance operator.Instance, now t
 		fmt.Fprintf(b, "\nRetry %s: %s/%s attempt %d, issue tokens %d, due %s\n", retry.IssueIdentifier, retry.Kind, retry.Reason, retry.Attempt, retry.IssueUsage.TotalTokens, formatTimeOrAge(now, retry.Due))
 	}
 	for _, wait := range snapshot.Coordinator.Waiting {
-		if wait.Reason == "blocked_by_relation" {
+		switch wait.Reason {
+		case "blocked_by_relation":
 			fmt.Fprintf(b, "\nWaiting %s (%s): blocked by %s; waiting %s\n", wait.IssueIdentifier, wait.IssueState, strings.Join(wait.BlockedBy, ","), formatDuration(now.Sub(wait.Since)))
-			continue
+		case "abandon_cooldown":
+			// The one waiting reason Symphony imposed on itself: the issue is
+			// eligible and uncontended, and is being passed over because its last
+			// dispatch episode was abandoned (see the dispatch_abandoned record for
+			// the failure and the cooldown window).
+			fmt.Fprintf(b, "\nWaiting %s (%s): cooling down after an abandoned dispatch; waiting %s\n", wait.IssueIdentifier, wait.IssueState, formatDuration(now.Sub(wait.Since)))
+		default:
+			fmt.Fprintf(b, "\nWaiting %s (%s): eligible, no capacity; waiting %s\n", wait.IssueIdentifier, wait.IssueState, formatDuration(now.Sub(wait.Since)))
 		}
-		fmt.Fprintf(b, "\nWaiting %s (%s): eligible, no capacity; waiting %s\n", wait.IssueIdentifier, wait.IssueState, formatDuration(now.Sub(wait.Since)))
 	}
 	m.writeRecentLog(b, instance)
 }

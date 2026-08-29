@@ -121,7 +121,14 @@ claim, so a boundary that fails deterministically cannot occupy a claim and
 re-dispatch at the backoff ceiling for the daemon's lifetime. The tracker is
 untouched by that give-up, which is why the record is the operator's only
 signal; a landing wait does not escalate the attempt and so never reaches the
-ceiling.
+ceiling. The ceiling bounds one episode, and an in-process cooldown bounds how
+often episodes may follow one another: an abandoned issue is refused by the
+poll, under its own `abandon_cooldown` reason, for ten times the longer of
+`agent.max_retry_backoff_ms` and `polling.interval_ms`, so a permanently failing
+issue costs `max_attempts` launches per cooldown rather than per poll. The
+cooldown is scheduling state and dies with the process, like every claim and
+retry timer; see [observability.md](observability.md) for the record and what a
+restart means for it.
 
 The optional `create_followup_issue` capability follows the same model: it is
 disabled unless `tracker.provider.followup_issue_creation` is configured and

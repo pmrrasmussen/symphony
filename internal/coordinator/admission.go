@@ -10,22 +10,24 @@ import (
 	"github.com/pmrrasmussen/symphony/internal/domain"
 )
 
-// waitReasonAtCapacity and waitReasonBlockedByRelation are the two disjoint
-// causes waitingState.reason can hold, mirroring the identically named
-// ineligibleReason/claim values that produce them: an issue is either
-// eligible and short only of an orchestrator slot, or held ineligible by an
-// open blocker relation (PMR-146). dispatchable() decides
-// Dispatchable before capacity is ever consulted, so the two are mutually
-// exclusive and an issue is never reported under both.
+// The three disjoint causes waitingState.reason can hold, mirroring the
+// identically named ineligibleReason/claim values that produce them: an issue
+// is eligible and short only of an orchestrator slot, held ineligible by an
+// open blocker relation (PMR-146), or serving the cooldown that follows an
+// abandoned dispatch episode (PMR-191). They are mutually exclusive by
+// construction: dispatchable() decides Dispatchable before capacity is ever
+// consulted, and claim tests the cooldown before capacity, so an issue is
+// never reported under two of them.
 const (
 	waitReasonAtCapacity        = "at_capacity"
 	waitReasonBlockedByRelation = "blocked_by_relation"
+	waitReasonAbandonCooldown   = "abandon_cooldown"
 )
 
-// waitingCandidate is one poll's observation of an issue sitting idle for
-// waitReasonAtCapacity or waitReasonBlockedByRelation, collected by tick and
-// handed to updateWaiting to reconcile against the coordinator's own memory.
-// blockedBy is set only when reason is waitReasonBlockedByRelation.
+// waitingCandidate is one poll's observation of an issue sitting idle for one
+// of the three wait reasons above, collected by tick and handed to
+// updateWaiting to reconcile against the coordinator's own memory. blockedBy is
+// set only when reason is waitReasonBlockedByRelation.
 type waitingCandidate struct {
 	issue     domain.Issue
 	reason    string
@@ -45,6 +47,7 @@ func (c *Coordinator) tick(ctx context.Context) error {
 	s := c.settings()
 	now := c.clock.Now()
 	c.sweepHandoffObservations(now, s)
+	c.sweepAbandonCooldowns(now)
 	issues, err := c.tracker.ListCandidates(ctx, s.Tracker.ActiveStates)
 	if err != nil {
 		c.log.Error("candidate poll failed", "error", err)
@@ -81,8 +84,8 @@ func (c *Coordinator) tick(ctx context.Context) error {
 		if ok, reason := c.claim(i, s); !ok {
 			summary.rejected[reason]++
 			c.log.Debug("poll candidate rejected", "issue_identifier", i.Identifier, "reason", reason)
-			if reason == waitReasonAtCapacity {
-				waiting[i.ID] = waitingCandidate{issue: i, reason: waitReasonAtCapacity}
+			if reason == waitReasonAtCapacity || reason == waitReasonAbandonCooldown {
+				waiting[i.ID] = waitingCandidate{issue: i, reason: reason}
 			}
 			continue
 		}
@@ -133,13 +136,13 @@ const waitingEscalationFloor = 5 * time.Minute
 const waitingEscalationMultiplier = 10
 
 // updateWaiting reconciles the coordinator's memory of issues seen this poll
-// under waitReasonAtCapacity or waitReasonBlockedByRelation against the
-// previous poll's memory, and reports every genuinely new entry -- or one
-// whose reason just changed -- once, by logging its identifier, state, and
-// (for a blocker hold) the blocker itself: the things pollSummary is not
-// allowed to carry. An issue absent from seen this poll is no longer waiting
-// for whatever reason (admitted, unblocked, turned ineligible for some other
-// reason, or dropped from the tracker's candidate list) and its memory is
+// under any of the three wait reasons against the previous poll's memory, and
+// reports every genuinely new entry -- or one whose reason just changed --
+// once, by logging its identifier, state, and (for a blocker hold) the blocker
+// itself: the things pollSummary is not allowed to carry. An issue absent from
+// seen this poll is no longer waiting for whatever reason (admitted, unblocked,
+// cooled down, turned ineligible for some other reason, or dropped from the
+// tracker's candidate list) and its memory is
 // dropped here, so the waiting set can only ever describe issues this exact
 // poll actually re-observed.
 func (c *Coordinator) updateWaiting(seen map[string]waitingCandidate, now time.Time, s config.Settings) {
@@ -176,18 +179,31 @@ func (c *Coordinator) updateWaiting(seen map[string]waitingCandidate, now time.T
 // carrying anything beyond identifiers.
 func (c *Coordinator) logWaiting(level func(string, ...any), issue domain.Issue, reason string, blockedBy []string, stuck bool) {
 	attrs := []any{"issue_id", issue.ID, "issue_identifier", issue.Identifier, "issue_state", config.Norm(issue.State)}
-	message := "issue eligible but waiting for capacity"
-	if stuck {
-		message = "issue still waiting for capacity"
-	}
 	if reason == waitReasonBlockedByRelation {
 		attrs = append(attrs, "blocked_by", strings.Join(blockedBy, ","))
-		message = "issue blocked by an open dependency"
-		if stuck {
-			message = "issue still blocked by an open dependency"
-		}
 	}
-	level(message, attrs...)
+	level(waitingMessage(reason, stuck), attrs...)
+}
+
+// waitingMessage is one waiting record's text. Only the two open-ended waits
+// have a "still" wording: an abandonment cooldown ends at a deadline the
+// coordinator set itself, so escalateStuckWaits never raises one and it needs
+// no second phrasing.
+func waitingMessage(reason string, stuck bool) string {
+	switch reason {
+	case waitReasonBlockedByRelation:
+		if stuck {
+			return "issue still blocked by an open dependency"
+		}
+		return "issue blocked by an open dependency"
+	case waitReasonAbandonCooldown:
+		return "issue cooling down after an abandoned dispatch"
+	default:
+		if stuck {
+			return "issue still waiting for capacity"
+		}
+		return "issue eligible but waiting for capacity"
+	}
 }
 
 // escalateStuckWaits raises a one-time Warn for any issue that has sat in the
@@ -197,6 +213,12 @@ func (c *Coordinator) logWaiting(level func(string, ...any), issue domain.Issue,
 // on entry is enough; at and above it a wait that is still recurring is no
 // longer distinguishable, on the timeline alone, from one that will never
 // clear -- for a blocker hold, from a dependency nobody intends to schedule.
+//
+// An abandonment cooldown is exempt, and is the one wait that is: it is not
+// waiting on anything outside the coordinator, its end is a deadline the
+// coordinator itself set, and the abandonment it follows already logged at
+// error level. Warning about it would only repeat that record, on a schedule
+// that says nothing new (PMR-191).
 func (c *Coordinator) escalateStuckWaits(now time.Time, s config.Settings) {
 	threshold := waitingEscalationFloor
 	if window := waitingEscalationMultiplier * s.Polling.Interval; window > threshold {
@@ -205,7 +227,7 @@ func (c *Coordinator) escalateStuckWaits(now time.Time, s config.Settings) {
 	c.mu.Lock()
 	var escalated []waitingState
 	for _, st := range c.states {
-		if st.waiting == nil || st.waitingEscalated || now.Sub(st.waiting.since) < threshold {
+		if st.waiting == nil || st.waitingEscalated || st.waiting.reason == waitReasonAbandonCooldown || now.Sub(st.waiting.since) < threshold {
 			continue
 		}
 		st.waitingEscalated = true
@@ -290,6 +312,11 @@ func blockerIdentifierList(blockers []domain.Blocker) []string {
 // filled between the categorization and the reservation, so a refusal here is
 // never a stale reading of a state some other goroutine has since changed
 // (PMR-194).
+//
+// The abandonment cooldown is tested ahead of capacity for the reason
+// ineligibleReason orders its own checks: an issue serving one is refused
+// however much capacity is free, so reporting it as at_capacity would name a
+// cause an operator freeing a slot would never fix.
 func (c *Coordinator) claim(i domain.Issue, s config.Settings) (bool, string) {
 	c.mu.Lock()
 	switch {
@@ -299,6 +326,9 @@ func (c *Coordinator) claim(i domain.Issue, s config.Settings) (bool, string) {
 	case c.claimedStateLocked(i.ID) != nil:
 		c.mu.Unlock()
 		return false, "already_claimed"
+	case c.cooldownActiveLocked(i.ID, c.clock.Now()):
+		c.mu.Unlock()
+		return false, waitReasonAbandonCooldown
 	case !c.capacityAvailableLocked(config.Norm(i.State), s):
 		c.mu.Unlock()
 		return false, waitReasonAtCapacity
@@ -309,6 +339,11 @@ func (c *Coordinator) claim(i domain.Issue, s config.Settings) (bool, string) {
 	// A claimed issue is being actively worked; any prior handoff memory is
 	// stale (the poll loop already reported an external revert before this).
 	st.handoff = nil
+	// An elapsed abandonment cooldown no sweep has reached yet goes the same way:
+	// the gate above already decided this issue may start a fresh episode, so
+	// leaving the record would only make "claimed" and "cooling down" look
+	// simultaneously true (see checkInvariants).
+	st.cooldown = nil
 	// The waiting memory goes with it, for the same reason and one tick sooner
 	// than updateWaiting would drop it: an issue this poll just admitted is no
 	// longer waiting for capacity or a blocker. Leaving it to the end of the

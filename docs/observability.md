@@ -175,9 +175,10 @@ before the coordinator gives up on that episode — Symphony logs a single
 `operation: dispatch_abandoned`, the issue, the classified failure `reason`
 (`workspace_prepare`, `before_run`, `prompt_render`, `session_start`,
 `stalled`, `agent_blocked`, `turn_limit_exhausted`, `source_integrity`), the
-final `attempt`, and `max_attempts`. Each of these names something about *this
-issue's* run — its template, its own agent, its own turn budget — never the
-shared environment dispatching it.
+final `attempt`, `max_attempts`, and `cooldown_ms` (the window before a new
+episode may start; see "The cooldown after an abandonment" below). Each of
+these reasons names something about *this issue's* run — its template, its own
+agent, its own turn budget — never the shared environment dispatching it.
 
 `source_integrity` is the one that can name a *different* session's write: it
 is the post-run source-integrity verdict (see the `internal/workspace` records
@@ -261,18 +262,54 @@ PMR-128 gives tracker errors a real `Retryable` signal, `issue_refresh` and
 only when the wrapped error is not `Retryable`" — but that is future work, not a
 precondition for the exemption as it stands.
 
-That record is deliberately the *whole* outcome:
-the claim and the retry timer are dropped, and the tracker is left exactly as
-it was. That is what
+That record is deliberately the whole *tracker* outcome: the claim and the retry
+timer are dropped, and the tracker is left exactly as it was. That is what
 makes the record load-bearing — the board will keep showing the issue as
 active work, so this is the only place the give-up is visible. A later poll may
 start a fresh, equally bounded episode; an issue that keeps producing this
 record needs a person, not another retry. Abandonment is therefore not
-quarantine: an issue nobody acts on keeps starting new bounded episodes at the
-poll interval, which makes `dispatch_abandoned` a record to alert on rather than
-one to let accumulate. Below the ceiling nothing changes:
+quarantine — but it is no longer instant re-admission either (see the cooldown
+below), so `dispatch_abandoned` is still a record to alert on rather than one to
+let accumulate. Below the ceiling nothing changes:
 each earlier failure keeps its warn-level `"msg":"agent run retry scheduled"`.
 Landing waits never reach it, because a wait does not escalate the attempt.
+
+#### The cooldown after an abandonment
+
+Until PMR-191 the released claim *was* the whole outcome, and the next poll
+re-admitted the issue at attempt 0. `max_attempts` therefore bounded one episode
+but not the spend: an issue that fails the same way every time — a `before_run`
+hook that always exits non-zero, or an `agent_blocked` that reproduces on every
+run and launches a real, paid model session each time — burned `max_attempts`
+launches per poll interval, for as long as the daemon ran. The cadence *after*
+giving up was faster than the backoff ceiling the episode had just climbed to.
+
+Abandonment now also starts an in-process cooldown for that issue, of
+`cooldown_ms`: ten times whichever is longer, `agent.max_retry_backoff_ms` or
+`polling.interval_ms`. It is derived rather than configured, so it stays in
+proportion on a fast-polling instance and a slow one alike, and ten is the same
+step `agent_rate_limited` takes above the same ceiling — far enough past the
+ladder the episode exhausted that the next episode cannot become the tighter
+loop. With this repository's settings that is 50 minutes between episodes
+instead of one poll interval.
+
+While it runs, the issue stays a candidate and stays eligible; the poll simply
+refuses it under its own reason, `abandon_cooldown`, which appears in the debug
+`"msg":"poll candidate rejected"` record and the `rejected` map of the poll
+summary. It is also reported once at info level as
+`"msg":"issue cooling down after an abandoned dispatch"` and listed in the
+runtime status snapshot's waiting set (`reason: abandon_cooldown`) and in the
+TUI, so an issue Symphony is deliberately passing over is never invisible. It is
+the one waiting reason that is never escalated to a warning: its end is a
+deadline Symphony set itself, and the error record above already said everything
+a warning would repeat.
+
+The memory is in-process only, exactly like the poll loop's memory of the
+handoffs it performed (above). **A restart clears every cooldown**, so
+an operator who has fixed the cause does not have to wait one out: restarting
+the service re-admits the issue on the first poll. Left alone, the cooldown
+elapses on its own and the issue starts a fresh, equally bounded episode — the
+give-up remains a pause, not a quarantine.
 
 Abandonment does not comment on the issue either, and that is the same decision
 rather than an omission. The coordinator holds only `domain.Tracker` (candidates,
@@ -283,16 +320,17 @@ a new host tracker-write path, for a record that would repeat on every episode.
 
 The escalated attempt counter is the ceiling's unit: a failure at attempt N ends
 the (N+1)th launch of the episode, so a boundary that fails every time dispatches
-exactly `max_attempts` times and arms no further retry. Of the coordinator's two
-host-side escalations for a retrying agent episode, only the failed retry refresh
-raises that counter and routes it through the ceiling check at all — and
-`retry_refresh` is itself one of the exemptions above (PMR-142), so that check
-never actually abandons the episode; the counter keeps climbing the ordinary
-backoff ladder instead, the same way a classified `issue_refresh` failure does.
-The other escalation, a contended orchestrator slot, never reaches the ceiling at
-all: it is capacity contention rather than a failure, so it keeps the attempt
-fixed, the same way a landing episode's own escalations do, since the attempt
-feeds the rendered prompt and neither a wait nor contention should inflate it.
+exactly `max_attempts` times and arms no further retry. Neither of the
+coordinator's two host-side escalations for a retrying agent episode can reach
+that ceiling. A failed pre-dispatch retry refresh is `retry_refresh`, one of the
+exemptions above, so it holds the attempt fixed and climbs the ordinary backoff
+ladder on the systemic streak instead, the same way a classified `issue_refresh`
+failure does; it used to run the ceiling check anyway, on a reason that could
+never pass it, and PMR-191 removed that check rather than leave a bound in the
+code that was not one. A contended orchestrator slot is capacity contention
+rather than a failure, so it too keeps the attempt fixed, the same way a landing
+episode's own escalations do, since the attempt feeds the rendered prompt and
+neither a wait nor contention should inflate it.
 
 Every `operation` value — the performed edges above, these three observed ones,
 and `dispatch_abandoned` — comes from one bounded vocabulary of fixed literals
@@ -365,7 +403,7 @@ diagnose a run that looks idle:
 * **Poll summaries** (`"msg":"poll summary"`) — one per poll, with
   `candidates`, `eligible`, and `admitted` counts plus a `rejected` map of
   categorized counts (`not_active`, `terminal`, `not_routable`,
-  `already_claimed`, `at_capacity`, `stopping`, …). Each rejected candidate
+  `already_claimed`, `abandon_cooldown`, `at_capacity`, `stopping`, …). Each rejected candidate
   also gets its own `"msg":"poll candidate rejected"` record with its
   `issue_identifier` and `reason`.
 * **Claim and preparation records** — `"msg":"issue claimed"`,
