@@ -82,7 +82,7 @@ func (h *Handoff) PrepareWithSettings(ctx context.Context, s config.Settings, is
 	}
 	stateID, followupStateID, comment := "", "", ""
 	if strings.TrimSpace(s.Tracker.HandoffState) != "" {
-		stateID, err = h.resolveState(ctx, s, active.TeamID(), s.Tracker.HandoffState)
+		stateID, err = resolveHandoffState(ctx, h.client, s, active.TeamID(), s.Tracker.HandoffState)
 		if err != nil {
 			return nil, err
 		}
@@ -98,7 +98,7 @@ func (h *Handoff) PrepareWithSettings(ctx context.Context, s config.Settings, is
 		}
 	}
 	if s.Tracker.FollowupIssueCreation {
-		followupStateID, err = h.resolveState(ctx, s, active.TeamID(), "Backlog")
+		followupStateID, err = resolveHandoffState(ctx, h.client, s, active.TeamID(), "Backlog")
 		if err != nil {
 			return nil, err
 		}
@@ -279,15 +279,14 @@ func (s *HandoffSession) RefuseLanding(ctx context.Context, mergeState, reason s
 	// (PMR-185). The non-terminal policy is the one that applies here -- unlike
 	// CompleteLanding's Done, neither end of a refuse_landing edge may be a
 	// terminal state, which the configuration loader already rejects.
-	resolver := &Handoff{client: s.client}
-	sourceID, err := resolver.resolveState(ctx, s.settings, current.TeamID(), mergeState)
+	sourceID, err := resolveHandoffState(ctx, s.client, s.settings, current.TeamID(), mergeState)
 	if err != nil {
 		return false, err
 	}
 	if sourceID != current.StateID() {
 		return false, nil
 	}
-	targetID, err := resolver.resolveState(ctx, s.settings, current.TeamID(), target)
+	targetID, err := resolveHandoffState(ctx, s.client, s.settings, current.TeamID(), target)
 	if err != nil {
 		return false, err
 	}
@@ -324,25 +323,7 @@ func (s *HandoffSession) CompleteLanding(ctx context.Context, mergeState string)
 	if !strings.EqualFold(strings.TrimSpace(current.State.Name), strings.TrimSpace(mergeState)) {
 		return false, trackerError("handoff_scope", "linked issue is no longer in the configured Merging state")
 	}
-	doneName := ""
-	for _, state := range s.settings.Tracker.TerminalStates {
-		if strings.EqualFold(strings.TrimSpace(state), "Done") {
-			doneName = strings.TrimSpace(state)
-			break
-		}
-	}
-	if doneName == "" {
-		return false, trackerError("invalid_handoff_config", "terminal state Done is required for GitHub landing completion")
-	}
-	doneID, err := (&Handoff{client: s.client}).resolveStateAllowTerminal(ctx, s.settings, s.issue.TeamID(), doneName)
-	if err != nil {
-		return false, err
-	}
-	if err := s.transitionTo(ctx, doneID); err != nil {
-		return false, err
-	}
-	s.logEdge(observability.OperationLandingCompleted, current.State.Name, doneName)
-	return true, nil
+	return s.completeToDone(ctx, observability.OperationLandingCompleted, current.State.Name)
 }
 
 // ReconcileMerged reconciles the bound issue to Done after a linked pull
@@ -372,25 +353,7 @@ func (s *HandoffSession) ReconcileMerged(ctx context.Context, mergeState string)
 	if !eligible {
 		return false, nil
 	}
-	doneName := ""
-	for _, state := range s.settings.Tracker.TerminalStates {
-		if strings.EqualFold(strings.TrimSpace(state), "Done") {
-			doneName = strings.TrimSpace(state)
-			break
-		}
-	}
-	if doneName == "" {
-		return false, trackerError("invalid_handoff_config", "terminal state Done is required for GitHub completion")
-	}
-	doneID, err := (&Handoff{client: s.client}).resolveStateAllowTerminal(ctx, s.settings, s.issue.TeamID(), doneName)
-	if err != nil {
-		return false, err
-	}
-	if err := s.transitionTo(ctx, doneID); err != nil {
-		return false, err
-	}
-	s.logEdge(observability.OperationMergeReconciled, current.State.Name, doneName)
-	return true, nil
+	return s.completeToDone(ctx, observability.OperationMergeReconciled, current.State.Name)
 }
 
 // LandComment adds a bounded, host-generated comment to the bound issue. It
@@ -458,6 +421,17 @@ func (s *HandoffSession) Complete(ctx context.Context) (bool, error) {
 	if !s.isTargetState(current) {
 		return false, trackerError("handoff_scope", "linked issue is no longer in the configured review state")
 	}
+	return s.completeToDone(ctx, observability.OperationReviewCompleted, current.State.Name)
+}
+
+// completeToDone owns what counts as Done for every host-side completion:
+// the configured terminal state named "Done", resolved on the bound issue's
+// team and applied to the bound issue. CompleteLanding, ReconcileMerged, and
+// Complete each keep only their own eligibility gate and call this; from is
+// the freshly read state name that gate accepted, recorded as the logged
+// edge's source, and op names the operation the edge is logged under. The
+// caller has already read the issue and holds handoffMu.
+func (s *HandoffSession) completeToDone(ctx context.Context, op observability.Operation, from string) (bool, error) {
 	doneName := ""
 	for _, state := range s.settings.Tracker.TerminalStates {
 		if strings.EqualFold(strings.TrimSpace(state), "Done") {
@@ -468,14 +442,16 @@ func (s *HandoffSession) Complete(ctx context.Context) (bool, error) {
 	if doneName == "" {
 		return false, trackerError("invalid_handoff_config", "terminal state Done is required for GitHub completion")
 	}
-	doneID, err := (&Handoff{client: s.client}).resolveStateAllowTerminal(ctx, s.settings, s.issue.TeamID(), doneName)
+	// Done is terminal by definition, so this is the one resolution that must
+	// bypass the non-terminal target policy every other transition enforces.
+	doneID, err := resolveHandoffStateAllowTerminal(ctx, s.client, s.settings, s.issue.TeamID(), doneName)
 	if err != nil {
 		return false, err
 	}
 	if err := s.transitionTo(ctx, doneID); err != nil {
 		return false, err
 	}
-	s.logEdge(observability.OperationReviewCompleted, current.State.Name, doneName)
+	s.logEdge(op, from, doneName)
 	return true, nil
 }
 
@@ -588,11 +564,27 @@ func (s *HandoffSession) transition(ctx context.Context) error {
 }
 
 func (s *HandoffSession) transitionTo(ctx context.Context, stateID string) error {
-	response, err := requestWithSettings(ctx, s.client, s.settings, handoffTransitionQuery, map[string]any{
-		"issueID": s.issue.ID, "stateID": stateID,
-	})
+	applied, err := applyHandoffTransition(ctx, s.client, s.settings, s.issue.ID, stateID)
 	if err != nil {
 		return err
+	}
+	if !applied {
+		return trackerError("handoff_response", "Linear did not accept the configured handoff state")
+	}
+	return nil
+}
+
+// applyHandoffTransition sends the one fixed issueUpdate mutation and reports
+// whether Linear applied it. The session path above and the host-owned
+// Tracker.Transition issue the same query and decode the same payload, so the
+// mutation and its success decode live here once; each caller keeps its own
+// refusal error, which is the only part that differs.
+func applyHandoffTransition(ctx context.Context, client *http.Client, s config.Settings, issueID, stateID string) (bool, error) {
+	response, err := requestWithSettings(ctx, client, s, handoffTransitionQuery, map[string]any{
+		"issueID": issueID, "stateID": stateID,
+	})
+	if err != nil {
+		return false, err
 	}
 	var payload struct {
 		Data struct {
@@ -601,10 +593,13 @@ func (s *HandoffSession) transitionTo(ctx context.Context, stateID string) error
 			} `json:"issueUpdate"`
 		} `json:"data"`
 	}
-	if err := json.Unmarshal(response, &payload); err != nil || !payload.Data.IssueUpdate.Success {
-		return trackerError("handoff_response", "Linear did not accept the configured handoff state")
+	// An undecodable response is reported as not-applied rather than as its own
+	// error: neither caller distinguishes a malformed payload from an explicit
+	// success:false, and both must refuse the same way.
+	if err := json.Unmarshal(response, &payload); err != nil {
+		return false, nil
 	}
-	return nil
+	return payload.Data.IssueUpdate.Success, nil
 }
 
 func (s *HandoffSession) comment(ctx context.Context, body string) error {
@@ -713,16 +708,21 @@ func readHandoffIssue(ctx context.Context, client *http.Client, s config.Setting
 	return *payload.Data.Issue, nil
 }
 
-func (h *Handoff) resolveState(ctx context.Context, s config.Settings, teamID, target string) (string, error) {
-	return h.resolveStateWithPolicy(ctx, s, teamID, target, false)
+// resolveHandoffState and resolveHandoffStateAllowTerminal resolve one state
+// name on one team. Like readHandoffIssue they need only the client and the
+// passed settings, so they are free functions: a caller that holds neither a
+// Handoff nor a session (Tracker.Transition, the completion paths) uses them
+// directly rather than constructing a throwaway Handoff to reach them.
+func resolveHandoffState(ctx context.Context, client *http.Client, s config.Settings, teamID, target string) (string, error) {
+	return resolveHandoffStateWithPolicy(ctx, client, s, teamID, target, false)
 }
 
-func (h *Handoff) resolveStateAllowTerminal(ctx context.Context, s config.Settings, teamID, target string) (string, error) {
-	return h.resolveStateWithPolicy(ctx, s, teamID, target, true)
+func resolveHandoffStateAllowTerminal(ctx context.Context, client *http.Client, s config.Settings, teamID, target string) (string, error) {
+	return resolveHandoffStateWithPolicy(ctx, client, s, teamID, target, true)
 }
 
-func (h *Handoff) resolveStateWithPolicy(ctx context.Context, s config.Settings, teamID, target string, allowTerminal bool) (string, error) {
-	response, err := requestWithSettings(ctx, h.client, s, handoffStatesQuery, map[string]any{"teamID": teamID})
+func resolveHandoffStateWithPolicy(ctx context.Context, client *http.Client, s config.Settings, teamID, target string, allowTerminal bool) (string, error) {
+	response, err := requestWithSettings(ctx, client, s, handoffStatesQuery, map[string]any{"teamID": teamID})
 	if err != nil {
 		return "", err
 	}

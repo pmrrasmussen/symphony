@@ -300,24 +300,15 @@ func (t *Tracker) Transition(ctx context.Context, issue domain.Issue, fromState,
 		t.logTransitionRefused(current, fromState, toState)
 		return domain.TransitionResult{FromState: freshState}, nil
 	}
-	stateID, err := (&Handoff{client: t.client}).resolveState(ctx, s, current.TeamID(), toState)
+	stateID, err := resolveHandoffState(ctx, t.client, s, current.TeamID(), toState)
 	if err != nil {
 		return domain.TransitionResult{FromState: freshState}, err
 	}
-	response, err := requestWithSettings(ctx, t.client, s, handoffTransitionQuery, map[string]any{
-		"issueID": current.ID, "stateID": stateID,
-	})
+	applied, err := applyHandoffTransition(ctx, t.client, s, current.ID, stateID)
 	if err != nil {
 		return domain.TransitionResult{FromState: freshState}, err
 	}
-	var payload struct {
-		Data struct {
-			IssueUpdate struct {
-				Success bool `json:"success"`
-			} `json:"issueUpdate"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal(response, &payload); err != nil || !payload.Data.IssueUpdate.Success {
+	if !applied {
 		return domain.TransitionResult{FromState: freshState}, trackerError("transition_response", "Linear did not accept the transition")
 	}
 	t.logTransition(current, toState)
