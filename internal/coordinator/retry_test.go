@@ -81,7 +81,7 @@ func TestStoppedRetryCallbackCannotReclaimIssue(t *testing.T) {
 	defer assertInvariants(t, c)
 	timer := &fakeTimer{}
 	c.timer = timer
-	if !c.claim(issue, w.Config) {
+	if !claims(c, issue, w.Config) {
 		t.Fatal("claim failed")
 	}
 	c.scheduleRetry(context.Background(), issue, domain.Workspace{}, 1, retryAgent, "test", time.Second)
@@ -131,7 +131,7 @@ func TestQueuedRetryDoesNotConsumeAnOrchestratorSlot(t *testing.T) {
 	timer := &fakeTimer{}
 	c.timer = timer
 
-	if !c.claim(retrying, w.Config) {
+	if !claims(c, retrying, w.Config) {
 		t.Fatal("retrying issue was not claimed")
 	}
 	c.scheduleRetry(context.Background(), retrying, domain.Workspace{}, 1, retryAgent, "test", time.Minute)
@@ -169,11 +169,11 @@ func TestRetryAtCapacityRequeuesOnFixedCadence(t *testing.T) {
 	timer := &fakeTimer{}
 	c.timer = timer
 
-	if !c.claim(retrying, w.Config) {
+	if !claims(c, retrying, w.Config) {
 		t.Fatal("retrying issue was not claimed")
 	}
 	c.scheduleRetry(context.Background(), retrying, domain.Workspace{}, 1, retryAgent, "test", time.Second)
-	if !c.claim(running, w.Config) || !c.launch(context.Background(), running, 0) {
+	if !claims(c, running, w.Config) || !c.launch(context.Background(), running, 0) {
 		t.Fatal("running issue was not admitted")
 	}
 	<-agent.started
@@ -217,11 +217,11 @@ func TestRetryAtCapacityNeverAbandons(t *testing.T) {
 	timer := &fakeTimer{}
 	c.timer = timer
 
-	if !c.claim(retrying, w.Config) {
+	if !claims(c, retrying, w.Config) {
 		t.Fatal("retrying issue was not claimed")
 	}
 	c.scheduleRetry(context.Background(), retrying, domain.Workspace{}, 1, retryAgent, "test", time.Second)
-	if !c.claim(running, w.Config) || !c.launch(context.Background(), running, 0) {
+	if !claims(c, running, w.Config) || !c.launch(context.Background(), running, 0) {
 		t.Fatal("running issue was not admitted")
 	}
 	<-agent.started
@@ -265,7 +265,7 @@ func TestRetryRefreshFailureKeepsAttemptAndRetries(t *testing.T) {
 	timer := &fakeTimer{}
 	c.timer = timer
 
-	if !c.claim(issue, w.Config) {
+	if !claims(c, issue, w.Config) {
 		t.Fatal("issue was not claimed")
 	}
 	c.scheduleRetry(context.Background(), issue, domain.Workspace{}, 1, retryAgent, "test", time.Second)
@@ -306,7 +306,7 @@ func TestRetryRefreshFailureNeverAbandonsIssue(t *testing.T) {
 	timer := &fakeTimer{}
 	c.timer = timer
 
-	if !c.claim(issue, w.Config) {
+	if !claims(c, issue, w.Config) {
 		t.Fatal("issue was not claimed")
 	}
 	c.scheduleRetry(context.Background(), issue, domain.Workspace{}, 1, retryAgent, "test", time.Second)

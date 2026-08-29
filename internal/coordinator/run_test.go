@@ -233,11 +233,11 @@ func TestLaunchReservationPreventsOversubscriptionBeforeSessionStart(t *testing.
 	c := testCoordinator(w.Config, &fakeTracker{issue: first}, agent, ws)
 	defer assertInvariants(t, c)
 
-	if !c.claim(first, w.Config) || !c.launch(context.Background(), first, 0) {
+	if !claims(c, first, w.Config) || !c.launch(context.Background(), first, 0) {
 		t.Fatal("first launch was not admitted")
 	}
 	<-ws.prepareStarted
-	if c.claim(second, w.Config) {
+	if claims(c, second, w.Config) {
 		t.Fatal("second issue claimed a slot while first preparation had reserved it")
 	}
 	close(gate)

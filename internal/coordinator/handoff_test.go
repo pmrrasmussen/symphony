@@ -73,7 +73,7 @@ func TestExternalHandoffRevertIsObservedAtPoll(t *testing.T) {
 	// Pre-claim the reverted issue so the poll does not also launch a run, then
 	// record Symphony's own prior handoff into the review state (claiming clears
 	// any prior memory, so the observation must be set afterward).
-	if !c.claim(reverted, w.Config) {
+	if !claims(c, reverted, w.Config) {
 		t.Fatal("pre-claim failed")
 	}
 	c.noteHandoffObservation(domain.Issue{ID: reverted.ID, Identifier: reverted.Identifier, State: "In Review"}, w.Config, c.clock.Now())
@@ -237,7 +237,7 @@ func TestPostHandoffStateChangeIsClassified(t *testing.T) {
 			// Pre-claim so the poll only classifies the change instead of also
 			// launching a run, then record Symphony's own prior handoff (claiming
 			// clears any prior memory, so the observation must be set afterward).
-			if !c.claim(moved, w.Config) {
+			if !claims(c, moved, w.Config) {
 				t.Fatal("pre-claim failed")
 			}
 			c.noteHandoffObservation(domain.Issue{ID: moved.ID, Identifier: moved.Identifier, State: "In Review"}, w.Config, c.clock.Now())

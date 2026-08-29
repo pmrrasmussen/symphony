@@ -12,9 +12,9 @@ import (
 
 // waitReasonAtCapacity and waitReasonBlockedByRelation are the two disjoint
 // causes waitingState.reason can hold, mirroring the identically named
-// ineligibleReason/admissionRejectReason values that produce them: an issue
-// is either eligible and short only of an orchestrator slot, or held
-// ineligible by an open blocker relation (PMR-146). dispatchable() decides
+// ineligibleReason/claim values that produce them: an issue is either
+// eligible and short only of an orchestrator slot, or held ineligible by an
+// open blocker relation (PMR-146). dispatchable() decides
 // Dispatchable before capacity is ever consulted, so the two are mutually
 // exclusive and an issue is never reported under both.
 const (
@@ -78,18 +78,12 @@ func (c *Coordinator) tick(ctx context.Context) error {
 			continue
 		}
 		summary.eligible++
-		if reason := c.admissionRejectReason(i, s); reason != "" {
+		if ok, reason := c.claim(i, s); !ok {
 			summary.rejected[reason]++
 			c.log.Debug("poll candidate rejected", "issue_identifier", i.Identifier, "reason", reason)
 			if reason == waitReasonAtCapacity {
 				waiting[i.ID] = waitingCandidate{issue: i, reason: waitReasonAtCapacity}
 			}
-			continue
-		}
-		if !c.claim(i, s) {
-			// A concurrent reconciliation or retry changed capacity between the
-			// check above and this claim; still a rejection, just a narrower one.
-			summary.rejected["claim_raced"]++
 			continue
 		}
 		summary.admitted++
@@ -223,11 +217,11 @@ func (c *Coordinator) escalateStuckWaits(now time.Time, s config.Settings) {
 	}
 }
 
-// ineligibleReason mirrors eligible's own checks so a rejected candidate's
-// debug record explains exactly which one failed. blocked_by_relation is
-// split out from the generic not_routable so a Todo issue held by an open
-// blocker (PMR-146) is distinguishable, at the poll log, from one rejected
-// for an assignee mismatch or a missing required label.
+// ineligibleReason is the one eligibility predicate: it names the check that
+// refused a candidate, and eligible is defined as its empty verdict.
+// blocked_by_relation is split out from the generic not_routable so a Todo
+// issue held by an open blocker (PMR-146) is distinguishable, at the poll log,
+// from one rejected for an assignee mismatch or a missing required label.
 //
 // The assignee check is ordered ahead of the blocker check because
 // dispatchable() in internal/linear/tracker.go decides Dispatchable in that
@@ -289,28 +283,25 @@ func blockerIdentifierList(blockers []domain.Blocker) []string {
 	return identifiers
 }
 
-// admissionRejectReason peeks at claim's own admission checks purely to
-// categorize a poll rejection; it does not itself claim or mutate state.
-func (c *Coordinator) admissionRejectReason(i domain.Issue, s config.Settings) string {
+// claim reserves the orchestrator slot for the issue, or reports the single
+// admission check that refused it -- the same categories the poll summary
+// counts. Deciding and reserving under one acquisition of c.mu is the point:
+// a separate read-only peek would leave a window in which capacity freed or
+// filled between the categorization and the reservation, so a refusal here is
+// never a stale reading of a state some other goroutine has since changed
+// (PMR-194).
+func (c *Coordinator) claim(i domain.Issue, s config.Settings) (bool, string) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	switch {
 	case c.stopping:
-		return "stopping"
-	case c.claimedStateLocked(i.ID) != nil:
-		return "already_claimed"
-	case !c.capacityAvailableLocked(config.Norm(i.State), s):
-		return waitReasonAtCapacity
-	default:
-		return ""
-	}
-}
-
-func (c *Coordinator) claim(i domain.Issue, s config.Settings) bool {
-	c.mu.Lock()
-	if c.stopping || c.claimedStateLocked(i.ID) != nil || !c.capacityAvailableLocked(config.Norm(i.State), s) {
 		c.mu.Unlock()
-		return false
+		return false, "stopping"
+	case c.claimedStateLocked(i.ID) != nil:
+		c.mu.Unlock()
+		return false, "already_claimed"
+	case !c.capacityAvailableLocked(config.Norm(i.State), s):
+		c.mu.Unlock()
+		return false, waitReasonAtCapacity
 	}
 	st := c.ensureStateLocked(i.ID)
 	st.claimed = true
@@ -328,7 +319,7 @@ func (c *Coordinator) claim(i domain.Issue, s config.Settings) bool {
 	st.waitingEscalated = false
 	c.mu.Unlock()
 	c.log.Debug("issue claimed", "issue_id", i.ID, "issue_identifier", i.Identifier, "state", config.Norm(i.State))
-	return true
+	return true, ""
 }
 
 func active(i domain.Issue, s config.Settings) bool {
@@ -368,8 +359,11 @@ func routable(i domain.Issue, s config.Settings) bool {
 	return true
 }
 
+// eligible is ineligibleReason's own verdict, not a second spelling of it: the
+// callers that only need the yes/no answer (retry, run, turn) must never be
+// able to disagree with the reason the poll log reported (PMR-194).
 func eligible(i domain.Issue, s config.Settings) bool {
-	return i.ID != "" && i.Identifier != "" && i.Title != "" && active(i, s) && !issueTerminal(i, s) && routable(i, s)
+	return ineligibleReason(i, s) == ""
 }
 
 func sortIssues(v []domain.Issue) {

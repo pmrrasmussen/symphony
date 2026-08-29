@@ -415,7 +415,7 @@ func TestLandingRetryRefreshFailureIgnoresMaxAttempts(t *testing.T) {
 	timer := &fakeTimer{}
 	c.timer = timer
 
-	if !c.claim(issue, w.Config) {
+	if !claims(c, issue, w.Config) {
 		t.Fatal("issue was not claimed")
 	}
 	c.scheduleRetry(context.Background(), issue, domain.Workspace{}, 3, retryLanding, "landing_waiting", time.Second)
