@@ -124,6 +124,13 @@ func TestPollFailureLogsTheUnderlyingError(t *testing.T) {
 // fixed string or interpolates only a numeric status code, so attaching it to
 // the poll-failure record cannot forward a response body or credential-derived
 // text into the log.
+//
+// The response body is not unlogged, though: the HTTP layer records its own
+// bounded, redacted excerpt against "GitHub request failed", because the reason
+// a call failed exists only there (PMR-184). What this test pins is that the
+// excerpt stays in that one record -- every error that propagates outward,
+// here onto the poll-failure record, still carries nothing but the fixed
+// string -- and that no record anywhere carries the credential.
 func TestPollFailureLogDoesNotLeakProviderResponseBody(t *testing.T) {
 	const secret = "wire-secret-should-never-reach-the-log"
 	api, git, linear := newAPI(t), &fakeGit{}, &fakeLinear{}
@@ -137,8 +144,13 @@ func TestPollFailureLogDoesNotLeakProviderResponseBody(t *testing.T) {
 	api.mu.Unlock()
 	m.Poll(context.Background())
 
-	if strings.Contains(logs.String(), secret) {
-		t.Fatalf("poll failure log leaked the provider response body: %s", logs.String())
+	for _, line := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
+		if strings.Contains(line, `"msg":"GitHub request failed"`) {
+			continue
+		}
+		if strings.Contains(line, secret) {
+			t.Fatalf("a record outside the HTTP layer leaked the provider response body: %s", line)
+		}
 	}
 	if strings.Contains(logs.String(), "private-token") {
 		t.Fatalf("poll failure log leaked the credential: %s", logs.String())

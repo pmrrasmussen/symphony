@@ -16,9 +16,16 @@ import (
 	"github.com/pmrrasmussen/symphony/internal/config"
 	"github.com/pmrrasmussen/symphony/internal/domain"
 	"github.com/pmrrasmussen/symphony/internal/hostenv"
+	"github.com/pmrrasmussen/symphony/internal/observability"
 )
 
 const maxResponse = 1 << 20
+
+// maxErrorBody bounds how much of a failed response is read for the host-side
+// diagnosis. observability.Text caps and scrubs the excerpt again before it
+// reaches the log, so this only keeps a verbose or hostile error body from
+// being read into memory at all; the response is discarded either way.
+const maxErrorBody = 4 << 10
 
 // maxPages bounds how many pages of one paginated GitHub collection a single
 // read may follow. At the per_page=100 every paginated caller asks for, the
@@ -284,6 +291,12 @@ func (m *Manager) request(ctx context.Context, s config.GitHub, method, path str
 // collection was read to its end: false means the page cap stopped the walk
 // with a rel="next" link still outstanding, so the collected items are a
 // prefix of the collection and not the whole of it.
+//
+// The walk abandons the collection on the first page that fails rather than
+// skipping past it, which is also what keeps requestWithHeader's failure log
+// proportionate: one failing read is one record, not one per remaining page.
+// A page whose failure were tolerated here would both hand a gate an
+// incomplete collection it believes is complete and log maxPages times.
 func paginate[T any](ctx context.Context, m *Manager, s config.GitHub, path string, collect func(T)) (bool, error) {
 	for page := 0; page < maxPages; page++ {
 		var decoded T
@@ -356,10 +369,24 @@ func (m *Manager) requestWithHeader(ctx context.Context, s config.GitHub, method
 	}
 	response, err := m.client.Do(req)
 	if err != nil {
+		// Both failure branches follow the push-error pattern (session.go's
+		// publish gate, land.go's stale-branch push): the returned string stays
+		// the fixed, provider-shaped-text-free one every caller and every agent
+		// already sees, and the actual diagnosis goes to the host log alone.
+		// Without this the transport error was dropped outright -- an issue
+		// parked in Merging read "github request failed" and nothing more.
+		m.logger.Warn("GitHub request failed", "method", method, "path", observability.Text(path), "transport_error", observability.Text(err.Error()))
 		return nil, errors.New("github request failed")
 	}
 	defer response.Body.Close()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		// GitHub puts the why in the body of exactly these responses -- "At
+		// least 1 approving review is required" for a 405 the daemon token
+		// cannot satisfy, "Base branch was modified", a rate-limit message --
+		// so an operator diagnosing a stuck merge reads it here rather than
+		// reconstructing it from a bare status code (PMR-184).
+		excerpt, _ := io.ReadAll(io.LimitReader(response.Body, maxErrorBody))
+		m.logger.Warn("GitHub request failed", "method", method, "path", observability.Text(path), "status", response.StatusCode, "response_excerpt", observability.Text(strings.TrimSpace(string(excerpt))))
 		return nil, fmt.Errorf("github request failed with status %d", response.StatusCode)
 	}
 	limited := io.LimitReader(response.Body, maxResponse+1)
