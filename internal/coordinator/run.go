@@ -197,7 +197,7 @@ func (c *Coordinator) launch(parent context.Context, i domain.Issue, attempt int
 		}
 		c.log.Debug("workspace prepared", "issue_id", i.ID, "issue_identifier", i.Identifier, "attempt", attempt, "created", ws.CreatedNow)
 		if err = c.workspaces.BeforeRun(ctx, ws, i); err != nil {
-			c.workspaces.AfterRun(context.Background(), ws, i)
+			c.afterRunBeforeFailure(ws, i)
 			c.unreserve(i.ID, reservation)
 			c.finishFailure(parent, i, attempt, "before_run", err)
 			return
@@ -214,7 +214,7 @@ func (c *Coordinator) launch(parent context.Context, i domain.Issue, attempt int
 		launch := s.AgentLaunch()
 		prompt, deliveryBytes, err := render(s, i, attempt, launch.Backend)
 		if err != nil {
-			c.workspaces.AfterRun(context.Background(), ws, i)
+			c.afterRunBeforeFailure(ws, i)
 			c.unreserve(i.ID, reservation)
 			c.finishFailure(parent, i, attempt, "prompt_render", err)
 			return
@@ -225,14 +225,14 @@ func (c *Coordinator) launch(parent context.Context, i domain.Issue, attempt int
 		c.log.Debug("agent launch requested", "issue_id", i.ID, "issue_identifier", i.Identifier, "attempt", attempt, "agent_backend", launch.Backend)
 		session, events, err := c.agent.Start(ctx, domain.AgentRequest{Issue: i, Backend: launch.Backend, Model: launch.Model, Workspace: ws.Path, GitMetadataRoots: ws.GitMetadataRoots, Prompt: prompt, Command: launch.Command, ApprovalPolicy: launch.ApprovalPolicy, ThreadSandbox: launch.ThreadSandbox, TurnSandboxPolicy: launch.TurnSandboxPolicy, TurnTimeout: launch.TurnTimeout, ReadTimeout: launch.ReadTimeout, StartTimeout: launch.StartTimeout})
 		if err != nil {
-			c.workspaces.AfterRun(context.Background(), ws, i)
+			c.afterRunBeforeFailure(ws, i)
 			c.unreserve(i.ID, reservation)
 			c.finishFailure(parent, i, attempt, "session_start", err)
 			return
 		}
 		if ctx.Err() != nil {
 			c.cancelSession(context.Background(), session)
-			c.workspaces.AfterRun(context.Background(), ws, i)
+			c.afterRunBeforeFailure(ws, i)
 			c.release(i.ID)
 			return
 		}
@@ -245,7 +245,7 @@ func (c *Coordinator) launch(parent context.Context, i domain.Issue, attempt int
 		if c.stopping {
 			c.mu.Unlock()
 			c.cancelSession(context.Background(), session)
-			c.workspaces.AfterRun(context.Background(), ws, i)
+			c.afterRunBeforeFailure(ws, i)
 			c.release(i.ID)
 			return
 		}
@@ -266,21 +266,32 @@ func (c *Coordinator) launch(parent context.Context, i domain.Issue, attempt int
 				consumeErr = context.Canceled
 			}
 		}
-		c.finishRun(r, ended, stopped, ctx, consumeErr)
 		if ended {
 			c.cancelSession(context.Background(), r.session)
 		} else if consumeErr != nil && stopped == "" && ctx.Err() == nil {
 			c.cancelSession(context.Background(), r.session)
 		}
-		c.workspaces.AfterRun(context.Background(), ws, i)
+		// AfterRun's source-integrity verdict is part of this run's outcome, so
+		// it is read before the run is recorded finished: a run that left the
+		// source repository's branches moved with no operator explanation is a
+		// failed run, not a successful one with an ERROR beside it (PMR-161).
+		integrityErr := c.workspaces.AfterRun(context.Background(), ws, i)
 		if ended {
 			// A run that ended because its issue reached the review handoff
 			// state is Symphony's own handoff; remember it so an external
-			// revert of that handoff is attributable at the next poll.
+			// revert of that handoff is attributable at the next poll. It
+			// happened whatever the integrity verdict is, so it is recorded
+			// before that verdict can demote the run below.
 			c.mu.Lock()
 			final := r.issue
 			c.mu.Unlock()
 			c.noteHandoffObservation(final, s, c.clock.Now())
+		}
+		if ended && integrityErr != nil {
+			ended, consumeErr = false, integrityErr
+		}
+		c.finishRun(r, ended, stopped, ctx, consumeErr)
+		if ended {
 			c.release(i.ID)
 			return
 		}
@@ -345,6 +356,16 @@ func (c *Coordinator) transitionToStarted(ctx context.Context, i domain.Issue, s
 	}
 	c.log.Info("issue moved to started state", "operation", observability.OperationStartTransition, "issue_id", i.ID, "issue_identifier", i.Identifier, "from_state", from, "to_state", config.Norm(target))
 	return target
+}
+
+// afterRunBeforeFailure closes the workspace bracket on a dispatch that already
+// has an outcome -- a failed launch step, a cancellation, or a shutdown -- and
+// drops AfterRun's source-integrity verdict. There is nothing left to fail: the
+// dispatch is already ending as a failure or a cancellation, and the alert
+// itself is logged by the workspace boundary on every one of these paths
+// regardless (PMR-161).
+func (c *Coordinator) afterRunBeforeFailure(ws domain.Workspace, i domain.Issue) {
+	_ = c.workspaces.AfterRun(context.Background(), ws, i)
 }
 
 func (c *Coordinator) refreshRunIssue(r *running, fresh domain.Issue) {

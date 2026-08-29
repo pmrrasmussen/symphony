@@ -245,6 +245,10 @@ func (l *Local) setGitMetadataRoot(ctx context.Context, ws *domain.Workspace, is
 		return fmt.Errorf("resolve Git object store for local commits: %w", err)
 	}
 	ws.GitMetadataRoots = []string{objects, filepath.Clean(state.GitWorktreeDir)}
+	// The source root travels with the workspace so the post-run check reads the
+	// repository this baseline was taken against, rather than re-reading a state
+	// record a terminal run's own cleanup has already removed by then (PMR-161).
+	ws.SourceRoot = state.SourceRoot
 	// The integrity baseline is a best-effort backstop: an unexpected failure to
 	// fingerprint the source must not fail an otherwise valid workspace. An empty
 	// baseline simply skips the post-run assertion.
@@ -258,11 +262,17 @@ func (l *Local) setGitMetadataRoot(ctx context.Context, ws *domain.Workspace, is
 func (l *Local) BeforeRun(ctx context.Context, ws domain.Workspace, issue domain.Issue) error {
 	return l.hook(ctx, ws, issue, "before_run", l.settings().Hooks.BeforeRun)
 }
-func (l *Local) AfterRun(ctx context.Context, ws domain.Workspace, issue domain.Issue) {
+
+// AfterRun runs the after_run hook and then the source-integrity check, and
+// returns only the latter's verdict (see domain.WorkspaceExecutor). The hook
+// runs first and its failure is logged rather than returned: it is
+// repository-owned automation that may legitimately fail, while the integrity
+// verdict is the enforced remainder of the write boundary and fails the run.
+func (l *Local) AfterRun(ctx context.Context, ws domain.Workspace, issue domain.Issue) error {
 	if err := l.hook(ctx, ws, issue, "after_run", l.settings().Hooks.AfterRun); err != nil {
 		l.logger().Warn("workspace hook failed", "hook", "after_run", "issue_id", issue.ID, "issue_identifier", issue.Identifier, "error", err)
 	}
-	l.assertSourceIntegrity(ctx, ws, issue)
+	return l.assertSourceIntegrity(ctx, ws, issue)
 }
 
 // Cleanup discards the workspace Symphony owns for issue, or reports why it

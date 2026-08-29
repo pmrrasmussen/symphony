@@ -3,6 +3,7 @@ package domain
 
 import (
 	"context"
+	"fmt"
 	"time"
 )
 
@@ -214,13 +215,26 @@ type AgentRequest struct {
 	// could otherwise start a session on one runtime with another's launch
 	// parameters. An empty value lets the router choose the configured backend.
 	Backend string
-	// GitMetadataRoots are the only paths outside the workspace directory a
-	// workspace-write turn may write: the source repository's shared object
-	// store and this linked worktree's own per-worktree metadata directory. It
-	// deliberately excludes the rest of the source common directory (branch
-	// refs, the primary index, packed-refs, other worktrees) so a misbehaving
-	// agent cannot mutate the source repository's branches or primary working
-	// tree (PMR-65).
+	// GitMetadataRoots are the only paths outside the workspace directory
+	// Symphony asks a workspace-write turn to be granted: the source
+	// repository's shared object store and this linked worktree's own
+	// per-worktree metadata directory. It deliberately names neither the rest
+	// of the source common directory (branch refs, the primary index,
+	// packed-refs, other worktrees) nor anything above it (PMR-65).
+	//
+	// It is a request, and what enforces it is the backend, not this field.
+	// Codex confines a workspace-write turn to exactly these roots. The Claude
+	// CLI widens its own git-metadata grant to the whole enclosing .git
+	// directory once any subpath of it is granted, so a Bash command in that
+	// session still reaches the source repository's refs/heads and packed-refs,
+	// and no setting Symphony's launch contract can render narrows it back
+	// (PMR-161). Do not read this comment as a guarantee that the source
+	// repository's branches cannot move: under Claude the enforced backstop is
+	// the post-run source-integrity check, which detects an unexplained move
+	// and fails the run (see WorkspaceExecutor.AfterRun and
+	// SourceIntegrityError). docs/architecture.md's "Workspace isolation and
+	// the sandbox boundary" states the accepted exposure, why prevention was
+	// not built, and the containment requirement that stands while it does.
 	Workspace                     string
 	GitMetadataRoots              []string
 	Prompt, Command               string
@@ -249,6 +263,13 @@ type AgentBackend interface {
 type Workspace struct {
 	Path, Key        string
 	GitMetadataRoots []string
+	// SourceRoot is the repository this workspace is a linked worktree of, as
+	// resolved at preparation time. The post-run integrity check reads it from
+	// here rather than from the workspace's own state record, because a run
+	// whose issue reached a terminal state removes that record before AfterRun
+	// is reached -- which used to skip the check on exactly the runs that ended
+	// cleanly (PMR-161). Empty for a workspace with no source repository.
+	SourceRoot string
 	// GitIntegrityBaseline is a JSON-encoded snapshot of the source
 	// repository's non-symphony branch heads at preparation time, so a
 	// post-run assertion can detect drift that slips past the narrowed
@@ -309,6 +330,32 @@ type IssueForgetter interface {
 type WorkspaceExecutor interface {
 	Prepare(context.Context, Issue) (Workspace, error)
 	BeforeRun(context.Context, Workspace, Issue) error
-	AfterRun(context.Context, Workspace, Issue)
+	// AfterRun brackets the run and returns its source-integrity verdict: a
+	// SourceIntegrityError when the run left the source repository's branch
+	// refs changed in a way no operator activity explains, and nil otherwise.
+	// That error is the only thing it reports. An after_run hook failure is
+	// logged and not returned, because a hook is repository-owned automation
+	// whose failure says nothing about whether the write boundary held.
+	AfterRun(context.Context, Workspace, Issue) error
 	Cleanup(context.Context, Issue) (CleanupOutcome, error)
+}
+
+// SourceIntegrityError is AfterRun's verdict that a run left the source
+// repository's branch refs changed, with nothing an operator did explaining it
+// (PMR-65, PMR-161). Under the Claude backend the write boundary this reports
+// on is enforced by the CLI's own sandbox and is known not to cover a Bash
+// command inside the source .git directory, so this is a detection that must
+// fail its run rather than a redundant assertion about a boundary already held.
+//
+// Changes carries the rendered ref changes, each attributed where possible to
+// the workspace whose HEAD carries the commit the ref moved to -- which is
+// frequently not the run reporting the error, because whichever run finishes
+// first is the one that observes another's write.
+type SourceIntegrityError struct {
+	SourceRoot string
+	Changes    string
+}
+
+func (e SourceIntegrityError) Error() string {
+	return fmt.Sprintf("source repository %s has ref changes no operator activity explains: %s", e.SourceRoot, e.Changes)
 }

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/pmrrasmussen/symphony/internal/config"
+	"github.com/pmrrasmussen/symphony/internal/domain"
 )
 
 // TestPermanentDispatchFailureStopsAtMaxAttempts covers the PMR-111 defect: a
@@ -67,6 +68,61 @@ func TestPermanentDispatchFailureStopsAtMaxAttempts(t *testing.T) {
 	// so the abandonment is the only new record on this path.
 	if count := strings.Count(records, `"msg":"agent run retry scheduled"`); count != 2 {
 		t.Fatalf("retry warnings=%d, want one per dispatch below the ceiling: %s", count, records)
+	}
+	if err := c.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestUnexplainedSourceIntegrityAlertFailsTheRun covers the PMR-161 decision:
+// the source-integrity check is the only thing enforcing the write boundary the
+// Claude CLI widens, so an unexplained alert has to fail its run rather than
+// leave a successful run with an ERROR beside it. The run here ends the way a
+// good run does -- the agent completes and the issue reaches the review handoff
+// state -- and is still recorded as a failure, carrying the ref change and the
+// workspace the alert attributed it to. The handoff observation is recorded
+// regardless: the handoff did happen, and a later external revert of it must
+// stay attributable.
+func TestUnexplainedSourceIntegrityAlertFailsTheRun(t *testing.T) {
+	w := testSettings(t)
+	w.Config.Agent.MaxAttempts = 3
+	w.Config.Tracker.HandoffState = "In Review"
+	w.Config.Tracker.ActiveStates = []string{"Todo", "In Progress"}
+	issue := testIssue()
+	issue.State = "In Progress"
+	handoff := issue
+	handoff.State = "In Review"
+	handoff.Dispatchable = false
+	tracker := &fakeTracker{issue: issue}
+	tracker.setFresh(handoff)
+	agent := &fakeAgent{events: completedEvents}
+	verdict := domain.SourceIntegrityError{SourceRoot: "/src", Changes: "refs/heads/main aaa->bbb attributed_to=ENG-2"}
+	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{}, 1), afterErr: verdict}
+	var log syncBuffer
+	c := New(tracker, agent, ws, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&log, nil)))
+	defer assertInvariants(t, c)
+	timer := &fakeTimer{signal: make(chan struct{}, 1)}
+	c.timer = timer
+
+	c.Tick(context.Background())
+	<-timer.signal
+
+	retry, armed := c.armedRetry(issue.ID)
+	if !armed || retry.kind != retryAgent || retry.reason != "source_integrity" {
+		t.Fatalf("retry=%+v armed=%v, want a source_integrity agent failure", retry, armed)
+	}
+	if retry.attempt != 1 {
+		t.Fatalf("attempt=%d, want the failure to spend an attempt", retry.attempt)
+	}
+	records := log.String()
+	if !strings.Contains(records, `"msg":"agent logical run finished","issue_id":"id","issue_identifier":"ENG-1","session_id":"t-u","status":"failed"`) {
+		t.Fatalf("a run that moved the source repository's refs was not recorded as failed: %s", records)
+	}
+	if !strings.Contains(records, "attributed_to=ENG-2") {
+		t.Fatalf("failure record dropped the attributed ref change: %s", records)
+	}
+	if observation, ok := c.handoffMemory(issue.ID); !ok || observation.state != "in review" {
+		t.Fatalf("handoff observation=%+v ok=%v, want the handoff remembered despite the failure", observation, ok)
 	}
 	if err := c.Shutdown(context.Background()); err != nil {
 		t.Fatal(err)

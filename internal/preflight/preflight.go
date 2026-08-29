@@ -486,13 +486,14 @@ func (f *fakeBoundaries) BeforeRun(context.Context, domain.Workspace, domain.Iss
 	f.before++
 	return nil
 }
-func (f *fakeBoundaries) AfterRun(context.Context, domain.Workspace, domain.Issue) {
+func (f *fakeBoundaries) AfterRun(context.Context, domain.Workspace, domain.Issue) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.after++
 	if f.after == 1 {
 		close(f.afterRun)
 	}
+	return nil
 }
 func (*fakeBoundaries) Cleanup(context.Context, domain.Issue) (domain.CleanupOutcome, error) {
 	return domain.CleanupClean, errorsf("unexpected cleanup")

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"os"
@@ -396,6 +397,170 @@ func TestSourceIntegrityAlertIsStructuredAndNeverReachesStderr(t *testing.T) {
 	}
 	if !strings.Contains(record.ChangedRefs, "refs/heads/unexpected") || !strings.Contains(record.ChangedRefs, "(none)") {
 		t.Fatalf("integrity alert did not name the changed ref with its before/after values: %q", record.ChangedRefs)
+	}
+}
+
+// TestSourceIntegrityVerdictFailsOnlyTheUnexplainedMove covers both halves of
+// the PMR-145 distinction at the level PMR-161 made load-bearing: the verdict
+// AfterRun returns, which is what fails the run. An operator's `git pull
+// --ff-only` in the source checkout must return nil -- the documented operator
+// workflow may not fail a run -- while a commit no remote has ever seen must
+// return a domain.SourceIntegrityError naming the ref that moved.
+func TestSourceIntegrityVerdictFailsOnlyTheUnexplainedMove(t *testing.T) {
+	source := newGitRepository(t)
+	root := filepath.Join(t.TempDir(), "workspaces")
+	s := config.Settings{Workspace: config.Workspace{Root: root, SourceRoot: source}}
+	l := New(func() config.Settings { return s })
+	l.SetLogger(slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	issue := domain.Issue{ID: "issue-161", Identifier: "PMR-161"}
+	ws, err := l.Prepare(context.Background(), issue)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Half one: a second operator lands a pull request and this checkout pulls
+	// it, while the run is in flight.
+	publisher := cloneRepository(t, source)
+	if err := os.WriteFile(filepath.Join(publisher, "landed.txt"), []byte("landed\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, publisher, "add", "landed.txt")
+	runGit(t, publisher, "commit", "-m", "operator landed a PR")
+	runGit(t, publisher, "push", "origin", "main")
+	runGit(t, source, "pull", "--ff-only")
+
+	if err := l.AfterRun(context.Background(), ws, issue); err != nil {
+		t.Fatalf("an operator fast-forward pull failed the run: %v", err)
+	}
+
+	// Half two: the breach this check exists to catch -- main advances to a
+	// commit no remote-tracking ref has ever heard of, which is what a `git
+	// commit` or `git update-ref` run against the source root produces.
+	if err := os.WriteFile(filepath.Join(source, "escape.txt"), []byte("agent write\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, source, "add", "escape.txt")
+	runGit(t, source, "commit", "-m", "agent wrote the source repository")
+
+	err = l.AfterRun(context.Background(), ws, issue)
+	var integrity domain.SourceIntegrityError
+	if !errors.As(err, &integrity) {
+		t.Fatalf("an agent-authored source commit did not fail the run: %v", err)
+	}
+	if !strings.Contains(integrity.Changes, "refs/heads/main") {
+		t.Fatalf("verdict did not name the moved ref: %+v", integrity)
+	}
+	if integrity.SourceRoot == "" {
+		t.Fatalf("verdict did not name the source repository: %+v", integrity)
+	}
+}
+
+// TestSourceIntegrityVerdictSurvivesTerminalCleanup covers the hole PMR-161
+// found while making this check load-bearing: a run whose issue reached a
+// terminal state cleans its own workspace up from inside the run, which removes
+// the state record, and the check used to read the source root from that record
+// -- so it silently did nothing on exactly the runs that ended cleanly. The
+// baseline and its source root now travel on the workspace value instead.
+func TestSourceIntegrityVerdictSurvivesTerminalCleanup(t *testing.T) {
+	source := newGitRepository(t)
+	root := filepath.Join(t.TempDir(), "workspaces")
+	s := config.Settings{Workspace: config.Workspace{Root: root, SourceRoot: source}}
+	l := New(func() config.Settings { return s })
+	l.SetLogger(slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	issue := domain.Issue{ID: "issue-161-terminal", Identifier: "PMR-161T"}
+	ws, err := l.Prepare(context.Background(), issue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, source, "commit", "--allow-empty", "-m", "agent wrote the source repository")
+
+	// The terminal path's own order: the run cleans the workspace up, then
+	// AfterRun brackets it.
+	if _, err := l.Cleanup(context.Background(), issue); err != nil {
+		t.Fatal(err)
+	}
+	err = l.AfterRun(context.Background(), ws, issue)
+	var integrity domain.SourceIntegrityError
+	if !errors.As(err, &integrity) {
+		t.Fatalf("a terminal run's cleanup suppressed the integrity verdict: %v", err)
+	}
+	if !strings.Contains(integrity.Changes, "refs/heads/main") {
+		t.Fatalf("verdict did not name the moved ref: %+v", integrity)
+	}
+}
+
+// TestSourceIntegrityAlertNamesTheWorkspaceThatMovedTheRef proves the PMR-161
+// attribution fix against the exact shape PMR-156 observed live: an alert filed
+// under one issue reporting refs/heads/main moving to another issue's commit,
+// naming only the issue that happened to finish first. The alert must name the
+// workspace that wrote the commit, and must not name the source repository's own
+// working tree, which is sitting on that same commit by then.
+func TestSourceIntegrityAlertNamesTheWorkspaceThatMovedTheRef(t *testing.T) {
+	source := newGitRepository(t)
+	root := filepath.Join(t.TempDir(), "workspaces")
+	s := config.Settings{Workspace: config.Workspace{Root: root, SourceRoot: source}}
+	l := New(func() config.Settings { return s })
+	var logs bytes.Buffer
+	l.SetLogger(slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+
+	// The reporter prepares first, so its baseline predates the write, exactly
+	// as the session that finishes first held a baseline from before the other
+	// session's commit.
+	reporter := domain.Issue{ID: "issue-153", Identifier: "PMR-153"}
+	reporterWS, err := l.Prepare(context.Background(), reporter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	culprit := domain.Issue{ID: "issue-144", Identifier: "PMR-144"}
+	culpritWS, err := l.Prepare(context.Background(), culprit)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The culprit commits in its own worktree -- legitimate -- and then moves
+	// the source repository's main onto it, which is the write the CLI's widened
+	// .git grant still permits from a Bash command.
+	runGit(t, culpritWS.Path, "commit", "--allow-empty", "-m", "agent work")
+	moved := gitShow(t, culpritWS.Path, "HEAD")
+	runGit(t, source, "update-ref", "refs/heads/main", moved)
+
+	err = l.AfterRun(context.Background(), reporterWS, reporter)
+	var integrity domain.SourceIntegrityError
+	if !errors.As(err, &integrity) {
+		t.Fatalf("a moved source branch did not fail the reporting run: %v", err)
+	}
+	if !strings.Contains(integrity.Changes, "attributed_to="+Key(culprit.Identifier)) {
+		t.Fatalf("verdict did not attribute the move to the workspace that wrote it: %q", integrity.Changes)
+	}
+	if strings.Contains(integrity.Changes, "attributed_to="+Key(reporter.Identifier)) {
+		t.Fatalf("verdict attributed the move to the reporting workspace: %q", integrity.Changes)
+	}
+	if strings.Contains(integrity.Changes, filepath.Base(source)) {
+		t.Fatalf("verdict attributed the move to the source repository's own working tree: %q", integrity.Changes)
+	}
+
+	var record struct {
+		Msg         string `json:"msg"`
+		ChangedRefs string `json:"changed_refs"`
+	}
+	found := false
+	for _, line := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
+		if line == "" {
+			continue
+		}
+		if err := json.Unmarshal([]byte(line), &record); err != nil {
+			t.Fatal(err)
+		}
+		if record.Msg == "workspace source integrity alert" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("no integrity alert was logged: %s", logs.String())
+	}
+	if record.ChangedRefs != integrity.Changes {
+		t.Fatalf("logged changed_refs %q does not match the verdict %q", record.ChangedRefs, integrity.Changes)
 	}
 }
 

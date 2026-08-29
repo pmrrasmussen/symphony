@@ -189,8 +189,9 @@ func (w *lifecycleWorkspace) Prepare(context.Context, domain.Issue) (domain.Work
 func (w *lifecycleWorkspace) BeforeRun(context.Context, domain.Workspace, domain.Issue) error {
 	return nil
 }
-func (w *lifecycleWorkspace) AfterRun(context.Context, domain.Workspace, domain.Issue) {
+func (w *lifecycleWorkspace) AfterRun(context.Context, domain.Workspace, domain.Issue) error {
 	w.afterRun <- struct{}{}
+	return nil
 }
 func (w *lifecycleWorkspace) Cleanup(context.Context, domain.Issue) (domain.CleanupOutcome, error) {
 	return domain.CleanupClean, nil

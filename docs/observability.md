@@ -174,10 +174,18 @@ before the coordinator gives up on that episode — Symphony logs a single
 **error**-level `"msg":"dispatch abandoned after max attempts"` with
 `operation: dispatch_abandoned`, the issue, the classified failure `reason`
 (`workspace_prepare`, `before_run`, `prompt_render`, `session_start`,
-`stalled`, `agent_blocked`, `turn_limit_exhausted`), the final `attempt`, and
-`max_attempts`. Each of these names something about *this issue's* run — its
-template, its own agent, its own turn budget — never the shared environment
-dispatching it.
+`stalled`, `agent_blocked`, `turn_limit_exhausted`, `source_integrity`), the
+final `attempt`, and `max_attempts`. Each of these names something about *this
+issue's* run — its template, its own agent, its own turn budget — never the
+shared environment dispatching it.
+
+`source_integrity` is the one that can name a *different* session's write: it
+is the post-run source-integrity verdict (see the `internal/workspace` records
+below), and the run that observes an unexplained ref move is often not the run
+that caused it. It arms the ceiling anyway, on purpose — a dispatch that keeps
+ending with the source repository's branches moved must stop being
+redispatched — and the record's `error` carries the changed refs with the
+workspace each was attributed to, which is where to look first.
 
 Six reasons never appear on that abandonment record, because none of them is
 evidence the issue itself is unworkable (`systemicFailureReasons` in
@@ -662,18 +670,28 @@ redaction boundary rather than to `os.Stderr` — the JSONL log is the operator'
 complete record of them:
 
 * `"msg":"workspace source integrity alert"` is the
-  [PMR-65](https://linear.app/pmrrasmussen/issue/PMR-65) defense-in-depth
-  backstop: after a run, Symphony re-checks that the source repository's
-  branch heads (other than the `symphony/*` publish branches it creates
-  itself) and primary working tree index are exactly as they were before the
-  run, and this **error**-level record is written if they are not — the
-  narrowed sandbox grant a linked worktree receives is supposed to make that
-  impossible, so this is the highest-signal record the package can produce. It
-  carries `operation: source_integrity_alert`, `issue_id`/`issue_identifier`,
-  and `source_root`. A failure to even compute the post-run fingerprint (for
-  example, the source repository became unreadable) instead logs
-  `"msg":"workspace source integrity check failed"` at **warn**, with the same
-  issue attributes and a bounded `error`.
+  [PMR-65](https://linear.app/pmrrasmussen/issue/PMR-65) backstop: after a run,
+  Symphony re-checks that the source repository's branch heads (other than the
+  `symphony/*` publish branches it creates itself) are exactly as they were
+  before the run, and this **error**-level record is written if they are not.
+  Under the Claude backend it is not defense in depth but the enforced half of
+  the write boundary — see "The source `.git` exposure" in
+  [architecture.md](architecture.md) — so since
+  [PMR-161](https://linear.app/pmrrasmussen/issue/PMR-161) the same verdict also
+  fails the run, as a `source_integrity` dispatch failure. It carries
+  `operation: source_integrity_alert`, `issue_id`/`issue_identifier`,
+  `source_root`, and `changed_refs`: one `name before->after` entry per ref,
+  each carrying `attributed_to=<workspace key>` when a live workspace's own HEAD
+  carries the commit the ref moved to. **Read `attributed_to`, not
+  `issue_identifier`** — the record is filed under whichever run happened to
+  finish first and run the check, which is frequently not the one that wrote
+  the ref; an entry with no `attributed_to` means no live workspace carries that
+  commit. A ref whose classification could not be completed appends
+  `classification_failed=<error>` instead of being dropped. A failure to even
+  compute the post-run fingerprint (for example, the source repository became
+  unreadable) instead logs `"msg":"workspace source integrity check failed"` at
+  **warn**, with the same issue attributes and a bounded `error`, and fails
+  nothing: it is evidence about the check, not about the boundary.
 * `"msg":"workspace hook failed"` covers an `after_run` or `before_remove` hook
   that exits non-zero. Neither hook's failure stops the run or the cleanup it
   brackets, so unlike `before_run` (whose failure reaches the coordinator's own
