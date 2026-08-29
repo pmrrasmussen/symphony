@@ -539,6 +539,46 @@ func (g *overlapTrackingGit) Run(_ context.Context, _ string, args, _ []string) 
 	return "", nil
 }
 
+// landRefreshOverlapGit tracks concurrent "fetch" invocations the way
+// overlapTrackingGit does, but for a landing session: it starts a second
+// session's fetch (onFirstFetch) from inside the landing session's first
+// fetch, then holds that fetch open long enough that an unserialized second
+// fetch would overlap it. Every other git invocation delegates to fakeGit, so
+// landing proceeds normally around it.
+type landRefreshOverlapGit struct {
+	*fakeGit
+	onFirstFetch func()
+
+	overlapMu sync.Mutex
+	active    int
+	maxActive int
+	first     sync.Once
+}
+
+func (g *landRefreshOverlapGit) Run(ctx context.Context, dir string, args, env []string) (string, error) {
+	if args[0] != "fetch" {
+		return g.fakeGit.Run(ctx, dir, args, env)
+	}
+	g.overlapMu.Lock()
+	g.active++
+	if g.active > g.maxActive {
+		g.maxActive = g.active
+	}
+	g.overlapMu.Unlock()
+	g.first.Do(func() { go g.onFirstFetch() })
+	time.Sleep(50 * time.Millisecond)
+	g.overlapMu.Lock()
+	g.active--
+	g.overlapMu.Unlock()
+	return g.fakeGit.Run(ctx, dir, args, env)
+}
+
+func (g *landRefreshOverlapGit) observedMaxActive() int {
+	g.overlapMu.Lock()
+	defer g.overlapMu.Unlock()
+	return g.maxActive
+}
+
 // testLandingSession builds a Session configured for github_land_pr: the
 // fixture's pull request head SHA is set to "head" so it matches fakeGit's
 // default HEAD, meaning no push is exercised unless a test overrides it.
