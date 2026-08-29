@@ -79,8 +79,14 @@ type fakeLinear struct {
 	// simulate a human moving the issue away from Merging. refuseErr and
 	// completeErr let a test simulate the fallback transition or the Done
 	// completion call itself failing independently of the substantive gate.
-	mergeStateErr    error
-	refuseErr        error
+	mergeStateErr error
+	refuseErr     error
+	// refuseNoop makes RefuseLanding report the transition it correctly declines
+	// to make: no configured refuse_landing edge, or an issue that already left
+	// the merge state. It is (false, nil), not an error, and it writes no
+	// transition record -- which is why the caller has to log the gate reason
+	// itself (PMR-169).
+	refuseNoop       bool
 	refused          int
 	refusedDestState string
 	refusedReason    string
@@ -149,6 +155,9 @@ func (l *fakeLinear) RefuseLanding(_ context.Context, mergeState, reason string)
 	defer l.mu.Unlock()
 	if l.refuseErr != nil {
 		return false, l.refuseErr
+	}
+	if l.refuseNoop {
+		return false, nil
 	}
 	l.refused++
 	l.refusedDestState = mergeState
@@ -819,6 +828,24 @@ func logRecordError(t *testing.T, logs, msg string) string {
 		return errText
 	}
 	return ""
+}
+
+// behindBaseGit is a worktree whose HEAD is behind a base branch that is not
+// moving: every base read returns the same commit, and the ancestry question
+// "does the base already contain this head" is answered no. That is what BEHIND
+// means, and it is a different fact from the stale base staleBaseGit simulates
+// (PMR-169). merge-base is the only command whose exit status carries an
+// answer here, so a failure from it is the whole simulation.
+type behindBaseGit struct{ *fakeGit }
+
+func (g *behindBaseGit) Run(ctx context.Context, dir string, args, env []string) (string, error) {
+	if args[0] == "merge-base" {
+		g.mu.Lock()
+		g.calls = append(g.calls, append([]string(nil), args...))
+		g.mu.Unlock()
+		return "", errors.New("not an ancestor")
+	}
+	return g.fakeGit.Run(ctx, dir, args, env)
 }
 
 // alwaysStaleBaseGit makes every base read observe a new commit, including

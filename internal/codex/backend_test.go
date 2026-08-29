@@ -926,7 +926,8 @@ IFS= read -r line
 printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'
 IFS= read -r line
 IFS= read -r line
-case "$line" in *github_publish_pr*github_pr_context*github_land_pr*) ;; *) exit 20;; esac
+case "$line" in *github_pr_context*github_land_pr*) ;; *) exit 20;; esac
+case "$line" in *github_publish_pr*) exit 29;; esac
 printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thread-1"}}}'
 IFS= read -r line
 printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn-1"}}}'
@@ -1273,11 +1274,13 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{}}'
 			if gotLand := strings.Contains(string(data), "github_land_pr"); gotLand != test.wantLand {
 				t.Fatalf("issueState=%q github_land_pr present=%v want=%v params=%s", test.issueState, gotLand, test.wantLand, data)
 			}
-			// Trust boundary: the agent is never advertised a Linear-mutating
-			// tool. github_publish_pr must remain; linear_graphql must be absent.
-			if !strings.Contains(string(data), "github_publish_pr") {
-				t.Fatalf("issueState=%q github_publish_pr missing: %s", test.issueState, data)
+			// The two are exclusive: a landing dispatch's delivery is the merge, so
+			// it is served no publish tool, and a dispatch in any other state is
+			// served publish and no landing tool (PMR-169).
+			if gotPublish := strings.Contains(string(data), "github_publish_pr"); gotPublish == test.wantLand {
+				t.Fatalf("issueState=%q github_publish_pr present=%v alongside github_land_pr present=%v: %s", test.issueState, gotPublish, test.wantLand, data)
 			}
+			// Trust boundary: the agent is never advertised a Linear-mutating tool.
 			if strings.Contains(string(data), "linear_graphql") {
 				t.Fatalf("issueState=%q advertised a Linear-mutating linear_graphql tool: %s", test.issueState, data)
 			}
@@ -1388,8 +1391,10 @@ func TestDynamicToolsWrapEveryDefinitionInTheAppServerEnvelope(t *testing.T) {
 		GitHub:   &githubhost.Session{},
 	})
 	tools := dynamicTools(registry)
-	if len(tools) != 5 {
-		t.Fatalf("wrapped %d tools, want 5", len(tools))
+	// Four, not five: these bindings are a landing dispatch, which is served
+	// github_land_pr in place of github_publish_pr rather than in addition to it.
+	if len(tools) != 4 {
+		t.Fatalf("wrapped %d tools, want 4", len(tools))
 	}
 	for _, tool := range tools {
 		if tool["type"] != "function" {
@@ -1867,13 +1872,19 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{}}'
 	if err != nil {
 		t.Fatal(err)
 	}
-	// The GitHub manager reached capability.Build (all four GitHub tools, land
-	// included for the configured Merging state) and so did the Linear handoff:
-	// without a prepared handoff the GitHub session is never prepared at all.
-	for _, tool := range []string{"refresh_base_ref", "github_publish_pr", "github_pr_context", "github_land_pr"} {
+	// The GitHub manager reached capability.Build (every GitHub tool a landing
+	// dispatch is served, land included for the configured Merging state) and so
+	// did the Linear handoff: without a prepared handoff the GitHub session is
+	// never prepared at all.
+	for _, tool := range []string{"refresh_base_ref", "github_pr_context", "github_land_pr"} {
 		if !strings.Contains(string(params), tool) {
 			t.Fatalf("passed providers did not advertise %s: %s", tool, params)
 		}
+	}
+	// Publish is the one GitHub capability a Merging dispatch is deliberately not
+	// told about, so that landing is its only delivery (PMR-169).
+	if strings.Contains(string(params), "github_publish_pr") {
+		t.Fatalf("a landing dispatch was advertised github_publish_pr: %s", params)
 	}
 	if strings.Contains(string(params), "linear_graphql") {
 		t.Fatalf("advertised a Linear-mutating tool: %s", params)

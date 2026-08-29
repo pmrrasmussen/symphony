@@ -67,6 +67,18 @@ gate). The same reason also lands on the deferred refusal fired after a
 bounded-fix session exhausts its retry attempts (`fireDeferredRefusal`), not
 only on an immediate hard-gate refusal.
 
+A refusal whose fallback transition moves nothing carries that same `operation`
+on a record of its own, because there is no transition record to carry it: the
+configured `refuse_landing` edge may be absent, or the issue may have left
+`merge_state` before the gate fired, and `RefuseLanding` then correctly writes
+nothing at all. `internal/github` logs a warn-level `"msg":"GitHub landing
+refused without a tracker transition"` with `operation: landing_refused`, the
+same `reason` vocabulary above, the issue, and the `branch`; a fallback that
+was attempted and *failed* logs `"msg":"GitHub land Merging fallback
+transition failed"` with that operation and reason plus the transition
+`error`. So every landing refusal is queryable as `landing_refused` carrying a
+reason, whatever the tracker did with it (PMR-169).
+
 That last gate additionally logs a warn-level `"msg":"GitHub land could not
 push branch"` record carrying `push_error`: the underlying `git push` failure
 text, exactly like `github_publish_pr`'s own push gate below. Widening
@@ -77,11 +89,15 @@ never forwarded to the agent (PMR-163).
 A `github_publish_pr` refusal gets the equivalent record, one level earlier in
 the lifecycle: before any push, pull request creation, or Linear handoff has
 happened, so it is not itself a tracker edge and is logged directly rather than
-through `"msg":"Linear transition"`. Every one of Publish's eight refusal gates
+through `"msg":"Linear transition"`. Every one of Publish's nine refusal gates
 logs a warn-level `"msg":"GitHub publish refused"` with `operation:
 publish_refused`, the `reason` that fired, the issue (`issue_id`/
 `issue_identifier`), the `branch`, and -- once the worktree HEAD is known -- a
-`head` short SHA. `reason` is one of: whatever `EnsureActive` returned (the
+`head` short SHA. `reason` is one of: `github publish is not available for an
+issue in the configured Merging state; land the pull request with
+github_land_pr instead` (a landing dispatch, which is served no publish
+capability at all, so this is the record of a call that should not have been
+reachable), whatever `EnsureActive` returned (the
 issue is no longer active), `github publish worktree origin does not match the
 configured repository`, `github publish requires a clean worktree`, `github
 publish requires a committed HEAD`, `github publish requires committed

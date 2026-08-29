@@ -193,7 +193,7 @@ func (b *Backend) Start(ctx context.Context, r domain.AgentRequest) (domain.Agen
 	bindings := capability.Bindings{Settings: settings, Issue: r.Issue, Handoff: handoff, GitHub: githubSession}
 	registry := capability.Build(bindings)
 	advertised := advertisedNames(registry)
-	if err := verifyPromises(settings, r.Prompt, advertised); err != nil {
+	if err := verifyPromises(settings, r.Issue.State, r.Prompt, advertised); err != nil {
 		return domain.AgentSession{}, nil, err
 	}
 	s := &session{id: id, ctx: ctx, registry: registry, advertised: advertised,
@@ -232,13 +232,22 @@ func advertisedNames(registry mcpbridge.Capabilities) []string {
 // function runs against a snapshot the backend read later, and no comparison
 // made purely within either snapshot sees a reload between the two.
 //
-// Three refusals, and they are three different failures: a promise with nothing
-// to serve it; publish advertised with no handoff state to publish into, which
-// is the more damaging direction because LinkAndHandoff mutates GitHub before it
-// fails; and a prompt that names an advertised capability without the rule that
-// maps it to the name this transport serves it under.
+// Four refusals, and they are four different failures: a promise with nothing
+// to serve it; a landing prompt with no landing capability, which would leave a
+// run told to merge holding no tool that can; publish advertised with no handoff
+// state to publish into, which is the more damaging direction because
+// LinkAndHandoff mutates GitHub before it fails; and a prompt that names an
+// advertised capability without the rule that maps it to the name this
+// transport serves it under.
 //
-// That third check is not "no bare name appears": a bare name is legitimate and
+// issueState is why the first check is not settings-only: an enabled landing
+// configuration promises publish for every state except the merge state, where
+// the rendered prompt promises landing instead and the session deliberately
+// advertises no publish capability (PMR-169). Reading the promise off the
+// prompt as well as off the settings keeps that agreement checked in both
+// directions.
+//
+// That last check is not "no bare name appears": a bare name is legitimate and
 // routine, and refusing every one would refuse every real dispatch. The
 // invariant is the conditional one -- a prompt that names an advertised
 // capability must also carry the rule that maps it, because the rule and the
@@ -246,11 +255,15 @@ func advertisedNames(registry mcpbridge.Capabilities) []string {
 //
 // See the package comment, and docs/architecture.md's opening section, for why a
 // cross-check is what stands in for a fix here.
-func verifyPromises(settings config.Settings, prompt string, advertised []string) error {
+func verifyPromises(settings config.Settings, issueState, prompt string, advertised []string) error {
+	landing := settings.GitHub.LandingDispatch(issueState)
 	servesPublish := slices.Contains(advertised, capability.NameGitHubPublishPR)
-	promisesPublish := settings.HostSidePublishPromised() || strings.Contains(prompt, config.HostSidePublishPromiseMarker)
+	promisesPublish := (settings.HostSidePublishPromised() && !landing) || strings.Contains(prompt, config.HostSidePublishPromiseMarker)
 	if promisesPublish && !servesPublish {
 		return fmt.Errorf("claude launch refused: host-side publish is promised for this run but this session advertises no %s capability", capability.NameGitHubPublishPR)
+	}
+	if strings.Contains(prompt, config.LandingDeliveryMarker) && !slices.Contains(advertised, capability.NameGitHubLandPR) {
+		return fmt.Errorf("claude launch refused: landing is promised for this run but this session advertises no %s capability", capability.NameGitHubLandPR)
 	}
 	if servesPublish && strings.TrimSpace(settings.Tracker.HandoffState) == "" {
 		return fmt.Errorf("claude launch refused: this session advertises %s with no tracker.provider.handoff_state, so a publish would leave the pull request created and the issue untransitioned", capability.NameGitHubPublishPR)

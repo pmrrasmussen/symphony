@@ -150,7 +150,8 @@ The local full-lifecycle profile must:
   `github.required_checks`;
 - provide a state-specific `Merging` prompt branch that calls the zero-argument
   `github_land_pr` tool. That branch must not rebuild the change or call
-  `github_publish_pr`; a pending-check result waits in `Merging`, while a hard
+  `github_publish_pr`, which such a dispatch is not served and which refuses if
+  called anyway; a pending-check result waits in `Merging`, while a hard
   refusal uses the host-owned fallback to `In Review`.
 
 Create one disposable issue in `Todo` and observe the complete path: the host

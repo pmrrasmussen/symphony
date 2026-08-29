@@ -393,6 +393,6 @@ func render(s config.Settings, i domain.Issue, attempt int, backend string) (str
 	if err != nil {
 		return "", 0, err
 	}
-	instructions := s.DeliveryInstructions(backend)
+	instructions := s.DeliveryInstructions(backend, i.State)
 	return prompt + "\n\n" + instructions, len(instructions), nil
 }

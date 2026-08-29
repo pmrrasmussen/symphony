@@ -198,6 +198,20 @@ func (s *Session) logPublishRefused(reason, head string, extra ...any) {
 func (s *Session) Publish(ctx context.Context, input PublishInput) (Result, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// A landing run has no publish delivery. EnsureActive below would accept
+	// this session, because the configured merge state is the state it was bound
+	// to and so is its own "initial" state -- and LinkAndHandoff would then walk
+	// an approved issue from Merging back to In Review, costing a second human
+	// approval, a second agent run, and a second CI run to land the same commit.
+	// This is the authority behind capability.Build not advertising publish for a
+	// landing run; the two together are what make a Merging dispatch's outcome
+	// the merge every time rather than whichever tool the model reached for
+	// (PMR-169).
+	if s.settings.LandingDispatch(s.issue.State) {
+		reason := "github publish is not available for an issue in the configured Merging state; land the pull request with github_land_pr instead"
+		s.logPublishRefused(reason, "")
+		return Result{}, errors.New(reason)
+	}
 	if err := s.linear.EnsureActive(ctx); err != nil {
 		s.logPublishRefused(err.Error(), "")
 		return Result{}, err

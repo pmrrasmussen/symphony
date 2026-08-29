@@ -374,7 +374,7 @@ func TestAnAllWhitespaceHandoffStateIsNoHandoffStateAtAll(t *testing.T) {
 		t.Fatal("an all-whitespace handoff state reported a capability as advertisable")
 	}
 	for _, backend := range AgentBackends() {
-		guidance := s.DeliveryInstructions(backend)
+		guidance := s.DeliveryInstructions(backend, "In Progress")
 		if strings.Contains(guidance, HostSidePublishPromiseMarker) {
 			t.Fatalf("backend %q was promised host-side publish: %q", backend, guidance)
 		}
