@@ -48,8 +48,11 @@ type link struct {
 	issueID, identifier string
 	prNumber            int
 	prURL               string
-	settings            config.GitHub
-	linear              linearLifecycle
+	// settings is the configuration this pull request was published under. It
+	// fixes the repository the link's number is meaningful in; the credential
+	// each poll actually authenticates with is re-read live, see pollSettings.
+	settings config.GitHub
+	linear   linearLifecycle
 	// settled marks the end of this link's life: the pull request reached a
 	// terminal observation, so Poll sweeps the link out and no later tick
 	// requests it again. It is also the exactly-once completion guard, because

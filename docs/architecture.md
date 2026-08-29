@@ -1221,10 +1221,21 @@ because neither provider exposes the closure it captured, and Go cannot compare
 closures, so this cannot be enforced in the constructor: `Start` freezes one
 settings snapshot for the session (which capabilities exist, and the
 `config.GitHub` the session is bound to) while the manager independently reads its
-own callback for `Enabled`, `MatchesSecret`, and the read-only `VerifyLanded`.
+own callback for `Enabled`, `MatchesSecret`, the read-only `VerifyLanded`, and
+the credential each poll of a linked pull request authenticates with.
 Feeding them different callbacks makes those disagree -- a session that froze
 GitHub as disabled beside a landing verifier that sees it enabled would let
 terminal cleanup discard local commits for an issue no session ever published.
+
+The poll's credential is on that list because a link outlives the session that
+published it by design: nothing evicts an open pull request on age, so a link
+routinely outlives the token it was published with. Reading only the frozen one
+would make a rotation fail every remaining poll of every un-settled link, once
+per tick for as long as the daemon runs, and none of them would ever observe the
+merge that settles them (PMR-197). Only the repository identity stays frozen --
+the link's number names a pull request there and nowhere else -- and a live
+configuration that stopped describing that repository falls back to the
+snapshot, having no credential for it to offer.
 
 The same reasoning extends to the loopback MCP capability endpoint: it is one
 listener for the daemon's lifetime, shared by every concurrent session and
