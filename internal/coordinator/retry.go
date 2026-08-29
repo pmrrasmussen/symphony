@@ -121,12 +121,12 @@ func (c *Coordinator) runRetry(id string, generation uint64) {
 		// "retry_refresh" is systemic, so failureCounters holds the attempt fixed
 		// here for the same reason the branch above holds it fixed for a landing:
 		// the tracker being unreachable is not an attempt at this issue's work.
-		// Only the backoff climbs, keyed to the outage's own streak.
+		// Only the backoff climbs, keyed to the outage's own streak. There is no
+		// ceiling check either, and its absence is the rule rather than an
+		// oversight: attemptsExhausted refuses every systemic reason, so the check
+		// this site used to make could not return true on any input it had
+		// (PMR-142's exemption, removed here in PMR-191).
 		attempt, escalation, _ := c.failureCounters(id, retry.attempt, "retry_refresh")
-		attrs := []any{"issue_id", retry.issue.ID, "issue_identifier", retry.issue.Identifier, "reason", "retry_refresh", "attempt", attempt}
-		if c.attemptsExhausted(retry.issue, retry.kind, "retry_refresh", attempt, s, attrs) {
-			return
-		}
 		c.scheduleRetry(ctx, retry.issue, retry.workspace, attempt, retry.kind, "retry_refresh", backoff(escalation, s.Agent.MaxRetryBackoff))
 		return
 	}

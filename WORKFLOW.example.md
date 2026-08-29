@@ -151,6 +151,14 @@ agent:
   # start a fresh, equally bounded episode; the error record is the signal that
   # a human, not another retry, is what the issue needs.
   #
+  # "A later poll" is not the next one. Abandonment also cools the issue down
+  # for ten times the longer of max_retry_backoff_ms and polling.interval_ms
+  # (reported as cooldown_ms on that record), during which the poll refuses it
+  # under its own abandon_cooldown reason and lists it in the waiting set. There
+  # is no setting for the window: it is derived so that this ceiling bounds the
+  # spend and not merely one episode of it. The cooldown is in-process, so
+  # restarting the service clears it and re-admits the issue at once.
+  #
   # A non-terminal landing wait is exempt: it is not an agent failure, does not
   # escalate the attempt, and keeps the bounded-delay redispatch described under
   # github.poll_interval_ms below. Defaults to 5; must be a positive integer.

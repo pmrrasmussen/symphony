@@ -20,11 +20,13 @@ import (
 //   - The claim group (claimed, state, reservation, run, retry, landingWaits,
 //     landingEscalated, usage) is created by claim and dropped as a unit by
 //     releaseLocked. Nothing in it outlives the claim.
-//   - handoff, waiting, and waitingEscalated describe an issue Symphony is
-//     *not* currently working: the memory that it drove the issue into the
-//     review handoff state (which must survive the release that immediately
-//     follows the handoff), and the memory that a candidate is sitting idle
-//     for capacity or an open blocker without holding a claim at all.
+//   - handoff, cooldown, waiting, and waitingEscalated describe an issue
+//     Symphony is *not* currently working: the memory that it drove the issue
+//     into the review handoff state (which must survive the release that
+//     immediately follows the handoff), the memory that it abandoned a dispatch
+//     episode (which must survive the release abandonment itself performs), and
+//     the memory that a candidate is sitting idle for capacity, an open
+//     blocker, or that cooldown without holding a claim at all.
 //
 // A record exists only while it remembers something; see stateLive.
 type issueState struct {
@@ -112,14 +114,22 @@ type issueState struct {
 	// which is why releaseLocked leaves it alone. It is in-process only and
 	// discarded safely on restart.
 	handoff *handoffObservation
+	// cooldown records that a dispatch episode for this issue was abandoned at
+	// agent.max_attempts, and holds the issue out of admission until it elapses
+	// (PMR-191). Like handoff it must outlive a release -- abandonDispatch drops
+	// the claim on its way out, so a cooldown in the claim group would be erased
+	// by the very release it exists to survive -- and like handoff it is
+	// in-process only, so a restart readmits the issue immediately.
+	cooldown *abandonCooldown
 	// waiting records a Todo issue that is sitting idle for a reason that earns
 	// neither a claim nor a retry timer, so no other tracking remembers it
-	// (PMR-139, PMR-152): a candidate rejected only for capacity, or one held
-	// ineligible by an open blocker relation, is re-evaluated fresh from
-	// ListCandidates on the next poll, with nothing else tracking it in the
-	// interim. It is cleared the moment the issue is no longer seen in either
-	// state -- admitted, unblocked, turned ineligible for some other reason, or
-	// dropped from the tracker's candidate list.
+	// (PMR-139, PMR-152): a candidate rejected only for capacity, one held
+	// ineligible by an open blocker relation, or one serving the cooldown above,
+	// is re-evaluated fresh from ListCandidates on the next poll, with nothing
+	// else reporting it in the interim. It is cleared the moment the issue is no
+	// longer seen in any of those states -- admitted, unblocked, cooled down,
+	// turned ineligible for some other reason, or dropped from the tracker's
+	// candidate list.
 	waiting *waitingState
 	// waitingEscalated marks that the "still waiting" Warn has already fired
 	// once, mirroring landingEscalated: an issue that stays stuck keeps logging
@@ -134,7 +144,7 @@ type issueState struct {
 // run is checked separately only because it is dropped a moment before the
 // claim it belongs to.
 func (s *issueState) stateLive() bool {
-	return s.claimed || s.run != nil || s.handoff != nil || s.waiting != nil
+	return s.claimed || s.run != nil || s.handoff != nil || s.cooldown != nil || s.waiting != nil
 }
 
 // stateLocked returns the issue's record, or nil when the coordinator
@@ -346,10 +356,10 @@ func (c *Coordinator) capacityAvailableLocked(state string, s config.Settings) b
 
 // release drops an issue's entire claim in one operation: the reservation, any
 // armed retry timer, the landing-wait accounting, the episode's accumulated
-// usage, and the claim itself. The handoff and waiting memories are
+// usage, and the claim itself. The handoff, cooldown, and waiting memories are
 // deliberately untouched -- they describe an issue Symphony is not working, and
-// the handoff one is recorded immediately before the release that ends the run
-// it belongs to.
+// the first two are recorded immediately before the release that ends the
+// episode they belong to.
 func (c *Coordinator) release(id string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

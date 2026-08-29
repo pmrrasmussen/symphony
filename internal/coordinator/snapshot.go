@@ -8,9 +8,13 @@ import (
 )
 
 // waitingState is the coordinator's memory of one issue sitting idle for
-// waitReasonAtCapacity or waitReasonBlockedByRelation. It stores the issue
-// itself, exactly as retryState does, only so Snapshot can report its current
-// identifier and state. blockedBy carries the open blockers' identifiers
+// waitReasonAtCapacity, waitReasonBlockedByRelation, or
+// waitReasonAbandonCooldown. It stores the issue itself, exactly as retryState
+// does, only so Snapshot can report its current identifier and state. The
+// cooldown's own deadline is not copied here: the abandonment record carries
+// the window (see abandonDispatch), and this memory exists to say which issues
+// an operator's poll is currently passing over, not to restate it.
+// blockedBy carries the open blockers' identifiers
 // (PMR-146's blockerIdentifiers, identifiers only, never titles or
 // descriptions) and is set only when reason is waitReasonBlockedByRelation.
 // since is the timestamp of the first poll this issue was seen under its
@@ -31,7 +35,8 @@ type Snapshot struct {
 	Retrying []RetrySnapshot   `json:"retrying"`
 	// Waiting lists an eligible issue that has reserved neither an
 	// orchestrator slot nor (unlike Retrying) a retry timer: a candidate the
-	// poll rejected only for capacity, re-checked fresh on every poll (PMR-139).
+	// poll rejected only for capacity, for an open blocker, or for the cooldown
+	// after an abandoned dispatch, re-checked fresh on every poll (PMR-139).
 	// It never overlaps Running or Retrying -- a claimed issue is removed here
 	// the moment it is claimed.
 	Waiting  []WaitingSnapshot `json:"waiting"`
@@ -83,10 +88,12 @@ type RetrySnapshot struct {
 }
 
 // WaitingSnapshot is one issue sitting idle for waitReasonAtCapacity (eligible
-// but not yet admitted) or waitReasonBlockedByRelation (held ineligible by an
-// open blocker, PMR-146/PMR-152). Reason distinguishes the two; an issue is
-// never reported under both, since dispatchable() decides them in a fixed,
-// mutually exclusive order. BlockedBy carries only the open blockers'
+// but not yet admitted), waitReasonBlockedByRelation (held ineligible by an
+// open blocker, PMR-146/PMR-152), or waitReasonAbandonCooldown (an abandoned
+// dispatch episode's cooldown has not elapsed, PMR-191). Reason distinguishes
+// the three; an issue is never reported under two, since dispatchable() and
+// admissionRejectReason decide them in a fixed, mutually exclusive order.
+// BlockedBy carries only the open blockers'
 // identifiers -- never titles or descriptions -- and is empty for
 // waitReasonAtCapacity. WaitingMS is how long the issue has held its current
 // reason, in milliseconds, computed at snapshot time rather than stored as a

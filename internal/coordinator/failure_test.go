@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -68,6 +69,85 @@ func TestPermanentDispatchFailureStopsAtMaxAttempts(t *testing.T) {
 	// so the abandonment is the only new record on this path.
 	if count := strings.Count(records, `"msg":"agent run retry scheduled"`); count != 2 {
 		t.Fatalf("retry warnings=%d, want one per dispatch below the ceiling: %s", count, records)
+	}
+	if err := c.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestAbandonedDispatchCoolsDownBeforeTheNextEpisode covers the PMR-191
+// defect: abandonment used to be nothing but an error record and a released
+// claim, so the very next poll re-admitted the issue at attempt 0 and a
+// permanently failing one spent max_attempts launches per poll interval for the
+// daemon's lifetime -- a tighter relaunch cadence than the backoff ceiling the
+// episode had just climbed to. Episodes are now separated by
+// abandonCooldownWindow, and the poll rejection in between names its own
+// reason. max_attempts is 1 here so that one launch is one whole episode, and
+// the spacing between launches is exactly what this test measures.
+func TestAbandonedDispatchCoolsDownBeforeTheNextEpisode(t *testing.T) {
+	w := testSettings(t)
+	w.Config.Agent.MaxAttempts = 1
+	w.Config.Agent.MaxRetryBackoff = time.Minute
+	window := abandonCooldownWindow(w.Config)
+	issue := testIssue()
+	var log syncBuffer
+	agent := &fakeAgent{startErr: errors.New("agent binary not found")}
+	ws := &fakeWorkspace{after: make(chan struct{}, 4)}
+	c := New(&fakeTracker{issue: issue}, agent, ws, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&log, nil)))
+	defer assertInvariants(t, c)
+	start := time.Date(2026, 8, 29, 9, 41, 0, 0, time.UTC)
+	clock := &mutableClock{now: start}
+	c.clock = clock
+	timer := &fakeTimer{}
+	c.timer = timer
+
+	c.Tick(context.Background())
+	<-ws.after
+	waitForRelease(t, c, issue.ID)
+	record := waitForSubstring(t, &log, `"msg":"dispatch abandoned after max attempts"`, time.Second)
+	if want := `"cooldown_ms":` + strconv.FormatInt(window.Milliseconds(), 10); !strings.Contains(record, want) {
+		t.Fatalf("abandonment record missing %s: %s", want, record)
+	}
+	cooldown, ok := c.abandonCooldownMemory(issue.ID)
+	if !ok || !cooldown.until.Equal(start.Add(window)) {
+		t.Fatalf("cooldown=%+v ok=%v, want one ending at %s", cooldown, ok, start.Add(window))
+	}
+
+	// One tick short of the deadline: the issue is still a candidate, still
+	// eligible, and still refused -- under its own reason, not for capacity.
+	clock.set(start.Add(window - time.Second))
+	c.Tick(context.Background())
+
+	if starts, _, _ := agent.counts(); starts != 1 {
+		t.Fatalf("starts=%d, want the cooldown to hold the second episode back", starts)
+	}
+	waiting := c.Snapshot().Waiting
+	if len(waiting) != 1 || waiting[0].IssueIdentifier != "ENG-1" || waiting[0].Reason != waitReasonAbandonCooldown {
+		t.Fatalf("waiting=%+v, want ENG-1 named as %s", waiting, waitReasonAbandonCooldown)
+	}
+	if records := log.String(); !strings.Contains(records, `"msg":"issue cooling down after an abandoned dispatch"`) {
+		t.Fatalf("the cooldown wait was not reported: %s", records)
+	}
+
+	// At the deadline the issue is admitted again, and the fresh episode is
+	// abandoned and cooled down exactly like the first.
+	clock.set(start.Add(window))
+	c.Tick(context.Background())
+	<-ws.after
+	waitForRelease(t, c, issue.ID)
+
+	if starts, _, _ := agent.counts(); starts != 2 {
+		t.Fatalf("starts=%d, want a second episode once the cooldown elapsed", starts)
+	}
+	records := log.String()
+	if count := strings.Count(records, `"msg":"dispatch abandoned after max attempts"`); count != 2 {
+		t.Fatalf("abandonments=%d, want one per episode: %s", count, records)
+	}
+	if next, ok := c.abandonCooldownMemory(issue.ID); !ok || !next.until.Equal(start.Add(2*window)) {
+		t.Fatalf("cooldown=%+v ok=%v, want the second episode to cool down too", next, ok)
+	}
+	if len(timer.delays) != 0 {
+		t.Fatalf("armed %d retries, want none: a cooldown is not a retry timer", len(timer.delays))
 	}
 	if err := c.Shutdown(context.Background()); err != nil {
 		t.Fatal(err)

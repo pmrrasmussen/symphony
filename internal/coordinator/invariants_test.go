@@ -79,6 +79,12 @@ func (c *Coordinator) checkInvariants() error {
 		// The waiting escalation likewise only under a wait.
 		case st.waitingEscalated && st.waiting == nil:
 			return fmt.Errorf("%s: escalated a wait it is not in", id)
+		// An abandonment cooldown and a claim are mutually exclusive: the cooldown
+		// is recorded as the abandoned episode's claim is dropped, and claim clears
+		// an elapsed one on its way in, so a record holding both would mean an
+		// issue was re-admitted during its own cooldown (PMR-191).
+		case st.claimed && st.cooldown != nil:
+			return fmt.Errorf("%s: is claimed while cooling down after an abandoned dispatch", id)
 		}
 		if st.reservation != 0 {
 			admitted++
@@ -160,6 +166,17 @@ func (c *Coordinator) handoffMemory(id string) (handoffObservation, bool) {
 		return *st.handoff, true
 	}
 	return handoffObservation{}, false
+}
+
+// abandonCooldownMemory returns a copy of the issue's abandonment cooldown, if
+// it still has one.
+func (c *Coordinator) abandonCooldownMemory(id string) (abandonCooldown, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if st := c.states[id]; st != nil && st.cooldown != nil {
+		return *st.cooldown, true
+	}
+	return abandonCooldown{}, false
 }
 
 // landingWaitRecords is the number of issues carrying landing-wait

@@ -34,6 +34,7 @@ func TestStatusViewRendersOnlySafeRuntimeFields(t *testing.T) {
 					Waiting: []coordinator.WaitingSnapshot{
 						{IssueIdentifier: "PMR-77", IssueState: "Merging", Reason: "at_capacity", Since: now.Add(-10 * time.Minute), WaitingMS: 600000},
 						{IssueIdentifier: "PMR-90", IssueState: "Todo", Reason: "blocked_by_relation", BlockedBy: []string{"PMR-70"}, Since: now.Add(-5 * time.Minute), WaitingMS: 300000},
+						{IssueIdentifier: "PMR-91", IssueState: "Todo", Reason: "abandon_cooldown", Since: now.Add(-time.Minute), WaitingMS: 60000},
 					},
 				},
 			},
@@ -43,7 +44,7 @@ func TestStatusViewRendersOnlySafeRuntimeFields(t *testing.T) {
 	model := New([]operator.Instance{instance}, now)
 	model, _ = model.Update("enter")
 	view := model.View(now)
-	for _, want := range []string{"PMR-75 (In Progress)", "turns 4/20", "tokens: input 12, output 3, total 15", "waiting: mcpToolCall github_pr_context", "Retry PMR-76", "Waiting PMR-77 (Merging)", "Waiting PMR-90 (Todo): blocked by PMR-70", "Recent redacted lifecycle activity", "issue claimed"} {
+	for _, want := range []string{"PMR-75 (In Progress)", "turns 4/20", "tokens: input 12, output 3, total 15", "waiting: mcpToolCall github_pr_context", "Retry PMR-76", "Waiting PMR-77 (Merging)", "Waiting PMR-90 (Todo): blocked by PMR-70", "Waiting PMR-91 (Todo): cooling down after an abandoned dispatch", "Recent redacted lifecycle activity", "issue claimed"} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("status view missing %q:\n%s", want, view)
 		}
