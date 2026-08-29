@@ -208,6 +208,124 @@ func TestLandRefusesOnUnresolvedReviewThreads(t *testing.T) {
 	}
 }
 
+// TestLandReadsGatesPastTheFirstPage drives the three gate inputs that used to
+// be read one page deep, each with its deciding item placed past that page.
+// Landing must reach the same outcome it would have reached had the item been
+// on page one: the required check lands, the unresolved thread and the
+// changes-requested review do not (PMR-190).
+func TestLandReadsGatesPastTheFirstPage(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		configure func(*apiFixture)
+		wantMerge bool
+		wantGate  string
+	}{
+		{
+			name: "required check on the second page lands",
+			configure: func(api *apiFixture) {
+				passingRequiredChecks(api, "noise/a", "noise/b", "ci/build")
+			},
+			wantMerge: true,
+		},
+		{
+			name: "unresolved thread past the first page does not merge",
+			configure: func(api *apiFixture) {
+				passingRequiredChecks(api, "ci/build")
+				api.threadPageSize = 2
+				api.threads = []map[string]any{{"isResolved": true}, {"isResolved": true}, {"isResolved": false}}
+			},
+			wantGate: "unresolved review threads",
+		},
+		{
+			name: "changes-requested review past the first page does not merge",
+			configure: func(api *apiFixture) {
+				passingRequiredChecks(api, "ci/build")
+				api.reviews = append(api.reviews,
+					map[string]any{"user": map[string]any{"login": "carol"}, "state": "COMMENTED", "body": "one thought", "submitted_at": "t2"},
+					map[string]any{"user": map[string]any{"login": "bob"}, "state": "CHANGES_REQUESTED", "body": "no", "submitted_at": "t3"})
+			},
+			wantGate: "effective changes-requested review",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			api, git, linear := newAPI(t), &fakeGit{}, &fakeLinear{}
+			api.prExists = true
+			readyToLand(api)
+			// Two per page: every collection this test configures puts its
+			// deciding entry third or later, so page one alone cannot decide.
+			api.pageSize = 2
+			test.configure(api)
+			_, session := testLandingSession(t, api, git, linear, []string{"ci/build"}, "merge")
+			result, err := session.Land(context.Background())
+			if test.wantMerge {
+				if err != nil {
+					t.Fatalf("landing failed: %v", err)
+				}
+				if result.Status != LandMerged || api.merges != 1 {
+					t.Fatalf("result=%+v merges=%d", result, api.merges)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), test.wantGate) {
+				t.Fatalf("error=%v want a %q gate", err, test.wantGate)
+			}
+			if api.merges != 0 || linear.landCompleted != 0 {
+				t.Fatalf("a gate past the first page merged anyway: merges=%d completed=%d", api.merges, linear.landCompleted)
+			}
+		})
+	}
+}
+
+// TestLandWaitsWhenTheReviewThreadListingIsIncomplete pins the fail-closed
+// direction of the one gate whose completeness the adapter can only report,
+// not repair: threads exist that the bounded cursor walk never read, so every
+// thread it did see being resolved does not prove there is no unresolved one.
+// Landing waits -- keeping the issue in Merging for a human -- rather than
+// merging past a hard gate it could not read (PMR-190).
+func TestLandWaitsWhenTheReviewThreadListingIsIncomplete(t *testing.T) {
+	api, git, linear := newAPI(t), &fakeGit{}, &fakeLinear{}
+	api.prExists = true
+	passingRequiredChecks(api, "ci/build")
+	readyToLand(api)
+	// Every thread served is resolved, but the connection counts more than the
+	// walk could read, which is what exceeding the page cap looks like.
+	api.threads = []map[string]any{{"isResolved": true}}
+	api.threadsTotal = 5000
+	_, session := testLandingSession(t, api, git, linear, []string{"ci/build"}, "merge")
+	result, err := session.Land(context.Background())
+	if err != nil {
+		t.Fatalf("an unreadable thread listing must wait, not error: %v", err)
+	}
+	if result.Status != LandWaiting || result.Reason != "github review threads could not be read completely" {
+		t.Fatalf("result=%+v", result)
+	}
+	if api.merges != 0 || linear.landCompleted != 0 || linear.refused != 0 {
+		t.Fatalf("waiting mutated GitHub or Linear: merges=%d completed=%d refused=%d", api.merges, linear.landCompleted, linear.refused)
+	}
+}
+
+// TestLandDoesNotWaitOnTheReviewExcerptCap guards against the inverse mistake:
+// reviews' third return is an excerpt cap, not a completeness signal, so a
+// pull request with more than contextMaxItems reviews must land normally
+// instead of parking in a permanent wait (PMR-190).
+func TestLandDoesNotWaitOnTheReviewExcerptCap(t *testing.T) {
+	api, git, linear := newAPI(t), &fakeGit{}, &fakeLinear{}
+	api.prExists = true
+	passingRequiredChecks(api, "ci/build")
+	readyToLand(api)
+	for range contextMaxItems + 5 {
+		api.reviews = append(api.reviews, map[string]any{"user": map[string]any{"login": "carol"}, "state": "COMMENTED", "body": "thoughts", "submitted_at": "t2"})
+	}
+	_, session := testLandingSession(t, api, git, linear, []string{"ci/build"}, "merge")
+	result, err := session.Land(context.Background())
+	if err != nil {
+		t.Fatalf("landing failed: %v", err)
+	}
+	if result.Status != LandMerged || api.merges != 1 {
+		t.Fatalf("result=%+v merges=%d", result, api.merges)
+	}
+}
+
 func TestLandWaitsWhileMergeabilityIsUndetermined(t *testing.T) {
 	api, git, linear := newAPI(t), &fakeGit{}, &fakeLinear{}
 	api.prExists = true

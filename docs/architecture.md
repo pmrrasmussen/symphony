@@ -227,8 +227,17 @@ reviewer approves or re-requests and a plain comment review does not clear it
 (PMR-174); moving the issue to `merge_state` is itself the human approval, so
 no separate approving review is required), unresolved review
 threads, the pull request's state and mergeability, and the base commit
-again. Missing or pending required checks, or undetermined mergeability,
-return a non-terminal waiting result without mutating Linear. A waiting result
+again. Each of those listings is read to its end, not one page deep: the two
+check tables and the review listing follow GitHub's `Link` pagination at
+`per_page=100`, and the review threads follow their GraphQL cursor, both
+bounded by a page cap. GitHub's own 30-item default would otherwise hide a
+required check, a changes-requested review, or an unresolved thread on page two
+of a busy pull request from gates that, with no branch protection binding the
+daemon's token, are the only gates there are (PMR-190). Missing or pending
+required checks, undetermined mergeability, or a review-thread listing the
+capped walk could not read completely — every thread it saw is resolved, but
+not every thread — return a non-terminal waiting result without mutating
+Linear. A waiting result
 is settled by the host, not by the model (PMR-78): it ends the logical run at
 once, releases the concurrency slot, keeps the issue in `merge_state`, and the
 coordinator schedules one delayed landing redispatch whose timer holds only the
