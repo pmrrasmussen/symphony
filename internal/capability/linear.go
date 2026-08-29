@@ -3,6 +3,7 @@ package capability
 import (
 	"context"
 	"encoding/json"
+	"errors"
 
 	"github.com/pmrrasmussen/symphony/internal/domain"
 	"github.com/pmrrasmussen/symphony/internal/linear"
@@ -29,7 +30,10 @@ func (c followupIssueCapability) Definition() Definition {
 				// The title bound is the provider's own. The description and
 				// acceptance-criteria bounds are per field, while the provider
 				// bounds the rendered body they are combined into; the invariant
-				// test asserts they cannot sum past it.
+				// test asserts they cannot sum past it. Every bound below and every
+				// bound the provider enforces counts code points, the unit a schema
+				// maxLength counts, so a schema-valid non-ASCII body cannot be
+				// refused by a bound the agent was never told about (PMR-183).
 				"title":               map[string]any{"type": "string", "minLength": 1, "maxLength": linear.MaxFollowupIssueTitleRunes},
 				"description":         map[string]any{"type": "string", "minLength": 1, "maxLength": 16000},
 				"acceptance_criteria": map[string]any{"type": "string", "minLength": 1, "maxLength": 4000},
@@ -47,11 +51,29 @@ func (c followupIssueCapability) Prepare(arguments json.RawMessage) (Invocation,
 	return func(ctx context.Context) (Result, *Failure) {
 		result, err := c.handoff.CreateFollowupIssue(ctx, arguments)
 		if err != nil {
-			// Do not return provider errors, issue data, or any credential-derived
-			// value to the child. The generic response is enough for the model to
-			// choose another path.
-			return Result{}, &Failure{Message: "Linear follow-up issue creation was rejected.", Outcome: domain.ItemFailed}
+			return Result{}, followupRefusal(err)
 		}
 		return Result{Success: result.Success, Payload: result.Data}, nil
 	}, nil
+}
+
+// followupRefusal splits the provider's refusals the way every GitHub
+// capability already splits its own (PMR-132, PMR-149). The provider owns this
+// capability's argument validation, so its request refusals -- an invalid
+// title, a missing field, an exceeded bound, a scope that no longer holds --
+// are the only account of what was wrong with the call, and each is a fixed
+// host-authored string (linear.Error.RefusesRequest). Collapsing them left a
+// model with nothing to act on but the identical call it had just made
+// (PMR-183), so they are forwarded.
+//
+// Everything else -- a transport failure, a provider response -- keeps the
+// generic message: no provider error, issue data, or credential-derived value
+// reaches the child, and knowing the round trip failed is enough for the model
+// to choose another path.
+func followupRefusal(err error) *Failure {
+	var refusal *linear.Error
+	if errors.As(err, &refusal) && refusal.RefusesRequest() {
+		return &Failure{Message: "Linear follow-up issue creation needs a fix: " + refusal.Message + ".", Outcome: domain.ItemFailed}
+	}
+	return &Failure{Message: "Linear follow-up issue creation was rejected.", Outcome: domain.ItemFailed}
 }

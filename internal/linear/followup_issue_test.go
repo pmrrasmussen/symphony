@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -28,6 +29,8 @@ type followupIssueFixture struct {
 	relations          []struct{ Origin, Followup, Kind string }
 	failCreate         bool
 	failRelation       bool
+	failRead           bool
+	failReadBody       string
 	createdParentID    string
 	createdStateName   string
 }
@@ -74,6 +77,11 @@ func (f *followupIssueFixture) serveHTTP(w http.ResponseWriter, r *http.Request)
 	variables, _ := request["variables"].(map[string]any)
 	switch {
 	case strings.Contains(query, "SymphonyLinearHandoffIssue"):
+		if f.failRead {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(f.failReadBody))
+			return
+		}
 		writeJSON(f.t, w, map[string]any{"data": map[string]any{"issue": map[string]any{
 			"id": "active", "identifier": "PMR-41", "title": "Current task", "description": "private agent payload", "url": "https://linear.app/issue/PMR-41",
 			"project": map[string]string{"id": f.projectID, "slugId": f.project}, "team": map[string]string{"id": f.team},
@@ -259,6 +267,111 @@ func TestCreateFollowupIssueRejectsInvalidAndUnsupportedInput(t *testing.T) {
 	}
 	if len(f.created) != 0 {
 		t.Fatalf("created issues from invalid input: %+v", f.created)
+	}
+}
+
+// TestCreateFollowupIssueRefusalsNameWhatWasWrongAndAreForwardable is the
+// provider half of PMR-183: internal/capability forwards the message of a
+// refusal whose category RefusesRequest accepts, so each of these sentences is
+// what the model reads and has to act on. Pinning them here is what makes that
+// forwarding safe to widen -- a message that starts carrying provider text
+// fails this test before it reaches an agent.
+func TestCreateFollowupIssueRefusalsNameWhatWasWrongAndAreForwardable(t *testing.T) {
+	f := newFollowupIssueFixture(t)
+	session := f.session(t)
+	oversizedTitle, _ := json.Marshal(map[string]any{
+		"title": strings.Repeat("t", MaxFollowupIssueTitleRunes+1), "description": "d", "acceptance_criteria": "a",
+	})
+	oversizedBody, _ := json.Marshal(map[string]any{
+		"title": "t", "description": strings.Repeat("d", MaxFollowupIssueBodyRunes), "acceptance_criteria": "a",
+	})
+	for name, test := range map[string]struct{ arguments, message string }{
+		"non-object arguments": {`[]`, "tool arguments must be a JSON object"},
+		"unsupported field":    {`{"title":"t","description":"d","acceptance_criteria":"a","project":"other"}`, "tool arguments contain an unsupported field"},
+		"wrong field type":     {`{"title":7,"description":"d","acceptance_criteria":"a"}`, "tool arguments have invalid field types"},
+		"oversized title":      {string(oversizedTitle), "follow-up issue title is invalid"},
+		"blank description":    {`{"title":"t","description":" ","acceptance_criteria":"a"}`, "follow-up issue description and acceptance criteria are required"},
+		"oversized body":       {string(oversizedBody), "follow-up issue description is too large"},
+		"invalid relationship": {`{"title":"t","description":"d","acceptance_criteria":"a","relationship":"blocks_other"}`, "follow-up issue relationship is invalid"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := session.CreateFollowupIssue(context.Background(), json.RawMessage(test.arguments))
+			var refusal *Error
+			if !errors.As(err, &refusal) {
+				t.Fatalf("accepted invalid input %s: %v", test.arguments, err)
+			}
+			if !refusal.RefusesRequest() {
+				t.Fatalf("category %q is not forwardable, so %q never reaches the agent", refusal.Category, refusal.Message)
+			}
+			if refusal.Message != test.message {
+				t.Fatalf("message = %q, want %q", refusal.Message, test.message)
+			}
+		})
+	}
+
+	// A scope refusal is forwardable for the same reason: the agent can read
+	// that the issue moved and stop retrying.
+	f.stateID, f.stateName = "done", "Done"
+	_, err := createFollowupIssue(session, validFollowupArgs())
+	var refusal *Error
+	if !errors.As(err, &refusal) || !refusal.RefusesRequest() || refusal.Message != "active issue state changed after session setup" {
+		t.Fatalf("scope refusal = %v", err)
+	}
+	if len(f.created) != 0 {
+		t.Fatalf("created issues from refused calls: %+v", f.created)
+	}
+}
+
+// TestCreateFollowupIssueRoundTripFailuresAreNotForwardable is the other half:
+// a failure that describes a round trip rather than the request must answer
+// false, so its caller keeps a generic refusal. The read below plants a secret
+// in the response body to prove that what is withheld is exactly the class of
+// message a provider can influence.
+func TestCreateFollowupIssueRoundTripFailuresAreNotForwardable(t *testing.T) {
+	t.Run("create rejected by Linear", func(t *testing.T) {
+		f := newFollowupIssueFixture(t)
+		f.failCreate = true
+		_, err := createFollowupIssue(f.session(t), validFollowupArgs())
+		var refusal *Error
+		if !errors.As(err, &refusal) || refusal.Category != "handoff_response" || refusal.RefusesRequest() {
+			t.Fatalf("create failure = %v", err)
+		}
+	})
+
+	t.Run("transport failure", func(t *testing.T) {
+		f := newFollowupIssueFixture(t)
+		session := f.session(t)
+		f.failRead, f.failReadBody = true, "wire-secret-should-never-reach-the-agent"
+		_, err := createFollowupIssue(session, validFollowupArgs())
+		var refusal *Error
+		if !errors.As(err, &refusal) || refusal.RefusesRequest() {
+			t.Fatalf("transport failure = %v", err)
+		}
+		if strings.Contains(refusal.Message, "wire-secret") {
+			t.Fatalf("message carried the response body: %q", refusal.Message)
+		}
+	})
+}
+
+// TestCreateFollowupIssueBoundsTheBodyInTheUnitTheSchemaAdvertises covers the
+// units half of PMR-183: the advertised per-field bounds are code points, so a
+// description that fills them with non-ASCII text -- which used to exceed a
+// byte bound the agent was never told about -- is created, not refused.
+func TestCreateFollowupIssueBoundsTheBodyInTheUnitTheSchemaAdvertises(t *testing.T) {
+	f := newFollowupIssueFixture(t)
+	args := validFollowupArgs()
+	// The advertised maxLength of each field, in the unit maxLength counts,
+	// filled with runes that are two and three bytes wide.
+	args["description"] = strings.Repeat("æ", 16000)
+	args["acceptance_criteria"] = strings.Repeat("→", 4000)
+	if _, err := createFollowupIssue(f.session(t), args); err != nil {
+		t.Fatalf("a schema-valid non-ASCII body was refused: %v", err)
+	}
+	if len(f.created) != 1 {
+		t.Fatalf("created=%d", len(f.created))
+	}
+	if body := f.created[0]["description"].(string); len([]rune(body)) > MaxFollowupIssueBodyRunes || len([]byte(body)) <= MaxFollowupIssueBodyRunes {
+		t.Fatalf("body is %d runes / %d bytes, which does not exercise the unit difference", len([]rune(body)), len([]byte(body)))
 	}
 }
 

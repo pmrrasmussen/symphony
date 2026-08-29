@@ -185,15 +185,20 @@ func TestAdvertisedBoundsMatchTheProviderThatEnforcesThem(t *testing.T) {
 	}
 	// The provider bounds the rendered body rather than the two fields it is
 	// built from, so the advertised per-field bounds must not be able to sum
-	// past it -- otherwise a schema-valid call is refused after acceptance.
+	// past it -- otherwise a schema-valid call is refused after acceptance. The
+	// sum is only meaningful because both sides count code points: while the
+	// provider counted bytes, these bounds summed past it for any non-ASCII
+	// body and this assertion proved nothing about them (PMR-183).
 	description, okDescription := schemaBound(followup, "description")
 	acceptance, okAcceptance := schemaBound(followup, "acceptance_criteria")
 	if !okDescription || !okAcceptance {
 		t.Fatalf("follow-up body bounds unreadable: description ok=%v acceptance ok=%v", okDescription, okAcceptance)
 	}
-	const separatorBytes = len("\n\n## Acceptance criteria\n\n")
-	if total := description + acceptance + separatorBytes; total > linear.MaxFollowupIssueBodyBytes {
-		t.Fatalf("advertised body bounds sum to %d, past the provider bound %d", total, linear.MaxFollowupIssueBodyBytes)
+	// The heading the provider joins the two fields with is ASCII, so its byte
+	// length is also its code-point length.
+	const separatorRunes = len("\n\n## Acceptance criteria\n\n")
+	if total := description + acceptance + separatorRunes; total > linear.MaxFollowupIssueBodyRunes {
+		t.Fatalf("advertised body bounds sum to %d, past the provider bound %d", total, linear.MaxFollowupIssueBodyRunes)
 	}
 	// The two body bounds are advertised values in their own right, not just
 	// summands, so pin them: widening one silently narrows what the other may use.

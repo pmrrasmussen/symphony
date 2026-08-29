@@ -59,6 +59,31 @@ func trackerError(category, message string) error {
 	return &Error{Category: category, Message: message}
 }
 
+// RefusesRequest reports whether this error rejected the caller's own request --
+// its arguments, a bound they exceeded, or the scope and configuration that
+// request needs -- rather than reporting how a provider round trip went. Every
+// message under these three categories is a fixed string written in this
+// package, with no provider or wire-decoded text in it, so a bounded session
+// capability may forward Message to the agent verbatim instead of collapsing it
+// into a refusal that names nothing (PMR-183). The categories are enumerated
+// rather than inferred: a new category is not forwardable until it is added
+// here and its messages have been read.
+//
+// Every other category -- the tracker_* transport, status, and response
+// failures, and the handoff_response ones -- answers false. Those describe the
+// host's side of a round trip the agent cannot act on, and are also the only
+// ones a hostile provider response has any bearing on.
+func (e *Error) RefusesRequest() bool {
+	if e == nil {
+		return false
+	}
+	switch e.Category {
+	case "handoff_request", "handoff_scope", "invalid_tracker_config":
+		return true
+	}
+	return false
+}
+
 // classifyRequestError distinguishes the three ways client.Do can fail so a
 // caller-cancelled refresh (routine whenever a run ends mid-request), a
 // client-side timeout, and every other transport failure are no longer the

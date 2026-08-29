@@ -14,13 +14,20 @@ import (
 
 // MaxFollowupIssueTitleRunes is the single source for both the check below and
 // the advertised create_followup_issue schema, which reads it from
-// internal/capability. MaxFollowupIssueBodyBytes bounds the rendered body the
+// internal/capability. MaxFollowupIssueBodyRunes bounds the rendered body the
 // description and acceptance criteria are combined into, so it is not a
 // per-field schema bound; an invariant test asserts the per-field schema bounds
 // cannot sum past it.
+//
+// Both bounds count code points, because that is the unit a JSON Schema
+// maxLength counts: a byte bound here would make the advertised per-field
+// bounds sum past this one for any non-ASCII text, so a schema-valid
+// description could still be refused (PMR-183). The rendered body therefore
+// reaches Linear as at most four times this many bytes, which is the size of
+// one ordinary GraphQL mutation and not a payload worth a second bound.
 const (
 	MaxFollowupIssueTitleRunes = 255
-	MaxFollowupIssueBodyBytes  = 20 << 10
+	MaxFollowupIssueBodyRunes  = 20 << 10
 )
 
 type followupIssueRef struct {
@@ -65,7 +72,7 @@ func (s *HandoffSession) CreateFollowupIssue(ctx context.Context, arguments json
 		return ToolResult{}, trackerError("handoff_request", "follow-up issue description and acceptance criteria are required")
 	}
 	body := description + "\n\n## Acceptance criteria\n\n" + acceptanceCriteria
-	if len([]byte(body)) > MaxFollowupIssueBodyBytes {
+	if len([]rune(body)) > MaxFollowupIssueBodyRunes {
 		return ToolResult{}, trackerError("handoff_request", "follow-up issue description is too large")
 	}
 	relationship := strings.TrimSpace(input.Relationship)
