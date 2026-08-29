@@ -191,14 +191,18 @@ func (g *Registration) callTool(params json.RawMessage, respond func(map[string]
 		respond(toolResult(capability.Outcome{Refusal: capability.Unsupported()}))
 		return
 	}
-	// The session context, never the request's: see Register.
+	// The session context, never the request's: see Register. The argument object
+	// is handed over exactly as it arrived, absent field and all: MCP declares it
+	// optional, but whether an absent one is refused is refusal semantics, so the
+	// mapping onto the registry's empty object belongs to the shared dispatch,
+	// where both transports get it (PMR-186).
 	capability.Dispatch(g.sessionCtx, g.capabilities, capability.Transport{
 		CallID:  nextCallID(),
 		Respond: func(outcome capability.Outcome) { respond(toolResult(outcome)) },
 		Emit:    g.emit,
 		Allow:   g.advertises,
 		Enter:   g.enterCall,
-	}, call.Name, arguments(call.Arguments))
+	}, call.Name, call.Arguments)
 }
 
 // enterCall claims the single invocation slot for one dispatched call and
@@ -244,20 +248,6 @@ func (g *Registration) advertises(name string) bool {
 		}
 	}
 	return false
-}
-
-// arguments normalizes an absent argument object. MCP declares "arguments"
-// optional, so a zero-argument tool call may legitimately arrive without it,
-// while the registry's canonical spelling of "no arguments" is the empty JSON
-// object and its decoder refuses absent bytes -- an omitted field would turn
-// every zero-argument capability into a permanent refusal. The mapping is a
-// transport normalization only: any argument content at all is passed through
-// untouched for the capability to validate.
-func arguments(raw json.RawMessage) json.RawMessage {
-	if len(raw) == 0 || string(raw) == "null" {
-		return json.RawMessage("{}")
-	}
-	return raw
 }
 
 // gateRefusal turns a closed invocation slot into text the model can act on.

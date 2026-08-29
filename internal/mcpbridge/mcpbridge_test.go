@@ -1228,10 +1228,14 @@ func TestInvocationNeverRunsOnTheRequestContext(t *testing.T) {
 	}
 }
 
-// TestAbsentArgumentsBecomeAnEmptyObject covers the one normalization this
-// transport performs. MCP declares arguments optional, and the registry's
-// zero-argument decoder accepts only an empty object, so an omitted field would
-// otherwise refuse every zero-argument capability for good.
+// TestAbsentArgumentsBecomeAnEmptyObject pins what an MCP tool call whose
+// arguments are absent, null, or empty reaches a capability as. The mapping
+// itself is the shared dispatch's since PMR-186 -- refusing an absent argument
+// object is refusal semantics, and this transport had it while the Codex one did
+// not -- so what is asserted here is that carrying the request over HTTP and
+// JSON-RPC preserves the distinction the dispatch acts on: an omitted field
+// arrives as absent bytes rather than as something already filled in or already
+// refused.
 func TestAbsentArgumentsBecomeAnEmptyObject(t *testing.T) {
 	seen := make(chan string, 1)
 	registry := newRegistry().withPrepare("tool", func(arguments json.RawMessage) (capability.Invocation, *capability.Failure) {

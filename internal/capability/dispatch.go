@@ -124,7 +124,7 @@ func Dispatch(ctx context.Context, resolver Resolver, transport Transport, name 
 		transport.Respond(Outcome{Refusal: unsupported()})
 		return
 	}
-	invoke, failure := bound.Prepare(arguments)
+	invoke, failure := bound.Prepare(normalizeArguments(arguments))
 	if failure != nil {
 		// A rejected argument list precedes the call, so it is not reported as one.
 		transport.Respond(Outcome{Refusal: failure})
@@ -148,17 +148,50 @@ func Dispatch(ctx context.Context, resolver Resolver, transport Transport, name 
 	}
 	payload, err := json.Marshal(result.Payload)
 	if err != nil {
+		// The invocation already ran and its provider already mutated, so this is
+		// not the unknown-capability refusal: answering "Unsupported client-side
+		// tool." would tell the model the tool it just ran does not exist, and
+		// invite it to find another route to work that has already happened. For
+		// the same reason the terminal outcome below is still emitted -- a merged
+		// landing must end the run whether or not its receipt could be encoded.
 		call.finished(domain.ItemFailed)
-		transport.Respond(Outcome{Refusal: unsupported()})
-		return
+		transport.Respond(Outcome{Refusal: &Failure{
+			Message: "This tool ran, but its result could not be encoded. Do not repeat the call: whatever it did has already happened.",
+			Outcome: domain.ItemFailed,
+		}})
+	} else {
+		call.finished(domain.ItemCompleted)
+		transport.Respond(Outcome{Payload: payload, Success: result.Success})
 	}
-	call.finished(domain.ItemCompleted)
-	transport.Respond(Outcome{Payload: payload, Success: result.Success})
 	if result.Terminal != "" {
 		// A capability may settle the whole run. Reason is a fixed, bounded string
 		// owned by the provider.
 		transport.Emit(domain.Event{Kind: result.Terminal, At: time.Now(), Message: result.Reason})
 	}
+}
+
+// normalizeArguments maps an absent argument object onto the registry's
+// canonical spelling of "no arguments", the empty JSON object. Both wire
+// protocols declare that object optional, so a zero-argument capability may
+// legitimately be called without one, while decodeNoInput accepts only an empty
+// object -- an omitted or null field would otherwise turn every zero-argument
+// capability into a permanent refusal.
+//
+// Whether absent arguments are refused is refusal semantics, which is exactly
+// what this dispatch exists to keep identical for both transports. It lived in
+// internal/mcpbridge alone and the Codex adapter had already drifted, so the
+// same app-server behaviour would have refused github_pr_context for good over
+// one transport and not the other (PMR-186).
+//
+// Any argument content at all is passed through untouched, for the capability
+// and its provider to validate. The work is a length check and a two-byte
+// literal because the Codex adapter dispatches inline from the read loop that is
+// the only consumer of its child's stdout: nothing here may block it.
+func normalizeArguments(raw json.RawMessage) json.RawMessage {
+	if len(raw) == 0 || string(raw) == "null" {
+		return json.RawMessage("{}")
+	}
+	return raw
 }
 
 // lifecycle reports one call's start and finish as dynamicToolCall item records,
