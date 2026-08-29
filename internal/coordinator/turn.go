@@ -150,7 +150,13 @@ func continuationGuidance(turn, maxTurns int) string {
 
 func (c *Coordinator) finishRun(r *running, completed bool, stopped stopReason, ctx context.Context, err error) {
 	c.mu.Lock()
-	switch {
+	// A failure is classified from the typed error it ended with -- the same
+	// classification finishFailure's reason and retry policy come from -- and
+	// never from that error's text. Matching "timeout" anywhere in the message
+	// recorded a tracker outage wrapped in an issueRefreshError as an agent
+	// timeout: a status about the agent, asserted from evidence about Linear
+	// (PMR-179).
+	switch reason := agentFailureReason(err); {
 	case stopped == stopStalled:
 		r.run.Status = domain.RunStalled
 	case stopped != "" || ctx.Err() != nil:
@@ -159,10 +165,8 @@ func (c *Coordinator) finishRun(r *running, completed bool, stopped stopReason, 
 		r.run.Status = domain.RunSucceeded
 	case isLandingWait(err):
 		r.run.Status = domain.RunWaiting
-	case agentFailureReason(err) == "agent_blocked", agentFailureReason(err) == "turn_limit_exhausted":
+	case reason == "agent_blocked", reason == "turn_limit_exhausted":
 		r.run.Status = domain.RunBlocked
-	case err != nil && strings.Contains(strings.ToLower(err.Error()), "timeout"):
-		r.run.Status = domain.RunTimedOut
 	default:
 		r.run.Status = domain.RunFailed
 	}

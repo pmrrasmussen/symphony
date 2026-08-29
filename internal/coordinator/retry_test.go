@@ -251,7 +251,11 @@ func TestRetryAtCapacityNeverAbandons(t *testing.T) {
 	<-ws.after
 }
 
-func TestRetryRefreshFailureIncrementsAttemptAndRetries(t *testing.T) {
+// TestRetryRefreshFailureKeepsAttemptAndRetries pins the shape of a failed
+// pre-dispatch refresh: "retry_refresh" is systemic, so the redispatch repeats
+// the attempt it was already carrying (PMR-179) and only the delay climbs --
+// here to backoff's first rung, the first repeat of this outage.
+func TestRetryRefreshFailureKeepsAttemptAndRetries(t *testing.T) {
 	w := testSettings(t)
 	w.Config.Agent.MaxRetryBackoff = 15 * time.Second
 	issue := testIssue()
@@ -268,11 +272,11 @@ func TestRetryRefreshFailureIncrementsAttemptAndRetries(t *testing.T) {
 	timer.fire(0)
 
 	retry, _ := c.armedRetry(issue.ID)
-	if retry.reason != "retry_refresh" || retry.attempt != 2 {
+	if retry.reason != "retry_refresh" || retry.attempt != 1 {
 		t.Fatalf("retry=%+v", retry)
 	}
-	if len(timer.delays) != 2 || timer.delays[1] != 15*time.Second {
-		t.Fatalf("retry delays=%v, want capped 15s refresh retry", timer.delays)
+	if len(timer.delays) != 2 || timer.delays[1] != 10*time.Second {
+		t.Fatalf("retry delays=%v, want the first rung of the systemic streak's ladder", timer.delays)
 	}
 	if err := c.Shutdown(context.Background()); err != nil {
 		t.Fatal(err)
@@ -285,10 +289,10 @@ func TestRetryRefreshFailureIncrementsAttemptAndRetries(t *testing.T) {
 // (see systemicFailureReasons), just observed at a different moment -- the
 // moment an issue is waiting to redispatch rather than the moment one just
 // finished a turn. A sustained Linear outage drives every retrying issue
-// through exactly this site, so it must keep climbing the ordinary
-// escalating backoff ladder past agent.max_attempts, the same as
-// "issue_refresh", instead of abandoning the issue on infrastructure that
-// says nothing about whether its work is workable.
+// through exactly this site, so it must keep retrying -- climbing only the
+// delay ladder, never the attempt (PMR-179) -- the same as "issue_refresh",
+// instead of abandoning the issue, or spending its budget, on infrastructure
+// that says nothing about whether its work is workable.
 func TestRetryRefreshFailureNeverAbandonsIssue(t *testing.T) {
 	w := testSettings(t)
 	w.Config.Agent.MaxAttempts = 2
@@ -320,8 +324,14 @@ func TestRetryRefreshFailureNeverAbandonsIssue(t *testing.T) {
 	if retry.reason != "retry_refresh" {
 		t.Fatalf("reason=%q, want retry_refresh", retry.reason)
 	}
-	if retry.attempt <= w.Config.Agent.MaxAttempts {
-		t.Fatalf("attempt=%d, want it to keep climbing the ordinary ladder past max_attempts", retry.attempt)
+	if retry.attempt != 1 {
+		t.Fatalf("attempt=%d, want the scheduled attempt held fixed across every repeat", retry.attempt)
+	}
+	// The delay is the one thing that still escalates, keyed to the outage's
+	// own streak: by the sixth repeat it has saturated at max_retry_backoff_ms,
+	// so a stuck tracker cannot become a fixed-cadence relaunch loop (PMR-179).
+	if last := timer.delays[len(timer.delays)-1]; last != w.Config.Agent.MaxRetryBackoff {
+		t.Fatalf("last delay=%s, want the ladder saturated at %s", last, w.Config.Agent.MaxRetryBackoff)
 	}
 	if strings.Contains(log.String(), `"msg":"dispatch abandoned after max attempts"`) {
 		t.Fatalf("retry_refresh armed an abandonment record: %s", log.String())

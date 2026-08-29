@@ -205,9 +205,26 @@ host, or a shared backend, crosses:
   repository- or issue-specific outcome, only ever a host bug.
 
 Each of these six is exempt from the ceiling, so a transient, account-wide
-condition cannot abandon an otherwise-healthy issue; five of them (every
-reason but `agent_rate_limited`) also keep climbing the ordinary backoff
-ladder while they do. Every classified `reason` — armed or exempt alike, on
+condition cannot abandon an otherwise-healthy issue — and since PMR-179 the
+exemption is the stronger kind: a systemic failure does not raise the issue's
+`attempt` at all. It repeats the same attempt, exactly as a lost
+orchestrator-slot race does, so a quota wall or a Linear outage that spans
+hundreds of launches leaves the whole retry budget for the issue's own work.
+Until then an exempt reason still escalated the counter as it went, which meant
+the first genuine failure after a long systemic streak — the issue's first real
+try — hit the ceiling at once and abandoned the dispatch with zero real
+retries.
+
+The retry delay still escalates during an outage, but from a second counter:
+`systemic_failures`, the streak of consecutive systemic failures under this
+claim. The `"msg":"agent run retry scheduled"` warning carries it whenever the
+reason is one of these six — with the attempt held fixed it is the only
+operator-visible measure of how long the condition has been repeating — and a
+genuine failure resets it. Five of them (every reason but
+`agent_rate_limited`, which takes its delay from the rejection's own reset
+time) climb the ordinary `agent.max_retry_backoff_ms` ladder on that streak, so
+a sustained outage still backs off toward the ceiling rather than relaunching
+at a fixed cadence. Every classified `reason` — armed or exempt alike, on
 the `"msg":"agent run retry scheduled"` warning that precedes abandonment as
 well as on the abandonment record itself — also carries the underlying
 `error`, redacted and bounded the same way as any other `error`-keyed

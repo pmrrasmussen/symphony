@@ -60,6 +60,11 @@ func (c *Coordinator) checkInvariants() error {
 			return fmt.Errorf("%s: kept landing-wait accounting without a claim", id)
 		case st.landingEscalated && st.landingWaits == 0:
 			return fmt.Errorf("%s: escalated a landing wait it never had", id)
+		// The systemic-failure streak is counted against its claim the same way,
+		// and it keys the retry delay: a released record still carrying one would
+		// start the next episode's first outage part-way up the ladder (PMR-179).
+		case !st.claimed && st.systemicFailures != 0:
+			return fmt.Errorf("%s: kept a systemic-failure streak without a claim", id)
 		// The accumulated per-issue usage is meaningful only under the claim
 		// whose attempts spent it: the claim is the episode, so a released
 		// record still carrying a total would attribute one episode's cost to

@@ -17,8 +17,14 @@ func (c *Coordinator) finishFailure(ctx context.Context, i domain.Issue, attempt
 		return
 	}
 	s := c.settings()
-	next := attempt + 1
+	next, escalation, systemic := c.failureCounters(i.ID, attempt, reason)
 	attrs := []any{"issue_id", i.ID, "issue_identifier", i.Identifier, "reason", reason, "attempt", next}
+	if systemic {
+		// On this path escalation is the streak of consecutive systemic failures,
+		// and with the attempt held fixed it is the only operator-visible measure
+		// of how long the condition has been repeating.
+		attrs = append(attrs, "systemic_failures", escalation)
+	}
 	var blocked blockedError
 	if errors.As(err, &blocked) {
 		attrs = append(attrs, "blocker", blocked.category)
@@ -39,17 +45,45 @@ func (c *Coordinator) finishFailure(ctx context.Context, i domain.Issue, attempt
 		return
 	}
 	c.log.Warn("agent run retry scheduled", attrs...)
-	delay := backoff(next, s.Agent.MaxRetryBackoff)
+	delay := backoff(escalation, s.Agent.MaxRetryBackoff)
 	var limited rateLimitedError
 	if errors.As(err, &limited) {
-		// A backend-reported reset time always wins over the ordinary
-		// attempt-keyed ladder: retrying against a limit already known to be
-		// closed is wasted regardless of how many attempts have accumulated,
+		// A backend-reported reset time always wins over the ordinary escalating
+		// ladder: retrying against a limit already known to be closed is wasted
+		// regardless of how many attempts or repeats have accumulated,
 		// and the ladder's own cap (max_retry_backoff_ms) is far too short
 		// for a multi-hour quota window (PMR-131).
 		delay = rateLimitRetryDelay(limited.retryAfter, s.Agent.MaxRetryBackoff)
 	}
 	c.scheduleRetry(ctx, i, domain.Workspace{}, next, retryAgent, reason, delay)
+}
+
+// failureCounters resolves the two counters one classified retryAgent failure
+// moves, and reports whether its reason was systemic: next is the attempt the
+// redispatch runs under, and escalation is the count backoff keys its delay to.
+// For an issue-attributable failure they are the one escalated attempt they
+// have always been.
+//
+// A systemic reason splits them (PMR-179). It names a boundary the host or a
+// shared backend crossed and says nothing about this issue's work (see
+// systemicFailureReasons), so it must not spend the issue's attempt budget:
+// next repeats the attempt unchanged, exactly as runRetry repeats it for a lost
+// slot race. The delay must still escalate, though -- freezing it as well would
+// turn a sustained outage into a fixed-cadence relaunch loop at the ladder's
+// first rung, the failure mode agent.max_retry_backoff_ms exists to bound -- so
+// it climbs the streak of consecutive systemic failures under this claim
+// instead, which a genuine failure resets.
+//
+// docs/observability.md's "Abandoned dispatches" section holds the rest: what
+// the escalated counter did to an issue's budget before this split, and what
+// the streak is worth to an operator reading the retry warnings.
+func (c *Coordinator) failureCounters(id string, attempt int, reason string) (next, escalation int, systemic bool) {
+	systemic = systemicFailureReasons[reason]
+	streak := c.recordSystemicFailure(id, systemic)
+	if systemic {
+		return attempt, streak, true
+	}
+	return attempt + 1, attempt + 1, false
 }
 
 // rateLimitRetryDelay bounds the wait before a retryAgent episode ended by a
@@ -98,7 +132,12 @@ var systemicFailureReasons = map[string]bool{
 // attemptsExhausted reports whether next has reached agent.max_attempts for a
 // retryAgent episode, abandoning the dispatch (and releasing its claim) if so.
 // Only retryAgent consumes the ceiling, and only on a genuine, classified
-// dispatch failure that is not systemic (see systemicFailureReasons): a
+// dispatch failure that is not systemic (see systemicFailureReasons). Since
+// PMR-179 a systemic failure no longer raises next either (see
+// failureCounters), which is the stronger half of that exemption -- it keeps
+// the budget intact rather than merely deferring the abandonment. The reason
+// gate stays because it, not the arithmetic, is where the rule is stated: a
+// systemic reason may never end a dispatch, whatever counter it arrives with. A
 // retryLanding redispatch — whether from finishLandingWait or either
 // escalation in runRetry — never raises its attempt counter, and neither does
 // a retryAgent episode that merely lost an orchestrator slot race (see

@@ -118,12 +118,16 @@ func (c *Coordinator) runRetry(id string, generation uint64) {
 			c.scheduleRetry(ctx, retry.issue, retry.workspace, retry.attempt, retryLanding, "retry_refresh", landingRetryDelay(s, waits))
 			return
 		}
-		attempt := retry.attempt + 1
+		// "retry_refresh" is systemic, so failureCounters holds the attempt fixed
+		// here for the same reason the branch above holds it fixed for a landing:
+		// the tracker being unreachable is not an attempt at this issue's work.
+		// Only the backoff climbs, keyed to the outage's own streak.
+		attempt, escalation, _ := c.failureCounters(id, retry.attempt, "retry_refresh")
 		attrs := []any{"issue_id", retry.issue.ID, "issue_identifier", retry.issue.Identifier, "reason", "retry_refresh", "attempt", attempt}
 		if c.attemptsExhausted(retry.issue, retry.kind, "retry_refresh", attempt, s, attrs) {
 			return
 		}
-		c.scheduleRetry(ctx, retry.issue, retry.workspace, attempt, retry.kind, "retry_refresh", backoff(attempt, s.Agent.MaxRetryBackoff))
+		c.scheduleRetry(ctx, retry.issue, retry.workspace, attempt, retry.kind, "retry_refresh", backoff(escalation, s.Agent.MaxRetryBackoff))
 		return
 	}
 	if len(fresh) != 1 || fresh[0].ID != id {
