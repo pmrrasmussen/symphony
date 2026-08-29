@@ -396,6 +396,131 @@ func TestDiscoverUsesLaunchAgentCredentialFileReferenceWithoutLeakingIt(t *testi
 	}
 }
 
+// countingAgentCommand is an agent CLI that records every invocation, so a test
+// can count the subprocesses a sweep spawns rather than time them. It is spelled
+// with the trailing "app-server" a real codex.command carries, because the
+// authentication probe deliberately refuses to re-invoke anything else.
+func countingAgentCommand(t *testing.T, dir, counter string) string {
+	t.Helper()
+	path := filepath.Join(dir, "counting-codex")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\nprintf x >> "+counter+"\nexit 0\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return path + " app-server"
+}
+
+func probeCount(t *testing.T, counter string) int {
+	t.Helper()
+	data, err := os.ReadFile(counter)
+	if os.IsNotExist(err) {
+		return 0
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	return len(data)
+}
+
+// probeFixture writes a plist and workflow whose agent command counts its own
+// invocations, and returns the workflow path and that counter's path.
+func probeFixture(t *testing.T, dir, label string) (workflow, counter string) {
+	t.Helper()
+	counter = filepath.Join(dir, "probes")
+	workflow = filepath.Join(dir, "WORKFLOW.md")
+	source := filepath.Join(dir, "source")
+	if err := os.Mkdir(source, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	write(t, workflow, "---\ntracker: {kind: linear, provider: {project_slug_id: probe, api_key: dummy}, active_states: [Todo], terminal_states: [Done]}\nworkspace: {root: work, source_root: "+source+"}\ncodex: {command: "+countingAgentCommand(t, dir, counter)+"}\n---\nprompt")
+	writePlist(t, dir, label, workflow, filepath.Join(dir, "logs"), "")
+	return workflow, counter
+}
+
+// TestPreflightCacheKeepsAgentProbesOffRepeatedSweeps pins the whole reason the
+// cache exists: a caller that sweeps on a timer must not exec the agent CLI on
+// every pass, and must still notice the two files a result is derived from.
+func TestPreflightCacheKeepsAgentProbesOffRepeatedSweeps(t *testing.T) {
+	dir := t.TempDir()
+	workflow, counter := probeFixture(t, dir, labelPrefix+".cached")
+	options := Options{LaunchAgentsDir: dir, Inspector: fakeInspector{}, Preflight: &PreflightCache{}}
+	sweep := func(options Options) {
+		t.Helper()
+		instances, err := Discover(context.Background(), options)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(instances) != 1 || hasCode(instances[0], "preflight_agent_authentication") {
+			t.Fatalf("sweep did not report an authenticated agent: %#v", instances)
+		}
+	}
+	for range 3 {
+		sweep(options)
+	}
+	if got := probeCount(t, counter); got != 1 {
+		t.Fatalf("three unchanged sweeps spawned %d agent CLI probes, want 1", got)
+	}
+
+	// An explicit refresh probes again: logging the CLI in changes neither file.
+	refresh := options
+	refresh.RefreshPreflight = true
+	sweep(refresh)
+	if got := probeCount(t, counter); got != 2 {
+		t.Fatalf("explicit refresh left the probe count at %d, want 2", got)
+	}
+
+	// A rewritten workflow is a different result, and so is a rewritten plist.
+	write(t, workflow, readFile(t, workflow)+"\nmore prompt")
+	sweep(options)
+	writePlist(t, dir, labelPrefix+".cached", workflow, filepath.Join(dir, "logs-moved"), "")
+	sweep(options)
+	if got := probeCount(t, counter); got != 4 {
+		t.Fatalf("probe count = %d after a changed workflow and plist, want 4", got)
+	}
+}
+
+func TestDiscoverWithoutAPreflightCacheProbesEverySweep(t *testing.T) {
+	dir := t.TempDir()
+	_, counter := probeFixture(t, dir, labelPrefix+".uncached")
+	options := Options{LaunchAgentsDir: dir, Inspector: fakeInspector{}}
+	for range 2 {
+		if _, err := Discover(context.Background(), options); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := probeCount(t, counter); got != 2 {
+		t.Fatalf("uncached sweeps spawned %d probes, want one each", got)
+	}
+}
+
+// TestCancelledSweepSpawnsNoAgentProbe covers the context discovery threads into
+// preflight: a view that has been closed cancels its sweep, and the probe that
+// sweep would otherwise have blocked on is never started.
+func TestCancelledSweepSpawnsNoAgentProbe(t *testing.T) {
+	dir := t.TempDir()
+	_, counter := probeFixture(t, dir, labelPrefix+".cancelled")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	instances, err := Discover(ctx, Options{LaunchAgentsDir: dir, Inspector: fakeInspector{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := probeCount(t, counter); got != 0 {
+		t.Fatalf("cancelled sweep spawned %d agent CLI probes", got)
+	}
+	if !hasCode(instances[0], "preflight_agent_authentication") {
+		t.Fatalf("cancelled sweep reported an authentication result anyway: %#v", instances[0].Findings)
+	}
+}
+
+func readFile(t *testing.T, path string) string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(data)
+}
+
 // ownerOnlyDir creates and returns a subdirectory of dir with mode 0700.
 // t.TempDir() itself is not owner-only: its numbered leaf is created with
 // os.Mkdir(dir, 0o777), which a typical umask reduces to 0755, not the
