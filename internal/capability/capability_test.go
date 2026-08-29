@@ -55,10 +55,13 @@ func TestAdvertisedCapabilitiesAndOrderPerConfiguration(t *testing.T) {
 			[]string{NameGitHubRefreshBaseRef, NameGitHubPublishPR, NameGitHubPRContext}},
 		{"github with issue outside merge state", bindings(false, true, "In Progress", "Merging"),
 			[]string{NameGitHubRefreshBaseRef, NameGitHubPublishPR, NameGitHubPRContext}},
+		// A landing dispatch is served landing instead of publish, not in addition
+		// to it: publishing there pushes the branch and hands an approved issue
+		// back to review for an approval it already has (PMR-169).
 		{"github with issue in merge state", bindings(false, true, "Merging", "Merging"),
-			[]string{NameGitHubRefreshBaseRef, NameGitHubPublishPR, NameGitHubPRContext, NameGitHubLandPR}},
+			[]string{NameGitHubRefreshBaseRef, NameGitHubPRContext, NameGitHubLandPR}},
 		{"everything enabled", bindings(true, true, "merging", " Merging "),
-			[]string{NameCreateFollowupIssue, NameGitHubRefreshBaseRef, NameGitHubPublishPR, NameGitHubPRContext, NameGitHubLandPR}},
+			[]string{NameCreateFollowupIssue, NameGitHubRefreshBaseRef, NameGitHubPRContext, NameGitHubLandPR}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got := names(Build(tc.bindings).Definitions())
@@ -92,6 +95,21 @@ func TestLandingStaysDispatchableOutsideTheMergeState(t *testing.T) {
 	}
 }
 
+// TestPublishStaysDispatchableInTheMergeState is the same invariant from the
+// other side of the new predicate. Withholding the advertisement is what makes a
+// landing dispatch deterministic, but the registry must not become the
+// authority: a publish call that arrives anyway -- a stale prompt, a model that
+// remembers the tool -- resolves and reaches Session.Publish, which refuses it
+// with a logged reason of its own. (Over the MCP transport the advertisement
+// gate answers first, as it does for every unadvertised name; the Codex
+// transport has no such gate, which is exactly why the provider keeps one.)
+func TestPublishStaysDispatchableInTheMergeState(t *testing.T) {
+	registry := Build(bindings(false, true, "Merging", "Merging"))
+	if _, ok := registry.Lookup(NameGitHubPublishPR); !ok {
+		t.Fatal("publish must stay dispatchable so Publish can refuse a landing dispatch itself")
+	}
+}
+
 // TestNoTrackerTransitionCapabilityIsEverRegistered keeps PMR-59's removal of
 // agent-side Linear write access from regressing through this registry.
 func TestNoTrackerTransitionCapabilityIsEverRegistered(t *testing.T) {
@@ -101,8 +119,11 @@ func TestNoTrackerTransitionCapabilityIsEverRegistered(t *testing.T) {
 			t.Fatalf("capability %q must not exist", name)
 		}
 	}
-	if got := len(registry.Definitions()); got != 5 {
-		t.Fatalf("advertised %d capabilities, want exactly the 5 known ones", got)
+	// Four, not five: this binding is a landing dispatch, which withholds
+	// github_publish_pr. Every known capability is still registered -- the count
+	// is over what is advertised.
+	if got := len(registry.Definitions()); got != 4 {
+		t.Fatalf("advertised %d capabilities, want exactly the 4 a landing dispatch is told about", got)
 	}
 }
 

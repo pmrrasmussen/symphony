@@ -186,6 +186,10 @@ state.
   branch, pull request, required checks, effective review state, unresolved
   review threads, mergeability, and the base branch immediately before the
   irreversible merge call.
+- A pull request that is behind the base branch still lands, and landing it is
+  the whole run. Do not merge the base into the worktree, and do not publish:
+  a landing dispatch is served no github_publish_pr capability, and publishing
+  would hand this issue back to review for an approval it already has.
 
 ## Hard landing blockers
 - A pending-checks or pending-mergeability result is not an error: it ends
@@ -193,7 +197,8 @@ state.
   Symphony releases the worker and redispatches landing itself once checks
   settle, so retrying here only wastes turns.
 - Any other refusal (a failing check, an effective changes-requested review,
-  an unresolved review thread, a stale base, a merge conflict, or a closed or
+  an unresolved review thread, a base branch that moved while landing ran, a
+  merge conflict, or a closed or
   mismatched pull request) has already returned this issue to In Review for a
   human; do not retry the merge yourself or transition the issue directly.
   Report the refusal reason as a blocker.

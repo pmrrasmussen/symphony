@@ -110,20 +110,114 @@ func hostPublishSettings() Settings {
 	return Settings{GitHub: GitHub{Enabled: true}, Tracker: Tracker{HandoffState: "In Review"}}
 }
 
+// landingSettings is hostPublishSettings plus a configured merge state, so the
+// only thing separating the two modes in these tests is the issue state passed
+// to DeliveryInstructions.
+func landingSettings() Settings {
+	s := hostPublishSettings()
+	s.GitHub.MergeState = "Merging"
+	return s
+}
+
 func TestDeliveryInstructionsReportExactAvailableMode(t *testing.T) {
-	manual := (Settings{}).DeliveryInstructions(DefaultAgentBackend)
+	manual := (Settings{}).DeliveryInstructions(DefaultAgentBackend, "In Progress")
 	if !strings.Contains(manual, "Delivery mode: manual") || !strings.Contains(manual, "github.owner") {
 		t.Fatalf("manual instructions=%q", manual)
 	}
-	if host := hostPublishSettings().DeliveryInstructions(DefaultAgentBackend); host != hostPublishGuidance {
+	if host := hostPublishSettings().DeliveryInstructions(DefaultAgentBackend, "In Progress"); host != hostPublishGuidance {
 		t.Fatalf("host instructions=%q, want the unchanged Codex golden %q", host, hostPublishGuidance)
 	}
 	// An unrecognized backend is not given MCP names. Bare names are what the
 	// only two implemented transports need -- Codex serves them verbatim -- so a
 	// backend this function has never heard of must not be told its tools are
 	// renamed.
-	if unknown := hostPublishSettings().DeliveryInstructions("docker"); unknown != hostPublishGuidance {
+	if unknown := hostPublishSettings().DeliveryInstructions("docker", "In Progress"); unknown != hostPublishGuidance {
 		t.Fatalf("unknown-backend instructions=%q, want the bare-name golden", unknown)
+	}
+}
+
+// TestALandingDispatchIsToldToLandAndOnlyToLand covers the state half of the
+// mode: the same settings render publish guidance for an implementation state
+// and landing guidance for the configured merge state. The 2026-08-28 divergence
+// this fixes was one landing run publishing and another merging from the same
+// state, so the assertion that matters is that the landing text does not invite
+// the publish call at all -- naming github_publish_pr to refuse it is fine, but
+// the publish mode's "call github_publish_pr with why, what_changed, and
+// on_call" instruction must be absent (PMR-169).
+func TestALandingDispatchIsToldToLandAndOnlyToLand(t *testing.T) {
+	s := landingSettings()
+	for _, state := range []string{"Merging", "merging", "  Merging  "} {
+		landing := s.DeliveryInstructions(DefaultAgentBackend, state)
+		if !strings.HasPrefix(landing, LandingDeliveryMarker) {
+			t.Fatalf("state %q was not given the landing delivery mode: %q", state, landing)
+		}
+		if strings.Contains(landing, HostSidePublishPromiseMarker) || strings.Contains(landing, "call github_publish_pr with why") {
+			t.Fatalf("state %q was invited to publish: %q", state, landing)
+		}
+		if !strings.Contains(landing, "github_land_pr") {
+			t.Fatalf("state %q was not told to land: %q", state, landing)
+		}
+	}
+	for _, state := range []string{"In Progress", "Rework", "In Review", "", "Merging Soon"} {
+		publish := s.DeliveryInstructions(DefaultAgentBackend, state)
+		if publish != hostPublishGuidance {
+			t.Fatalf("state %q got %q, want the unchanged publish golden", state, publish)
+		}
+	}
+	// Landing is a mode of host-side delivery, not a mode of its own: a workflow
+	// that cannot publish host-side cannot land either, and must still be told
+	// which configuration is missing rather than to call a tool it is not served.
+	unconfigured := Settings{GitHub: GitHub{Enabled: true, MergeState: "Merging"}}
+	if manual := unconfigured.DeliveryInstructions(DefaultAgentBackend, "Merging"); !strings.Contains(manual, "Delivery mode: manual") {
+		t.Fatalf("a merge-state dispatch with no handoff state was not told delivery is manual: %q", manual)
+	}
+}
+
+// TestTheLandingModeRenamesItsToolsForClaudeToo repeats the naming contract for
+// the branch the publish-mode test cannot reach. A landing prompt that names a
+// bare tool is exactly the failure PMR-169 is about, one step earlier: the model
+// is told to call something the CLI does not serve under that name.
+func TestTheLandingModeRenamesItsToolsForClaudeToo(t *testing.T) {
+	claude := landingSettings().DeliveryInstructions(ClaudeAgentBackend, "Merging")
+	if !strings.HasPrefix(claude, mcpNamingPreamble) {
+		t.Fatalf("claude landing instructions did not open with the naming rule: %q", claude)
+	}
+	want := landingSettings().DeliveryInstructions(DefaultAgentBackend, "Merging")
+	for _, name := range symphonyToolNames {
+		want = strings.ReplaceAll(want, name, MCPToolPrefix+name)
+	}
+	if body := strings.TrimPrefix(claude, mcpNamingPreamble); body != want {
+		t.Fatalf("claude landing guidance=%q, want the Codex guidance with prefixed tool names %q", body, want)
+	}
+	for _, name := range symphonyToolNames {
+		if strings.Count(claude, name) != strings.Count(claude, MCPToolPrefix+name) {
+			t.Fatalf("tool %q appears unprefixed in the claude landing guidance: %q", name, claude)
+		}
+	}
+}
+
+// TestLandingDispatchIsOneTrimmedCaseInsensitiveStateMatch pins the predicate
+// three packages read. It is asserted against fixed expectations rather than
+// against DeliveryInstructions, which branches on it: comparing the two would
+// agree for any definition at all.
+func TestLandingDispatchIsOneTrimmedCaseInsensitiveStateMatch(t *testing.T) {
+	for _, tc := range []struct {
+		mergeState, issueState string
+		want                   bool
+	}{
+		{"Merging", "Merging", true},
+		{"Merging", "merging", true},
+		{"  Merging  ", "Merging", true},
+		{"Merging", "\tMerging\n", true},
+		{"Merging", "In Progress", false},
+		{"Merging", "Merging Soon", false},
+		{"Merging", "", false},
+		{"", "Merging", false},
+		{"   ", "   ", false},
+	} {
+		if got := (GitHub{MergeState: tc.mergeState}).LandingDispatch(tc.issueState); got != tc.want {
+			t.Fatalf("LandingDispatch(merge_state=%q, state=%q)=%v, want %v", tc.mergeState, tc.issueState, got, tc.want)
+		}
 	}
 }
 
@@ -138,7 +232,7 @@ func TestDeliveryInstructionsReportExactAvailableMode(t *testing.T) {
 // preamble is missing, keep the preamble but leave a name bare and the
 // substitution no longer matches.
 func TestClaudeGuidanceRenamesEveryToolItNames(t *testing.T) {
-	claude := hostPublishSettings().DeliveryInstructions(ClaudeAgentBackend)
+	claude := hostPublishSettings().DeliveryInstructions(ClaudeAgentBackend, "In Progress")
 	if !strings.HasPrefix(claude, mcpNamingPreamble) {
 		t.Fatalf("claude instructions did not open with the naming rule: %q", claude)
 	}
@@ -169,8 +263,8 @@ func TestAClaudeRunThatCanAdvertiseNothingReadsExactlyLikeACodexRun(t *testing.T
 		"handoff state with no github":         {Tracker: Tracker{HandoffState: "In Review"}},
 	} {
 		t.Run(name, func(t *testing.T) {
-			codex := s.DeliveryInstructions(DefaultAgentBackend)
-			claude := s.DeliveryInstructions(ClaudeAgentBackend)
+			codex := s.DeliveryInstructions(DefaultAgentBackend, "In Progress")
+			claude := s.DeliveryInstructions(ClaudeAgentBackend, "In Progress")
 			if claude != codex {
 				t.Fatalf("claude=%q, want byte-identical to codex %q", claude, codex)
 			}
@@ -188,11 +282,11 @@ func TestAClaudeRunThatCanAdvertiseNothingReadsExactlyLikeACodexRun(t *testing.T
 // still renamed by the transport.
 func TestTheNamingRuleCoversACapabilityTheDeliveryModeNeverNames(t *testing.T) {
 	s := Settings{Tracker: Tracker{FollowupIssueCreation: true}}
-	claude := s.DeliveryInstructions(ClaudeAgentBackend)
+	claude := s.DeliveryInstructions(ClaudeAgentBackend, "In Progress")
 	if !strings.HasPrefix(claude, mcpNamingPreamble) {
 		t.Fatalf("a follow-up-only claude run was given no naming rule: %q", claude)
 	}
-	if body := strings.TrimPrefix(claude, mcpNamingPreamble); body != s.DeliveryInstructions(DefaultAgentBackend) {
+	if body := strings.TrimPrefix(claude, mcpNamingPreamble); body != s.DeliveryInstructions(DefaultAgentBackend, "In Progress") {
 		t.Fatalf("delivery mode changed with the backend: %q", body)
 	}
 	if !strings.Contains(claude, "Delivery mode: manual") {
@@ -215,7 +309,7 @@ func TestHostSidePublishPromisedIsTheConditionTheGuidanceBranchesOn(t *testing.T
 		{GitHub: GitHub{Enabled: true}, Tracker: Tracker{HandoffState: "   "}},
 	} {
 		for _, backend := range AgentBackends() {
-			promised := strings.Contains(s.DeliveryInstructions(backend), "Delivery mode: host-side publish")
+			promised := strings.Contains(s.DeliveryInstructions(backend, "In Progress"), "Delivery mode: host-side publish")
 			if promised != s.HostSidePublishPromised() {
 				t.Fatalf("settings %+v backend %q: guidance promises publish=%v, HostSidePublishPromised=%v", s, backend, promised, s.HostSidePublishPromised())
 			}

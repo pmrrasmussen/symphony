@@ -361,6 +361,121 @@ func TestLandRefusesOnMergeConflicts(t *testing.T) {
 	}
 }
 
+// TestALandingRefusalIsRecordedEvenWhenTheTrackerMovesNothing covers the two
+// paths on which the Linear transition record PMR-159 added does not exist: the
+// fallback edge is missing or no longer applicable (false, nil), or the
+// transition call failed. In both, the gate still fired and the issue is not
+// going to land, so the reason has to reach the host log from here or it reaches
+// nowhere at all. The applied path is asserted too, in the negative: it must not
+// grow a second record, because Linear already logged that one (PMR-169).
+func TestALandingRefusalIsRecordedEvenWhenTheTrackerMovesNothing(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		linear   *fakeLinear
+		wantMsg  string
+		wantMore string
+	}{
+		{
+			name:    "the fallback edge moved nothing",
+			linear:  &fakeLinear{refuseNoop: true},
+			wantMsg: `"msg":"GitHub landing refused without a tracker transition"`,
+		},
+		{
+			name:     "the fallback transition failed",
+			linear:   &fakeLinear{refuseErr: errors.New("linear unavailable")},
+			wantMsg:  `"msg":"GitHub land Merging fallback transition failed"`,
+			wantMore: `"error":"linear unavailable"`,
+		},
+		{
+			name:   "the fallback edge applied",
+			linear: &fakeLinear{},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			api := newAPI(t)
+			api.prExists = true
+			api.checkRuns = failingChecks("ci/build")
+			manager, session := testLandingSession(t, api, &fakeGit{}, test.linear, []string{"ci/build"}, "merge")
+			var log bytes.Buffer
+			manager.logger = slog.New(slog.NewJSONHandler(&log, nil))
+
+			if _, err := session.Land(context.Background()); err == nil {
+				t.Fatal("a failing required check did not refuse landing")
+			}
+			output := log.String()
+			if test.wantMsg == "" {
+				if strings.Contains(output, `"operation":"landing_refused"`) {
+					t.Fatalf("an applied fallback logged a second refusal record: %s", output)
+				}
+				return
+			}
+			if strings.Count(output, test.wantMsg) != 1 {
+				t.Fatalf("expected exactly one %s record, got: %s", test.wantMsg, output)
+			}
+			if !strings.Contains(output, `"operation":"landing_refused"`) {
+				t.Fatalf("refusal record missing the operation PMR-159 defined: %s", output)
+			}
+			if !strings.Contains(output, `"reason":"github required checks failed: ci/build"`) {
+				t.Fatalf("refusal record does not name the gate that fired: %s", output)
+			}
+			if !strings.Contains(output, `"issue_identifier":"PMR-27"`) {
+				t.Fatalf("refusal record missing the issue: %s", output)
+			}
+			if test.wantMore != "" && !strings.Contains(output, test.wantMore) {
+				t.Fatalf("refusal record missing %s: %s", test.wantMore, output)
+			}
+		})
+	}
+}
+
+// TestLandMergesABehindButMergeablePullRequest is the case a whole wave of
+// dogfooding pull requests are in: every issue is cut from the same base, so
+// each one that merges leaves the rest BEHIND. Landing must merge them anyway,
+// and it must do so without touching the worktree, the branch, or the base --
+// GitHub merges a behind-but-conflict-free branch, and the merge commit is what
+// brings the base in.
+//
+// The distinction this pins is the one PMR-169 found misread: `behind` is not
+// `stale base`. The base commit this session read at the start is the same one
+// it reads before merging, so the stale-base gate does not fire; what makes the
+// pull request behind is that its head does not descend from that commit, which
+// landing deliberately never asks about. behindBaseGit answers exactly that
+// question in the negative, so an ancestry check added here would fail this
+// test rather than quietly cost a review cycle.
+func TestLandMergesABehindButMergeablePullRequest(t *testing.T) {
+	api, linear := newAPI(t), &fakeLinear{}
+	api.prExists = true
+	passingRequiredChecks(api, "ci/build")
+	readyToLand(api)
+	// What GitHub reports for a pull request whose base has moved past it:
+	// mergeable, and behind.
+	api.mergeableState = "behind"
+	git := &behindBaseGit{fakeGit: &fakeGit{}}
+	_, session := testLandingSession(t, api, git, linear, []string{"ci/build"}, "merge")
+	// Off, so this asserts the default deployment: nothing about landing a
+	// behind pull request depends on the stale-base update opt-in.
+	session.settings.UpdateStaleBranch = false
+
+	result, err := session.Land(context.Background())
+	if err != nil {
+		t.Fatalf("a behind but mergeable pull request did not land: %v", err)
+	}
+	if result.Status != LandMerged || api.merges != 1 || linear.landCompleted != 1 {
+		t.Fatalf("result=%+v merges=%d completed=%d", result, api.merges, linear.landCompleted)
+	}
+	if linear.refused != 0 {
+		t.Fatalf("landing a behind pull request returned the issue to review: refused=%d reason=%q", linear.refused, linear.refusedReason)
+	}
+	if api.updateBranchCalls != 0 {
+		t.Fatalf("landing updated the branch for a base that never moved: updates=%d", api.updateBranchCalls)
+	}
+	for _, call := range git.calls {
+		if call[0] == "push" || call[0] == "merge" {
+			t.Fatalf("landing a behind pull request mutated the branch: %v", call)
+		}
+	}
+}
+
 func TestLandRefusesOnStaleBase(t *testing.T) {
 	api, linear := newAPI(t), &fakeLinear{}
 	api.prExists = true

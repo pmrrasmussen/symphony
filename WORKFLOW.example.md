@@ -320,7 +320,10 @@ codex:
 #   # this exact Linear state receives a zero-argument github_land_pr tool;
 #   # moving the issue to this state (Merging in the canonical lifecycle
 #   # above) is itself the human approval to land, so no separate approving
-#   # review is required. It must be one of active_states and differ from
+#   # review is required. Such a session is served github_land_pr *instead of*
+#   # github_publish_pr, and its delivery instructions say so: publishing from
+#   # a landing dispatch would push the branch and hand an already-approved
+#   # issue back to review, so it is withheld and refused (PMR-169). It must be one of active_states and differ from
 #   # handoff_state and every terminal state, since a session only receives the
 #   # tool once actually dispatched for an issue in that state. required_checks
 #   # is then mandatory: every named check must be present and successful (or
@@ -334,10 +337,18 @@ codex:
 #   # Use the exact GitHub check names your CI reports (often the job names
 #   # from your CI workflow file).
 #   required_checks: [ci/build, ci/test]
-#   # Opt in to GitHub's deterministic update-branch operation when the base
-#   # moves during landing but all other landing gates pass. It creates only a
+#   # Opt in to GitHub's deterministic update-branch operation for the one
+#   # window this setting is about: the base branch moving between
+#   # github_land_pr's early base read and the one it takes immediately before
+#   # merging, while every other landing gate passes. It creates only a
 #   # merge-from-base commit, then github_land_pr waits for checks on that new
 #   # head. Disabled by default; a later base move still refuses landing.
+#   #
+#   # It is not about a pull request that is merely behind the base branch.
+#   # Landing never compares the head to the base, so a behind-but-mergeable
+#   # pull request merges as-is whether this is set or not; what this setting
+#   # buys is that a base moving underneath a landing session recovers instead
+#   # of returning the issue to review (PMR-169).
 #   update_stale_branch: true
 #   # Opt in to bounded fix attempts within the Merging turn (PMR-46). When
 #   # enabled, a retryable hard gate (failing required checks or unresolved

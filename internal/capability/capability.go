@@ -14,7 +14,6 @@ package capability
 import (
 	"context"
 	"encoding/json"
-	"strings"
 
 	"github.com/pmrrasmussen/symphony/internal/config"
 	"github.com/pmrrasmussen/symphony/internal/domain"
@@ -179,6 +178,7 @@ func Build(b Bindings) *Registry {
 		})
 	}
 	if b.GitHub != nil {
+		landing := b.Settings.GitHub.LandingDispatch(b.Issue.State)
 		r.entries = append(r.entries,
 			// refresh_base_ref is advertised whenever a workspace is bound, not
 			// gated on issue state (Todo, In Progress, and Rework all publish);
@@ -186,21 +186,20 @@ func Build(b Bindings) *Registry {
 			// merging or rebasing onto the base branch, so it precedes publish
 			// and context here (PMR-141).
 			entry{capability: refreshBaseRefCapability{session: b.GitHub}, advertised: true},
-			entry{capability: publishCapability{session: b.GitHub}, advertised: true},
+			// github_publish_pr and github_land_pr are advertised on opposite
+			// sides of the same predicate: a landing run's delivery is the merge,
+			// and publishing there pushes the branch and hands the issue back to
+			// review for an approval it already has (PMR-169). Both providers
+			// re-validate the live Linear state immediately before mutating
+			// anything -- Land through EnsureMergeState, Publish through its own
+			// merge-state refusal and EnsureActive -- so this stays a coarse
+			// dispatch-time filter rather than the authority.
+			entry{capability: publishCapability{session: b.GitHub}, advertised: !landing},
 			entry{capability: contextCapability{session: b.GitHub}, advertised: true},
-			// github_land_pr is advertised only for a session bound to an issue
-			// currently in the exact configured Merging state; Land itself
-			// re-validates that Linear state immediately before any mutation, so
-			// this is a coarse dispatch-time filter, not the authority.
-			entry{capability: landCapability{session: b.GitHub}, advertised: landAdvertised(b)},
+			entry{capability: landCapability{session: b.GitHub}, advertised: landing},
 		)
 	}
 	return r
-}
-
-func landAdvertised(b Bindings) bool {
-	mergeState := strings.TrimSpace(b.Settings.GitHub.MergeState)
-	return mergeState != "" && strings.EqualFold(strings.TrimSpace(b.Issue.State), mergeState)
 }
 
 // Definitions returns the advertised capabilities in registration order.

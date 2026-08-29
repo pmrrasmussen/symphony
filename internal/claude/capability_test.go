@@ -34,6 +34,19 @@ var allCapabilityNames = []string{
 	capability.NameGitHubLandPR,
 }
 
+// landingCapabilityNames is the largest set one dispatch can actually be told
+// about, and it is not the list above: a dispatch in the configured merge state
+// is served github_land_pr and no github_publish_pr, and every other state the
+// reverse (PMR-169). Tests that render a launch contract from an arbitrary name
+// list keep using allCapabilityNames; tests that build a real session from real
+// bindings use this.
+var landingCapabilityNames = []string{
+	capability.NameCreateFollowupIssue,
+	capability.NameGitHubRefreshBaseRef,
+	capability.NameGitHubPRContext,
+	capability.NameGitHubLandPR,
+}
+
 // TestTheLaunchContractWithoutACapabilityIsUnchanged is the Codex-parity
 // statement. A workflow that configures no Symphony capability still takes this
 // path, and the argument vector it produces has to be exactly the one it
@@ -941,11 +954,11 @@ func TestStartBindsTheHostProvidersAndTheirSecrets(t *testing.T) {
 	snapshot := func() config.Settings { return settings }
 
 	dir := t.TempDir()
-	// The init echo has to name all five capabilities, which is itself part of
-	// the assertion: a contract built from a registry missing its bindings would
-	// refuse this turn.
+	// The init echo has to name every capability this landing dispatch is served,
+	// which is itself part of the assertion: a contract built from a registry
+	// missing its bindings would refuse this turn.
 	tools := allCodingTools
-	for _, name := range allCapabilityNames {
+	for _, name := range landingCapabilityNames {
 		tools += `,"` + mcpToolName(name) + `"`
 	}
 	script := writeFakeClaude(t, dir, "cat <<'EOF'\n"+
@@ -976,8 +989,8 @@ func TestStartBindsTheHostProvidersAndTheirSecrets(t *testing.T) {
 	}
 	// The advertised set is the registry's own, so this is also what --tools was
 	// pinned to and what tools/list serves.
-	if strings.Join(s.advertised, ",") != strings.Join(allCapabilityNames, ",") {
-		t.Fatalf("advertised=%v, want %v", s.advertised, allCapabilityNames)
+	if strings.Join(s.advertised, ",") != strings.Join(landingCapabilityNames, ",") {
+		t.Fatalf("advertised=%v, want %v", s.advertised, landingCapabilityNames)
 	}
 	if s.secretMatcher == nil {
 		t.Fatal("Start bound providers without a secret matcher, so their resolved credentials reach the child")
@@ -1002,9 +1015,10 @@ func TestStartBindsTheHostProvidersAndTheirSecrets(t *testing.T) {
 
 // TestTheAdvertisedSetIsTheRegistrysOwn is the parity assertion PMR-52 asked
 // for, in the only form this package can make it: the same bindings that give
-// internal/codex its five dynamic tools give this backend the same five names,
-// in the same order, with the mcp__symphony__ prefix applied to each and nothing
-// added, dropped, or reordered. internal/codex asserts the app-server half of
+// internal/codex its dynamic tools give this backend the same names -- here a
+// landing dispatch's four, publish withheld -- in the same order, with the
+// mcp__symphony__ prefix applied to each and nothing added, dropped, or
+// reordered. internal/codex asserts the app-server half of
 // the same statement over the same bindings, so neither transport can quietly
 // grow a capability set of its own.
 func TestTheAdvertisedSetIsTheRegistrysOwn(t *testing.T) {
@@ -1027,8 +1041,8 @@ func TestTheAdvertisedSetIsTheRegistrysOwn(t *testing.T) {
 			t.Fatalf("name %d = %q, want the registry's %q", i, names[i], definition.Name)
 		}
 	}
-	if strings.Join(names, ",") != strings.Join(allCapabilityNames, ",") {
-		t.Fatalf("advertised=%v, want %v", names, allCapabilityNames)
+	if strings.Join(names, ",") != strings.Join(landingCapabilityNames, ",") {
+		t.Fatalf("advertised=%v, want %v", names, landingCapabilityNames)
 	}
 	contract, err := launchArgs(request(t, t.TempDir(), "unused"), "session-1", false,
 		&capabilityEndpoint{url: "http://127.0.0.1:1/mcp", token: "t", names: names})
@@ -1407,7 +1421,7 @@ func TestStartRefusesToRunAPromiseTheSessionCannotKeep(t *testing.T) {
 }
 
 // TestTheGuardRefusesEachDivergenceItClaimsToCover exercises verifyPromises
-// directly, over the three failures it distinguishes and the sessions it must
+// directly, over the four failures it distinguishes and the sessions it must
 // not refuse.
 //
 // It replaces a test that asserted two independent facts and never evaluated the
@@ -1420,11 +1434,17 @@ func TestTheGuardRefusesEachDivergenceItClaimsToCover(t *testing.T) {
 		Tracker: config.Tracker{HandoffState: "In Review"},
 		GitHub:  config.GitHub{Enabled: true},
 	}
-	prefixedPrompt := "task\n\n" + bound.DeliveryInstructions(config.ClaudeAgentBackend)
-	barePrompt := "task\n\n" + bound.DeliveryInstructions(config.DefaultAgentBackend)
+	prefixedPrompt := "task\n\n" + bound.DeliveryInstructions(config.ClaudeAgentBackend, "In Progress")
+	barePrompt := "task\n\n" + bound.DeliveryInstructions(config.DefaultAgentBackend, "In Progress")
+	landing := bound
+	landing.GitHub.MergeState = "Merging"
+	landingPrompt := "task\n\n" + landing.DeliveryInstructions(config.ClaudeAgentBackend, "Merging")
 
+	// An empty issueState is an implementation dispatch for every row whose
+	// settings configure no merge state, which is all but the landing rows.
 	for name, tc := range map[string]struct {
 		settings   config.Settings
+		issueState string
 		prompt     string
 		advertised []string
 		want       string
@@ -1433,11 +1453,11 @@ func TestTheGuardRefusesEachDivergenceItClaimsToCover(t *testing.T) {
 			settings: bound, prompt: prefixedPrompt, advertised: []string{publish, capability.NameGitHubPRContext},
 		},
 		"a manual run with nothing advertised is accepted": {
-			settings: config.Settings{}, prompt: "task\n\n" + (config.Settings{}).DeliveryInstructions(config.ClaudeAgentBackend),
+			settings: config.Settings{}, prompt: "task\n\n" + (config.Settings{}).DeliveryInstructions(config.ClaudeAgentBackend, "In Progress"),
 		},
 		"a follow-up-only session is accepted": {
 			settings:   config.Settings{Tracker: config.Tracker{FollowupIssueCreation: true}},
-			prompt:     "task\n\n" + config.Settings{Tracker: config.Tracker{FollowupIssueCreation: true}}.DeliveryInstructions(config.ClaudeAgentBackend),
+			prompt:     "task\n\n" + config.Settings{Tracker: config.Tracker{FollowupIssueCreation: true}}.DeliveryInstructions(config.ClaudeAgentBackend, "In Progress"),
 			advertised: []string{capability.NameCreateFollowupIssue},
 		},
 		// The settings term: this snapshot promises publish and the session
@@ -1469,7 +1489,7 @@ func TestTheGuardRefusesEachDivergenceItClaimsToCover(t *testing.T) {
 			settings: bound,
 			prompt: "Call github_publish_pr once the worktree is clean, read github_pr_context for\n" +
 				"feedback, call github_land_pr in Merging, and use create_followup_issue for\n" +
-				"out-of-scope work.\n\n" + bound.DeliveryInstructions(config.ClaudeAgentBackend),
+				"out-of-scope work.\n\n" + bound.DeliveryInstructions(config.ClaudeAgentBackend, "In Progress"),
 			advertised: []string{publish, capability.NameGitHubPRContext},
 		},
 		// The same body with the guidance rendered for the wrong backend: the
@@ -1477,7 +1497,7 @@ func TestTheGuardRefusesEachDivergenceItClaimsToCover(t *testing.T) {
 		"a repository body naming tools bare with no mapping rule is refused": {
 			settings: bound,
 			prompt: "Call github_publish_pr once the worktree is clean.\n\n" +
-				bound.DeliveryInstructions(config.DefaultAgentBackend),
+				bound.DeliveryInstructions(config.DefaultAgentBackend, "In Progress"),
 			advertised: []string{publish, capability.NameGitHubPRContext},
 			want:       "naming rule to map it",
 		},
@@ -1499,9 +1519,30 @@ func TestTheGuardRefusesEachDivergenceItClaimsToCover(t *testing.T) {
 			advertised: []string{capability.NameCreateFollowupIssue},
 			want:       "naming rule to map it",
 		},
+		// The landing rows (PMR-169). A landing dispatch promises landing and not
+		// publish, so the accepted row is the one that would refuse if the guard
+		// still read the promise off the settings alone: publish is configured and
+		// deliberately unadvertised.
+		"a landing dispatch is accepted": {
+			settings: landing, issueState: "Merging", prompt: landingPrompt,
+			advertised: []string{capability.NameGitHubRefreshBaseRef, capability.NameGitHubPRContext, capability.NameGitHubLandPR},
+		},
+		"a landing prompt with no landing capability is refused": {
+			settings: landing, issueState: "Merging", prompt: landingPrompt,
+			advertised: []string{capability.NameGitHubRefreshBaseRef, capability.NameGitHubPRContext},
+			want:       "advertises no " + capability.NameGitHubLandPR,
+		},
+		// The mode disagreement in the other direction, and the one a reload
+		// produces: the prompt was rendered as a publish run, the session was
+		// built as a landing one and serves no publish capability.
+		"a publish prompt handed to a landing session is refused": {
+			settings: landing, issueState: "Merging", prompt: prefixedPrompt,
+			advertised: []string{capability.NameGitHubPRContext, capability.NameGitHubLandPR},
+			want:       "advertises no " + publish,
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
-			err := verifyPromises(tc.settings, tc.prompt, tc.advertised)
+			err := verifyPromises(tc.settings, tc.issueState, tc.prompt, tc.advertised)
 			if tc.want == "" {
 				if err != nil {
 					t.Fatalf("a consistent session was refused: %v", err)
@@ -1539,7 +1580,7 @@ func TestStartRefusesAPromptRenderedForTheWrongBackend(t *testing.T) {
 	r.Issue = domain.Issue{ID: "issue-1", Identifier: "PMR-52", State: "In Progress"}
 	// Exactly what the coordinator would hand this session if it resolved the
 	// backend wrongly: valid guidance, bare tool names.
-	r.Prompt = "task\n\n" + settings.DeliveryInstructions(config.DefaultAgentBackend)
+	r.Prompt = "task\n\n" + settings.DeliveryInstructions(config.DefaultAgentBackend, "In Progress")
 
 	agentSession, events, err := backend.Start(context.Background(), r)
 	if err == nil {
@@ -1558,7 +1599,7 @@ func TestStartRefusesAPromptRenderedForTheWrongBackend(t *testing.T) {
 	// And the same session with the prompt it should have been given starts and
 	// completes, so the refusal above is about the naming and not about the
 	// session.
-	r.Prompt = "task\n\n" + settings.DeliveryInstructions(config.ClaudeAgentBackend)
+	r.Prompt = "task\n\n" + settings.DeliveryInstructions(config.ClaudeAgentBackend, "In Progress")
 	if _, events, err = backend.Start(context.Background(), r); err != nil {
 		t.Fatalf("a correctly rendered prompt was refused: %v", err)
 	}
@@ -1587,7 +1628,7 @@ func TestRefreshBaseRefAdvertisedDoesNotWidenSandboxWriteGrants(t *testing.T) {
 		`],"mcp_servers":[{"name":"symphony","status":"connected"}]}`+"\n"+resultLine(false, "")+"\nEOF\n")
 	r := request(t, dir, script)
 	r.Issue = domain.Issue{ID: "issue-1", Identifier: "PMR-52", State: "In Progress"}
-	r.Prompt = "task\n\n" + settings.DeliveryInstructions(config.ClaudeAgentBackend)
+	r.Prompt = "task\n\n" + settings.DeliveryInstructions(config.ClaudeAgentBackend, "In Progress")
 
 	_, events, err := backend.Start(context.Background(), r)
 	if err != nil {

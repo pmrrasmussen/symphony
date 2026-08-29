@@ -85,6 +85,24 @@ func TestRenderExplainsHostAndManualDeliveryModes(t *testing.T) {
 	if !strings.HasPrefix(claude, "Work on PMR-40\n\n") {
 		t.Fatalf("host guidance displaced the repository prompt: %q", claude)
 	}
+
+	// The third mode, and the reason render passes the issue as well as the
+	// backend: the same settings render publish guidance for the issue above and
+	// landing guidance for one in the configured merge state. A dropped state
+	// argument would tell a landing dispatch to publish -- which is exactly the
+	// extra review cycle PMR-169 was filed for.
+	settings.GitHub.MergeState = "Merging"
+	landing, _, err := render(settings, domain.Issue{Identifier: "PMR-40", State: "Merging"}, 0, config.DefaultAgentBackend)
+	if err != nil || !strings.Contains(landing, config.LandingDeliveryMarker) || !strings.Contains(landing, "github_land_pr") {
+		t.Fatalf("landing prompt=%q err=%v", landing, err)
+	}
+	if strings.Contains(landing, "github_publish_pr with why, what_changed, and on_call") {
+		t.Fatalf("a landing dispatch was told to publish: %q", landing)
+	}
+	stillPublishing, _, err := render(settings, domain.Issue{Identifier: "PMR-40", State: "Rework"}, 0, config.DefaultAgentBackend)
+	if err != nil || !strings.Contains(stillPublishing, config.HostSidePublishPromiseMarker) {
+		t.Fatalf("a rework dispatch lost its publish guidance: %q err=%v", stillPublishing, err)
+	}
 }
 
 // TestADispatchedPromptNamesTheToolsItsOwnBackendWillServe is the assertion the

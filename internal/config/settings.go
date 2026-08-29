@@ -1,6 +1,9 @@
 package config
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 type Settings struct {
 	Tracker            Tracker
@@ -51,8 +54,12 @@ type GitHub struct {
 	// Non-empty whenever MergeState is configured.
 	RequiredChecks []string
 	// UpdateStaleBranch permits github_land_pr to ask GitHub to merge the
-	// current base into a clean, stale pull-request branch. It is opt-in and
-	// disabled by default.
+	// current base into a clean pull-request branch when the base branch moves
+	// between Land's early base read and its immediate pre-merge one. It guards
+	// that time-of-check/time-of-use window only: a pull request that was
+	// already behind the base when landing started is landed as-is, because
+	// nothing in Land compares the head to the base. Without it, a base that
+	// moves mid-landing refuses instead. It is opt-in and disabled by default.
 	UpdateStaleBranch bool
 	// LandFixEnabled permits github_land_pr, for a retryable hard gate, to
 	// return a non-terminal fix request (naming the gate) so the same Codex
@@ -68,6 +75,27 @@ type GitHub struct {
 	// when LandFixEnabled is true). Off by default, so a merge conflict refuses
 	// immediately exactly as before.
 	AllowConflictResolution bool
+}
+
+// LandingDispatch reports whether a run bound to an issue in issueState is a
+// landing run: landing is configured, and the issue is in the exact configured
+// MergeState. It is the one predicate for that question, and four call sites in
+// three packages ask it -- which capabilities are advertised
+// (capability.Build), which delivery mode the prompt renders
+// (Settings.DeliveryInstructions), whether the Claude launch guard expects a
+// publish capability (claude.verifyPromises), and whether github_publish_pr
+// refuses (github.Session.Publish). A landing run and a publishing run are
+// mutually exclusive deliveries, so a second, paraphrased copy of this
+// condition anywhere would be a way for a prompt to invite exactly the tool the
+// session refuses (PMR-169).
+//
+// It answers a question about a dispatch, not about live tracker state: the
+// state is the one the session was bound to. A human move after that is
+// re-validated where it matters, by Land's EnsureMergeState and Publish's
+// EnsureActive, immediately before either mutates anything.
+func (g GitHub) LandingDispatch(issueState string) bool {
+	mergeState := strings.TrimSpace(g.MergeState)
+	return mergeState != "" && strings.EqualFold(strings.TrimSpace(issueState), mergeState)
 }
 
 type Tracker struct {

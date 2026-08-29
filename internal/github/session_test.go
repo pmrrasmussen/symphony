@@ -303,7 +303,7 @@ func TestPublishRefusalCausesAreDistinctAgentActionableMessages(t *testing.T) {
 // TestPublishRefusalLogsAWarnRecordNamingTheGate pins PMR-163: before this, a
 // publish refusal produced no host-side record at all, so a run that spent an
 // entire turn budget hitting the same refusal repeatedly left no trace of why.
-// Every one of Publish's eight refusal paths must log exactly one Warn
+// Every one of Publish's nine refusal paths must log exactly one Warn
 // "GitHub publish refused" record naming the gate that fired -- distinctly
 // enough that, for example, the stale-base ancestor gate and a dirty worktree
 // are never confused for one another -- so a newly added, silent gate fails
@@ -315,8 +315,20 @@ func TestPublishRefusalLogsAWarnRecordNamingTheGate(t *testing.T) {
 		wrap       func(*fakeGit) gitRunner
 		activeErr  error
 		prExists   bool
+		landing    bool
 		wantReason string
 	}{
+		{
+			// The gate that makes a Merging dispatch's outcome deterministic
+			// (PMR-169). It is first because it refuses before EnsureActive, which
+			// would otherwise accept this session: the configured merge state is
+			// the state it was bound to, so it is its own active state, and
+			// LinkAndHandoff would then walk an approved issue back to review.
+			name:       "landing dispatch",
+			base:       &fakeGit{},
+			landing:    true,
+			wantReason: "github publish is not available for an issue in the configured Merging state",
+		},
 		{
 			name:       "stale issue",
 			base:       &fakeGit{},
@@ -379,8 +391,15 @@ func TestPublishRefusalLogsAWarnRecordNamingTheGate(t *testing.T) {
 			if test.wrap != nil {
 				session.manager.git = test.wrap(test.base)
 			}
+			if test.landing {
+				session.settings.MergeState = "Merging"
+				session.issue.State = "Merging"
+			}
 			if _, err := session.Publish(context.Background(), testInput()); err == nil {
 				t.Fatal("unsafe publish succeeded")
+			}
+			if test.landing && (len(linear.links) != 0 || test.base.calls != nil) {
+				t.Fatalf("a landing dispatch's publish reached GitHub or Linear: links=%v git=%v", linear.links, test.base.calls)
 			}
 			output := log.String()
 			if strings.Count(output, `"msg":"GitHub publish refused"`) != 1 {

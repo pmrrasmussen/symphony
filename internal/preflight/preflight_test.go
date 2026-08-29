@@ -188,7 +188,11 @@ func TestTheHandoffCheckReportsExactlyWhatAWorkerWillBeTold(t *testing.T) {
 				t.Fatal(err)
 			}
 			// The expectation: what a worker on this workflow is actually told.
-			promised := strings.Contains(w.Config.DeliveryInstructions(w.Config.Agent.Backend), config.HostSidePublishPromiseMarker)
+			// The state is an implementation dispatch's, because that is what this
+			// check reports on: preflight validates configuration with no issue in
+			// hand, and none of these workflows configure a merge state anyway, so
+			// the landing delivery mode is unreachable here.
+			promised := strings.Contains(w.Config.DeliveryInstructions(w.Config.Agent.Backend, "Todo"), config.HostSidePublishPromiseMarker)
 			var got Status
 			for _, check := range result(t, workflow, dir).Checks {
 				if check.Name == "github_handoff" {

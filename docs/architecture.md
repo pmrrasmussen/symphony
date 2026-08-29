@@ -17,7 +17,8 @@ by the name its transport serves it under, which for that endpoint is
 `mcp__symphony__<tool>`; and `claude.Backend.Start` cross-checks the
 rendered prompt against what the session it is about to start can serve: it
 refuses a prompt that promises host-side publish where the registry advertises no
-`github_publish_pr`, a session advertising publish with no handoff state to
+`github_publish_pr`, a prompt that promises landing where it advertises no
+`github_land_pr`, a session advertising publish with no handoff state to
 publish into, and a prompt that names any advertised capability without its
 `mcp__symphony__` prefix.  That last one is what verifies the naming at runtime;
 without it the whole of the naming guarantee is a single backend-name comparison
@@ -174,7 +175,7 @@ durable GitHub PRs and Linear comments.
 
 Invalid or incomplete GitHub settings disable these capabilities rather than
 failing the workflow, which preserves the manual delivery path. That choice is
-what the two delivery modes are: with the integration enabled, workers create
+what the delivery modes are: with the integration enabled, workers create
 local commits and invoke the host capabilities instead of running `gh` or `git
 push` themselves, and all publishing authority stays with the host; without it,
 the host-generated delivery instructions tell the run that pull request delivery
@@ -182,6 +183,22 @@ is unavailable and name the missing configuration rather than asking a worker to
 publish directly. The narrower `merge_state`, `merge_method`, and
 `required_checks` settings are the deliberate exception, validated fail-closed
 as described below.
+
+A dispatch bound to an issue in `github.merge_state` is the third mode, and it
+is exclusive with publishing rather than additional to it. One predicate,
+`config.GitHub.LandingDispatch`, decides all of it: the registry advertises
+`github_land_pr` and withholds `github_publish_pr`, the rendered delivery
+instructions say landing is the whole run, and `Session.Publish` refuses
+outright as the authority behind the withheld advertisement. The reason is that
+a landing run told to publish has two ways to end from one identical state --
+merge the pull request, or push a merge commit and hand an already-approved
+issue back to review for a second approval, a second agent run, and a second CI
+run to land the same commit -- and on 2026-08-28 two pull requests in the same
+wave, in the same state, with the same rendered prompt, ended each way
+(PMR-169). The mode is settings-and-state, not live tracker state: a human who
+moves the issue after dispatch is caught where it matters, by `Land`'s
+`EnsureMergeState` and `Publish`'s `EnsureActive`, immediately before either
+mutates anything.
 
 `refresh_base_ref` exists because a merge that lands on the base branch mid-run
 leaves a session's `refs/remotes/origin/<base>` stale, and the session cannot
@@ -260,14 +277,32 @@ concurrency limit taken keeps that same cadence and attempt instead of
 escalating as a failure would. A terminal result -- merged, already merged, or a
 completed reconciliation -- ends the run the same way and closes
 `github_land_pr` for that run, so no later turn or duplicate tool call can
-re-invoke it; `Land` itself stays idempotent purely as the recovery path. With
-`github.update_stale_branch: true`, one clean stale-base update waits for
-checks on its new head. Any other hard gate -- a failing check, an effective
-changes-requested review, an unresolved thread, a stale base, a merge
-conflict, or a closed/mismatched pull request -- refuses landing and attempts
-the configured `merge_state -> In Review`
+re-invoke it; `Land` itself stays idempotent purely as the recovery path.
+
+The base-commit re-read is a time-of-check/time-of-use gate and nothing else:
+it compares the base this landing session started against the base it is about
+to merge onto, so what it catches is the base branch moving *underneath a
+landing that is already running*. It says nothing about a pull request that is
+merely behind the base — landing never compares the head to the base, and a
+behind-but-mergeable pull request merges as-is, which is what GitHub does with
+`required_status_checks.strict` unenforced for the daemon's token. With
+`github.update_stale_branch: true`, that one mid-landing base move is recovered
+by a single clean update-branch merge commit whose new head then waits for
+checks, instead of refusing; a second move refuses anyway. The setting is
+therefore rarely exercised — the window is the few seconds of one landing, and
+PMR-196 serialized the base fetches that used to widen it — but it is a
+narrow race guard, not dead configuration (PMR-169).
+
+Any other hard gate -- a failing check, an effective
+changes-requested review, an unresolved thread, a base that moved mid-landing,
+a merge conflict, or a closed/mismatched pull request -- refuses landing and
+attempts the configured `merge_state -> In Review`
 fallback transition, itself a safe no-op once the issue is no longer exactly
-in `merge_state`. A successful merge transitions the bound issue to `Done`
+in `merge_state`. Whether or not that transition moves anything, the gate
+reason is recorded under `operation: landing_refused`: the transition record
+carries it when the edge applies, and `internal/github` logs it directly when
+the edge is absent, already stale, or failed, so a refusal is never silent
+(see [observability.md](observability.md)). A successful merge transitions the bound issue to `Done`
 exactly once; a pull request GitHub already reports merged, discovered at any
 point (including a race during the merge call itself), reconciles that same
 `Done` transition idempotently instead of merging again, which is also how a

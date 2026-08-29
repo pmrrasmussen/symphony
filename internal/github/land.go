@@ -359,10 +359,30 @@ func (s *Session) completeLanding(ctx context.Context, pr pull) (LandResult, err
 func (s *Session) refuse(ctx context.Context, reason string) (LandResult, error) {
 	s.deferredFired = true
 	s.waitingOutcome = false
-	if _, err := s.linear.RefuseLanding(ctx, s.settings.MergeState, reason); err != nil {
-		s.manager.logger.Warn("GitHub land Merging fallback transition failed", "issue_id", s.issue.ID, "issue_identifier", s.issue.Identifier, "reason", reason, "error", observability.Text(err.Error()))
-	}
+	s.recordRefusal(ctx, reason)
 	return LandResult{}, errors.New(reason)
+}
+
+// recordRefusal applies the configured Merging -> In Review fallback and makes
+// sure the gate reason reaches the host log on every path, not only the one
+// where the tracker edge is applied. RefuseLanding logs the reason itself, on an
+// operation=landing_refused transition record (PMR-159), but only when it
+// actually transitions: it reports (false, nil) -- correctly, and silently --
+// when the issue has already left the merge state or no refuse_landing edge is
+// configured. Those refusals used to leave no trace of why landing stopped,
+// which is the same gap PMR-163 closed for publish, so they are logged here
+// under that same operation rather than under a second name for one decision
+// (PMR-169). It assumes s.mu is held.
+func (s *Session) recordRefusal(ctx context.Context, reason string) {
+	applied, err := s.linear.RefuseLanding(ctx, s.settings.MergeState, reason)
+	switch {
+	case err != nil:
+		// The fallback failed, so no transition record exists either; the reason
+		// travels on this record instead.
+		s.manager.logger.Warn("GitHub land Merging fallback transition failed", "operation", observability.OperationLandingRefused, "issue_id", s.issue.ID, "issue_identifier", s.issue.Identifier, "reason", observability.Text(reason), "error", observability.Text(err.Error()))
+	case !applied:
+		s.manager.logger.Warn("GitHub landing refused without a tracker transition", "operation", observability.OperationLandingRefused, "issue_id", s.issue.ID, "issue_identifier", s.issue.Identifier, "branch", s.branch, "reason", observability.Text(reason))
+	}
 }
 
 // gate handles a hard gate. When the bounded-fix feature is enabled, the gate
@@ -394,9 +414,7 @@ func (s *Session) fireDeferredRefusal(ctx context.Context) {
 		return
 	}
 	s.deferredFired = true
-	if _, err := s.linear.RefuseLanding(ctx, s.settings.MergeState, s.lastFailedGate); err != nil {
-		s.manager.logger.Warn("GitHub land deferred Merging fallback transition failed", "issue_id", s.issue.ID, "issue_identifier", s.issue.Identifier, "error", observability.Text(err.Error()))
-	}
+	s.recordRefusal(ctx, s.lastFailedGate)
 	if err := s.linear.LandComment(ctx, landingRefusalComment(s.lastFailedGate)); err != nil {
 		s.manager.logger.Warn("GitHub land refusal comment failed", "issue_id", s.issue.ID, "issue_identifier", s.issue.Identifier, "error", observability.Text(err.Error()))
 	}

@@ -25,6 +25,11 @@ const (
 	OperationHandoff Operation = "handoff"
 	// OperationLandingRefused is the landing fallback applied when a
 	// github_land_pr attempt hits a hard gate (merge state -> handoff state).
+	// It also names the same decision when that fallback moved nothing -- the
+	// issue had already left the merge state, no refuse_landing edge is
+	// configured, or the transition call failed -- in which case internal/github
+	// logs it directly, because the hard gate still fired and its reason is the
+	// only record of why landing stopped (PMR-169).
 	OperationLandingRefused Operation = "landing_refused"
 	// OperationPublishRefused names a github_publish_pr call that a fixed,
 	// host-checked gate refused before publishing anything. Unlike the landing

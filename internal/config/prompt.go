@@ -48,6 +48,19 @@ func (s Settings) LinearSessionCapabilityEnabled() bool {
 // the prompt was rendered from a settings snapshot the backend never sees.
 const HostSidePublishPromiseMarker = "Delivery mode: host-side publish is available for this run."
 
+// LandingDeliveryMarker opens the landing delivery mode, which replaces the
+// host-side publish mode for a run dispatched in the configured merge state.
+// It is exported for the same reason its publish counterpart is: internal/claude's
+// launch guard reads the rendered prompt rather than re-deriving what it says.
+//
+// The two modes are separate because a landing run that is told to publish has
+// two ways to end, and both are reachable from one identical state: land the
+// pull request, or push a merge commit and hand the issue back to review for a
+// second approval it does not need. That is not hypothetical -- it happened on
+// 2026-08-28 to one of two pull requests in the same wave, from the same state,
+// with the same rendered prompt (PMR-169).
+const LandingDeliveryMarker = "Delivery mode: landing. Host-side publish is not available for this run."
+
 // HostSidePublishPromised reports whether a run under these settings is told
 // that host-side publish is available. It is the exact condition
 // DeliveryInstructions branches on, named so that a backend can cross-check the
@@ -61,7 +74,7 @@ const HostSidePublishPromiseMarker = "Delivery mode: host-side publish is availa
 //
 // HandoffState is trimmed for the same reason every sibling predicate trims it
 // (LinearSessionCapabilityEnabled here, linear.PrepareWithSettings,
-// capability.landAdvertised): an all-whitespace value is unreachable through
+// GitHub.LandingDispatch): an all-whitespace value is unreachable through
 // Load, but this predicate is now consumed by two other packages, and an
 // untrimmed one would make the promise true while the handoff session and the
 // GitHub session built from the same field are both nil -- every launch then
@@ -128,7 +141,14 @@ const MCPNamingRuleMarker = "Tool naming: Symphony's bounded tools reach you thr
 // it is served over MCP. The rule below is stated over the prefix rather than
 // over an enumeration of names, so it cannot go stale against a workflow body
 // that adds one. See docs/architecture.md's opening section.
-func (s Settings) DeliveryInstructions(backend string) string {
+//
+// issueState is the state the dispatch is bound to, and it selects between the
+// two host-side modes: a run in the configured merge state is landing, and is
+// told so, because it is served github_land_pr and refused github_publish_pr.
+// Passing the state rather than a caller-computed boolean keeps the branch and
+// capability.Build reading the same predicate (GitHub.LandingDispatch) instead
+// of two that can disagree.
+func (s Settings) DeliveryInstructions(backend, issueState string) string {
 	// Only the Claude transport renames Symphony's tools. Every other backend --
 	// today only codex, whose dynamic tools carry the registry's own names --
 	// keeps the bare names, so for those this function renders byte-identically
@@ -142,6 +162,14 @@ func (s Settings) DeliveryInstructions(backend string) string {
 		preamble = MCPNamingRuleMarker + `, so each one is named ` + MCPToolPrefix + `<tool> and not <tool>. Wherever these instructions or the task above name a Symphony tool without that prefix, call ` + MCPToolPrefix + ` followed by that name. Your own tool list decides availability: a Symphony tool that is not in it is unavailable for this run, whatever the instructions say.
 
 `
+	}
+	if s.HostSidePublishPromised() && s.GitHub.LandingDispatch(issueState) {
+		return preamble + LandingDeliveryMarker + `
+
+- This issue is in the configured merge state, so landing it is the whole run: ` + tool("github_land_pr") + ` is the only delivery capability served, and it takes no arguments.
+- Do not run gh, git push, git merge, or otherwise try to publish or merge directly to GitHub.
+- ` + tool("github_publish_pr") + ` is not served for a landing run and refuses if called. Publishing here would push the branch and hand the issue back to review for a second approval instead of landing it, so bringing the worktree onto the base branch is not a step in this run.
+- Call ` + tool("github_pr_context") + ` (no arguments) to read bounded check status, review state, and unresolved feedback for that same pull request.`
 	}
 	if s.HostSidePublishPromised() {
 		return preamble + HostSidePublishPromiseMarker + `
