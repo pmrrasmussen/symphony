@@ -156,41 +156,6 @@ func copyTransitions(source map[string]string) map[string]string {
 	return copy
 }
 
-func (s *HandoffSession) resolveTeamStates(ctx context.Context, teamID string) (map[string]string, error) {
-	response, err := requestWithSettings(ctx, s.client, s.settings, handoffStatesQuery, map[string]any{"teamID": teamID})
-	if err != nil {
-		return nil, err
-	}
-	var payload struct {
-		Data struct {
-			Team *struct {
-				ID     string `json:"id"`
-				States struct {
-					Nodes []struct {
-						ID   string `json:"id"`
-						Name string `json:"name"`
-					} `json:"nodes"`
-				} `json:"states"`
-			} `json:"team"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal(response, &payload); err != nil || payload.Data.Team == nil || strings.TrimSpace(payload.Data.Team.ID) != strings.TrimSpace(teamID) {
-		return nil, trackerError("handoff_scope", "Linear did not return the active issue team")
-	}
-	states := make(map[string]string, len(payload.Data.Team.States.Nodes))
-	for _, state := range payload.Data.Team.States.Nodes {
-		name, id := strings.ToLower(strings.TrimSpace(state.Name)), strings.TrimSpace(state.ID)
-		if name == "" || id == "" {
-			return nil, trackerError("handoff_scope", "Linear returned an invalid active issue team state")
-		}
-		if _, exists := states[name]; exists {
-			return nil, trackerError("handoff_scope", "Linear returned ambiguous active issue team states")
-		}
-		states[name] = id
-	}
-	return states, nil
-}
-
 // handoffLocked coordinates the repository-owned completion comment and
 // transition. The exact comment is durable reconciliation state in Linear:
 // retries first discover it, so a failed or ambiguous transition never
@@ -287,6 +252,9 @@ func (s *HandoffSession) EnsureMergeState(ctx context.Context, mergeState string
 // issue elsewhere is never overridden. A missing or stale configured edge is
 // reported by returning (false, nil): the caller's hard-gate refusal must still
 // be honored even when no fallback transition is available or currently valid.
+// An edge whose configured source or target cannot be resolved on the team is
+// the one case that returns an error, so the misconfiguration is diagnosable;
+// the caller treats that as best effort and still refuses the landing.
 // reason is the fixed or repository-config derived gate string the GitHub
 // adapter refused landing for (never provider or model text); it is recorded
 // on the transition log record so an operator can tell which gate fired
@@ -305,14 +273,23 @@ func (s *HandoffSession) RefuseLanding(ctx context.Context, mergeState, reason s
 	if !ok {
 		return false, nil
 	}
-	states, err := s.resolveTeamStates(ctx, current.TeamID())
+	// Resolve only the two ends of this edge, through the same resolver every
+	// other transition uses: a duplicate state name elsewhere in the team is
+	// none of this edge's business and must not strand the issue in Merging
+	// (PMR-185). The non-terminal policy is the one that applies here -- unlike
+	// CompleteLanding's Done, neither end of a refuse_landing edge may be a
+	// terminal state, which the configuration loader already rejects.
+	resolver := &Handoff{client: s.client}
+	sourceID, err := resolver.resolveState(ctx, s.settings, current.TeamID(), mergeState)
 	if err != nil {
 		return false, err
 	}
-	sourceID, sourceOK := states[strings.ToLower(strings.TrimSpace(mergeState))]
-	targetID, targetOK := states[strings.ToLower(strings.TrimSpace(target))]
-	if !sourceOK || sourceID != current.StateID() || !targetOK {
+	if sourceID != current.StateID() {
 		return false, nil
+	}
+	targetID, err := resolver.resolveState(ctx, s.settings, current.TeamID(), target)
+	if err != nil {
+		return false, err
 	}
 	if err := s.transitionTo(ctx, targetID); err != nil {
 		return false, err
