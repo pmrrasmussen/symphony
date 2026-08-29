@@ -23,12 +23,12 @@ import (
 func TestSourceIntegritySnapshotIgnoresSymphonyBranches(t *testing.T) {
 	source := newGitRepository(t)
 	ctx := context.Background()
-	base, err := captureSourceIntegrity(ctx, source)
+	base, err := captureSourceIntegrity(ctx, config.Settings{}, source)
 	if err != nil {
 		t.Fatal(err)
 	}
 	runGit(t, source, "branch", "symphony/pmr-1")
-	afterSymphony, err := captureSourceIntegrity(ctx, source)
+	afterSymphony, err := captureSourceIntegrity(ctx, config.Settings{}, source)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -36,7 +36,7 @@ func TestSourceIntegritySnapshotIgnoresSymphonyBranches(t *testing.T) {
 		t.Fatalf("symphony/* branch changed the snapshot: got=%v base=%v", afterSymphony.Refs, base.Refs)
 	}
 	runGit(t, source, "branch", "feature")
-	afterFeature, err := captureSourceIntegrity(ctx, source)
+	afterFeature, err := captureSourceIntegrity(ctx, config.Settings{}, source)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -54,7 +54,7 @@ func TestDiffSourceRefsExplainsOperatorFastForwardPulls(t *testing.T) {
 	source := newGitRepository(t)
 	ctx := context.Background()
 
-	baseline, err := captureSourceIntegrity(ctx, source)
+	baseline, err := captureSourceIntegrity(ctx, config.Settings{}, source)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -71,11 +71,11 @@ func TestDiffSourceRefsExplainsOperatorFastForwardPulls(t *testing.T) {
 	runGit(t, publisher, "push", "origin", "main")
 	runGit(t, source, "pull", "--ff-only")
 
-	pulled, err := captureSourceIntegrity(ctx, source)
+	pulled, err := captureSourceIntegrity(ctx, config.Settings{}, source)
 	if err != nil {
 		t.Fatal(err)
 	}
-	alerts, explained := diffSourceRefs(ctx, source, baseline.Refs, pulled.Refs)
+	alerts, explained := diffSourceRefs(ctx, config.Settings{}, source, baseline.Refs, pulled.Refs)
 	if len(alerts) != 0 {
 		t.Fatalf("operator fast-forward pull was flagged as an alert: %+v", alerts)
 	}
@@ -91,11 +91,11 @@ func TestDiffSourceRefsExplainsOperatorFastForwardPulls(t *testing.T) {
 	runGit(t, source, "add", "escape.txt")
 	runGit(t, source, "commit", "-m", "agent wrote the source repository")
 
-	written, err := captureSourceIntegrity(ctx, source)
+	written, err := captureSourceIntegrity(ctx, config.Settings{}, source)
 	if err != nil {
 		t.Fatal(err)
 	}
-	alerts, explained = diffSourceRefs(ctx, source, pulled.Refs, written.Refs)
+	alerts, explained = diffSourceRefs(ctx, config.Settings{}, source, pulled.Refs, written.Refs)
 	if len(explained) != 0 {
 		t.Fatalf("an unreachable local write was explained away: %+v", explained)
 	}
@@ -118,7 +118,7 @@ func TestDiffSourceRefsFailsClosedOnClassificationFailure(t *testing.T) {
 	source := newGitRepository(t)
 	ctx := context.Background()
 
-	current, err := captureSourceIntegrity(ctx, source)
+	current, err := captureSourceIntegrity(ctx, config.Settings{}, source)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,7 +128,7 @@ func TestDiffSourceRefsFailsClosedOnClassificationFailure(t *testing.T) {
 	}
 	baseline := map[string]string{"refs/heads/main": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"}
 
-	alerts, explained := diffSourceRefs(ctx, source, baseline, current.Refs)
+	alerts, explained := diffSourceRefs(ctx, config.Settings{}, source, baseline, current.Refs)
 	if len(explained) != 0 {
 		t.Fatalf("an unclassifiable ref change was explained away: %+v", explained)
 	}
@@ -152,7 +152,7 @@ func TestDiffSourceRefsTreatsNotAncestorAsNegativeAnswer(t *testing.T) {
 	source := newGitRepository(t)
 	ctx := context.Background()
 
-	baseline, err := captureSourceIntegrity(ctx, source)
+	baseline, err := captureSourceIntegrity(ctx, config.Settings{}, source)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -172,7 +172,7 @@ func TestDiffSourceRefsTreatsNotAncestorAsNegativeAnswer(t *testing.T) {
 	runGit(t, source, "checkout", "main")
 	runGit(t, source, "branch", "-D", "orphan")
 
-	current, err := captureSourceIntegrity(ctx, source)
+	current, err := captureSourceIntegrity(ctx, config.Settings{}, source)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -181,7 +181,7 @@ func TestDiffSourceRefsTreatsNotAncestorAsNegativeAnswer(t *testing.T) {
 		t.Fatalf("main did not move: %s", after)
 	}
 
-	alerts, explained := diffSourceRefs(ctx, source, baseline.Refs, current.Refs)
+	alerts, explained := diffSourceRefs(ctx, config.Settings{}, source, baseline.Refs, current.Refs)
 	if len(explained) != 0 {
 		t.Fatalf("an orphaned reset was explained away: %+v", explained)
 	}
@@ -203,7 +203,7 @@ func TestDiffSourceRefsAlertsOnDeletedRef(t *testing.T) {
 	baseline := map[string]string{"refs/heads/main": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
 	current := map[string]string{}
 
-	alerts, explained := diffSourceRefs(ctx, source, baseline, current)
+	alerts, explained := diffSourceRefs(ctx, config.Settings{}, source, baseline, current)
 	if len(explained) != 0 {
 		t.Fatalf("a deleted ref was explained away: %+v", explained)
 	}
@@ -225,7 +225,7 @@ func TestDiffSourceRefsAlertsOnNewRef(t *testing.T) {
 	baseline := map[string]string{}
 	current := map[string]string{"refs/heads/feature": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}
 
-	alerts, explained := diffSourceRefs(ctx, source, baseline, current)
+	alerts, explained := diffSourceRefs(ctx, config.Settings{}, source, baseline, current)
 	if len(explained) != 0 {
 		t.Fatalf("a new ref was explained away: %+v", explained)
 	}

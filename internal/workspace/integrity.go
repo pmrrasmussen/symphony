@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/pmrrasmussen/symphony/internal/config"
 	"github.com/pmrrasmussen/symphony/internal/domain"
 	"github.com/pmrrasmussen/symphony/internal/observability"
 )
@@ -42,12 +43,13 @@ func (l *Local) assertSourceIntegrity(ctx context.Context, ws domain.Workspace, 
 	if err != nil || !found || state.SourceRoot == "" {
 		return
 	}
-	current, err := captureSourceIntegrity(ctx, state.SourceRoot)
+	settings := l.settings()
+	current, err := captureSourceIntegrity(ctx, settings, state.SourceRoot)
 	if err != nil {
 		l.logger().Warn("workspace source integrity check failed", "issue_id", issue.ID, "issue_identifier", issue.Identifier, "error", err)
 		return
 	}
-	alerts, explained := diffSourceRefs(ctx, state.SourceRoot, baseline.Refs, current.Refs)
+	alerts, explained := diffSourceRefs(ctx, settings, state.SourceRoot, baseline.Refs, current.Refs)
 	if len(explained) > 0 {
 		l.logger().Debug("workspace source integrity change explained by a fast-forward reachable from a remote-tracking ref",
 			"issue_id", issue.ID, "issue_identifier", issue.Identifier, "changed_refs", formatRefChanges(explained))
@@ -69,8 +71,8 @@ type sourceIntegritySnapshot struct {
 
 // captureSourceIntegrity reads the current refs/heads state to compare against
 // or record as a sourceIntegritySnapshot.
-func captureSourceIntegrity(ctx context.Context, sourceRoot string) (sourceIntegritySnapshot, error) {
-	refs, err := gitMetadataAllowEmpty(ctx, sourceRoot, "for-each-ref", "--format=%(refname) %(objectname)", "refs/heads/")
+func captureSourceIntegrity(ctx context.Context, settings config.Settings, sourceRoot string) (sourceIntegritySnapshot, error) {
+	refs, err := gitMetadataAllowEmpty(ctx, settings, sourceRoot, "for-each-ref", "--format=%(refname) %(objectname)", "refs/heads/")
 	if err != nil {
 		return sourceIntegritySnapshot{}, fmt.Errorf("read source branch heads: %w", err)
 	}
@@ -110,7 +112,7 @@ type refChange struct{ Name, Before, After, Reason string }
 // Reason set to the classification failure (PMR-147). isAncestor's exit-code-1
 // "not an ancestor" result is a legitimate negative answer, not a failure, and
 // is handled by isAncestor itself.
-func diffSourceRefs(ctx context.Context, sourceRoot string, baseline, current map[string]string) (alerts, explained []refChange) {
+func diffSourceRefs(ctx context.Context, settings config.Settings, sourceRoot string, baseline, current map[string]string) (alerts, explained []refChange) {
 	names := make(map[string]struct{}, len(baseline)+len(current))
 	for name := range baseline {
 		names[name] = struct{}{}
@@ -126,14 +128,14 @@ func diffSourceRefs(ctx context.Context, sourceRoot string, baseline, current ma
 		}
 		change := refChange{Name: name, Before: before, After: after}
 		if hadBefore && hasAfter {
-			ff, ffErr := isAncestor(ctx, sourceRoot, before, after)
+			ff, ffErr := isAncestor(ctx, settings, sourceRoot, before, after)
 			if ffErr != nil {
 				change.Reason = ffErr.Error()
 				alerts = append(alerts, change)
 				continue
 			}
 			if ff {
-				reachable, reachErr := reachableFromRemote(ctx, sourceRoot, after)
+				reachable, reachErr := reachableFromRemote(ctx, settings, sourceRoot, after)
 				if reachErr != nil {
 					change.Reason = reachErr.Error()
 					alerts = append(alerts, change)
@@ -154,8 +156,9 @@ func diffSourceRefs(ctx context.Context, sourceRoot string, baseline, current ma
 
 // isAncestor reports whether ancestor is an ancestor of (or equal to)
 // descendant, i.e. whether descendant is a fast-forward from ancestor.
-func isAncestor(ctx context.Context, dir, ancestor, descendant string) (bool, error) {
+func isAncestor(ctx context.Context, settings config.Settings, dir, ancestor, descendant string) (bool, error) {
 	cmd := exec.CommandContext(ctx, "git", "-C", dir, "merge-base", "--is-ancestor", ancestor, descendant)
+	cmd.Env = gitEnvironment(settings)
 	var stderr boundedBuffer
 	cmd.Stderr = &stderr
 	err := cmd.Run()
@@ -172,8 +175,8 @@ func isAncestor(ctx context.Context, dir, ancestor, descendant string) (bool, er
 // reachableFromRemote reports whether commit is reachable from any
 // remote-tracking ref, the mark of a commit the operator's own `git pull` (or
 // equivalent fetch) could plausibly have introduced.
-func reachableFromRemote(ctx context.Context, dir, commit string) (bool, error) {
-	out, err := gitMetadataAllowEmpty(ctx, dir, "for-each-ref", "--contains="+commit, "refs/remotes/")
+func reachableFromRemote(ctx context.Context, settings config.Settings, dir, commit string) (bool, error) {
+	out, err := gitMetadataAllowEmpty(ctx, settings, dir, "for-each-ref", "--contains="+commit, "refs/remotes/")
 	if err != nil {
 		return false, fmt.Errorf("check remote-tracking reachability: %w", err)
 	}

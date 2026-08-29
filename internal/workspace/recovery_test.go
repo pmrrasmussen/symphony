@@ -44,7 +44,7 @@ func TestInterruptedPreparationMarkerIsReconciled(t *testing.T) {
 	s := config.Settings{Workspace: config.Workspace{Root: root, SourceRoot: source}}
 	l := New(func() config.Settings { return s })
 	issue := domain.Issue{ID: "issue-17", Identifier: "PMR-17"}
-	identity, err := sourceIdentity(context.Background(), source)
+	identity, err := sourceIdentity(context.Background(), s, source)
 	if err != nil {
 		t.Fatal(err)
 	}

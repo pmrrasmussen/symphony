@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sync"
@@ -125,7 +124,7 @@ func (l *Local) Prepare(ctx context.Context, issue domain.Issue) (domain.Workspa
 	settings := l.settings()
 	if created {
 		if settings.Workspace.SourceRoot != "" {
-			identity, err := sourceIdentity(ctx, settings.Workspace.SourceRoot)
+			identity, err := sourceIdentity(ctx, settings, settings.Workspace.SourceRoot)
 			if err != nil {
 				return domain.Workspace{}, err
 			}
@@ -133,15 +132,15 @@ func (l *Local) Prepare(ctx context.Context, issue domain.Issue) (domain.Workspa
 			if err := l.writeState(issue, state); err != nil {
 				return domain.Workspace{}, err
 			}
-			if err := l.addWorktree(ctx, identity.sourceRoot, path, settings.GitHub.BaseBranch); err != nil {
+			if err := l.addWorktree(ctx, settings, identity.sourceRoot, path, settings.GitHub.BaseBranch); err != nil {
 				return domain.Workspace{}, err
 			}
-			worktreeDir, err := worktreeIdentity(ctx, path, identity.commonDir)
+			worktreeDir, err := worktreeIdentity(ctx, settings, path, identity.commonDir)
 			if err != nil {
 				return domain.Workspace{}, err
 			}
 			state.GitWorktreeDir = worktreeDir
-			state.BaseCommit, err = gitHead(ctx, path)
+			state.BaseCommit, err = gitHead(ctx, settings, path)
 			if err != nil {
 				return domain.Workspace{}, err
 			}
@@ -233,7 +232,8 @@ func (l *Local) setGitMetadataRoot(ctx context.Context, ws *domain.Workspace, is
 	if err := validateWorktreeIdentity(ws.Path, state); err != nil {
 		return fmt.Errorf("validate Git workspace for local commits: %w", err)
 	}
-	available, err := gitRepositoryAvailable(ctx, state)
+	settings := l.settings()
+	available, err := gitRepositoryAvailable(ctx, settings, state)
 	if err != nil {
 		return fmt.Errorf("validate Git workspace repository: %w", err)
 	}
@@ -248,7 +248,7 @@ func (l *Local) setGitMetadataRoot(ctx context.Context, ws *domain.Workspace, is
 	// The integrity baseline is a best-effort backstop: an unexpected failure to
 	// fingerprint the source must not fail an otherwise valid workspace. An empty
 	// baseline simply skips the post-run assertion.
-	if snapshot, err := captureSourceIntegrity(ctx, state.SourceRoot); err == nil {
+	if snapshot, err := captureSourceIntegrity(ctx, settings, state.SourceRoot); err == nil {
 		if encoded, err := json.Marshal(snapshot); err == nil {
 			ws.GitIntegrityBaseline = string(encoded)
 		}
@@ -321,8 +321,9 @@ func (l *Local) removeWorkspace(ctx context.Context, issue domain.Issue, path st
 	if err := validateStateOwner(state, issue); err != nil {
 		return domain.CleanupClean, err
 	}
+	settings := l.settings()
 	ws := domain.Workspace{Path: path, Key: Key(issue.Identifier)}
-	if err := l.hook(ctx, ws, issue, "before_remove", l.settings().Hooks.BeforeRemove); err != nil {
+	if err := l.hook(ctx, ws, issue, "before_remove", settings.Hooks.BeforeRemove); err != nil {
 		l.logger().Warn("workspace hook failed", "hook", "before_remove", "issue_id", issue.ID, "issue_identifier", issue.Identifier, "error", err)
 	}
 	git, err := isGitWorkspace(path)
@@ -338,12 +339,12 @@ func (l *Local) removeWorkspace(ctx context.Context, issue domain.Issue, path st
 			if err := validateWorktreeIdentity(path, state); err != nil {
 				return outcome, err
 			}
-			available, availableErr := gitRepositoryAvailable(ctx, state)
+			available, availableErr := gitRepositoryAvailable(ctx, settings, state)
 			if availableErr != nil {
 				return outcome, availableErr
 			}
 			if available {
-				unchanged := ensureGitWorkspaceUnchanged(ctx, path, state.BaseCommit)
+				unchanged := ensureGitWorkspaceUnchanged(ctx, settings, path, state.BaseCommit)
 				landed, err := l.permitCommittedRemoval(ctx, issue, unchanged)
 				if err != nil {
 					return outcome, err
@@ -351,10 +352,10 @@ func (l *Local) removeWorkspace(ctx context.Context, issue domain.Issue, path st
 				if landed {
 					outcome = domain.CleanupLanded
 				}
-				if err := removeRecordedWorktree(ctx, state, path, false); err != nil {
+				if err := removeRecordedWorktree(ctx, settings, state, path, false); err != nil {
 					return outcome, err
 				}
-				if err := pruneRecordedWorktrees(ctx, state); err != nil {
+				if err := pruneRecordedWorktrees(ctx, settings, state); err != nil {
 					return outcome, err
 				}
 			} else {
@@ -400,13 +401,4 @@ func (l *Local) permitCommittedRemoval(ctx context.Context, issue domain.Issue, 
 		return false, refusal
 	}
 	return true, nil
-}
-func (l *Local) Execute(ctx context.Context, ws domain.Workspace, command string, args []string) ([]byte, error) {
-	path, err := l.managedWorkspacePath(ws.Path)
-	if err != nil {
-		return nil, err
-	}
-	c := exec.CommandContext(ctx, command, args...)
-	c.Dir = path
-	return c.CombinedOutput()
 }

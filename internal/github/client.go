@@ -15,6 +15,7 @@ import (
 
 	"github.com/pmrrasmussen/symphony/internal/config"
 	"github.com/pmrrasmussen/symphony/internal/domain"
+	"github.com/pmrrasmussen/symphony/internal/hostenv"
 )
 
 const maxResponse = 1 << 20
@@ -23,17 +24,29 @@ type gitRunner interface {
 	Run(context.Context, string, []string, []string) (string, error)
 }
 
-type execGit struct{}
+// execGit runs the host-side git this package's publish and landing paths need.
+// It holds the settings callback only to build each child's environment; every
+// repository, branch, and credential decision is the caller's.
+type execGit struct{ settings func() config.Settings }
 
 // Run returns the real git output as the error's text on failure, rather than
 // a generic placeholder: Publish's push gate and Land's stale-branch push
 // gate are the two callers that surface this detail, and only to the host
 // log (via observability.Text), never to the agent -- see the comment on
 // each push failure below.
-func (execGit) Run(ctx context.Context, dir string, args, extraEnv []string) (string, error) {
+//
+// cmd.Dir is the agent's own worktree and the repository configuration git
+// reads there is agent-writable, so this is a child Symphony spawns like any
+// other and its environment goes through hostenv.Filter (PMR-175). It has no
+// session, so it passes no capability.SecretMatcher and gets filters 1 through
+// 3. extraEnv is appended after filtering because it is the credential the
+// caller deliberately hands over -- the push's http.extraheader, as GIT_CONFIG_*
+// entries -- which is why filtering the inherited environment costs the
+// authenticated paths nothing.
+func (g execGit) Run(ctx context.Context, dir string, args, extraEnv []string) (string, error) {
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), extraEnv...)
+	cmd.Env = append(hostenv.Filter(os.Environ(), nil, g.settings(), nil), extraEnv...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		detail := strings.TrimSpace(string(out))
