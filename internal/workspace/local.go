@@ -32,7 +32,7 @@ type Local struct {
 	// SetLogger is called or logger is first used, at which point logger falls
 	// back to the process default, so the zero value and existing tests keep
 	// working.
-	log *observability.Logger
+	log *slog.Logger
 	// fetchMu serializes every base-ref fetch addWorktree issues. It is the
 	// same invariant internal/github's Manager.fetchMu protects: refs/remotes/
 	// origin/<base> and packed-refs live in the shared Git common directory,
@@ -44,15 +44,15 @@ type Local struct {
 
 // logger returns the operator log sink, defaulting to the process-wide
 // handler for a Local built without SetLogger (including the zero value).
-func (l *Local) logger() *observability.Logger {
+func (l *Local) logger() *slog.Logger {
 	if l.log != nil {
 		return l.log
 	}
-	return observability.FromSlog(nil)
+	return observability.Logger(nil)
 }
 
 func New(settings func() config.Settings) *Local {
-	return &Local{settings: settings, log: observability.FromSlog(nil)}
+	return &Local{settings: settings, log: observability.Logger(nil)}
 }
 
 // SetLandingVerifier installs the host-side merge verification terminal
@@ -67,7 +67,7 @@ func (l *Local) SetLandingVerifier(v domain.LandingVerifier) { l.landing = v }
 // symphony.jsonl instead of launchd's stderr file.
 func (l *Local) SetLogger(logger *slog.Logger) {
 	if logger != nil {
-		l.log = observability.FromSlog(logger)
+		l.log = observability.Logger(logger)
 	}
 }
 func Key(identifier string) string {

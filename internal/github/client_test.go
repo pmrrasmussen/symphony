@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -180,6 +181,45 @@ func TestFailedRequestLogsTheProviderDiagnosisHostSideOnly(t *testing.T) {
 	}
 	if status, _ := records[0]["status"].(float64); int(status) != http.StatusMethodNotAllowed {
 		t.Fatalf("record status = %v, want 405", records[0]["status"])
+	}
+}
+
+// TestManagerLoggerRedactsWhatTheCallSiteDidNot is PMR-181's coverage half
+// seen from the package that used to be outside it. This package logs through a
+// *slog.Logger it is handed, so before the redaction became a handler
+// middleware its only protection was every call site remembering
+// observability.Text: an attribute named `token` was written verbatim, and a
+// credential shaped as a JSON member survived Text itself. Both are asserted
+// here rather than in internal/observability, because what changed is that
+// internal/github is covered at all.
+func TestManagerLoggerRedactsWhatTheCallSiteDidNot(t *testing.T) {
+	var logs bytes.Buffer
+	m, settings := requestFailureManager(t, &logs, func(string) http.HandlerFunc {
+		return func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusUnauthorized)
+			fmt.Fprint(w, `{"message":"Bad credentials","token":"ghp_do-not-log-this"}`)
+		}
+	})
+
+	// A call site of this package's own logger that forgets observability.Text
+	// entirely -- the failure the per-call-site convention had no backstop for.
+	m.logger.Warn("GitHub diagnostic", "token", "ghp_do-not-log-this",
+		"error", errors.New(`{"api_key":"sk-do-not-log-this"}`))
+
+	if err := m.request(context.Background(), settings, http.MethodGet, "/repos/owner/repo/pulls/7", nil, nil); err == nil {
+		t.Fatal("a 401 response produced no error")
+	}
+	if strings.Contains(logs.String(), "do-not-log-this") {
+		t.Fatalf("a secret-shaped value reached internal/github's log: %s", logs.String())
+	}
+	records := failureRecords(t, logs.String())
+	if len(records) != 1 {
+		t.Fatalf("failure records = %d, want exactly 1: %s", len(records), logs.String())
+	}
+	// The record still diagnoses the failure: redaction masks the credential
+	// member, not the provider's explanation next to it.
+	if excerpt, _ := records[0]["response_excerpt"].(string); !strings.Contains(excerpt, "Bad credentials") {
+		t.Fatalf("redaction ate the provider's explanation: %q", excerpt)
 	}
 }
 
