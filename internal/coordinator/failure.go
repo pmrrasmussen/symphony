@@ -114,10 +114,10 @@ func rateLimitRetryDelay(retryAfter, maxRetryBackoff time.Duration) time.Duratio
 //
 // The map is deliberately not exhaustive over finishFailure's reasons: the
 // absent ones ("workspace_prepare", "before_run", "prompt_render",
-// "session_start", "stalled", "agent_blocked", "turn_limit_exhausted",
-// "source_integrity") are issue-attributable and do arm the ceiling. Adding or
-// removing an entry here changes which failures can abandon an issue, so state
-// the case first. "source_integrity" is absent on purpose even though the write
+// "capability_prepare", "session_start", "stalled", "agent_blocked",
+// "turn_limit_exhausted", "source_integrity") are issue-attributable and do arm
+// the ceiling. Adding or removing an entry here changes which failures can
+// abandon an issue, so state the case first. "source_integrity" is absent on purpose even though the write
 // it reports may have come from another session (see attributeRefChanges): a
 // dispatch that keeps ending with the source repository's branches moved must
 // stop being redispatched, and the ceiling is what stops it.

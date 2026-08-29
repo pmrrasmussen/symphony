@@ -82,12 +82,12 @@ type GitHub struct {
 // MergeState. It is the one predicate for that question, and four call sites in
 // three packages ask it -- which capabilities are advertised
 // (capability.Build), which delivery mode the prompt renders
-// (Settings.DeliveryInstructions), whether the Claude launch guard expects a
-// publish capability (claude.verifyPromises), and whether github_publish_pr
-// refuses (github.Session.Publish). A landing run and a publishing run are
-// mutually exclusive deliveries, so a second, paraphrased copy of this
-// condition anywhere would be a way for a prompt to invite exactly the tool the
-// session refuses (PMR-169).
+// (Settings.DeliveryInstructions), whether the host-side preparation expects a
+// publish or a landing capability (capability.verifyPromise), and whether
+// github_publish_pr refuses (github.Session.Publish). A landing run and a
+// publishing run are mutually exclusive deliveries, so a second, paraphrased
+// copy of this condition anywhere would be a way for a prompt to invite exactly
+// the tool the session refuses (PMR-169).
 //
 // It answers a question about a dispatch, not about live tracker state: the
 // state is the one the session was bound to. A human move after that is

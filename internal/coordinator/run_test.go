@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -449,4 +452,150 @@ func TestReconciliationRefreshesStateCapacityForLaterAdmissions(t *testing.T) {
 	}
 	<-ws.after
 	<-ws.after
+}
+
+// fakeCapabilities is the host-side capability preparation, substituted so a
+// test can see what each dispatch prepared from and what it handed the backend.
+type fakeCapabilities struct {
+	mu sync.Mutex
+	// snapshots are the settings each dispatch prepared from, which is what says
+	// the registry and the prompt came from the same one.
+	snapshots  []config.Settings
+	issues     []domain.Issue
+	workspaces []string
+	value      domain.SessionCapabilities
+	err        error
+}
+
+func (f *fakeCapabilities) Prepare(_ context.Context, settings config.Settings, issue domain.Issue, workspace string) (domain.SessionCapabilities, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.snapshots = append(f.snapshots, settings)
+	f.issues = append(f.issues, issue)
+	f.workspaces = append(f.workspaces, workspace)
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.value, nil
+}
+
+func (f *fakeCapabilities) observed() ([]config.Settings, []domain.Issue, []string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]config.Settings(nil), f.snapshots...), append([]domain.Issue(nil), f.issues...), append([]string(nil), f.workspaces...)
+}
+
+// TestADispatchPreparesItsCapabilitiesFromTheSnapshotThatRenderedItsPrompt is
+// the whole point of preparing them here (PMR-182). The prompt promises which
+// bounded tools exist and the registry grants them; while a backend built its
+// own, the two came from different snapshots and a reload between them produced
+// a promise no session could keep, on an ordinary issue.
+//
+// The settings callback answers differently on every call, so a preparation made
+// from any snapshot other than the prompt's is visible: the marker rendered into
+// the dispatched prompt has to be the marker in the snapshot the preparation was
+// given.
+func TestADispatchPreparesItsCapabilitiesFromTheSnapshotThatRenderedItsPrompt(t *testing.T) {
+	base := testSettings(t).Config
+	var reads atomic.Int64
+	settings := func() config.Settings {
+		s := base
+		s.Prompt = fmt.Sprintf("Work on {{.issue.identifier}} under snapshot-%d", reads.Add(1))
+		return s
+	}
+	prepared := &fakeCapabilities{value: "prepared-capability-set"}
+	agent := &fakeAgent{events: completedEvents}
+	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{}, 1)}
+	c := New(&fakeTracker{issue: testIssue()}, agent, ws, settings, nil)
+	c.SetCapabilityPreparer(prepared)
+	defer assertInvariants(t, c)
+
+	c.Tick(context.Background())
+	<-ws.after
+	if err := c.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	requests := agent.requests()
+	if len(requests) != 1 {
+		t.Fatalf("dispatched %d requests, want 1", len(requests))
+	}
+	snapshots, issues, workspaces := prepared.observed()
+	if len(snapshots) != 1 {
+		t.Fatalf("prepared capabilities %d times for one dispatch", len(snapshots))
+	}
+	rendered, _, err := render(snapshots[0], issues[0], 0, snapshots[0].AgentLaunch().Backend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if requests[0].Prompt != rendered {
+		t.Fatalf("the prompt was rendered from a different snapshot than the capabilities were prepared from:\n prompt %q\nprepared from %q", requests[0].Prompt, rendered)
+	}
+	// The issue and the workspace are the dispatch's own: github_land_pr is
+	// advertised on the bound issue's state, and the GitHub session is bound to
+	// this worktree.
+	if issues[0].ID != "id" || workspaces[0] != requests[0].Workspace {
+		t.Fatalf("prepared for issue %+v in %q, want the dispatched issue in %q", issues[0], workspaces[0], requests[0].Workspace)
+	}
+	if requests[0].Capabilities != prepared.value {
+		t.Fatalf("the request carried %v, want the prepared capability set", requests[0].Capabilities)
+	}
+}
+
+// TestADispatchWithNoPreparationInstalledCarriesNoCapabilities pins the unwired
+// case, which --dry-run's synthetic lifecycle depends on: with no preparation
+// installed a dispatch runs with no bounded capability and, crucially, makes no
+// provider round trip at all.
+func TestADispatchWithNoPreparationInstalledCarriesNoCapabilities(t *testing.T) {
+	w := testSettings(t)
+	agent := &fakeAgent{events: completedEvents}
+	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{}, 1)}
+	c := New(&fakeTracker{issue: testIssue()}, agent, ws, func() config.Settings { return w.Config }, nil)
+	defer assertInvariants(t, c)
+
+	c.Tick(context.Background())
+	<-ws.after
+	if err := c.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	requests := agent.requests()
+	if len(requests) != 1 || requests[0].Capabilities != nil {
+		t.Fatalf("requests=%+v, want exactly one carrying no capabilities", requests)
+	}
+}
+
+// TestAFailedCapabilityPreparationFailsTheDispatchBeforeAnySession is the
+// refusal path: a preparation that cannot bind this run's capabilities -- a
+// tracker that would not answer, or a registry that cannot keep the promise the
+// prompt already makes -- must end the dispatch rather than start a session
+// without them.
+//
+// It is its own failure reason because the boundary it names is its own: a
+// session_start record here would send an operator looking at an agent that was
+// never launched.
+func TestAFailedCapabilityPreparationFailsTheDispatchBeforeAnySession(t *testing.T) {
+	w := testSettings(t)
+	var log syncBuffer
+	prepared := &fakeCapabilities{err: errors.New("prepare Linear handoff: tracker unavailable")}
+	agent := &fakeAgent{events: completedEvents}
+	ws := &fakeWorkspace{shouldRun: true, after: make(chan struct{}, 2)}
+	c := New(&fakeTracker{issue: testIssue()}, agent, ws, func() config.Settings { return w.Config }, slog.New(slog.NewJSONHandler(&log, nil)))
+	c.SetCapabilityPreparer(prepared)
+	defer assertInvariants(t, c)
+	c.timer = &fakeTimer{}
+
+	c.Tick(context.Background())
+	<-ws.after
+	waitForSubstring(t, &log, `"msg":"agent run retry scheduled"`, time.Second)
+
+	if starts, _, _ := agent.counts(); starts != 0 {
+		t.Fatalf("a dispatch whose capabilities could not be prepared still started %d sessions", starts)
+	}
+	record := waitForSubstring(t, &log, `"reason":"capability_prepare"`, time.Second)
+	if !strings.Contains(record, "tracker unavailable") {
+		t.Fatalf("the retry record does not carry the preparation failure: %s", record)
+	}
+	// The workspace bracket was closed on this path like every other pre-session
+	// failure -- the receive above is AfterRun's own -- or the worktree would
+	// stay owned by a run that never began.
 }

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/pmrrasmussen/symphony/internal/agent"
+	"github.com/pmrrasmussen/symphony/internal/capability"
 	"github.com/pmrrasmussen/symphony/internal/claude"
 	"github.com/pmrrasmussen/symphony/internal/codex"
 	"github.com/pmrrasmussen/symphony/internal/config"
@@ -149,11 +150,14 @@ func run(args []string, stdout, stderr io.Writer) int {
 	defer stop()
 	ws := workspace.New(settings)
 	ws.SetLogger(slog.New(log.Handler()))
-	backends, githubLifecycle, capabilityEndpoint, err := wire(settings, slog.New(log.Handler()))
+	backends, capabilities, capabilityEndpoint, err := wire(settings, slog.New(log.Handler()))
 	if err != nil {
 		fmt.Fprintln(stderr, "symphony startup error:", err)
 		return 2
 	}
+	// The one manager this process may hold, read back out of the component that
+	// binds it into every session rather than kept as a local of its own.
+	githubLifecycle := capabilities.GitHubManager()
 	// Deferred rather than closed inline after Shutdown, so it happens on every
 	// path out of run() -- including the startup validation below, which would
 	// otherwise leave the listener behind. It still runs after the scheduler has
@@ -187,6 +191,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 	var a domain.AgentBackend = agent.NewRouter(settings, backends)
 	var w domain.WorkspaceExecutor = ws
 	c := coordinator.New(t, a, w, settings, slog.New(log.Handler()))
+	// The scheduler prepares each dispatch's bounded capability set itself, from
+	// the same settings snapshot it renders that dispatch's prompt from, and
+	// hands the result to whichever backend runs it (PMR-182).
+	c.SetCapabilityPreparer(capabilities)
 	// The scheduler is the only component that knows an issue is finished, and
 	// the poll loop above is the one that would otherwise keep requesting that
 	// issue's pull request, and holding its credential snapshot and Linear
@@ -374,40 +382,44 @@ func runTUI(args []string, input io.Reader, stdout, stderr io.Writer, discover t
 	return 0
 }
 
-// wire builds the agent backend registry together with the host providers those
-// backends share, and hands back the one GitHub manager this process may hold.
-// It exists as a seam rather than inline wiring so the sharing is asserted by a
-// test: the manager comes back out of the backend that was given it, so the poll
-// loop and the landing verifier cannot end up on a second manager that merely
-// shares a configuration callback.
+// wire builds the agent backend registry together with the one host-side
+// capability preparation every dispatch runs through, and hands back the
+// preparation itself so the caller can read the one GitHub manager this process
+// may hold back out of it.
 //
-// The loopback MCP capability endpoint is built here for the same reason -- one
-// listener for the daemon's lifetime, handed back for the caller to close rather
-// than bound inside a backend that has nothing to close it with.
+// It exists as a seam rather than inline wiring so the sharing is asserted by a
+// test: the manager comes back out of the component that binds it into sessions,
+// so the poll loop and the landing verifier cannot end up on a second manager
+// that merely shares a configuration callback.
+//
+// No backend is given a provider. Both are handed the capability set on the
+// request instead, prepared once from the snapshot that rendered the run's
+// prompt, so the two transports cannot build different registries and neither
+// can build one the prompt does not describe (PMR-182).
+//
+// The loopback MCP capability endpoint is built here for the same reason the
+// preparation is -- one listener for the daemon's lifetime, handed back for the
+// caller to close rather than bound inside a backend that has nothing to close
+// it with.
 //
 // Optional host capabilities stay disabled until WORKFLOW.md supplies their
 // fixed scope; resolved credentials are filtered from the agent child.
 //
 // See docs/architecture.md's "One GitHub manager per process" for what a second
 // manager would break.
-func wire(settings func() config.Settings, logger *slog.Logger) (map[string]domain.AgentBackend, *githubhost.Manager, *mcpbridge.Server, error) {
+func wire(settings func() config.Settings, logger *slog.Logger) (map[string]domain.AgentBackend, *capability.Preparer, *mcpbridge.Server, error) {
 	handoff := linear.NewHandoff(settings)
 	handoff.SetLogger(logger)
 	endpoint, err := mcpbridge.Listen()
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	sessions := codex.NewWithProviders(settings, handoff, githubhost.New(settings, logger))
+	capabilities := capability.NewPreparer(handoff, githubhost.New(settings, logger))
 	backends := map[string]domain.AgentBackend{
-		config.DefaultAgentBackend: sessions,
-		// The Claude backend is given the very providers Codex holds, never
-		// copies: sessions.GitHubManager() is read back out rather than passing
-		// github along, so a future backend that quietly minted its own would
-		// fail the one-manager assertion instead of splitting the linked pull
-		// request table in production.
-		config.ClaudeAgentBackend: claude.NewWithProviders(settings, handoff, sessions.GitHubManager(), endpoint),
+		config.DefaultAgentBackend: codex.NewWithSettings(settings),
+		config.ClaudeAgentBackend:  claude.NewWithEndpoint(settings, endpoint),
 	}
-	return backends, sessions.GitHubManager(), endpoint, nil
+	return backends, capabilities, endpoint, nil
 }
 
 // logStartupCredentialStatus records whether startup resolved the credentials

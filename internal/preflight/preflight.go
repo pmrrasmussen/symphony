@@ -94,9 +94,10 @@ func run(ctx context.Context, workflowPath, logRoot, statusFile string, environm
 	for _, warning := range settings.Warnings {
 		result.add("workflow_migration", StatusWarning, warning)
 	}
-	// The same predicate the rendered guidance branches on and the Claude backend
-	// cross-checks its registry against, rather than a third copy of it: what
-	// preflight reports available is then what a worker is told is available.
+	// The same predicate the rendered guidance branches on and the host-side
+	// capability preparation cross-checks its registry against, rather than a
+	// third copy of it: what preflight reports available is then what a worker is
+	// told is available.
 	if settings.HostSidePublishPromised() {
 		result.add("github_handoff", StatusPassed, "host-side pull request publishing is enabled for the configured handoff state; a "+settings.AgentLaunch().Backend+" worker reaches it as "+handoffToolName(settings))
 	} else if settings.GitHub.Enabled {

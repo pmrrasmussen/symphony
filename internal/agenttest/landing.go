@@ -44,9 +44,10 @@ var landingStates = map[string]string{
 // it and refuses to claim success unless the state really moved.
 //
 // Nothing here substitutes a capability, a registry, or a provider: a backend
-// under test builds its own registry from a real linear.Handoff and a real
-// github.Manager, and the only stand-ins are these two remotes, the agent child,
-// and a scripted git (see WriteFakeGit).
+// under test runs against the registry the host preparation builds from a real
+// linear.Handoff and a real github.Manager, carried on the request exactly as a
+// dispatch carries one, and the only stand-ins are these two remotes, the agent
+// child, and a scripted git (see WriteFakeGit).
 type LandingRemote struct {
 	t      *testing.T
 	server *httptest.Server
