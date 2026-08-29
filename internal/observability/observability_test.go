@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"log/slog"
 	"strings"
 	"testing"
@@ -17,6 +18,62 @@ func TestTextRedactsCredentialsAndTruncates(t *testing.T) {
 	}
 	if !strings.Contains(value, "[REDACTED]") || !strings.HasSuffix(value, "…[truncated]") {
 		t.Fatalf("diagnostic was not redacted and truncated: %q", value)
+	}
+}
+
+// TestTextRedactsJSONShapedCredentials pins the form Text is most often handed:
+// Text is applied to error and stderr strings -- HTTP error bodies and CLI
+// diagnostics -- which carry a credential as a JSON member far more often than
+// as a shell-style assignment. Until PMR-181 the closing quote after the key
+// broke the match and every case below passed through verbatim.
+func TestTextRedactsJSONShapedCredentials(t *testing.T) {
+	for _, testCase := range []struct {
+		name  string
+		value string
+	}{
+		{name: "json body", value: `{"token":"lin_api_do-not-log-this"}`},
+		{name: "json body with space", value: `{"api_key": "sk-do-not-log-this"}`},
+		{name: "camel case", value: `{"apiKey":"do-not-log-this"}`},
+		{name: "unseparated key", value: `{"apikey":"do-not-log-this"}`},
+		{name: "quoted bearer", value: `{"authorization": "Bearer do-not-log-this"}`},
+		{name: "value with spaces", value: `secret="do-not-log-this and this too"`},
+		{name: "nested in a sentence", value: `github request failed: {"message":"Bad credentials","access_token":"do-not-log-this"}`},
+		{name: "single quotes", value: `--header 'authorization: do-not-log-this'`},
+		{name: "bare assignment still masked", value: `password=do-not-log-this`},
+		// A response body read through a byte-bounded reader can end mid-value,
+		// leaving an opening quote with no closing one.
+		{name: "truncated mid value", value: `{"message":"Bad credentials","token":"ghp_do-not-log-this`},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			got := Text(testCase.value)
+			if strings.Contains(got, "do-not-log-this") {
+				t.Fatalf("secret survived redaction: %q", got)
+			}
+			if !strings.Contains(got, "[REDACTED]") {
+				t.Fatalf("no redaction marker in %q", got)
+			}
+			// The quoted and bare forms run in sequence over the same string, so
+			// the second must leave the first's output alone; a diagnostic that
+			// passes through Text twice must read the same either way.
+			if again := Text(got); again != got {
+				t.Fatalf("Text was not stable across a second pass:\n first: %q\nsecond: %q", got, again)
+			}
+		})
+	}
+}
+
+// TestTextLeavesNonCredentialTextAlone keeps the widened pattern from eating
+// the diagnostics an operator reads: the point of a bounded excerpt is that
+// what survives is still legible.
+func TestTextLeavesNonCredentialTextAlone(t *testing.T) {
+	for _, value := range []string{
+		`{"message":"Base branch was modified","status":422}`,
+		"remote: Permission to owner/repo.git denied",
+		`{"pr_number": 27, "state": "open"}`,
+	} {
+		if got := Text(value); got != value {
+			t.Fatalf("Text rewrote a credential-free diagnostic\n got: %q\nwant: %q", got, value)
+		}
 	}
 }
 
@@ -73,16 +130,68 @@ func TestLoggerPassesAUsableContextToTheHandler(t *testing.T) {
 	}
 }
 
-func TestFromSlogUsesTheGivenHandlerAndSurvivesANilLogger(t *testing.T) {
+func TestLoggerUsesTheGivenHandlerAndSurvivesANilLogger(t *testing.T) {
 	var out bytes.Buffer
-	logger := FromSlog(slog.New(slog.NewJSONHandler(&out, nil)))
+	logger := Logger(slog.New(slog.NewJSONHandler(&out, nil)))
 	logger.Info("from slog event")
 	if !strings.Contains(out.String(), "from slog event") {
-		t.Fatalf("FromSlog did not forward to the given handler's writer: %s", out.String())
+		t.Fatalf("Logger did not forward to the given handler's writer: %s", out.String())
 	}
 
-	if logger := FromSlog(nil); logger == nil || logger.Handler() == nil {
-		t.Fatalf("FromSlog(nil) did not fall back to a default handler")
+	if logger := Logger(nil); logger == nil || logger.Handler() == nil {
+		t.Fatalf("Logger(nil) did not fall back to a default handler")
+	}
+}
+
+// TestRedactionIsAChokepointForBareSlog is the property the whole boundary
+// rests on: redaction lives in the handler, so a component holding a plain
+// *slog.Logger over that handler -- which is every component but the two that
+// used to wrap it -- is covered without remembering anything. Before PMR-181
+// an attr named `token` logged this way was written verbatim.
+func TestRedactionIsAChokepointForBareSlog(t *testing.T) {
+	var out bytes.Buffer
+	shared := New(slog.NewJSONHandler(&out, nil), nil)
+
+	bare := slog.New(shared.Handler())
+	bare.Info("bare slog record", "token", "do-not-log-this", "prompt", "issue text", "error", `{"api_key":"sk-do-not-log-this"}`)
+	// A logger built with With must be as bounded as one passing the same
+	// attribute per call, and a group must not be a hole in the boundary.
+	bare.With("prompt", "issue text").Info("derived record", slog.Group("detail", "stderr", "token=do-not-log-this"))
+
+	got := out.String()
+	if strings.Contains(got, "do-not-log-this") || strings.Contains(got, "issue text") {
+		t.Fatalf("a secret-shaped attribute survived the handler boundary: %s", got)
+	}
+	if !strings.Contains(got, `"prompt":"[REDACTED]"`) {
+		t.Fatalf("an opaque key was not redacted: %s", got)
+	}
+}
+
+// TestRedactIsIdempotent lets every component defensively wrap whatever logger
+// it is handed: without this, the wiring in cmd/symphony would pay for one
+// redaction pass per component and a record would read `[REDACTED]` nested in
+// `[REDACTED]`.
+func TestRedactIsIdempotent(t *testing.T) {
+	handler := Redact(slog.NewJSONHandler(io.Discard, nil), nil)
+	if again := Redact(handler, nil); again != handler {
+		t.Fatalf("Redact wrapped an already-redacting handler a second time")
+	}
+	logger := slog.New(handler)
+	if again := Logger(logger); again != logger {
+		t.Fatalf("Logger rewrapped a logger that already redacts")
+	}
+}
+
+// TestRedactedHandlerDelegatesEnabled proves the middleware is transparent to
+// the level policy it wraps: an operator's --log-level still decides what is
+// written, and a debug record still costs nothing beyond the Enabled check.
+func TestRedactedHandlerDelegatesEnabled(t *testing.T) {
+	handler := Redact(slog.NewJSONHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelWarn}), nil)
+	if handler.Enabled(context.Background(), slog.LevelInfo) {
+		t.Fatal("the wrapped handler reported info enabled at warn level")
+	}
+	if !handler.Enabled(context.Background(), slog.LevelError) {
+		t.Fatal("the wrapped handler reported error disabled at warn level")
 	}
 }
 

@@ -28,7 +28,7 @@ type Handoff struct {
 }
 
 func NewHandoff(settings func() config.Settings) *Handoff {
-	return &Handoff{settings: settings, client: newHTTPClient(nil), logger: slog.Default()}
+	return &Handoff{settings: settings, client: newHTTPClient(nil), logger: observability.Logger(nil)}
 }
 
 func (h *Handoff) Enabled() bool {
@@ -40,7 +40,7 @@ func (h *Handoff) Enabled() bool {
 // edge records land in the same structured log as the rest of the run.
 func (h *Handoff) SetLogger(logger *slog.Logger) {
 	if logger != nil {
-		h.logger = logger
+		h.logger = observability.Logger(logger)
 	}
 }
 

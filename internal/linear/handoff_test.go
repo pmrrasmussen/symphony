@@ -714,15 +714,23 @@ func TestHandoffWiringReportsCapabilityLoggerAndSecretMatcher(t *testing.T) {
 	if disabled.Enabled() {
 		t.Fatal("no handoff state and no follow-up creation must leave the capability off")
 	}
-	logger := slog.New(slog.NewJSONHandler(&bytes.Buffer{}, nil))
-	h.SetLogger(logger)
+	var sink bytes.Buffer
+	h.SetLogger(slog.New(slog.NewJSONHandler(&sink, nil)))
 	h.SetLogger(nil) // A nil logger must not drop the operator handler.
 	session, err := h.Prepare(context.Background(), domain.Issue{ID: "active"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if session.logger != logger {
+	// The session logs into the handler it was wired with, and through the
+	// redaction boundary: SetLogger wraps whatever it is handed (PMR-181), so
+	// the sink stays the caller's while the scrubbing stops being a property of
+	// each call site.
+	session.logger.Warn("wiring probe", "token", "do-not-log-this")
+	if !strings.Contains(sink.String(), "wiring probe") {
 		t.Fatal("the prepared session did not inherit the operator log handler")
+	}
+	if strings.Contains(sink.String(), "do-not-log-this") {
+		t.Fatalf("the prepared session's logger bypassed the redaction boundary: %s", sink.String())
 	}
 	// The launcher filters inherited values containing the credential without
 	// ever holding the credential itself.

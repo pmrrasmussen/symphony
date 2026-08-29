@@ -91,9 +91,7 @@ type linearLifecycle interface {
 var _ linearLifecycle = (*linear.HandoffSession)(nil)
 
 func New(settings func() config.Settings, logger *slog.Logger) *Manager {
-	if logger == nil {
-		logger = slog.Default()
-	}
+	logger = observability.Logger(logger)
 	return &Manager{settings: settings, client: &http.Client{Timeout: 30 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}, git: execGit{settings: settings}, logger: logger, linked: map[string]*link{}}
 }
 

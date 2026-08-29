@@ -117,6 +117,11 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 	defer f.Close()
 	log := observability.New(slog.NewJSONHandler(f, &slog.HandlerOptions{Level: logLevel}), stderr)
+	// The process default is the same redacted sink, so a package that logs
+	// without being handed a logger -- a free function, a future call site that
+	// reaches for the slog package directly -- writes into symphony.jsonl under
+	// the same guarantees instead of dropping unredacted text on stderr.
+	slog.SetDefault(log)
 	for _, warning := range s.Warnings {
 		log.Warn("workflow configuration warning", "warning", warning)
 	}
@@ -257,7 +262,7 @@ type terminalCleaner interface {
 // actually be discarded is the workspace layer's decision, not this loop's --
 // committed work survives unless the host-owned landing verifier confirmed it
 // merged, which is the only case worth an info record here.
-func cleanupTerminalWorkspaces(ctx context.Context, log *observability.Logger, tracker terminalLister, ws terminalCleaner, terminalStates []string) {
+func cleanupTerminalWorkspaces(ctx context.Context, log *slog.Logger, tracker terminalLister, ws terminalCleaner, terminalStates []string) {
 	terminals, err := tracker.ListTerminal(ctx, terminalStates)
 	if err != nil {
 		log.Warn("startup terminal cleanup query failed", "error", err)
@@ -412,7 +417,7 @@ func wire(settings func() config.Settings, logger *slog.Logger) (map[string]doma
 // linearCredentialsConfigured is the caller's tracker.Validate() outcome
 // rather than a value this function derives itself, so the record can never
 // drift from the check that actually gates startup.
-func logStartupCredentialStatus(log *observability.Logger, settings config.Settings, linearCredentialsConfigured bool) {
+func logStartupCredentialStatus(log *slog.Logger, settings config.Settings, linearCredentialsConfigured bool) {
 	log.Info("startup credential configuration",
 		"linear_credentials_configured", linearCredentialsConfigured,
 		"github_credentials_configured", settings.GitHub.Enabled,

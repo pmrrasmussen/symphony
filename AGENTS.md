@@ -43,7 +43,9 @@ handoff, rework, landing, and completion instructions. Read it, and
   it runs under the same filtered environment with no session matcher, and so is
   every host-side `git` this package and `internal/github` spawn.
 - `internal/domain` — the shared, provider-agnostic issue/agent/workspace types.
-- `internal/observability` — structured log redaction and level policy.
+- `internal/observability` — structured log redaction and level policy: the
+  `slog.Handler` middleware every component's logger is wrapped in, so a record
+  is scrubbed at the sink rather than by each call site.
 - `internal/preflight` — the `--dry-run` side-effect-free validation path.
 - `internal/status` — the versioned, redacted runtime status snapshot written for operator clients.
 - `internal/operator` — read-only discovery of local LaunchAgent instances, and the display-safe model built from launchd, status, configuration, and log observations.

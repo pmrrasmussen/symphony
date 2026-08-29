@@ -715,6 +715,41 @@ tail -F .symphony/logs/symphony.jsonl \
   | jq 'select(.msg == "workspace source integrity alert")'
 ```
 
+## Where redaction happens
+
+Redaction is a property of the sink, not of the call site (PMR-181).
+`internal/observability.Redact` wraps any `slog.Handler`, and every component
+that accepts a logger wraps whatever it is handed (`observability.Logger`),
+which is idempotent — so a record is scrubbed on its way out whether it was
+written by the coordinator, by `internal/linear`, `internal/github`, or by a
+plain `slog.Logger` derived from the same handler with `With`. The process
+default logger is set to that same sink, so a package that logs without being
+handed a logger writes into `symphony.jsonl` under the same guarantees rather
+than dropping unredacted text on stderr. Before this, only the coordinator and
+`internal/workspace` logged through the boundary and everything else relied on
+each call site remembering `observability.Text`; a call site that forgot had no
+backstop, and an attribute named `token` was written verbatim.
+
+Three rules apply to every attribute of every record:
+
+* **Opaque keys** are replaced by `[REDACTED]` whatever they hold. That is the
+  content vocabulary (`prompt`, `description`, `message`, `tool`,
+  `tool_arguments`, `environment`, `raw`, …) and the credential-shaped one
+  (`token`, `api_key`, `secret`, `password`, `authorization`, …). A
+  credential-shaped key needs no guess about the value's shape; the token-usage
+  counters are `input_tokens` and friends, so the exact match leaves them alone.
+* **Free text** — an `error` value, and the `error`/`stderr`/`diagnostic`
+  strings — goes through `observability.Text`, which masks credential
+  assignments and bounds the result to `MaxDiagnosticBytes` (512). `Text`
+  recognises the JSON form (`{"token":"lin_api_…"}`, `{"apiKey": "…"}`, a
+  quoted value with spaces in it) as well as `token=…` and `api_key: …`. That
+  matters because `Text` is applied to exactly the strings most likely to carry
+  a credential Symphony did not put there — HTTP error bodies and CLI stderr —
+  which carry one as JSON far more often than as a shell assignment.
+* **Anything else structured** is either a value from a closed vocabulary
+  (`observability.Operation`, checked by value) or `[OMITTED]`. Groups are
+  redacted member by member; nesting makes nothing safe.
+
 ## What never appears in the log
 
 Regardless of level, Symphony never logs: Linear or GitHub credentials or

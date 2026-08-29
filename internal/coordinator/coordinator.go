@@ -47,7 +47,7 @@ type Coordinator struct {
 	settings   func() config.Settings
 	timer      Timer
 	clock      Clock
-	log        *observability.Logger
+	log        *slog.Logger
 	// cleanupTimeout bounds every workspace cleanup attempt; see
 	// workspaceCleanupTimeout, which is the only value production ever gives it.
 	// It is a field rather than a plain constant for the same reason Timer is a
@@ -85,12 +85,9 @@ type Coordinator struct {
 }
 
 func New(t domain.Tracker, a domain.AgentBackend, w domain.WorkspaceExecutor, settings func() config.Settings, logger *slog.Logger) *Coordinator {
-	if logger == nil {
-		logger = slog.Default()
-	}
 	return &Coordinator{
 		tracker: t, agent: a, workspaces: w, settings: settings,
-		timer: realTimer{}, clock: realClock{}, log: observability.FromSlog(logger),
+		timer: realTimer{}, clock: realClock{}, log: observability.Logger(logger),
 		cleanupTimeout: workspaceCleanupTimeout,
 		states:         map[string]*issueState{}, admittedByState: map[string]int{},
 	}

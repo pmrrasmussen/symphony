@@ -122,7 +122,7 @@ type viewerResolution struct {
 }
 
 func New(settings func() config.Settings) *Tracker {
-	return &Tracker{settings: settings, client: newHTTPClient(nil), now: time.Now, logger: slog.Default()}
+	return &Tracker{settings: settings, client: newHTTPClient(nil), now: time.Now, logger: observability.Logger(nil)}
 }
 
 // SetLogger routes host-side transition edge records at the operator log
@@ -130,7 +130,7 @@ func New(settings func() config.Settings) *Tracker {
 // lands in the same structured log as the agent-driven ones.
 func (t *Tracker) SetLogger(logger *slog.Logger) {
 	if logger != nil {
-		t.logger = logger
+		t.logger = observability.Logger(logger)
 	}
 }
 
@@ -674,7 +674,12 @@ func normalizeIssues(records []linearIssue, assignee string, strict bool) ([]dom
 			if strict {
 				return nil, trackerError("tracker_response", "Linear returned a malformed requested issue")
 			}
-			slog.Warn("dropping malformed Linear issue record", "reason", err.Error())
+			// normalizeIssues is a free function with no tracker in hand, so this
+			// is the one record here that goes to the process logger. It still
+			// goes through the redaction boundary rather than to bare slog: a
+			// diagnostic derived from a provider response is exactly what the
+			// boundary exists for.
+			observability.Logger(nil).Warn("dropping malformed Linear issue record", "error", err)
 			continue
 		}
 		out = append(out, issue)
