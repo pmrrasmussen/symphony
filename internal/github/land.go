@@ -103,7 +103,7 @@ func (s *Session) Land(ctx context.Context) (LandResult, error) {
 	if err != nil {
 		return LandResult{}, errors.New("github land requires a committed HEAD")
 	}
-	if _, err := s.manager.git.Run(ctx, s.workspace, []string{"fetch", "origin", s.settings.BaseBranch}, nil); err != nil {
+	if err := s.fetchBaseRef(ctx); err != nil {
 		return LandResult{}, errors.New("github land could not fetch the configured base branch")
 	}
 	base1, err := s.manager.git.Run(ctx, s.workspace, []string{"rev-parse", "refs/remotes/origin/" + s.settings.BaseBranch}, nil)
@@ -235,7 +235,7 @@ func (s *Session) Land(ctx context.Context) (LandResult, error) {
 		return s.gate(ctx, "github pull request has merge conflicts", s.settings.AllowConflictResolution)
 	}
 
-	if _, err := s.manager.git.Run(ctx, s.workspace, []string{"fetch", "origin", s.settings.BaseBranch}, nil); err != nil {
+	if err := s.fetchBaseRef(ctx); err != nil {
 		return LandResult{}, errors.New("github land could not fetch the configured base branch")
 	}
 	base2, err := s.manager.git.Run(ctx, s.workspace, []string{"rev-parse", "refs/remotes/origin/" + s.settings.BaseBranch}, nil)
@@ -261,6 +261,22 @@ func (s *Session) Land(ctx context.Context) (LandResult, error) {
 	}
 	s.manager.logger.Info("GitHub pull request merged", "issue_id", s.issue.ID, "issue_identifier", s.issue.Identifier, "repository", s.settings.Owner+"/"+s.settings.Repository, "pr_number", fresh.Number, "merge_method", s.settings.MergeMethod)
 	return s.completeLanding(ctx, fresh)
+}
+
+// fetchBaseRef performs one base-branch fetch under manager.fetchMu. Every
+// base-ref fetch in this package goes through it, because
+// refs/remotes/origin/<base> and packed-refs live in the shared Git common
+// directory rather than in any one session's worktree: at raised
+// agent.max_concurrent_agents, a landing fetch racing another session's
+// landing fetch or its github_refresh_base_ref call would contend for the
+// same repository-wide ref lock and fail a landing on a self-inflicted
+// transient (PMR-141/PMR-162/PMR-196). It assumes s.mu is held, and takes the
+// same s.mu -> fetchMu order RefreshBaseRef does.
+func (s *Session) fetchBaseRef(ctx context.Context) error {
+	s.manager.fetchMu.Lock()
+	defer s.manager.fetchMu.Unlock()
+	_, err := s.manager.git.Run(ctx, s.workspace, []string{"fetch", "origin", s.settings.BaseBranch}, nil)
+	return err
 }
 
 // updateStaleBranch asks GitHub to create exactly one merge-from-base commit
@@ -323,11 +339,9 @@ func (s *Session) completeLanding(ctx context.Context, pr pull) (LandResult, err
 	// it here, best effort: a merge that already succeeded must still be
 	// reconciled to Done even if this fetch fails, so failure is logged rather
 	// than returned (PMR-135).
-	s.manager.fetchMu.Lock()
-	if _, err := s.manager.git.Run(ctx, s.workspace, []string{"fetch", "origin", s.settings.BaseBranch}, nil); err != nil {
+	if err := s.fetchBaseRef(ctx); err != nil {
 		s.manager.logger.Warn("GitHub post-land base ref refresh failed", "issue_id", s.issue.ID, "issue_identifier", s.issue.Identifier, "repository", s.settings.Owner+"/"+s.settings.Repository, "error", observability.Text(err.Error()))
 	}
-	s.manager.fetchMu.Unlock()
 	if _, err := s.linear.CompleteLanding(ctx, s.settings.MergeState); err != nil {
 		return LandResult{}, err
 	}

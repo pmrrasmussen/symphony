@@ -1089,3 +1089,43 @@ func TestLandReconcilesWhenGitHubSucceedsButLinearCompletionFails(t *testing.T) 
 		t.Fatalf("recovery completion=%d", linear.landCompleted)
 	}
 }
+
+// TestLandBaseFetchesSerializeWithRefreshBaseRef asserts that Land's two
+// stale-base gate fetches take manager.fetchMu, so a landing session and a
+// second session's github_refresh_base_ref never fetch the shared
+// refs/remotes/origin/<base> at once. Both write the Git common directory
+// rather than either session's worktree, so at raised
+// agent.max_concurrent_agents an unserialized landing fetch would race the
+// same repository-wide ref and its packed-refs, failing the landing on a
+// self-inflicted transient (PMR-196).
+func TestLandBaseFetchesSerializeWithRefreshBaseRef(t *testing.T) {
+	api, linear := newAPI(t), &fakeLinear{}
+	api.prExists = true
+	passingRequiredChecks(api, "ci/build")
+	readyToLand(api)
+	git := &landRefreshOverlapGit{fakeGit: &fakeGit{}}
+	manager, session := testLandingSession(t, api, git, linear, []string{"ci/build"}, "merge")
+
+	// A second session on the same Manager, standing in for a concurrent run
+	// calling github_refresh_base_ref while this one lands.
+	refresher := &Session{manager: manager, settings: session.settings, issue: domain.Issue{ID: "issue-28", Identifier: "PMR-28"}, workspace: t.TempDir(), branch: "symphony/pmr-28"}
+	refreshed := make(chan error, 1)
+	git.onFirstFetch = func() {
+		_, err := refresher.RefreshBaseRef(context.Background())
+		refreshed <- err
+	}
+
+	result, err := session.Land(context.Background())
+	if err != nil {
+		t.Fatalf("land error=%v", err)
+	}
+	if result.Status != LandMerged || api.merges != 1 {
+		t.Fatalf("result=%+v merges=%d", result, api.merges)
+	}
+	if err := <-refreshed; err != nil {
+		t.Fatalf("concurrent RefreshBaseRef returned %v", err)
+	}
+	if got := git.observedMaxActive(); got != 1 {
+		t.Fatalf("max concurrent base fetches = %d, want 1 (serialized by fetchMu)", got)
+	}
+}
