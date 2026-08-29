@@ -218,9 +218,12 @@ The `refuse_landing` fallback accepts no agent input. On a refused landing
 Symphony refreshes the bound issue, permits the mutation only when the refreshed
 source matches the configured `github.merge_state`, and moves it to the mapped
 state. A call already off the merge state is an idempotent no-op; reversed,
-terminal, stale, cross-project, and cross-team states are rejected. Host
-transitions are serialized per session, so a race or ambiguous provider result
-is reconciled by the next scoped call.
+terminal, stale, cross-project, and cross-team states are rejected. Ambiguity is
+judged per resolved state, as it is for every other host transition: a duplicate
+state name elsewhere in the team does not block the fallback, so a refused
+landing is never stranded in the merge state by a state the edge never touches.
+Host transitions are serialized per session, so a race or ambiguous provider
+result is reconciled by the next scoped call.
 
 ## Operator prerequisites for the canonical lifecycle
 

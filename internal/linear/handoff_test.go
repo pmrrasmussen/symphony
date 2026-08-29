@@ -41,6 +41,7 @@ type handoffFixture struct {
 	changedStateName    string
 	postTransitionID    string
 	postTransitionName  string
+	extraStates         []map[string]string
 }
 
 func newHandoffFixture(t *testing.T) *handoffFixture {
@@ -100,9 +101,13 @@ func (f *handoffFixture) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			"project": map[string]string{"slugId": f.project}, "team": map[string]string{"id": f.team}, "state": map[string]string{"id": f.stateID, "name": f.stateName},
 		}}})
 	case strings.Contains(query, "SymphonyLinearHandoffStates"):
-		writeJSON(f.t, w, map[string]any{"data": map[string]any{"team": map[string]any{"id": "team-1", "states": map[string]any{"nodes": []any{
+		nodes := []any{
 			map[string]string{"id": "todo", "name": "Todo"}, map[string]string{"id": "in-progress", "name": "In Progress"}, map[string]string{"id": "merging", "name": "Merging"}, map[string]string{"id": "review", "name": "In Review"}, map[string]string{"id": "done", "name": "Done"},
-		}}}}})
+		}
+		for _, state := range f.extraStates {
+			nodes = append(nodes, state)
+		}
+		writeJSON(f.t, w, map[string]any{"data": map[string]any{"team": map[string]any{"id": "team-1", "states": map[string]any{"nodes": nodes}}}})
 	case strings.Contains(query, "SymphonyLinearHandoffComments"):
 		nodes := make([]any, 0, len(f.comments))
 		for _, body := range f.comments {
@@ -359,6 +364,20 @@ func TestRefuseLandingLogsTheGateReasonThatCausedIt(t *testing.T) {
 		if edge["reason"] != reason {
 			t.Fatalf("reason %q: logged reason = %v", reason, edge["reason"])
 		}
+	}
+}
+
+func TestRefuseLandingIgnoresDuplicateStateNamesOutsideItsEdge(t *testing.T) {
+	// A team that carries two states sharing a name (here "Triage") is
+	// ambiguous only for that name. Merging and In Review still resolve
+	// uniquely, so the fallback must still apply rather than failing and
+	// stranding the refused landing in Merging (PMR-185).
+	f := newHandoffFixture(t)
+	f.extraStates = []map[string]string{{"id": "triage-a", "name": "Triage"}, {"id": "triage-b", "name": "Triage"}}
+	session := mergingSession(t, f, map[string]string{"Merging": "In Review"})
+	changed, err := session.RefuseLanding(context.Background(), "Merging", "github required checks failed: build")
+	if err != nil || !changed || f.stateName != "In Review" || f.transitionAttempts != 1 {
+		t.Fatalf("changed=%v err=%v state=%s transitions=%d", changed, err, f.stateName, f.transitionAttempts)
 	}
 }
 
