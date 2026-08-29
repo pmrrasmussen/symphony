@@ -550,8 +550,11 @@ write access to only the two paths a detached-HEAD commit needs -- the source
 repository's shared object store and this linked worktree's own per-worktree
 metadata directory -- and never the rest of the common directory, so the agent
 cannot write the source repository's branch refs (including the primary branch)
-or the primary working tree's index. No host-owned Linear or GitHub credential
-is passed to the worker as a variable.
+or the primary working tree's index. Symphony asks for exactly those two roots
+under Claude as well, but there it is a request the CLI does not honor in full;
+"The source `.git` exposure" below is the one description of what is actually
+enforced, and by what. No host-owned Linear or GitHub credential is passed to
+the worker as a variable.
 
 That bound covers writes and the environment only. A Codex sandbox does not
 restrict reads: a worker can read any file the user running Symphony can,
@@ -578,6 +581,66 @@ validation keeps the policy from widening further: `writableRoots` is rejected
 so the launcher remains the only source of writable paths, and unknown keys
 inside the policy are rejected so a misspelled field cannot silently change
 what the operator believes is configured.
+
+### The source `.git` exposure, and what enforces the boundary instead (PMR-161)
+
+**This exposure is known, accepted, and unprevented; what follows is what
+bounds it.** Under the Claude backend a `Bash` command can write anywhere in
+the source repository's `.git` directory -- `refs/heads/*`, `packed-refs`, the
+primary index, other worktrees' metadata -- and not only the two roots
+Symphony's rendered `sandbox.filesystem.allowWrite` names. The rendered array
+is correct; the CLI's own sandbox generator widens a granted subpath of a
+`.git` directory to the whole enclosing directory, and no setting this launch
+contract can express was found to narrow it back (PMR-156, against
+`claude 2.1.248`). `git commit` and `git update-ref` run against the source
+root therefore succeed, which is what happened live on 2026-08-27: two
+agent-authored commits on the operator's own `main`.
+
+The sharpest consequence is not the moved ref. The shared `.git/config` is
+inside that widened grant, so a session can set `core.fsmonitor` to a program
+of its choosing, and the next host-side `git status` over that repository --
+`ensureGitWorkspaceUnchanged`, on the cleanup path -- runs it. That is
+arbitrary code execution on the host, outside any sandbox. Since PMR-175 every
+host-side git child's environment comes from `hostenv.Filter`, so it carries no
+daemon credential; what remains is an unsandboxed host process with a filtered
+environment, acting on a repository the operator has already agreed to treat as
+disposable.
+
+Two preventions were considered for PMR-161 and both were declined:
+
+* **A Symphony-owned OS sandbox** (`sandbox-exec` on darwin, or an equivalent
+  per platform) wrapping the agent child, so the write boundary is enforced by
+  the OS rather than by a vendor's policy. This reverses the decision recorded
+  below rather than extending it, is platform-specific, and needs its own
+  profile, compatibility evidence, and review -- see "Sandbox ownership
+  decision (PMR-85)", which is still where reopening this belongs.
+* **A full clone per workspace** instead of a linked worktree, so no `.git` is
+  shared with the source at all. It costs disk and a fetch per workspace, and
+  gives up the shared `refs/remotes/*` that PMR-135 measured as load-bearing
+  for keeping a workspace's base ref fresh after a landed merge.
+
+What was built instead is detection that fails the run. `assertSourceIntegrity`
+already compared the source's `refs/heads/*` against a preparation-time
+baseline and classified both live occurrences correctly; since PMR-161 it
+returns that verdict, `AfterRun` propagates it, and the coordinator records the
+run as failed with reason `source_integrity` -- a run that left the source
+repository's branches moved is never reported as a good run, however cleanly
+the agent finished. PMR-145's exemption is intact and load-bearing: a
+fast-forward to a commit reachable from a `refs/remotes/origin/*` ref is
+ordinary operator pull activity, stays at Debug, and fails nothing. Only the
+unexplained case escalates. The alert also names the workspace whose own HEAD
+carries the commit the ref moved to, because the session that observes the
+breach is usually not the session that caused it -- whichever run finishes
+first is the one that runs the check (PMR-156 filed an alert under one issue
+reporting another issue's commit, and named only the reporter).
+
+Detection is not prevention, and the difference is the operating requirement:
+**`workspace.source_root` must point at a dedicated clone, never at the
+operator's own checkout, for as long as this stands.** That is what makes the
+blast radius a throwaway repository -- one whose branches can be reset and
+whose working tree holds nothing anyone is editing -- rather than the checkout
+the operator works in. `docs/dogfooding.md` states the operator-side half of
+the same requirement.
 
 ## Sandbox ownership decision (PMR-85)
 
@@ -608,6 +671,13 @@ decision records the current trade-off rather than promising that the backend
 contracts are equivalent. No current product decision requires Symphony to
 impose a uniform OS-level boundary, so that work is not adopted as part of
 PMR-85 or of PMR-156.
+
+PMR-161 revisited this decision with that gap in hand and **reaffirmed it**,
+rather than reversing it: it accepted the exposure, wrote it down with its
+containment requirement, and built the detect-and-fail backstop instead (see
+"The source `.git` exposure" above). Reaffirmed is not resolved -- the write is
+still possible and only detected afterward -- so an operator or product need
+for prevention reopens this section rather than being blocked by it.
 
 The Claude backend has a fixed launch contract but not equivalent write
 containment, and none of that contract is configurable: the `claude:` block
@@ -760,7 +830,10 @@ way `Edit`/`Write` were closed -- with a boundary this process owns rather
 than one the CLI's own sandbox generator applies -- is exactly the
 Symphony-owned OS sandbox the "Sandbox ownership decision (PMR-85)" section
 below declined to build; that decision, not this one, is where reopening the
-question belongs. Third, reads are not confined,
+question belongs. PMR-161 accepted the gap and made the post-run
+source-integrity check fail the run instead: "The source `.git` exposure"
+above is the one description of what that leaves enforced, and of the
+dedicated-clone requirement that bounds it. Third, reads are not confined,
 exactly as for Codex. Fourth, `network.allowedDomains: ["*"]` is unrestricted
 outbound access, the same deliberate choice as the Codex profile's
 `networkAccess: true`; per-domain control exists and works but is not used to

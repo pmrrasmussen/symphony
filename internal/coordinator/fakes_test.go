@@ -230,6 +230,9 @@ type fakeWorkspace struct {
 	after          chan struct{}
 	prepareStarted chan struct{}
 	prepareGate    <-chan struct{}
+	// afterErr is the source-integrity verdict AfterRun reports, the one error
+	// that boundary returns (domain.WorkspaceExecutor).
+	afterErr error
 	// cleanupStarted and cleanupGate let a test pause the first Cleanup call
 	// until it has arranged a race against it (a concurrent stopRun, or a
 	// second Cleanup call), and cleanupErr makes that first call fail so the
@@ -267,10 +270,11 @@ func (f *fakeWorkspace) Prepare(ctx context.Context, _ domain.Issue) (domain.Wor
 	return domain.Workspace{Path: "/tmp/work"}, nil
 }
 func (f *fakeWorkspace) BeforeRun(context.Context, domain.Workspace, domain.Issue) error { return nil }
-func (f *fakeWorkspace) AfterRun(context.Context, domain.Workspace, domain.Issue) {
+func (f *fakeWorkspace) AfterRun(context.Context, domain.Workspace, domain.Issue) error {
 	if f.after != nil {
 		f.after <- struct{}{}
 	}
+	return f.afterErr
 }
 func (f *fakeWorkspace) Cleanup(ctx context.Context, _ domain.Issue) (domain.CleanupOutcome, error) {
 	f.mu.Lock()

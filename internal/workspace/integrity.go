@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -14,51 +15,69 @@ import (
 	"github.com/pmrrasmussen/symphony/internal/observability"
 )
 
-// assertSourceIntegrity is the PMR-65 defense-in-depth backstop. It re-checks
-// that the run left the source repository's branches (other than the symphony/*
-// publish branches Symphony itself creates) exactly as they were when the
-// workspace was prepared, and alerts if not. It deliberately only detects and
-// alerts; it never rewrites the operator's refs, because it cannot distinguish
-// an agent breach from a legitimate concurrent operator change.
+// assertSourceIntegrity is the PMR-65 backstop, and since PMR-161 the enforced
+// half of the write boundary rather than defense in depth: the Claude CLI
+// widens its own git-metadata grant to the whole source .git directory, so a
+// Bash command there can still move refs/heads/* and no launch setting narrows
+// it back. It re-checks that the run left the source repository's branches
+// (other than the symphony/* publish branches Symphony itself creates) exactly
+// as they were when the workspace was prepared, alerts if not, and returns that
+// alert so the caller fails the run. It still never rewrites the operator's
+// refs: it cannot distinguish an agent breach from a concurrent operator change
+// well enough to repair one, only well enough to refuse to call the run good.
 //
 // A moved ref is not automatically an alert: a fast-forward to a commit
-// reachable from that branch's remote-tracking ref is logged at Debug instead
-// (PMR-145). Any other change to refs/heads/* still alerts at Error, and
-// diffSourceRefs fails closed on a ref it could not classify rather than
-// dropping it (PMR-147).
+// reachable from that branch's remote-tracking ref is logged at Debug, fails
+// nothing, and returns nil (PMR-145). Any other change to refs/heads/* still
+// alerts at Error, and diffSourceRefs fails closed on a ref it could not
+// classify rather than dropping it (PMR-147).
+//
+// Both halves of what it compares -- the baseline and the source root it was
+// taken against -- travel on the workspace value, not in the state record on
+// disk. A run whose issue reached a terminal state removes that record from
+// inside the run, before AfterRun is reached, so reading the root from disk
+// skipped this check entirely on the runs that ended cleanly (PMR-161).
+//
+// The check itself failing -- an unreadable baseline, a source repository that
+// cannot be fingerprinted -- stays a Warn and fails nothing: that is evidence
+// about the check, not about the boundary. A ref it did read and could not
+// classify is the opposite case and does fail the run, because there the
+// evidence is about a ref that genuinely moved (see diffSourceRefs).
 //
 // docs/architecture.md's "Workspace isolation and the sandbox boundary" section
 // states why classification is the expensive half and what its failure modes
 // are.
-func (l *Local) assertSourceIntegrity(ctx context.Context, ws domain.Workspace, issue domain.Issue) {
+func (l *Local) assertSourceIntegrity(ctx context.Context, ws domain.Workspace, issue domain.Issue) error {
 	if ws.GitIntegrityBaseline == "" {
-		return
+		return nil
 	}
 	var baseline sourceIntegritySnapshot
 	if err := json.Unmarshal([]byte(ws.GitIntegrityBaseline), &baseline); err != nil {
 		l.logger().Warn("workspace source integrity check failed", "issue_id", issue.ID, "issue_identifier", issue.Identifier, "error", err)
-		return
+		return nil
 	}
-	state, found, err := l.loadState(issue)
-	if err != nil || !found || state.SourceRoot == "" {
-		return
+	if ws.SourceRoot == "" {
+		return nil
 	}
 	settings := l.settings()
-	current, err := captureSourceIntegrity(ctx, settings, state.SourceRoot)
+	current, err := captureSourceIntegrity(ctx, settings, ws.SourceRoot)
 	if err != nil {
 		l.logger().Warn("workspace source integrity check failed", "issue_id", issue.ID, "issue_identifier", issue.Identifier, "error", err)
-		return
+		return nil
 	}
-	alerts, explained := diffSourceRefs(ctx, settings, state.SourceRoot, baseline.Refs, current.Refs)
+	alerts, explained := diffSourceRefs(ctx, settings, ws.SourceRoot, baseline.Refs, current.Refs)
 	if len(explained) > 0 {
 		l.logger().Debug("workspace source integrity change explained by a fast-forward reachable from a remote-tracking ref",
 			"issue_id", issue.ID, "issue_identifier", issue.Identifier, "changed_refs", formatRefChanges(explained))
 	}
 	if len(alerts) == 0 {
-		return
+		return nil
 	}
+	attributeRefChanges(ctx, settings, ws.SourceRoot, alerts)
+	changes := formatRefChanges(alerts)
 	l.logger().Error("workspace source integrity alert", "operation", observability.OperationSourceIntegrityAlert,
-		"issue_id", issue.ID, "issue_identifier", issue.Identifier, "source_root", state.SourceRoot, "changed_refs", formatRefChanges(alerts))
+		"issue_id", issue.ID, "issue_identifier", issue.Identifier, "source_root", ws.SourceRoot, "changed_refs", changes)
+	return domain.SourceIntegrityError{SourceRoot: ws.SourceRoot, Changes: changes}
 }
 
 // sourceIntegritySnapshot is the JSON-encoded shape of GitIntegrityBaseline: the
@@ -95,8 +114,108 @@ func captureSourceIntegrity(ctx context.Context, settings config.Settings, sourc
 // the prepare-time baseline and the post-run snapshot. Before or After is
 // empty when the ref did not exist on that side. Reason is set only when this
 // change is an alert because it could not be classified (see diffSourceRefs);
-// it names the git subprocess failure responsible.
-type refChange struct{ Name, Before, After, Reason string }
+// it names the git subprocess failure responsible. Attribution names the
+// workspace that wrote the commit, when attributeRefChanges could identify one.
+type refChange struct{ Name, Before, After, Reason, Attribution string }
+
+// attributeRefChanges names, for each alerting change, the workspace whose own
+// HEAD carries the commit the ref moved to -- the session that wrote it, rather
+// than whichever session happened to finish first and run the check. PMR-156
+// observed the difference directly: an alert filed under one issue reported
+// refs/heads/main moving to another issue's commit, and named only the reporter.
+//
+// Two shapes of evidence count and nothing else does. A workspace HEAD equal to
+// the new value is unambiguous. Otherwise the commit must be reachable from that
+// HEAD *and* from no remote-tracking ref: every workspace starts detached at the
+// freshly fetched base commit, so a commit it contains that no remote has is one
+// written inside it. Dropping that second condition would attribute a ref moved
+// backwards onto an old commit to every live workspace at once, since they all
+// contain it. Ambiguity is reported rather than resolved -- several matches are
+// all named -- and a git call that fails leaves the change unattributed, because
+// attribution is a diagnostic and the alert stands without it.
+func attributeRefChanges(ctx context.Context, settings config.Settings, sourceRoot string, alerts []refChange) {
+	worktrees, err := linkedWorktrees(ctx, settings, sourceRoot)
+	if err != nil || len(worktrees) == 0 {
+		return
+	}
+	for i := range alerts {
+		commit := alerts[i].After
+		if commit == "" {
+			continue // A deleted ref names no commit to attribute.
+		}
+		reachable, err := reachableFromRemote(ctx, settings, sourceRoot, commit)
+		local := err == nil && !reachable
+		var exact, contains []string
+		for _, wt := range worktrees {
+			if wt.head == commit {
+				exact = append(exact, wt.key)
+				continue
+			}
+			if !local {
+				continue
+			}
+			if ancestor, err := isAncestor(ctx, settings, sourceRoot, commit, wt.head); err == nil && ancestor {
+				contains = append(contains, wt.key)
+			}
+		}
+		matched := exact
+		if len(matched) == 0 {
+			matched = contains
+		}
+		if len(matched) > 0 {
+			sort.Strings(matched)
+			alerts[i].Attribution = strings.Join(matched, ",")
+		}
+	}
+}
+
+// linkedWorktree is one of Symphony's own workspaces as the source repository
+// knows it: the workspace key its directory is named for, and the commit its
+// HEAD is at.
+type linkedWorktree struct{ key, head string }
+
+// linkedWorktrees lists the source repository's linked worktrees, excluding its
+// own main working tree -- a ref that moved to the commit the operator's own
+// checkout is sitting on says nothing about which session wrote it.
+func linkedWorktrees(ctx context.Context, settings config.Settings, sourceRoot string) ([]linkedWorktree, error) {
+	out, err := gitMetadataAllowEmpty(ctx, settings, sourceRoot, "worktree", "list", "--porcelain")
+	if err != nil {
+		return nil, err
+	}
+	main := resolvedPath(sourceRoot)
+	var list []linkedWorktree
+	var path, head string
+	flush := func() {
+		if path != "" && path != main && head != "" {
+			list = append(list, linkedWorktree{key: filepath.Base(path), head: head})
+		}
+		path, head = "", ""
+	}
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		switch {
+		case strings.HasPrefix(line, "worktree "):
+			flush()
+			path = resolvedPath(strings.TrimPrefix(line, "worktree "))
+		case strings.HasPrefix(line, "HEAD "):
+			head = strings.TrimSpace(strings.TrimPrefix(line, "HEAD "))
+		}
+	}
+	flush()
+	return list, nil
+}
+
+// resolvedPath canonicalizes a path for comparison, falling back to a lexical
+// clean for one that no longer exists: git's own listing and Symphony's
+// recorded source root can name the same directory through different symlinks
+// (/var and /private/var on darwin), and a failed comparison would leave the
+// main working tree in the candidate set.
+func resolvedPath(path string) string {
+	if resolved, err := canonicalExistingDirectory(path); err == nil {
+		return resolved
+	}
+	return filepath.Clean(strings.TrimSpace(path))
+}
 
 // diffSourceRefs classifies every ref that moved between baseline and current
 // into alerts (report at Error) and explained (a fast-forward reachable from a
@@ -187,7 +306,10 @@ func reachableFromRemote(ctx context.Context, settings config.Settings, dir, com
 // "name before->after" entry per change, "(none)" standing in for a ref that
 // did not exist on that side. A change whose classification failed (Reason
 // set) appends " classification_failed=<error>" so an operator can triage it
-// as a diagnostic gap rather than mistake it for a plain ref move.
+// as a diagnostic gap rather than mistake it for a plain ref move. An
+// attributed change appends " attributed_to=<workspace keys>", which is the
+// session an operator should look at rather than the one this record is filed
+// under; its absence means no live workspace carries that commit.
 func formatRefChanges(changes []refChange) string {
 	parts := make([]string, 0, len(changes))
 	for _, c := range changes {
@@ -199,6 +321,9 @@ func formatRefChanges(changes []refChange) string {
 			after = "(none)"
 		}
 		entry := fmt.Sprintf("%s %s->%s", c.Name, before, after)
+		if c.Attribution != "" {
+			entry += " attributed_to=" + c.Attribution
+		}
 		if c.Reason != "" {
 			entry += " classification_failed=" + c.Reason
 		}

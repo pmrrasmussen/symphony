@@ -206,9 +206,20 @@ doubles as the fix for a base that went stale during an outage: the merge also
 produces the push event that generates a fresh CI run.
 
 **Use `--detach` for every operator review worktree.** Creating or deleting a
-`refs/heads/*` ref while the daemon runs trips the PMR-65 integrity alert and
-produces a false ERROR. `symphony/*` refs are excluded from that alert;
-`claude/*` and personal-prefix branches are not.
+`refs/heads/*` ref while the daemon runs trips the PMR-65 integrity alert, and
+since PMR-161 that alert also **fails whichever run observes it** -- no longer
+just a false ERROR. `symphony/*` refs are excluded from the check, and so is a
+fast-forward to a commit some `refs/remotes/origin/*` ref already has, which is
+what makes an ordinary `git pull --ff-only` safe; creating, deleting, or
+force-moving a branch is none of those.
+
+**Point `workspace.source_root` at a dedicated clone, never at the checkout you
+work in.** Under the Claude backend a `Bash` command still reaches the whole of
+the source repository's `.git`, so an agent can move its branches and can set
+`core.fsmonitor` to a program Symphony's own host-side `git status` then runs.
+That is accepted and documented (architecture.md, "The source `.git`
+exposure"); what keeps it survivable is that the repository on the receiving
+end is disposable. This repository's own daemon uses `~/repos/symphony-agent-src`.
 
 **Do not hand-author a branch named `symphony/pmr-<NN>`.** That shape is the
 daemon's ownership signal, and workspace recovery will adopt the branch as its

@@ -99,6 +99,10 @@ func agentFailureReason(err error) string {
 	if errors.As(err, &cont) {
 		return "session_continue"
 	}
+	var integrity domain.SourceIntegrityError
+	if errors.As(err, &integrity) {
+		return "source_integrity"
+	}
 	// Anything else reaching here is domain.EventFailed carrying e.Message
 	// verbatim (consume, "agent failed: %s") -- genuine model or provider
 	// text, the one case this reason is now reserved for.

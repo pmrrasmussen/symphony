@@ -133,9 +133,10 @@ func (w *observingLocalWorkspace) BeforeRun(ctx context.Context, workspace domai
 	return w.local.BeforeRun(ctx, workspace, issue)
 }
 
-func (w *observingLocalWorkspace) AfterRun(ctx context.Context, workspace domain.Workspace, issue domain.Issue) {
-	w.local.AfterRun(ctx, workspace, issue)
+func (w *observingLocalWorkspace) AfterRun(ctx context.Context, workspace domain.Workspace, issue domain.Issue) error {
+	err := w.local.AfterRun(ctx, workspace, issue)
 	w.afterRun <- struct{}{}
+	return err
 }
 
 func (w *observingLocalWorkspace) Cleanup(ctx context.Context, issue domain.Issue) (domain.CleanupOutcome, error) {

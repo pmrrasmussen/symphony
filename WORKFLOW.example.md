@@ -99,6 +99,13 @@ workspace:
   # freshly fetched origin/main. Existing issue workspaces retain their history.
   # The original checkout is never used as an agent workspace. See
   # docs/completion-markers.md for ownership, cleanup, and recovery.
+  #
+  # Under agent.backend: claude, point this at a clone you can throw away, not
+  # at the checkout you work in. A Bash command in that backend reaches the
+  # whole of this repository's .git -- branch refs included -- because the CLI
+  # widens its own git-metadata grant; Symphony detects an unexplained ref move
+  # after the fact and fails that run, but does not prevent it. See
+  # docs/architecture.md, "The source .git exposure".
   source_root: .
 hooks:
   timeout_ms: 60000
