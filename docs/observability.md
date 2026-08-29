@@ -189,12 +189,21 @@ One `operation` value names no tracker edge at all. When a dispatch reaches
 before the coordinator gives up on that episode — Symphony logs a single
 **error**-level `"msg":"dispatch abandoned after max attempts"` with
 `operation: dispatch_abandoned`, the issue, the classified failure `reason`
-(`workspace_prepare`, `before_run`, `prompt_render`, `session_start`,
-`stalled`, `agent_blocked`, `turn_limit_exhausted`, `source_integrity`), the
-final `attempt`, `max_attempts`, and `cooldown_ms` (the window before a new
-episode may start; see "The cooldown after an abandonment" below). Each of
-these reasons names something about *this issue's* run — its template, its own
-agent, its own turn budget — never the shared environment dispatching it.
+(`workspace_prepare`, `before_run`, `prompt_render`, `capability_prepare`,
+`session_start`, `stalled`, `agent_blocked`, `turn_limit_exhausted`,
+`source_integrity`), the final `attempt`, `max_attempts`, and `cooldown_ms` (the
+window before a new episode may start; see "The cooldown after an abandonment"
+below). Each of these reasons names something about *this issue's* run — its
+template, its own agent, its own turn budget — never the shared environment
+dispatching it.
+
+`capability_prepare` is the newest of them and the only one that names a
+boundary crossed *for* the session rather than by it: the host-side preparation
+that binds this dispatch's bounded capabilities (a Linear handoff round trip)
+and refuses a registry that cannot keep the delivery promise the prompt already
+makes. It is deliberately not `session_start` — no agent was launched — and it is
+issue-attributable rather than systemic, because the refusal is about this run's
+issue and configuration.
 
 `source_integrity` is the one that can name a *different* session's write: it
 is the post-run source-integrity verdict (see the `internal/workspace` records
@@ -330,9 +339,10 @@ give-up remains a pause, not a quarantine.
 Abandonment does not comment on the issue either, and that is the same decision
 rather than an omission. The coordinator holds only `domain.Tracker` (candidates,
 refresh, and the one start edge), and an abandoned dispatch has often failed
-before any session existed (`workspace_prepare`, `before_run`, `prompt_render`),
-so there is no `HandoffSession` whose `LandComment` shape could be reused — only
-a new host tracker-write path, for a record that would repeat on every episode.
+before any session existed (`workspace_prepare`, `before_run`, `prompt_render`,
+`capability_prepare`), so there is no `HandoffSession` whose `LandComment` shape
+could be reused — only a new host tracker-write path, for a record that would
+repeat on every episode.
 
 The escalated attempt counter is the ceiling's unit: a failure at attempt N ends
 the (N+1)th launch of the episode, so a boundary that fails every time dispatches

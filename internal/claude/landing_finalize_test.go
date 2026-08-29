@@ -13,8 +13,6 @@ import (
 	"github.com/pmrrasmussen/symphony/internal/capability"
 	"github.com/pmrrasmussen/symphony/internal/config"
 	"github.com/pmrrasmussen/symphony/internal/domain"
-	githubhost "github.com/pmrrasmussen/symphony/internal/github"
-	"github.com/pmrrasmussen/symphony/internal/linear"
 )
 
 // This file covers the wiring from a turn ending to the deferred
@@ -39,27 +37,28 @@ import (
 // landing capability the only way a real one can, over loopback HTTP with the
 // token it found in its own environment.
 
-// landingRegistry is the real registry a Merging session gets: the host's own
-// providers, bound to the fixture's remotes. Build decides advertisement, so the
-// returned names are what the launch contract and the init echo must agree on.
-func landingRegistry(t *testing.T, f *agenttest.LandingRemote, workspace string) (*capability.Registry, []string) {
+// landingCapabilities is the real capability set a Merging session gets: the
+// host's own providers, bound to the fixture's remotes, prepared exactly as the
+// scheduler prepares one and carried on the request the same way. The preparation
+// decides advertisement, so the returned names are what the launch contract and
+// the init echo must agree on.
+func landingCapabilities(t *testing.T, f *agenttest.LandingRemote, workspace string) (domain.SessionCapabilities, []string) {
 	t.Helper()
 	settings := f.Settings()
-	snapshot := func() config.Settings { return settings }
-	handoff, err := linear.NewHandoff(snapshot).PrepareWithSettings(context.Background(), settings, f.Issue())
+	carried, err := hostPreparer(func() config.Settings { return settings }).
+		Prepare(context.Background(), settings, f.Issue(), workspace)
 	if err != nil {
-		t.Fatalf("prepare Linear handoff: %v", err)
+		t.Fatalf("prepare session capabilities: %v", err)
 	}
-	session := githubhost.New(snapshot, nil).PrepareWithSettings(settings.GitHub, f.Issue(), workspace, handoff)
-	if session == nil {
-		t.Fatal("the fixture's configuration produced no GitHub session")
+	prepared, err := capability.From(domain.AgentRequest{Capabilities: carried})
+	if err != nil {
+		t.Fatal(err)
 	}
-	registry := capability.Build(capability.Bindings{Settings: settings, Issue: f.Issue(), Handoff: handoff, GitHub: session})
-	names := advertisedNames(registry)
+	names := advertisedNames(prepared.Registry())
 	if len(names) == 0 {
 		t.Fatal("a Merging session advertised no capability")
 	}
-	return registry, names
+	return carried, names
 }
 
 // landingInitLine is the init echo a Merging session must produce: the endpoint
@@ -134,7 +133,7 @@ func requireCurl(t *testing.T) {
 func landingSession(t *testing.T, ctx context.Context, f *agenttest.LandingRemote, dir string, calls []bool, ending string) (*Backend, *agenttest.FakeTimer, domain.AgentSession, <-chan domain.Event) {
 	t.Helper()
 	agenttest.WriteFakeGit(t, dir)
-	registry, names := landingRegistry(t, f, workspaceOf(dir))
+	capabilities, names := landingCapabilities(t, f, workspaceOf(dir))
 	script := writeFakeClaude(t, dir, landingChildBody(dir, calls)+
 		"cat <<'EOF'\n"+landingInitLine(dir, names)+"\nEOF\n"+ending)
 	backend, _ := backendWithEndpoint(t)
@@ -145,7 +144,8 @@ func landingSession(t *testing.T, ctx context.Context, f *agenttest.LandingRemot
 	// irrelevant now that no test waits for it -- what matters is that it is the
 	// one budget a landing turn schedules.
 	r.TurnTimeout = landingTurnBudget
-	session, events, err := startWithRegistry(t, backend, ctx, r, registry)
+	r.Capabilities = capabilities
+	session, events, err := backend.Start(ctx, r)
 	if err != nil {
 		t.Fatal(err)
 	}

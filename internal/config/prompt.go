@@ -41,11 +41,12 @@ func (s Settings) LinearSessionCapabilityEnabled() bool {
 }
 
 // HostSidePublishPromiseMarker opens the host-side publish delivery mode. It is
-// exported because it is the only part of the rendered prompt another package
-// reads: internal/claude's launch guard compares what the prompt actually says
-// against what the session it is about to start can actually serve, and reading
-// the artifact is strictly stronger than re-deriving the promise from settings --
-// the prompt was rendered from a settings snapshot the backend never sees.
+// exported because two things outside this package have to recognize the promise
+// in the rendered artifact rather than paraphrase it: --dry-run, which reports
+// what a worker will be told, and the tests that hold this marker and
+// HostSidePublishPromised together. The launch-time cross-check that used to read
+// it now runs beside the registry it compares against, from this same snapshot,
+// so it reads the predicate instead (capability.verifyPromise, PMR-182).
 const HostSidePublishPromiseMarker = "Delivery mode: host-side publish is available for this run."
 
 // LandingDeliveryMarker opens the landing delivery mode, which replaces the
@@ -67,18 +68,19 @@ const LandingDeliveryMarker = "Delivery mode: landing. Host-side publish is not 
 // promise against what its own session actually advertises.
 //
 // It exists as a predicate rather than as an inline condition for one reason: the
-// prompt is rendered before a session exists, so the only thing that can catch a
-// promise the session cannot keep is a comparison made at launch, and a
-// comparison against a paraphrase of this condition would drift from the branch
-// it is meant to mirror. internal/claude.Backend.Start is the caller.
+// prompt is rendered before the session's capabilities are built, so the only
+// thing that can catch a promise the session cannot keep is a comparison against
+// the registry, and a comparison against a paraphrase of this condition would
+// drift from the branch it is meant to mirror. capability.verifyPromise is the
+// caller, on the same settings snapshot this prompt was rendered from.
 //
 // HandoffState is trimmed for the same reason every sibling predicate trims it
 // (LinearSessionCapabilityEnabled here, linear.PrepareWithSettings,
 // GitHub.LandingDispatch): an all-whitespace value is unreachable through
 // Load, but this predicate is now consumed by two other packages, and an
 // untrimmed one would make the promise true while the handoff session and the
-// GitHub session built from the same field are both nil -- every launch then
-// refusing at session_start, with retry and backoff.
+// GitHub session built from the same field are both nil -- every dispatch then
+// refusing at capability_prepare, with retry and backoff.
 func (s Settings) HostSidePublishPromised() bool {
 	return s.GitHub.Enabled && strings.TrimSpace(s.Tracker.HandoffState) != ""
 }

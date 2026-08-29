@@ -225,8 +225,20 @@ func (c *Coordinator) launch(parent context.Context, i domain.Issue, attempt int
 		// Byte lengths only, never the prompt itself: this is what answers
 		// whether trimming WORKFLOW.md's prompt body is worth anything.
 		c.log.Debug("prompt rendered", "issue_id", i.ID, "issue_identifier", i.Identifier, "attempt", attempt, "prompt_bytes", len(prompt), "delivery_instruction_bytes", deliveryBytes)
+		// The capabilities are prepared from the same snapshot the prompt was
+		// rendered from, and from the issue state the start transition above
+		// left, because both decide what this run may do: whether host-side
+		// publish is promised, and whether this issue is in the state that
+		// grants the landing tool (PMR-182).
+		capabilities, err := c.prepareCapabilities(ctx, s, i, ws.Path)
+		if err != nil {
+			c.afterRunBeforeFailure(ws, i)
+			c.unreserve(i.ID, reservation)
+			c.finishFailure(parent, i, attempt, "capability_prepare", err)
+			return
+		}
 		c.log.Debug("agent launch requested", "issue_id", i.ID, "issue_identifier", i.Identifier, "attempt", attempt, "agent_backend", launch.Backend)
-		session, events, err := c.agent.Start(ctx, domain.AgentRequest{Issue: i, Backend: launch.Backend, Model: launch.Model, Workspace: ws.Path, GitMetadataRoots: ws.GitMetadataRoots, Prompt: prompt, Command: launch.Command, ApprovalPolicy: launch.ApprovalPolicy, ThreadSandbox: launch.ThreadSandbox, TurnSandboxPolicy: launch.TurnSandboxPolicy, TurnTimeout: launch.TurnTimeout, ReadTimeout: launch.ReadTimeout, StartTimeout: launch.StartTimeout})
+		session, events, err := c.agent.Start(ctx, domain.AgentRequest{Issue: i, Backend: launch.Backend, Model: launch.Model, Workspace: ws.Path, GitMetadataRoots: ws.GitMetadataRoots, Prompt: prompt, Command: launch.Command, ApprovalPolicy: launch.ApprovalPolicy, ThreadSandbox: launch.ThreadSandbox, TurnSandboxPolicy: launch.TurnSandboxPolicy, TurnTimeout: launch.TurnTimeout, ReadTimeout: launch.ReadTimeout, StartTimeout: launch.StartTimeout, Capabilities: capabilities})
 		if err != nil {
 			c.afterRunBeforeFailure(ws, i)
 			c.unreserve(i.ID, reservation)
@@ -316,6 +328,22 @@ func (c *Coordinator) launch(parent context.Context, i domain.Issue, attempt int
 		c.finishFailure(parent, i, attempt, agentFailureReason(consumeErr), consumeErr)
 	}()
 	return true
+}
+
+// prepareCapabilities builds this dispatch's bounded capability set, or nothing
+// at all when no preparation is installed.
+//
+// A failure here fails the dispatch rather than starting a session without the
+// capabilities the prompt already promises. It is its own failure reason: the
+// work is a live provider round trip (a Linear handoff object) plus the refusal
+// that says this run's registry cannot keep the promise the prompt makes, and
+// folding either into session_start would report a boundary the session never
+// reached.
+func (c *Coordinator) prepareCapabilities(ctx context.Context, s config.Settings, i domain.Issue, workspace string) (domain.SessionCapabilities, error) {
+	if c.capabilities == nil {
+		return nil, nil
+	}
+	return c.capabilities.Prepare(ctx, s, i, workspace)
 }
 
 // transitionToStarted deterministically moves a freshly dispatched issue from

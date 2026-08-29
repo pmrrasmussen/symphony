@@ -58,6 +58,12 @@ type Coordinator struct {
 	// It is installed once at startup, before Start, and never replaced, so the
 	// scheduling goroutines that read it need no lock of their own.
 	forget domain.IssueForgetter
+	// capabilities prepares each dispatch's bounded capability set, on the same
+	// terms as forget: installed once at startup and never replaced. With none
+	// installed a dispatch carries no capabilities, which is what a host with no
+	// providers wired produces -- and is what keeps --dry-run's synthetic
+	// lifecycle side-effect-free, since preparation is a live provider round trip.
+	capabilities CapabilityPreparer
 
 	mu sync.Mutex
 	// states is the coordinator's single per-issue record, keyed by issue ID.
@@ -97,6 +103,25 @@ func New(t domain.Tracker, a domain.AgentBackend, w domain.WorkspaceExecutor, se
 // reaches its terminal tracker state. Call it before Start; with none
 // installed the coordinator simply reports nothing, exactly as before.
 func (c *Coordinator) SetIssueForgetter(f domain.IssueForgetter) { c.forget = f }
+
+// CapabilityPreparer builds one dispatch's bounded capability set from the
+// settings snapshot this dispatch resolved. capability.Preparer is the
+// implementation.
+//
+// The scheduler is where this belongs and nowhere else: it is the one place that
+// resolves the launch, renders the prompt promising which bounded tools exist,
+// and starts the session, so preparing here is what makes the promise and the
+// grant one decision made from one snapshot. It returns the opaque handle the
+// request carries, so the scheduler forwards a capability set without depending
+// on internal/capability at all.
+type CapabilityPreparer interface {
+	Prepare(ctx context.Context, settings config.Settings, issue domain.Issue, workspace string) (domain.SessionCapabilities, error)
+}
+
+// SetCapabilityPreparer installs the host-side capability preparation. Call it
+// before Start; with none installed every dispatch runs with no bounded
+// capability, exactly as one against unwired providers does.
+func (c *Coordinator) SetCapabilityPreparer(p CapabilityPreparer) { c.capabilities = p }
 
 func (c *Coordinator) Start(parent context.Context) {
 	c.mu.Lock()

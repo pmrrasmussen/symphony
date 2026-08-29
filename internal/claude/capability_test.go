@@ -771,15 +771,38 @@ func backendWithEndpoint(t *testing.T) (*Backend, *mcpbridge.Server) {
 		defer cancel()
 		_ = endpoint.Close(closeCtx)
 	})
-	return NewWithProviders(settingsFunc(), nil, nil, endpoint), endpoint
+	return NewWithEndpoint(settingsFunc(), endpoint), endpoint
 }
 
-// startWithRegistry runs a first turn against a substituted registry. Start
-// builds its own from the host providers, which is right in production and
-// unusable here: the turn-end lifecycle under test is observable only through the
-// registry. Everything after the registry -- the registration, the launch
-// contract, the environment, the spawn, and every turn-end path -- is the
-// production code path.
+// hostPreparer builds the preparation the host would run this dispatch through:
+// one Linear handoff and one GitHub manager over the given settings. There is no
+// production constructor that mints providers for a backend, so a test that needs
+// them does the host's wiring itself.
+func hostPreparer(snapshot func() config.Settings) *capability.Preparer {
+	return capability.NewPreparer(linear.NewHandoff(snapshot), githubhost.New(snapshot, nil))
+}
+
+// hostPrepared carries that preparation on the request, which is the only way a
+// session gets a capability at all now that no backend prepares one.
+func hostPrepared(t *testing.T, preparer *capability.Preparer, settings config.Settings, r domain.AgentRequest) domain.AgentRequest {
+	t.Helper()
+	carried, err := preparer.Prepare(context.Background(), settings, r.Issue, r.Workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Capabilities = carried
+	return r
+}
+
+// startWithRegistry runs a first turn against a substituted registry.
+//
+// Start takes the one the host prepared, which is a *capability.Registry and is
+// right in production; the turn-end lifecycle under test here is observable only
+// through a registry that records what it was asked, so these tests substitute the
+// endpoint's own narrow view of one instead. Everything after the registry -- the
+// registration, the launch contract, the environment, the spawn, and every
+// turn-end path -- is the production code path, and the production path from a
+// prepared request to this same field is what the landing suite's fixture runs.
 func startWithRegistry(t *testing.T, b *Backend, ctx context.Context, r domain.AgentRequest, registry mcpbridge.Capabilities) (domain.AgentSession, <-chan domain.Event, error) {
 	t.Helper()
 	id, err := newSessionID()
@@ -907,18 +930,18 @@ func assertArgs(t *testing.T, got, want []string) {
 	}
 }
 
-// TestStartBindsTheHostProvidersAndTheirSecrets covers the block every other
+// TestStartBindsWhatTheHostPreparedAndItsSecrets covers the block every other
 // test in this file steps over. The capability tests build a session by hand so
-// they can substitute a registry, which leaves Start's own preparation -- the
-// handoff, the GitHub session, the secret matcher, and the Bindings the registry
-// is built from -- asserted by nothing at all.
+// they can substitute a registry, which leaves the path from a prepared request
+// to a live session -- the registry, the advertised set it decides, and the
+// secret matcher carried beside it -- asserted by nothing at all.
 //
-// That is the one function the whole wiring rests on, and its failure is silent
-// by construction: drop the bindings and advertisedNames returns nil, so no
-// --mcp-config is rendered, so verifyInit expects zero MCP servers and finds
-// zero, so the session is approved and the turn ends completed with committed,
-// unpublished work. Every gate passes. Only this test does not.
-func TestStartBindsTheHostProvidersAndTheirSecrets(t *testing.T) {
+// That is the whole of what Start still does with a capability, and its failure
+// is silent by construction: drop the request's preparation and advertisedNames
+// returns nil, so no --mcp-config is rendered, so verifyInit expects zero MCP
+// servers and finds zero, so the session is approved and the turn ends completed
+// with committed, unpublished work. Every gate passes. Only this test does not.
+func TestStartBindsWhatTheHostPreparedAndItsSecrets(t *testing.T) {
 	tracker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer r.Body.Close()
 		var query struct {
@@ -971,11 +994,11 @@ func TestStartBindsTheHostProvidersAndTheirSecrets(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = mcpEndpoint.Close(context.Background()) })
-	backend := NewWithProviders(snapshot, linear.NewHandoff(snapshot), githubhost.New(snapshot, nil), mcpEndpoint)
+	backend := NewWithEndpoint(snapshot, mcpEndpoint)
 
 	r := request(t, dir, script)
 	r.Issue = domain.Issue{ID: "issue-1", Identifier: "PMR-52", State: "Merging"}
-	agentSession, events, err := backend.Start(context.Background(), r)
+	agentSession, events, err := backend.Start(context.Background(), hostPrepared(t, hostPreparer(snapshot), settings, r))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -993,7 +1016,7 @@ func TestStartBindsTheHostProvidersAndTheirSecrets(t *testing.T) {
 		t.Fatalf("advertised=%v, want %v", s.advertised, landingCapabilityNames)
 	}
 	if s.secretMatcher == nil {
-		t.Fatal("Start bound providers without a secret matcher, so their resolved credentials reach the child")
+		t.Fatal("Start bound the prepared registry without its secret matcher, so the providers' resolved credentials reach the child")
 	}
 	// Both providers' credentials must be recognized: only the matcher can see
 	// them, because neither has a configured name or a configured value.
@@ -1338,96 +1361,20 @@ func TestTheRenderedNameMatchesTheNameTheCLIWillServe(t *testing.T) {
 	}
 }
 
-// TestStartRefusesToRunAPromiseTheSessionCannotKeep is the launch-time
-// consistency guard, in the form that reaches it without a hand-built session.
-//
-// The divergence is real rather than contrived: an issue whose identifier
-// contains no branch-safe character has no deterministic branch, so
-// github.Manager prepares no session for it and the registry advertises no
-// GitHub capability -- while configuration still promises host-side publish and
-// the coordinator has already rendered a prompt saying so. Without the guard the
-// turn runs, the model finds no publish tool, and the run ends completed with
-// committed, unpublished work; nothing in the launch contract is inconsistent, so
-// verifyInit approves it.
-func TestStartRefusesToRunAPromiseTheSessionCannotKeep(t *testing.T) {
-	tracker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		defer r.Body.Close()
-		var query struct {
-			Query string `json:"query"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&query); err != nil {
-			t.Error(err)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		switch {
-		case strings.Contains(query.Query, "SymphonyLinearHandoffIssue"):
-			_, _ = w.Write([]byte(`{"data":{"issue":{"id":"issue-1","identifier":"###","title":"Parity","description":"safe",` +
-				`"url":"https://linear.app/issue/x","project":{"id":"project-uuid","slugId":"project-1"},` +
-				`"team":{"id":"team-1"},"state":{"id":"progress","name":"In Progress"}}}}`))
-		case strings.Contains(query.Query, "SymphonyLinearHandoffStates"):
-			_, _ = w.Write([]byte(`{"data":{"team":{"id":"team-1","states":{"nodes":[{"id":"review","name":"In Review"}]}}}}`))
-		default:
-			t.Errorf("unexpected query: %s", query.Query)
-		}
-	}))
-	defer tracker.Close()
-	settings := config.Settings{
-		Tracker: config.Tracker{
-			Provider:     map[string]any{"api_key": "linear-api-secret", "project_slug_id": "project-1", "endpoint": tracker.URL},
-			ActiveStates: []string{"In Progress"},
-			HandoffState: "In Review",
-		},
-		GitHub: config.GitHub{Enabled: true, Owner: "owner", Repository: "repo", BaseBranch: "main",
-			Token: "github-token-secret", Endpoint: tracker.URL},
-	}
-	snapshot := func() config.Settings { return settings }
-	if !settings.HostSidePublishPromised() {
-		t.Fatal("these settings do not promise host-side publish, so the guard is not under test")
-	}
-
-	dir := t.TempDir()
-	script := writeFakeClaude(t, dir, "cat <<'EOF'\n"+initLine(dir, allCodingTools)+"\n"+resultLine(false, "")+"\nEOF\n")
-	mcpEndpoint, err := mcpbridge.Listen()
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = mcpEndpoint.Close(context.Background()) })
-	backend := NewWithProviders(snapshot, linear.NewHandoff(snapshot), githubhost.New(snapshot, nil), mcpEndpoint)
-
-	r := request(t, dir, script)
-	r.Issue = domain.Issue{ID: "issue-1", Identifier: "###", State: "In Progress"}
-	agentSession, events, err := backend.Start(context.Background(), r)
-	if err == nil {
-		t.Fatalf("a session that cannot publish was started anyway: %+v", agentSession)
-	}
-	if !strings.Contains(err.Error(), capability.NameGitHubPublishPR) {
-		t.Fatalf("the refusal does not name the missing capability: %v", err)
-	}
-	if events != nil {
-		t.Fatal("a refused launch returned an event stream")
-	}
-	// No child may run: the guard exists precisely because a turn that starts is
-	// a turn that ends completed with unpublished work.
-	if _, statErr := os.Stat(filepath.Join(dir, "args.txt")); statErr == nil {
-		t.Fatal("the refused launch still spawned the CLI")
-	}
-	backend.mu.Lock()
-	live := len(backend.sessions)
-	backend.mu.Unlock()
-	if live != 0 {
-		t.Fatalf("a refused launch left %d sessions registered", live)
-	}
-}
-
-// TestTheGuardRefusesEachDivergenceItClaimsToCover exercises verifyPromises
-// directly, over the four failures it distinguishes and the sessions it must
-// not refuse.
+// TestTheGuardRefusesEachDivergenceItClaimsToCover exercises verifyNaming
+// directly, over the failure it distinguishes and the prompts it must not refuse.
 //
 // It replaces a test that asserted two independent facts and never evaluated the
 // guard at all: mutating the guard into a blanket refusal of every promised
 // publish left that test passing, and only a pre-existing test caught it. The
 // acceptance rows here are what make a blanket refusal fail.
+//
+// The rows it used to carry for the three delivery-promise refusals are gone
+// with those refusals: a settings snapshot and a registry are now one
+// preparation, so that cross-check is made there and its rows moved with it
+// (capability.TestPreparationRefusesAPromiseTheSessionCannotKeep, PMR-182). What
+// is left is the one comparison only this transport can make, because only this
+// transport renames the tools.
 func TestTheGuardRefusesEachDivergenceItClaimsToCover(t *testing.T) {
 	publish := capability.NameGitHubPublishPR
 	bound := config.Settings{
@@ -1440,45 +1387,28 @@ func TestTheGuardRefusesEachDivergenceItClaimsToCover(t *testing.T) {
 	landing.GitHub.MergeState = "Merging"
 	landingPrompt := "task\n\n" + landing.DeliveryInstructions(config.ClaudeAgentBackend, "Merging")
 
-	// An empty issueState is an implementation dispatch for every row whose
-	// settings configure no merge state, which is all but the landing rows.
 	for name, tc := range map[string]struct {
-		settings   config.Settings
-		issueState string
 		prompt     string
 		advertised []string
 		want       string
 	}{
 		"a fully bound session is accepted": {
-			settings: bound, prompt: prefixedPrompt, advertised: []string{publish, capability.NameGitHubPRContext},
+			prompt: prefixedPrompt, advertised: []string{publish, capability.NameGitHubPRContext},
 		},
 		"a manual run with nothing advertised is accepted": {
-			settings: config.Settings{}, prompt: "task\n\n" + (config.Settings{}).DeliveryInstructions(config.ClaudeAgentBackend, "In Progress"),
+			prompt: "task\n\n" + (config.Settings{}).DeliveryInstructions(config.ClaudeAgentBackend, "In Progress"),
 		},
 		"a follow-up-only session is accepted": {
-			settings:   config.Settings{Tracker: config.Tracker{FollowupIssueCreation: true}},
 			prompt:     "task\n\n" + config.Settings{Tracker: config.Tracker{FollowupIssueCreation: true}}.DeliveryInstructions(config.ClaudeAgentBackend, "In Progress"),
 			advertised: []string{capability.NameCreateFollowupIssue},
 		},
-		// The settings term: this snapshot promises publish and the session
-		// serves none, which is the degenerate-identifier route.
-		"settings promise publish with nothing advertised": {
-			settings: bound, prompt: prefixedPrompt, want: "advertises no " + publish,
+		// A landing dispatch renders the other host-side mode, which names three
+		// tools of its own (PMR-169). Its guidance carries the same mapping rule,
+		// so it must be accepted for exactly the same reason.
+		"a landing dispatch is accepted": {
+			prompt:     landingPrompt,
+			advertised: []string{capability.NameGitHubRefreshBaseRef, capability.NameGitHubPRContext, capability.NameGitHubLandPR},
 		},
-		// The prompt term, and the reload this guard exists for: the prompt was
-		// rendered while github was enabled, the snapshot read here has it
-		// disabled, so the settings term is false and only the prompt sees it.
-		"a reload disabled github after the prompt was rendered": {
-			settings: config.Settings{}, prompt: prefixedPrompt, want: "advertises no " + publish,
-		},
-		// The reverse direction: publish reachable with no state to hand off to.
-		"publish advertised with no handoff state": {
-			settings: config.Settings{GitHub: config.GitHub{Enabled: true}}, prompt: barePrompt,
-			advertised: []string{publish}, want: "no tracker.provider.handoff_state",
-		},
-		// The naming term, which is the defect this pull request exists to fix:
-		// a prompt rendered for the wrong backend names the bare tool while the
-		// CLI is pinned to the prefixed one.
 		// The row that matters most, and the one whose absence let a guard that
 		// refused any bare mention look correct: a real dispatch prompt is a
 		// repository-owned body that names Symphony's tools bare, followed by the
@@ -1486,7 +1416,6 @@ func TestTheGuardRefusesEachDivergenceItClaimsToCover(t *testing.T) {
 		// WORKFLOW.md body names them seven times -- or every claude dispatch
 		// refuses at session_start.
 		"a repository body naming tools bare under the mapping rule is accepted": {
-			settings: bound,
 			prompt: "Call github_publish_pr once the worktree is clean, read github_pr_context for\n" +
 				"feedback, call github_land_pr in Merging, and use create_followup_issue for\n" +
 				"out-of-scope work.\n\n" + bound.DeliveryInstructions(config.ClaudeAgentBackend, "In Progress"),
@@ -1495,54 +1424,28 @@ func TestTheGuardRefusesEachDivergenceItClaimsToCover(t *testing.T) {
 		// The same body with the guidance rendered for the wrong backend: the
 		// bare names are now unmapped, which is the whole failure.
 		"a repository body naming tools bare with no mapping rule is refused": {
-			settings: bound,
 			prompt: "Call github_publish_pr once the worktree is clean.\n\n" +
 				bound.DeliveryInstructions(config.DefaultAgentBackend, "In Progress"),
 			advertised: []string{publish, capability.NameGitHubPRContext},
 			want:       "naming rule to map it",
 		},
-		// A whitespace-only handoff state promises nothing, prepares nothing, and
-		// must therefore not be refused. Without the TrimSpace in
-		// HostSidePublishPromised the promise is true, the session serves nothing,
-		// and every launch refuses at session_start with retry and backoff.
-		"a whitespace handoff state neither promises nor refuses": {
-			settings: config.Settings{GitHub: config.GitHub{Enabled: true}, Tracker: config.Tracker{HandoffState: "   "}},
-			prompt:   "task",
-		},
 		"the prompt names an advertised tool bare": {
-			settings: bound, prompt: barePrompt, advertised: []string{publish, capability.NameGitHubPRContext},
+			prompt: barePrompt, advertised: []string{publish, capability.NameGitHubPRContext},
 			want: "naming rule to map it",
 		},
 		"a bare name with no mapping rule at all is refused": {
-			settings:   config.Settings{Tracker: config.Tracker{FollowupIssueCreation: true}},
 			prompt:     "capture leftovers with create_followup_issue",
 			advertised: []string{capability.NameCreateFollowupIssue},
 			want:       "naming rule to map it",
 		},
-		// The landing rows (PMR-169). A landing dispatch promises landing and not
-		// publish, so the accepted row is the one that would refuse if the guard
-		// still read the promise off the settings alone: publish is configured and
-		// deliberately unadvertised.
-		"a landing dispatch is accepted": {
-			settings: landing, issueState: "Merging", prompt: landingPrompt,
-			advertised: []string{capability.NameGitHubRefreshBaseRef, capability.NameGitHubPRContext, capability.NameGitHubLandPR},
-		},
-		"a landing prompt with no landing capability is refused": {
-			settings: landing, issueState: "Merging", prompt: landingPrompt,
-			advertised: []string{capability.NameGitHubRefreshBaseRef, capability.NameGitHubPRContext},
-			want:       "advertises no " + capability.NameGitHubLandPR,
-		},
-		// The mode disagreement in the other direction, and the one a reload
-		// produces: the prompt was rendered as a publish run, the session was
-		// built as a landing one and serves no publish capability.
-		"a publish prompt handed to a landing session is refused": {
-			settings: landing, issueState: "Merging", prompt: prefixedPrompt,
-			advertised: []string{capability.NameGitHubPRContext, capability.NameGitHubLandPR},
-			want:       "advertises no " + publish,
+		// A prompt that names nothing this session serves is not this guard's
+		// business, however it was rendered.
+		"a bare prompt naming no advertised tool is accepted": {
+			prompt: barePrompt, advertised: []string{capability.NameCreateFollowupIssue},
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
-			err := verifyPromises(tc.settings, tc.issueState, tc.prompt, tc.advertised)
+			err := verifyNaming(tc.prompt, tc.advertised)
 			if tc.want == "" {
 				if err != nil {
 					t.Fatalf("a consistent session was refused: %v", err)
@@ -1560,12 +1463,12 @@ func TestTheGuardRefusesEachDivergenceItClaimsToCover(t *testing.T) {
 }
 
 // TestStartRefusesAPromptRenderedForTheWrongBackend is the naming refusal through
-// Start rather than through verifyPromises, on a session whose providers are all
-// really bound. It is the launch-time half of what the coordinator's dispatch
+// Start rather than through verifyNaming, on a session whose capabilities were
+// prepared from really bound providers. It is the launch-time half of what the coordinator's dispatch
 // test asserts at the other end: between them, a prompt rendered for the wrong
 // backend fails at the call site and at the launch.
 func TestStartRefusesAPromptRenderedForTheWrongBackend(t *testing.T) {
-	backend, dir, settings := boundBackend(t)
+	backend, preparer, dir, settings := boundBackend(t)
 	// This session advertises refresh, publish, and context, so the init echo
 	// has to name all three prefixed tools and the connected server, or
 	// verifyInit refuses the accepted launch below for an unrelated reason.
@@ -1581,6 +1484,7 @@ func TestStartRefusesAPromptRenderedForTheWrongBackend(t *testing.T) {
 	// Exactly what the coordinator would hand this session if it resolved the
 	// backend wrongly: valid guidance, bare tool names.
 	r.Prompt = "task\n\n" + settings.DeliveryInstructions(config.DefaultAgentBackend, "In Progress")
+	r = hostPrepared(t, preparer, settings, r)
 
 	agentSession, events, err := backend.Start(context.Background(), r)
 	if err == nil {
@@ -1618,7 +1522,7 @@ func TestStartRefusesAPromptRenderedForTheWrongBackend(t *testing.T) {
 // PMR-65 closed, which is the whole reason this fetch is host-mediated rather
 // than a sandbox change (PMR-141).
 func TestRefreshBaseRefAdvertisedDoesNotWidenSandboxWriteGrants(t *testing.T) {
-	backend, dir, settings := boundBackend(t)
+	backend, preparer, dir, settings := boundBackend(t)
 	tools := allCodingTools
 	for _, name := range []string{capability.NameGitHubRefreshBaseRef, capability.NameGitHubPublishPR, capability.NameGitHubPRContext} {
 		tools += `,"` + mcpToolName(name) + `"`
@@ -1630,7 +1534,7 @@ func TestRefreshBaseRefAdvertisedDoesNotWidenSandboxWriteGrants(t *testing.T) {
 	r.Issue = domain.Issue{ID: "issue-1", Identifier: "PMR-52", State: "In Progress"}
 	r.Prompt = "task\n\n" + settings.DeliveryInstructions(config.ClaudeAgentBackend, "In Progress")
 
-	_, events, err := backend.Start(context.Background(), r)
+	_, events, err := backend.Start(context.Background(), hostPrepared(t, preparer, settings, r))
 	if err != nil {
 		t.Fatalf("Start refused a session advertising refresh_base_ref: %v", err)
 	}
@@ -1658,10 +1562,11 @@ func TestRefreshBaseRefAdvertisedDoesNotWidenSandboxWriteGrants(t *testing.T) {
 	}
 }
 
-// boundBackend is a Claude backend whose Linear and GitHub providers really do
-// prepare sessions, against a scripted tracker. It is the fixture for asserting
-// what Start does with a session that has every capability available to it.
-func boundBackend(t *testing.T) (*Backend, string, config.Settings) {
+// boundBackend is a Claude backend and the host preparation a dispatch to it runs
+// through, whose Linear and GitHub providers really do prepare sessions against a
+// scripted tracker. It is the fixture for asserting what Start does with a
+// request that carries every capability available to it.
+func boundBackend(t *testing.T) (*Backend, *capability.Preparer, string, config.Settings) {
 	t.Helper()
 	tracker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer r.Body.Close()
@@ -1700,7 +1605,7 @@ func boundBackend(t *testing.T) (*Backend, string, config.Settings) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = endpoint.Close(context.Background()) })
-	return NewWithProviders(snapshot, linear.NewHandoff(snapshot), githubhost.New(snapshot, nil), endpoint), t.TempDir(), settings
+	return NewWithEndpoint(snapshot, endpoint), hostPreparer(snapshot), t.TempDir(), settings
 }
 
 // TestABoundGitHubManagerWithoutAHandoffStillStripsItsToken is the counterpart
@@ -1725,9 +1630,10 @@ func TestABoundGitHubManagerWithoutAHandoffStillStripsItsToken(t *testing.T) {
 
 	// No handoff provider at all, so nothing can prepare a GitHub session: the
 	// manager is the only thing that knows this token.
-	backend := NewWithProviders(snapshot, nil, githubhost.New(snapshot, nil), nil)
+	backend := New(snapshot)
 	r := request(t, dir, script)
 	r.Issue = domain.Issue{ID: "issue-1", Identifier: "PMR-94", State: "Todo"}
+	r = hostPrepared(t, capability.NewPreparer(nil, githubhost.New(snapshot, nil)), settings, r)
 	_, events, err := backend.Start(context.Background(), r)
 	if err != nil {
 		t.Fatal(err)

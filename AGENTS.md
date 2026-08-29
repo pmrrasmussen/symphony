@@ -19,14 +19,14 @@ handoff, rework, landing, and completion instructions. Read it, and
 - `internal/hostenv` — the one implementation of that filter (`Filter`), applied
   by every launcher. It depends only on `internal/config`, so a caller with no
   session passes no secret matcher and still gets the other three parts.
-- `internal/coordinator` — the scheduling core: polling, capacity, retries, and reconciliation.
+- `internal/coordinator` — the scheduling core: polling, capacity, retries, and reconciliation, and the one place a dispatch's prompt and its bounded capability set are decided together, from one settings snapshot.
 - `internal/linear` — the Linear GraphQL tracker adapter and the host-side review handoff, transitions, and bounded `create_followup_issue` tooling.
 - `internal/github` — the optional, fixed-repository GitHub PR publish/context/land adapter.
 - `internal/agent` — routes new sessions to the configured `agent.backend` and pins continuation and cancellation to the backend that started each session.
-- `internal/capability` — the agent-neutral registry of bounded session capabilities: definitions, availability, argument validation, invocation, and typed results/refusals, plus the one dispatch that runs a call for either transport — lookup, gates, invocation, item records, and terminal outcome — so only the wire envelope is a backend's own.
+- `internal/capability` — the agent-neutral registry of bounded session capabilities: definitions, availability, argument validation, invocation, and typed results/refusals; the one dispatch that runs a call for either transport — lookup, gates, invocation, item records, and terminal outcome — so only the wire envelope is a backend's own; and the one host-side preparation that binds the providers and builds that registry per dispatch, from the settings snapshot the scheduler rendered the prompt with, so no backend builds one of its own.
 - `internal/mcpbridge` — the in-process loopback MCP endpoint that serves that registry to an MCP-capable agent process: one listener, per-session bearer tokens, one invocation in flight per session, and drain-before-finalize revocation. Wired into the Claude backend and reachable: a Claude workflow may bind Symphony's session capabilities.
 - `internal/codex` — the Codex app-server JSON-RPC backend and dynamic tool wiring.
-- `internal/claude` — the Claude Code CLI backend: the fixed, non-configurable launch contract (tool surface, permission mode, settings sources, sandbox, MCP configuration) re-applied and re-verified on every turn, the per-turn capability-endpoint registration retired before the next turn is minted, the launch-time cross-check that the rendered prompt's capability promises match what this session advertises, and the narrow `--print` stream decode.
+- `internal/claude` — the Claude Code CLI backend: the fixed, non-configurable launch contract (tool surface, permission mode, settings sources, sandbox, MCP configuration) re-applied and re-verified on every turn, the per-turn capability-endpoint registration retired before the next turn is minted, the launch-time cross-check that the rendered prompt names the advertised capabilities under the prefix this transport actually serves them by, and the narrow `--print` stream decode.
 - `internal/agentstream` — the output path both backends share and neither owns:
   the bounded line framing a child's stdout is read through (an oversized line is
   skipped, never fatal) and the sink that owns a turn's event channel — one

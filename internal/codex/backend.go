@@ -21,9 +21,7 @@ import (
 	"github.com/pmrrasmussen/symphony/internal/capability"
 	"github.com/pmrrasmussen/symphony/internal/config"
 	"github.com/pmrrasmussen/symphony/internal/domain"
-	githubhost "github.com/pmrrasmussen/symphony/internal/github"
 	"github.com/pmrrasmussen/symphony/internal/hostenv"
-	"github.com/pmrrasmussen/symphony/internal/linear"
 	"github.com/pmrrasmussen/symphony/internal/observability"
 	"github.com/pmrrasmussen/symphony/internal/procgroup"
 )
@@ -32,9 +30,11 @@ type Backend struct {
 	mu          sync.Mutex
 	sessions    map[string]*client
 	secretNames []string
-	settings    func() config.Settings
-	handoff     *linear.Handoff
-	github      *githubhost.Manager
+	// settings is read for one thing only: the host secret names filter 3 of the
+	// credential filter removes. What a session may *do* is not read from here at
+	// all -- the capability registry and its credential matcher are prepared
+	// host-side and arrive on the request (PMR-182).
+	settings func() config.Settings
 	// timer schedules every bound a session enforces itself. It defaults to the
 	// real one and is replaced only by a test. See Timer.
 	timer Timer
@@ -77,70 +77,41 @@ const invocationDrain = 2 * time.Minute
 // sending goroutine and orphan the child.
 const eventBuffer = 32
 
-// New builds a Codex backend. secretNames are extra environment variable names
-// this child may not inherit, on top of everything hostenv.Filter blocks for
-// every child Symphony spawns.
+// New builds a Codex backend that reads no settings of its own. secretNames are
+// extra environment variable names this child may not inherit, on top of
+// everything hostenv.Filter blocks for every child Symphony spawns.
 func New(secretNames ...string) *Backend {
 	return &Backend{sessions: map[string]*client{}, secretNames: uniquePaths(secretNames), timer: realTimer{}}
 }
 
-// NewWithProviders binds already-built host providers to this backend instead
-// of constructing them. Both are process-wide and neither belongs to Codex, and
-// settings must be the same callback the two providers were built from -- it is
-// a separate parameter only because neither exposes the closure it captured, so
-// this cannot be enforced here.
-//
-// A nil provider leaves its capabilities unbound, exactly as an unconfigured
-// integration does.
-//
-// See docs/architecture.md's "One GitHub manager per process" for what a second
-// manager, or a second settings callback, would break.
-func NewWithProviders(settings func() config.Settings, handoff *linear.Handoff, github *githubhost.Manager, secretNames ...string) *Backend {
+// NewWithSettings binds the process's settings callback, which this backend reads
+// for exactly one thing: the host secret names filter 3 removes from a child's
+// environment. It deliberately binds no provider -- what a session may do arrives
+// prepared on the request, from the same snapshot the run's prompt was rendered
+// with (see capability.Preparer).
+func NewWithSettings(settings func() config.Settings, secretNames ...string) *Backend {
 	b := New(secretNames...)
 	b.settings = settings
-	b.handoff = handoff
-	b.github = github
 	return b
 }
 
-// GitHubManager reports the manager this backend was given. The host reads its
-// poll loop and landing-verifier target back out of the backend rather than
-// keeping a local of its own, so the instance it polls cannot drift from the
-// instance sessions write into: there is deliberately no constructor that mints
-// a manager for a single backend, because every such call would produce a
-// second linked-pull-request table no poll loop walks. It is nil when GitHub is
-// unwired, which leaves cleanup verification and polling as strict as they were
-// before the integration existed.
-func (b *Backend) GitHubManager() *githubhost.Manager { return b.github }
 func (b *Backend) Start(ctx context.Context, r domain.AgentRequest) (domain.AgentSession, <-chan domain.Event, error) {
+	// The registry and the credential matcher are two halves of one host-side
+	// preparation, so they are read out together and neither is rebuilt here.
+	prepared, err := capability.From(r)
+	if err != nil {
+		return domain.AgentSession{}, nil, err
+	}
 	settings := config.Settings{}
 	if b.settings != nil {
 		settings = b.settings()
 	}
-	var handoff *linear.HandoffSession
-	var err error
-	if b.handoff != nil && settings.LinearSessionCapabilityEnabled() {
-		handoff, err = b.handoff.PrepareWithSettings(ctx, settings, r.Issue)
-		if err != nil {
-			return domain.AgentSession{}, nil, fmt.Errorf("prepare Linear handoff: %w", err)
-		}
-	}
-	var githubSession *githubhost.Session
-	if b.github != nil {
-		githubSession = b.github.PrepareWithSettings(settings.GitHub, r.Issue, r.Workspace, handoff)
-	}
 	r.TurnSandboxPolicy = localCommitSandbox(r)
-	// The registry is per session and holds these same provider session
-	// pointers, because every per-run idempotency latch lives in them. The
-	// secret matcher is derived from the same bindings, so the providers this
-	// session can reach and the credentials it strips cannot disagree.
-	bindings := capability.Bindings{Settings: settings, Issue: r.Issue, Handoff: handoff, GitHub: githubSession}
-	capabilities := capability.Build(bindings)
 	// The child environment is filtered by hostenv, which every child Symphony
 	// spawns shares: this backend adds no name of its own beyond the ones its
 	// constructor was given, and nothing at all after filtering.
-	environment := hostenv.Filter(os.Environ(), b.secretNames, settings, capability.SecretMatcher(bindings, b.github))
-	c, err := start(ctx, r, environment, capabilities, b.timer)
+	environment := hostenv.Filter(os.Environ(), b.secretNames, settings, prepared.SecretMatcher())
+	c, err := start(ctx, r, environment, prepared.Registry(), b.timer)
 	if err != nil {
 		return domain.AgentSession{}, nil, err
 	}

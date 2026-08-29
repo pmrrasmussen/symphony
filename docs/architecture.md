@@ -9,33 +9,44 @@ respectively.  Which `AgentBackend` a session starts on is configuration-driven
 and an unrecognized one is rejected at load rather than defaulted.  Only the
 selected backend's launch contract has to be complete, so an absent `codex:` or
 `claude:` block fails a candidate only when that backend is the one selected.
-A `claude` workflow may enable Symphony's session capabilities.  The backend
-prepares the same provider sessions Codex does, builds the same registry, and
-serves it over the private loopback MCP endpoint (`internal/mcpbridge`)
-described below; the host-generated delivery instructions name each capability
-by the name its transport serves it under, which for that endpoint is
-`mcp__symphony__<tool>`; and `claude.Backend.Start` cross-checks the
-rendered prompt against what the session it is about to start can serve: it
-refuses a prompt that promises host-side publish where the registry advertises no
-`github_publish_pr`, a prompt that promises landing where it advertises no
-`github_land_pr`, a session advertising publish with no handoff state to
-publish into, and a prompt that names any advertised capability without its
-`mcp__symphony__` prefix.  That last one is what verifies the naming at runtime;
-without it the whole of the naming guarantee is a single backend-name comparison
-in `internal/config`.  The cross-check exists because the promise and the grant
-are made by different components, in a fixed order, from *different settings
-snapshots*: the coordinator renders the prompt from its own snapshot before the
-backend builds the registry from a later one plus the bound issue and its
-prepared provider sessions.  A reload that disables the GitHub integration
-between the two is enough to produce a promise no session can keep, on an
-ordinary issue.  The
-shape that removes the problem rather than detecting it is to hoist
-`capability.Build` into the host and pass the registry on `domain.AgentRequest`;
-that touches `internal/domain`, both backends, and the router, and has not been
-done.  Detecting it is not optional, because the undetected failure is the worst
-available: every gate passes -- configuration valid, preflight green, init echo
-exactly as expected -- while the turn ends `EventCompleted` with committed,
-unpublished work.
+A `claude` workflow may enable Symphony's session capabilities.  Neither backend
+builds them: the scheduler prepares one registry per dispatch, host-side
+(`capability.Preparer`), from the same settings snapshot it rendered that
+dispatch's prompt from, and carries it on `domain.AgentRequest`; the Codex
+adapter advertises it as dynamic tools and the Claude backend serves it over the
+private loopback MCP endpoint (`internal/mcpbridge`) described below, where the
+host-generated delivery instructions name each capability by the name that
+transport serves it under, `mcp__symphony__<tool>`.
+
+Preparing there is what makes the promise and the grant one decision.  Both used
+to be made by different components, in a fixed order, from *different settings
+snapshots*: the coordinator rendered the prompt from its own snapshot and the
+backend then built the registry from a later one, so a reload that disabled the
+GitHub integration between the two produced a promise no session could keep, on
+an ordinary issue.  That is now unrepresentable, and it is also why the two
+backends no longer hold providers at all -- the duplicated preparation each
+carried was a second place for the two transports to drift (PMR-182).
+
+Two cross-checks remain, and each is now made where both of its halves come from
+one snapshot.  `capability.verifyPromise` refuses a prepared session that cannot
+keep the delivery mode the prompt renders: settings that promise host-side
+publish where the registry advertises no `github_publish_pr` -- which survives
+the hoist, because whether a GitHub session exists depends on the bound issue and
+not only on configuration -- a landing dispatch where it advertises no
+`github_land_pr`, which would leave a run told to merge holding no tool that can
+(PMR-169), and a session advertising publish with no handoff state to publish
+into, where `LinkAndHandoff` mutates GitHub before it fails.  Its terms read
+`HostSidePublishPromised` and `GitHub.LandingDispatch`, the very predicates
+`capability.Build` advertises on and `DeliveryInstructions` branches on, rather
+than paraphrases of them.  `claude.verifyNaming` refuses a rendered prompt that
+names any advertised capability without its `mcp__symphony__` prefix; it stays in
+that backend because that backend is the only one that renames the tools, and it
+is what verifies the naming at runtime.  Without it the whole of the naming
+guarantee is a single backend-name comparison in `internal/config`.  Neither
+check is optional, for the same reason the ordering hole was not: the undetected
+failure is the worst available -- every gate passes, configuration valid,
+preflight green, init echo exactly as expected -- while the turn ends
+`EventCompleted` with committed, unpublished work.
 
 Two residual configuration rules remain, both applying only to `claude`.  An
 enabled GitHub integration requires `handoff_state`.  Without one and with
@@ -52,14 +63,20 @@ transitions it to no state at all, so the refusal lands after an irreversible
 GitHub mutation.  The second rule is the narrower one it leaves behind: a
 `handoff_state` with neither an enabled GitHub integration nor
 `followup_issue_creation` prepares a handoff object nothing model-facing uses.
-Both stay accepted under `codex`, where they behave identically because the
-advertisement is the same registry's; they always have been, and the
-prompt/advertisement mismatch above is pre-existing there and is not addressed
-here.  Under `claude` they are refused so that "no MCP server at all" in the init
-echo keeps a single meaning -- this workflow configures no capability -- rather
-than also standing for a capability that was configured and could not be
-reached.  A `github:` block that does not resolve stays disabled, as it does
-under `codex`, so it configures nothing and reaches neither rule.
+Both stay accepted at load under `codex`, where they behave identically because
+the advertisement is the same registry's.  What changed with PMR-182 is where the
+first one is caught: `capability.verifyPromise` runs in the one host-side
+preparation both transports are served by, so a dispatch that would advertise
+publish with no `handoff_state` is now refused before any session starts, on
+either backend, rather than only under `claude` and only at load.  A `codex`
+workflow in exactly that state therefore fails at `capability_prepare` with the
+missing key named, instead of dispatching a worker that reaches `LinkAndHandoff`
+after the irreversible mutation above.  Under `claude` the load-time rules stay
+as they were, so that "no MCP server at all" in the init echo keeps a single
+meaning -- this workflow configures no capability -- rather than also standing
+for a capability that was configured and could not be reached.  A `github:`
+block that does not resolve stays disabled, as it does under `codex`, so it
+configures nothing and reaches neither rule.
 
 The initial implementation is intentionally for a trusted local machine.
 `WORKFLOW.md` is repository-owned, versioned policy and its hooks are trusted
@@ -531,9 +548,12 @@ nothing is bound, which every launcher reads as "no provider filter".
 It lives in `internal/capability`, beside `Build`, and takes the same `Bindings`,
 because the set of bound providers and the set of their credentials must not be
 able to diverge: a provider added to `Bindings` gains both its capabilities and
-its credential filter, or neither. Both backends call it, so the two cannot
-differ on which provider credential is stripped -- they did before, in the same
-way twice.
+its credential filter, or neither. Since PMR-182 there is exactly one caller,
+`Preparer.Prepare`, which carries the matcher on the same `capability.Session` as
+the registry it built from those bindings; each backend reads it off the request
+it was handed. The two therefore cannot differ on which provider credential is
+stripped -- they did before, in the same way twice, back when each called this
+itself.
 
 Every bound provider is asked, and a match by any of them is a match. It is
 deliberately not a dispatch to whichever is most specific: the three read
@@ -574,7 +594,9 @@ Each numbered filter is proven once over `hostenv.Filter`, in
 proven to reach it with the whole of what it must contribute, because a hole
 would be silent either way: see `TestNoHostCredentialReachesTheChildEnvironment`
 in `internal/codex`, `TestHostSecretsNeverReachTheChild` plus
-`TestStartBindsTheHostProvidersAndTheirSecrets` in `internal/claude`, and
+`TestStartBindsWhatTheHostPreparedAndItsSecrets` in `internal/claude`,
+`TestPrepareBindsTheGivenProvidersIntoOneSessionsCapabilities` in
+`internal/capability` for the matcher those two are handed, and
 `TestNoHostCredentialReachesAHook` in `internal/workspace`. Filter 1's
 names are also the names `internal/service` writes into the LaunchAgent plist;
 `TestReservedNamesCoverTheServiceCredentialVariables` holds those two lists
@@ -1001,11 +1023,11 @@ that keeps it so is that anything varying from turn to turn belongs in the
 continuation guidance and everything else belongs in the initial prompt. Tool
 naming is emphatically the second kind: `config.DeliveryInstructions` renders it,
 every fresh dispatch renders that, and a resume replays it — and it is safe there
-because the advertised set is frozen when the session's registry is built
-(`capability.landAdvertised` reads `Issue.State` once, at `Build` time) and no
-later turn can change it. A `landing_waiting` redispatch is not a continuation
-either: it goes through `scheduleRetry`/`retryLanding` to a fresh `Start` and
-therefore a fresh render. So there is nothing for a continuation turn to correct,
+because the advertised set is frozen when the dispatch's registry is prepared
+(`capability.Build` reads the bound `Issue.State` once, through
+`GitHub.LandingDispatch`) and no later turn can change it. A `landing_waiting`
+redispatch is not a continuation either: it goes through
+`scheduleRetry`/`retryLanding` to a fresh `Start` and therefore a fresh render. So there is nothing for a continuation turn to correct,
 and adding a note anyway only leaked one backend's vocabulary into the other's
 prompt.
 
@@ -1246,28 +1268,30 @@ after its drain, so it shares no clock with this.
 
 ## One GitHub manager per process
 
-`cmd/symphony`'s `wire` builds the agent backend registry together with the host
-providers those backends share, and hands back the one GitHub manager this
-process may hold. It exists as a seam rather than inline wiring so the sharing is
-asserted by a test: the manager comes back out of the backend that was given it,
-so the poll loop and the landing verifier cannot end up on a second manager that
-merely shares a configuration callback. That second manager is the whole hazard
--- it would own its own linked-pull-request table and its own exactly-once
-completion guard, so a merged pull request would leave its Linear issue
-unreconciled while the guard on the polled manager never fired.
+`cmd/symphony`'s `wire` builds the agent backend registry together with the one
+host-side capability preparation every dispatch runs through, and hands that
+preparation back so the caller can read the one GitHub manager this process may
+hold out of it. It exists as a seam rather than inline wiring so the sharing is
+asserted by a test: the manager comes back out of the component that binds it
+into sessions, so the poll loop and the landing verifier cannot end up on a
+second manager that merely shares a configuration callback. That second manager
+is the whole hazard -- it would own its own linked-pull-request table and its own
+exactly-once completion guard, so a merged pull request would leave its Linear
+issue unreconciled while the guard on the polled manager never fired.
 
-Both backends' `NewWithProviders` constructors exist for the same reason: they
-bind already-built providers instead of constructing them. `settings` must be the
-same callback the providers were built from. It is a separate parameter only
-because neither provider exposes the closure it captured, and Go cannot compare
-closures, so this cannot be enforced in the constructor: `Start` freezes one
-settings snapshot for the session (which capabilities exist, and the
-`config.GitHub` the session is bound to) while the manager independently reads its
-own callback for `Enabled`, `MatchesSecret`, the read-only `VerifyLanded`, and
-the credential each poll of a linked pull request authenticates with.
-Feeding them different callbacks makes those disagree -- a session that froze
-GitHub as disabled beside a landing verifier that sees it enabled would let
-terminal cleanup discard local commits for an issue no session ever published.
+Since PMR-182 exactly one component binds the providers at all:
+`capability.NewPreparer` takes the already-built pair, and no backend holds
+either. A backend that did would also be building a registry from a settings
+snapshot of its own, which is the divergence the opening section describes, so
+"no backend reports a manager" and "no backend prepares capabilities" are the
+same assertion made once. The scheduler passes the snapshot to prepare from per
+dispatch -- the same one that rendered that dispatch's prompt -- while the manager
+independently reads its own callback for `Enabled`, `MatchesSecret`, the
+read-only `VerifyLanded`, and the credential each poll of a linked pull request
+authenticates with. Feeding those different callbacks makes them disagree -- a
+session that froze GitHub as disabled beside a landing verifier that sees it
+enabled would let terminal cleanup discard local commits for an issue no session
+ever published.
 
 The poll's credential is on that list because a link outlives the session that
 published it by design: nothing evicts an open pull request on age, so a link

@@ -27,8 +27,9 @@ import (
 // reason the budget would otherwise have reported (PMR-177).
 //
 // Nothing is substituted but the two remotes (one httptest server) and the two
-// child processes (the scripted app-server, and a scripted git). The backend
-// builds its own registry from a real linear.Handoff and a real github.Manager.
+// child processes (the scripted app-server, and a scripted git). The session runs
+// against the registry the host preparation builds from a real linear.Handoff and
+// a real github.Manager, carried on the request as a dispatch carries one.
 
 // landingScript is the app-server transcript a landing session runs: it
 // completes the handshake, makes one github_land_pr call per requested outcome,
@@ -99,10 +100,10 @@ func landingSession(t *testing.T, ctx context.Context, remote *agenttest.Landing
 	t.Helper()
 	agenttest.WriteFakeGit(t, dir)
 	script := writeAppServer(t, dir, transcript)
-	b := integratedBackend(remote.SettingsFunc())
+	b := NewWithSettings(remote.SettingsFunc())
 	r := request(dir, script)
 	r.Issue = remote.Issue()
-	session, events, err := b.Start(ctx, r)
+	session, events, err := b.Start(ctx, hostPrepared(t, remote.SettingsFunc(), r))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -206,12 +207,12 @@ func TestATimedOutTurnFinalizesOnlyWhenTheRunIsStopped(t *testing.T) {
 	remote := agenttest.NewLandingRemote(t)
 	agenttest.WriteFakeGit(t, dir)
 	script := writeAppServer(t, dir, landingScript(dir, []bool{false}, turnHangs))
-	b := integratedBackend(remote.SettingsFunc())
+	b := NewWithSettings(remote.SettingsFunc())
 	timer := timedBackend(t, b)
 	r := request(dir, script)
 	r.Issue = remote.Issue()
 	r.TurnTimeout = 90 * time.Second
-	session, events, err := b.Start(context.Background(), r)
+	session, events, err := b.Start(context.Background(), hostPrepared(t, remote.SettingsFunc(), r))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -257,12 +258,12 @@ func TestATimedOutTurnReportsAnInFlightLandingsOutcomeInsteadOfTheTimeout(t *tes
 	// The child holds the turn open once its landing call is answered, so the
 	// budget is the only thing that can end this turn.
 	script := writeAppServer(t, dir, landingScript(dir, []bool{true}, turnHangs))
-	b := integratedBackend(remote.SettingsFunc())
+	b := NewWithSettings(remote.SettingsFunc())
 	timer := timedBackend(t, b)
 	r := request(dir, script)
 	r.Issue = remote.Issue()
 	r.TurnTimeout = 90 * time.Second
-	session, events, err := b.Start(context.Background(), r)
+	session, events, err := b.Start(context.Background(), hostPrepared(t, remote.SettingsFunc(), r))
 	if err != nil {
 		t.Fatal(err)
 	}

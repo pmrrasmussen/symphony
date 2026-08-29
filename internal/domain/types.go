@@ -246,7 +246,25 @@ type AgentRequest struct {
 	// is deliberately separate from ReadTimeout so a generous cold-start budget
 	// does not loosen steady-state mid-turn hang detection.
 	StartTimeout time.Duration
+	// Capabilities is the bounded capability set the host prepared for this
+	// dispatch, built once from the same settings snapshot that rendered Prompt
+	// and carried here so a backend never builds one of its own (PMR-182). A
+	// request carrying nothing leaves the session with no capability at all,
+	// which is what a host with no providers wired prepares.
+	Capabilities SessionCapabilities
 }
+
+// SessionCapabilities is what a host-side capability preparation produces for
+// one request, carried opaquely.
+//
+// It has no method set, and that is a constraint rather than a preference:
+// internal/capability imports this package -- its Bindings name a domain.Issue,
+// its results a domain.EventKind -- so naming Registry, Definition, or
+// Capability here would close an import cycle. The two backends narrow it back
+// with capability.From, which is the one place the concrete type is asserted and
+// the one place a request carrying something else is refused.
+type SessionCapabilities any
+
 type AgentSession struct {
 	ID, ThreadID, TurnID string
 	// Backend is the runtime that created this session, stamped by the router.

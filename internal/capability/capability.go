@@ -5,10 +5,12 @@
 // call or writes a response back, so a second backend can reuse the same
 // definitions, scope checks, and refusals without importing the Codex adapter.
 //
-// A registry is built per session and holds the same provider session pointers
-// the launcher prepared, because all per-run idempotency state (landing
-// attempts, the resolved-landing latch, a stale-base update) lives in those
-// provider sessions. A process-wide registry would share or reset that state.
+// A registry is built per session, host-side, by the Preparer in this package,
+// and holds the provider session pointers prepared with it, because all per-run
+// idempotency state (landing attempts, the resolved-landing latch, a stale-base
+// update) lives in those provider sessions. A process-wide registry would share
+// or reset that state, and a per-backend one would be built from a settings
+// snapshot later than the one the run's prompt was rendered from -- see Preparer.
 package capability
 
 import (
@@ -214,6 +216,22 @@ func (r *Registry) Definitions() []Definition {
 		}
 	}
 	return definitions
+}
+
+// advertises reports whether this session tells an agent the named capability
+// exists. It reads the entries rather than re-deriving the answer from settings,
+// so the launch-time promise check and what the agent is actually offered cannot
+// disagree.
+func (r *Registry) advertises(name string) bool {
+	if r == nil {
+		return false
+	}
+	for _, e := range r.entries {
+		if e.advertised && e.capability.Definition().Name == name {
+			return true
+		}
+	}
+	return false
 }
 
 // Lookup resolves a name to a bound capability. It intentionally ignores

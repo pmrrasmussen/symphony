@@ -10,14 +10,12 @@
 // The launch policy is fixed by launch.go, not configurable, and the only
 // confirmation that it applied is the CLI's own init event -- see verifyInit.
 //
-// One ordering problem is not solved here: the prompt that promises which
-// bounded tools exist is rendered by the coordinator before Start is called,
-// from a different settings snapshot than the registry that grants them is built
-// from. verifyPromises detects rather than removes the problem; the shape that
-// removes it -- hoisting capability.Build into the host and passing the
-// *Registry on domain.AgentRequest -- touches internal/domain, both backends,
-// and the router. docs/architecture.md's opening section states why detecting it
-// is not optional.
+// What this package no longer does is decide which bounded tools a session has.
+// The registry is prepared host-side, from the same settings snapshot the prompt
+// was rendered with, and arrives on domain.AgentRequest (capability.Preparer,
+// PMR-182). What is left here is the half that is genuinely this transport's:
+// this is the one backend that renames Symphony's tools on the wire, so
+// verifyNaming still reads the rendered prompt.
 package claude
 
 import (
@@ -25,7 +23,6 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
-	"slices"
 	"strings"
 	"sync"
 
@@ -33,8 +30,6 @@ import (
 	"github.com/pmrrasmussen/symphony/internal/capability"
 	"github.com/pmrrasmussen/symphony/internal/config"
 	"github.com/pmrrasmussen/symphony/internal/domain"
-	githubhost "github.com/pmrrasmussen/symphony/internal/github"
-	"github.com/pmrrasmussen/symphony/internal/linear"
 	"github.com/pmrrasmussen/symphony/internal/mcpbridge"
 )
 
@@ -45,13 +40,15 @@ const eventBuffer = 64
 
 // Backend implements domain.AgentBackend on the Claude Code CLI.
 type Backend struct {
+	// settings is re-read on every turn, for one thing only: the host secret
+	// names filter 3 of the credential filter removes, which a reload may rotate
+	// mid-run. What a session may *do* is not read from here at all -- the
+	// capability registry and its credential matcher are prepared host-side and
+	// arrive on the request (PMR-182).
 	settings    func() config.Settings
 	secretNames []string
-	// handoff, github, and endpoint are the host-owned providers and the
-	// transport that reaches them. All three are process-wide and none of them
-	// belongs to this backend: see NewWithProviders.
-	handoff  *linear.Handoff
-	github   *githubhost.Manager
+	// endpoint is the transport a session's capabilities are served over. It is
+	// process-wide and does not belong to this backend: see NewWithEndpoint.
 	endpoint *mcpbridge.Server
 	// timer schedules every turn's budget. It defaults to the real one and is
 	// replaced only by a test. See Timer.
@@ -79,10 +76,11 @@ type session struct {
 	// values -- see mcpbridge.finalizerBudget.
 	ctx context.Context
 
-	// registry is built once per run and holds the provider session pointers the
-	// launcher prepared, because every per-run idempotency latch -- landing
-	// attempts, the resolved-landing latch, a stale-base update -- lives in
-	// those pointers. It cannot live on a turn: claude --print runs one turn and
+	// registry is the one the host prepared for this run, and it holds the
+	// provider session pointers prepared with it, because every per-run
+	// idempotency latch -- landing attempts, the resolved-landing latch, a
+	// stale-base update -- lives in those pointers. It is held for the run rather
+	// than taken from each turn's request: claude --print runs one turn and
 	// exits, so a per-turn registry would reset that state on every
 	// continuation and a second landing attempt would look like a first.
 	// Its type is the endpoint's own narrow view of a registry rather than
@@ -116,88 +114,59 @@ type session struct {
 	endpoint *registration
 }
 
-// New builds a Claude backend with no Symphony capabilities at all. secretNames
-// are environment variable names whose values must never reach the child.
+// New builds a Claude backend with no capability transport at all: with no
+// endpoint a session can reach no Symphony capability, whatever the request
+// carries. secretNames are environment variable names whose values must never
+// reach the child.
 func New(settings func() config.Settings, secretNames ...string) *Backend {
 	return &Backend{settings: settings, secretNames: secretNames, sessions: map[string]*session{}, timer: realTimer{}}
 }
 
-// NewWithProviders binds already-built host providers, and the endpoint that
-// serves them, to this backend instead of constructing them.
+// NewWithEndpoint binds the process's one loopback capability endpoint to this
+// backend instead of constructing one. It is shared by every concurrent session
+// and separated by per-registration bearer tokens, so it belongs to the daemon's
+// lifetime rather than to this backend.
 //
-// The providers are the same instances internal/codex is given, and settings
-// must be the callback both were built from. Sharing them is not an
-// optimization: see docs/architecture.md's "One GitHub manager per process" for
-// what a second manager, or a second settings callback, would break.
-//
-// endpoint is likewise one loopback listener for the daemon's lifetime, shared
-// by every concurrent session and separated by per-registration bearer tokens.
-//
-// A nil provider leaves its capabilities unbound, exactly as an unconfigured
-// integration does, and a nil endpoint leaves the session with no reachable
-// capability at all -- which is what New produces.
-func NewWithProviders(settings func() config.Settings, handoff *linear.Handoff, github *githubhost.Manager, endpoint *mcpbridge.Server, secretNames ...string) *Backend {
+// No provider is bound here, and that is the point: the registry a session serves
+// over that endpoint is prepared host-side and arrives on the request, so this
+// backend cannot build one from a settings snapshot later than the one the run's
+// prompt was rendered from (capability.Preparer).
+func NewWithEndpoint(settings func() config.Settings, endpoint *mcpbridge.Server, secretNames ...string) *Backend {
 	b := New(settings, secretNames...)
-	b.handoff = handoff
-	b.github = github
 	b.endpoint = endpoint
 	return b
 }
 
-// GitHubManager reports the manager this backend was given, so the host can read
-// its poll loop and landing-verifier target back out of a backend rather than
-// keeping a local of its own. See codex.Backend.GitHubManager: the one-manager
-// invariant is asserted over every wired backend that answers this, so a backend
-// that held a manager without exposing it would silently escape the assertion.
-func (b *Backend) GitHubManager() *githubhost.Manager { return b.github }
-
-// Start prepares this run's provider sessions and capability registry, assigns a
+// Start binds this run to the capabilities the host prepared for it, assigns a
 // session ID, and runs the first turn.
 //
-// The preparation mirrors codex.Backend.Start deliberately: the same providers,
-// the same settings snapshot, the same secret matcher, and the same
-// capability.Build call, so there is no second implementation of a capability
-// for the two transports to drift apart on. What differs is only how a call is
-// framed on the wire, which is the whole point of internal/capability being
-// transport-neutral.
+// The registry and the credential matcher are read out of the request together,
+// because they are two halves of one preparation: the providers this session can
+// reach and the credentials it strips cannot disagree, and neither can this
+// backend and internal/codex, which is handed the same pair. What differs
+// between them is only how a call is framed on the wire, which is the whole
+// point of internal/capability being transport-neutral.
 //
-// One settings snapshot is frozen here for the run's lifetime -- which
-// capabilities exist, and the config.GitHub the session is bound to -- because a
-// reload mid-run that changed either would leave the registry and the launch
-// contract describing different sessions.
+// Both are frozen on the session for the run's lifetime. A --print turn exits, so
+// a continuation arrives with a fresh request; rebinding from it would let a
+// reload move the run's capabilities out from under a session already advertising
+// them, and would reset the per-run latches that live in the provider sessions.
 func (b *Backend) Start(ctx context.Context, r domain.AgentRequest) (domain.AgentSession, <-chan domain.Event, error) {
-	settings := config.Settings{}
-	if b.settings != nil {
-		settings = b.settings()
+	prepared, err := capability.From(r)
+	if err != nil {
+		return domain.AgentSession{}, nil, err
 	}
-	var handoff *linear.HandoffSession
-	var err error
-	if b.handoff != nil && settings.LinearSessionCapabilityEnabled() {
-		handoff, err = b.handoff.PrepareWithSettings(ctx, settings, r.Issue)
-		if err != nil {
-			return domain.AgentSession{}, nil, fmt.Errorf("prepare Linear handoff: %w", err)
-		}
-	}
-	var githubSession *githubhost.Session
-	if b.github != nil {
-		githubSession = b.github.PrepareWithSettings(settings.GitHub, r.Issue, r.Workspace, handoff)
+	registry := prepared.Registry()
+	advertised := advertisedNames(registry)
+	if err := verifyNaming(r.Prompt, advertised); err != nil {
+		return domain.AgentSession{}, nil, err
 	}
 	id, err := newSessionID()
 	if err != nil {
 		return domain.AgentSession{}, nil, err
 	}
-	// One set of bindings drives both the registry and the secret matcher, so
-	// the providers this session can reach and the credentials it strips cannot
-	// disagree -- and neither can this backend and internal/codex, which derives
-	// both from the same call.
-	bindings := capability.Bindings{Settings: settings, Issue: r.Issue, Handoff: handoff, GitHub: githubSession}
-	registry := capability.Build(bindings)
-	advertised := advertisedNames(registry)
-	if err := verifyPromises(settings, r.Issue.State, r.Prompt, advertised); err != nil {
-		return domain.AgentSession{}, nil, err
-	}
 	s := &session{id: id, ctx: ctx, registry: registry, advertised: advertised,
-		secretMatcher: capability.SecretMatcher(bindings, b.github)}
+		secretMatcher: prepared.SecretMatcher()}
 	b.mu.Lock()
 	b.sessions[id] = s
 	b.mu.Unlock()
@@ -225,54 +194,32 @@ func advertisedNames(registry mcpbridge.Capabilities) []string {
 	return names
 }
 
-// verifyPromises is the launch-time consistency guard: it refuses a turn whose
-// rendered prompt and whose reachable capability set do not describe the same
-// session. It reads r.Prompt and not only settings, and that is the point: the
-// prompt was rendered by the coordinator from its own settings snapshot, this
-// function runs against a snapshot the backend read later, and no comparison
-// made purely within either snapshot sees a reload between the two.
+// verifyNaming is the launch-time consistency guard this transport still owns: it
+// refuses a turn whose rendered prompt names an advertised capability without the
+// rule that maps it to the name this transport serves it under. This is the one
+// backend that renames Symphony's tools -- the CLI derives every tool name from
+// the MCP server it came from -- so a prompt rendered for any other backend names
+// tools this session does not serve, and nothing else would notice: the launch
+// contract is still self-consistent, so verifyInit approves the turn.
 //
-// Four refusals, and they are four different failures: a promise with nothing
-// to serve it; a landing prompt with no landing capability, which would leave a
-// run told to merge holding no tool that can; publish advertised with no handoff
-// state to publish into, which is the more damaging direction because
-// LinkAndHandoff mutates GitHub before it fails; and a prompt that names an
-// advertised capability without the rule that maps it to the name this
-// transport serves it under.
+// The check is not "no bare name appears": a bare name is legitimate and routine
+// -- this repository's own WORKFLOW.md body names Symphony's tools bare -- and
+// refusing every one would refuse every real dispatch. The invariant is the
+// conditional one: a prompt that names an advertised capability must also carry
+// the rule that maps it, because the rule and the prefixes are emitted together
+// or not at all.
 //
-// issueState is why the first check is not settings-only: an enabled landing
-// configuration promises publish for every state except the merge state, where
-// the rendered prompt promises landing instead and the session deliberately
-// advertises no publish capability (PMR-169). Reading the promise off the
-// prompt as well as off the settings keeps that agreement checked in both
-// directions.
-//
-// That last check is not "no bare name appears": a bare name is legitimate and
-// routine, and refusing every one would refuse every real dispatch. The
-// invariant is the conditional one -- a prompt that names an advertised
-// capability must also carry the rule that maps it, because the rule and the
-// prefixes are emitted together or not at all.
-//
-// See the package comment, and docs/architecture.md's opening section, for why a
-// cross-check is what stands in for a fix here.
-func verifyPromises(settings config.Settings, issueState, prompt string, advertised []string) error {
-	landing := settings.GitHub.LandingDispatch(issueState)
-	servesPublish := slices.Contains(advertised, capability.NameGitHubPublishPR)
-	promisesPublish := (settings.HostSidePublishPromised() && !landing) || strings.Contains(prompt, config.HostSidePublishPromiseMarker)
-	if promisesPublish && !servesPublish {
-		return fmt.Errorf("claude launch refused: host-side publish is promised for this run but this session advertises no %s capability", capability.NameGitHubPublishPR)
+// What it no longer checks is whether the session can keep the prompt's delivery
+// promise at all. That comparison was between a settings snapshot and a registry,
+// and it now happens where both come from one snapshot and one preparation, for
+// either transport: see capability.verifyPromise (PMR-182).
+func verifyNaming(prompt string, advertised []string) error {
+	if strings.Contains(prompt, config.MCPNamingRuleMarker) {
+		return nil
 	}
-	if strings.Contains(prompt, config.LandingDeliveryMarker) && !slices.Contains(advertised, capability.NameGitHubLandPR) {
-		return fmt.Errorf("claude launch refused: landing is promised for this run but this session advertises no %s capability", capability.NameGitHubLandPR)
-	}
-	if servesPublish && strings.TrimSpace(settings.Tracker.HandoffState) == "" {
-		return fmt.Errorf("claude launch refused: this session advertises %s with no tracker.provider.handoff_state, so a publish would leave the pull request created and the issue untransitioned", capability.NameGitHubPublishPR)
-	}
-	if !strings.Contains(prompt, config.MCPNamingRuleMarker) {
-		for _, name := range advertised {
-			if strings.Contains(prompt, name) {
-				return fmt.Errorf("claude launch refused: the rendered prompt names the %s capability with no %s naming rule to map it, so it names a tool this session does not serve", name, config.MCPToolPrefix)
-			}
+	for _, name := range advertised {
+		if strings.Contains(prompt, name) {
+			return fmt.Errorf("claude launch refused: the rendered prompt names the %s capability with no %s naming rule to map it, so it names a tool this session does not serve", name, config.MCPToolPrefix)
 		}
 	}
 	return nil

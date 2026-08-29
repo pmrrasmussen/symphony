@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/pmrrasmussen/symphony/internal/config"
+	"github.com/pmrrasmussen/symphony/internal/coordinator"
 	"github.com/pmrrasmussen/symphony/internal/domain"
 	githubhost "github.com/pmrrasmussen/symphony/internal/github"
 	"github.com/pmrrasmussen/symphony/internal/observability"
@@ -263,27 +264,31 @@ func TestCleanupTerminalWorkspacesSkipsCleanupWhenTheQueryFails(t *testing.T) {
 	}
 }
 
-// TestWireGivesTheHostTheGitHubManagerItsBackendsUse asserts the process-level
+// TestWireGivesTheHostTheGitHubManagerItsSessionsUse asserts the process-level
 // invariant the whole provider-ownership seam exists for: the manager this
-// process polls and verifies landings on is the very instance bound to the
-// backend that runs sessions. Two managers would each own a linked-pull-request
-// table and an exactly-once completion guard, so the poll loop would walk a
-// table no session writes into and a merged pull request would leave its Linear
-// issue unreconciled. Every wired backend that reports a manager must report
-// that same one, so a second capability-bearing backend given a manager of its
-// own fails here rather than in production -- provided it exposes the manager
-// it holds, which is the reason codex.Backend does. A backend reporting none is
-// fine, since that is an unwired integration, but no backend reporting one at
-// all is not: the invariant would then be silently unasserted.
-func TestWireGivesTheHostTheGitHubManagerItsBackendsUse(t *testing.T) {
+// process polls and verifies landings on is the very instance bound into every
+// session's capability registry. Two managers would each own a
+// linked-pull-request table and an exactly-once completion guard, so the poll
+// loop would walk a table no session writes into and a merged pull request would
+// leave its Linear issue unreconciled.
+//
+// One component binds it now -- the capability preparation every dispatch runs
+// through -- so the invariant is a single identity rather than a sweep over the
+// backends: no backend holds a provider at all any more, which is why none of
+// them can bind a second manager (PMR-182).
+func TestWireGivesTheHostTheGitHubManagerItsSessionsUse(t *testing.T) {
 	settings := func() config.Settings { return config.Settings{} }
-	backends, polled, endpoint, err := wire(settings, slog.Default())
+	backends, capabilities, endpoint, err := wire(settings, slog.Default())
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = endpoint.Close(context.Background()) })
+	if capabilities == nil {
+		t.Fatal("wire returned no capability preparation, so no dispatch could reach a bounded capability")
+	}
+	polled := capabilities.GitHubManager()
 	if polled == nil {
-		t.Fatal("wire returned no GitHub manager, so the host has nothing to poll or verify landings with")
+		t.Fatal("the capability preparation bound no GitHub manager, so the host has nothing to poll or verify landings with")
 	}
 	if endpoint == nil {
 		t.Fatal("wire returned no capability endpoint, so a capability-bearing backend would have no transport to serve one over")
@@ -296,20 +301,18 @@ func TestWireGivesTheHostTheGitHubManagerItsBackendsUse(t *testing.T) {
 	if _, ok := any(polled).(domain.IssueForgetter); !ok {
 		t.Fatal("the polled GitHub manager cannot be wired as the scheduler's issue forgetter, so terminal issues would be polled for the life of the process")
 	}
-	bound := 0
+	// The preparation is what the scheduler is given, so a wiring that built one
+	// here and installed another would poll a manager no dispatch prepares
+	// against.
+	var _ coordinator.CapabilityPreparer = capabilities
+	// No backend may hold a manager of its own. A backend that reported one would
+	// have prepared its own registry from its own settings snapshot, which is the
+	// duplication this seam removed.
 	for name, backend := range backends {
-		holder, ok := backend.(interface {
+		if _, ok := backend.(interface {
 			GitHubManager() *githubhost.Manager
-		})
-		if !ok {
-			continue
+		}); ok {
+			t.Fatalf("backend %q holds a GitHub manager of its own, so it prepares capabilities the host did not", name)
 		}
-		if holder.GitHubManager() != polled {
-			t.Fatalf("backend %q runs sessions against a GitHub manager the host neither polls nor verifies landings on", name)
-		}
-		bound++
-	}
-	if bound == 0 {
-		t.Fatal("no wired backend reported a bound GitHub manager, so the one-manager-per-process invariant is unasserted")
 	}
 }
