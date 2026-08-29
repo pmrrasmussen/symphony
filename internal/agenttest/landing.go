@@ -68,6 +68,10 @@ type LandingRemote struct {
 	// landFixOff turns the bounded-fix feature off, which makes the same failing
 	// required check an immediate refusal instead of a retryable gate.
 	landFixOff bool
+	// mergeReached and mergeHold park the merge request where a test can hold
+	// it. See PauseAtMerge.
+	mergeReached chan struct{}
+	mergeHold    chan struct{}
 }
 
 // NewLandingRemote returns a fixture whose required check has already failed:
@@ -102,6 +106,39 @@ func (f *LandingRemote) ReadyToLand() {
 	f.reviews = []any{map[string]any{"user": map[string]any{"login": "alice"}, "state": "APPROVED", "body": "lgtm", "submitted_at": "t1"}}
 	f.mergeable = true
 	f.mu.Unlock()
+}
+
+// PauseAtMerge parks the landing inside its merge request until the returned
+// release is called, and closes the returned channel when it gets there. It is
+// what makes "the turn budget expired while the landing was mid-merge" an exact
+// ordering rather than a likely one: a test can hold the invocation in flight,
+// end the turn underneath it, and let the merge succeed only afterwards.
+//
+// It must be called before the session starts, and it parks exactly one merge:
+// a landing that reaches the merge twice would be a different fixture's case.
+func (f *LandingRemote) PauseAtMerge() (reached <-chan struct{}, release func()) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.mergeReached, f.mergeHold = make(chan struct{}), make(chan struct{})
+	hold := f.mergeHold
+	return f.mergeReached, sync.OnceFunc(func() { close(hold) })
+}
+
+// pauseLocked parks a merge request until the test releases it, when a test
+// asked for that and nothing has claimed the pause yet. It is called with the
+// fixture's mutex held and returns holding it again, because everything around
+// the merge -- the test's own observations while the request is parked, and the
+// transition the landing issues once it resumes -- needs the fixture too.
+func (f *LandingRemote) pauseLocked() {
+	reached, hold := f.mergeReached, f.mergeHold
+	f.mergeReached, f.mergeHold = nil, nil
+	if hold == nil {
+		return
+	}
+	f.mu.Unlock()
+	close(reached)
+	<-hold
+	f.mu.Lock()
 }
 
 // DisableLandFix turns the bounded-fix feature off in the settings this fixture
@@ -202,6 +239,7 @@ func (f *LandingRemote) serveGitHub(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/pulls/7/reviews":
 		f.write(w, f.reviews)
 	case r.Method == http.MethodPut && r.URL.Path == "/repos/owner/repo/pulls/7/merge":
+		f.pauseLocked()
 		f.merges++
 		f.merged = true
 		f.write(w, map[string]any{"merged": true, "sha": "head", "message": "merged"})

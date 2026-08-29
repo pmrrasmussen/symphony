@@ -95,6 +95,33 @@ func (f *FakeTimer) AwaitLive(t *testing.T, d time.Duration) []time.Duration {
 // one the code under test can observe.
 func (f *FakeTimer) Elapse(t *testing.T, d time.Duration) {
 	t.Helper()
+	f.claim(t, d)()
+}
+
+// ElapseAsync fires d's budget on a goroutine of its own and returns a channel
+// closed once the callback returns. It exists for a callback that blocks on
+// something the test itself has to release -- a turn budget that waits for a
+// capability call still in flight -- where Elapse would park the very goroutine
+// that has to do the releasing.
+//
+// The budget is still claimed on the calling goroutine, so everything this can
+// fail on is asserted from the test's own goroutine and only the callback runs
+// elsewhere.
+func (f *FakeTimer) ElapseAsync(t *testing.T, d time.Duration) <-chan struct{} {
+	t.Helper()
+	fire := f.claim(t, d)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		fire()
+	}()
+	return done
+}
+
+// claim waits for a budget for exactly d, marks the oldest live one fired, and
+// returns its callback for the caller to run.
+func (f *FakeTimer) claim(t *testing.T, d time.Duration) func() {
+	t.Helper()
 	f.AwaitLive(t, d)
 	f.mu.Lock()
 	var elapsed *fakeBudget
@@ -110,6 +137,7 @@ func (f *FakeTimer) Elapse(t *testing.T, d time.Duration) {
 	f.mu.Unlock()
 	if elapsed == nil {
 		t.Fatalf("the %s budget was stopped before it could elapse; live budgets=%v", d, f.Live())
+		return func() {}
 	}
-	elapsed.fire()
+	return elapsed.fire
 }

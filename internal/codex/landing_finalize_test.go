@@ -22,7 +22,9 @@ import (
 // landing suite, which this file runs against a fixture of this transport's.
 // What is left here is this transport's own finalize trigger: client.turn's
 // three protocol turn endings, and its turn timeout, which is not a turn end at
-// all.
+// all -- and, because that timeout is the one path here that can observe a
+// capability call in flight, where a drained call's outcome ranks against the
+// reason the budget would otherwise have reported (PMR-177).
 //
 // Nothing is substituted but the two remotes (one httptest server) and the two
 // child processes (the scripted app-server, and a scripted git). The backend
@@ -228,4 +230,70 @@ func TestATimedOutTurnFinalizesOnlyWhenTheRunIsStopped(t *testing.T) {
 
 	settle(t, b, session)
 	remote.RequireDeferredRefusal(t)
+}
+
+// TestATimedOutTurnReportsAnInFlightLandingsOutcomeInsteadOfTheTimeout is
+// PMR-177: the turn budget expires while github_land_pr is mid-merge, and the
+// merge succeeds while the budget's own callback is draining that call.
+//
+// Both terminal events are real, and the first one detaches the stream, so which
+// one gets there decides what the coordinator records. The landing's has to win:
+// it is the run's actual outcome, and the timeout is only what to say when the
+// drained call produced no outcome at all. Emit the timeout first and the run is
+// recorded as failed against a pull request that merged, and the issue is
+// redispatched into a landing attempt with nothing left to land.
+//
+// The ordering is exact rather than likely in both places it has to be. The
+// fixture parks the merge, so the call is provably in flight when the budget is
+// elapsed; and the budget is elapsed on a goroutine of its own so that the merge
+// is released only once the drain's own bound is scheduled, which is the
+// observable edge of a callback that has reached the drain and not left it.
+func TestATimedOutTurnReportsAnInFlightLandingsOutcomeInsteadOfTheTimeout(t *testing.T) {
+	dir := t.TempDir()
+	remote := agenttest.NewLandingRemote(t)
+	remote.ReadyToLand()
+	reached, release := remote.PauseAtMerge()
+	agenttest.WriteFakeGit(t, dir)
+	// The child holds the turn open once its landing call is answered, so the
+	// budget is the only thing that can end this turn.
+	script := writeAppServer(t, dir, landingScript(dir, []bool{true}, turnHangs))
+	b := integratedBackend(remote.SettingsFunc())
+	timer := timedBackend(t, b)
+	r := request(dir, script)
+	r.Issue = remote.Issue()
+	r.TurnTimeout = 90 * time.Second
+	session, events, err := b.Start(context.Background(), r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	agenttest.Await(t, reached, "the landing never reached its merge")
+
+	fired := timer.ElapseAsync(t, r.TurnTimeout)
+	timer.AwaitLive(t, invocationDrain)
+	release()
+	agenttest.Await(t, fired, "the elapsed turn budget never returned")
+
+	collected := agenttest.DrainEvents(t, events)
+	outcome := collected[len(collected)-1]
+	if outcome.Kind != domain.EventLandingResolved {
+		t.Fatalf("the turn's outcome was %+v, want the drained landing's resolution", outcome)
+	}
+	// The budget really did expire, so the fallback it would have reported is
+	// left behind rather than merely reordered: one terminal event per turn.
+	for _, event := range collected {
+		if event.Kind == domain.EventFailed {
+			t.Fatalf("the turn also reported a failure: %+v", event)
+		}
+	}
+	settle(t, b, session)
+	transitions, comments, merges := remote.Observed()
+	if merges != 1 {
+		t.Fatalf("merges=%d, want exactly one", merges)
+	}
+	if len(transitions) != 1 || transitions[0] != "Done" {
+		t.Fatalf("Linear transitions=%v, want exactly one to Done", transitions)
+	}
+	if len(comments) != 0 {
+		t.Fatalf("the timed-out turn commented on a merged landing as a refusal: %v", comments)
+	}
 }

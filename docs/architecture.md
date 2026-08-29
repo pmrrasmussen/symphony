@@ -1039,6 +1039,21 @@ the merge it is the fallback for. The drain honours only its own bound, never
 `ctx`: a cancelled context is exactly the case where the child was killed
 mid-call, which is when skipping the drain would do the damage.
 
+That the drain cannot lose a landing's outcome is only half the guarantee, and
+the other half belongs to the transport that called `Revoke`: a turn must not
+choose an outcome of its own before the drain has finished. Both backends end a
+turn by reporting a fallback reason when nothing else claimed it -- `claude turn
+timeout`, `Codex turn timeout` -- and the event stream admits exactly one
+terminal event, so a fallback chosen ahead of the drain wins the latch and the
+drained landing's `EventLandingResolved` is dropped after it. The run is then
+recorded as a timeout against a pull request that merged, and the issue is
+redispatched into a landing attempt with nothing left to land (PMR-177). So the
+Claude transport retires the registration before its post-loop fallback (see
+`turn.stream`), and the Codex transport, which has no registration because it
+dispatches inline on its read loop, has its turn budget wait for a call in
+flight before it emits (`drainInvocation`). The timeout is the fallback in both,
+never the victor.
+
 `Revoke` is idempotent and always returns within its own bounds. It returns nil
 when it drained and finalized in order, and otherwise `ErrDrainExpired`,
 `ErrFinalizerExpired`, or both joined -- each of which means an invariant it
