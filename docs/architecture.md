@@ -709,6 +709,44 @@ whose working tree holds nothing anyone is editing -- rather than the checkout
 the operator works in. `docs/dogfooding.md` states the operator-side half of
 the same requirement.
 
+## The tool cache grant
+
+`agent.cache_root` is the one way a workflow can widen the write boundary: it
+names a single host-owned directory outside the worktree that a session may
+write, and it reaches both backends from one field -- Claude's
+`sandbox.filesystem.allowWrite` (and, through the same `writeRoots`, the
+path-scoped `Edit`/`Write` rules PMR-156 added) and Codex's `workspaceWrite`
+`writableRoots`. Unset, the default, it grants nothing.
+
+It exists because the boundary is otherwise unusable for a whole class of
+toolchain. Reads are unconfined, so credentials in `~/.netrc` and `~/.config`
+already work and no grant is needed for them; what fails is the cache. Bash
+writes to `$HOME` and `$TMPDIR` are both refused (see the section above), so
+`uv` aborts at `Failed to initialize cache at ~/.cache/uv`, and npm misreports
+the same denial as a root-owned cache folder, which reads as a broken machine
+rather than a sandbox boundary. The alternative -- a cache inside the worktree
+-- works but is rebuilt for every issue, which for a CUDA or PyTorch dependency
+set is gigabytes per dispatch.
+
+Three properties keep it from becoming a general escape hatch. It is one
+directory, not a list: a single grant whose purpose is named in the field is
+much harder to misuse than an open set of paths. It is validated in both
+directions against both workspace roots, so it can be neither an ancestor nor a
+descendant of `workspace.root` or `workspace.source_root` -- the first would
+hand a session every other issue's worktree, and the second would let it write
+the repository the post-run source-integrity check assumes it cannot (PMR-161).
+And the filesystem root and the operator's home directory are rejected by name,
+because both otherwise pass the containment checks whenever the workspace lives
+elsewhere, and neither is a cache.
+
+What it costs is real and is not hidden by the validation: every session on this
+workflow shares one directory, so a cache poisoned by one run is visible to the
+next, and to a run on the other backend. The host creates the directory before
+each dispatch -- the grant opens that path and not its parent, so a session
+cannot create it itself -- and a failure to create it drops the grant for that
+dispatch rather than failing it. Grant a directory that holds nothing but
+caches.
+
 ## Sandbox ownership decision (PMR-85)
 
 **Decision: do not add a Symphony-owned OS sandbox now.** Such a sandbox would

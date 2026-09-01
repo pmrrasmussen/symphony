@@ -136,6 +136,27 @@ agent:
   # headroom above every observed success without paying for as long a death
   # spiral.
   max_turns: 8
+  # One host-owned directory outside the worktree that a session may write.
+  # Unset -- the default -- grants nothing and leaves the write boundary at the
+  # worktree plus its two Git metadata roots.
+  #
+  # It exists for tools that keep a package cache under $HOME: Bash writes to
+  # both $HOME and $TMPDIR are refused, so uv dies at "Failed to initialize
+  # cache at ~/.cache/uv", npm reports the denial as "your cache folder
+  # contains root-owned files", and pip and Go fail the same way. Without this
+  # grant the only remedy is a cache inside the worktree, rebuilt every issue.
+  # Point the tool at a subdirectory of this root -- UV_CACHE_DIR,
+  # npm_config_cache, PIP_CACHE_DIR -- and the cache survives across dispatches.
+  #
+  # Rejected at load: a path that is, contains, or sits inside workspace.root or
+  # workspace.source_root, and the filesystem root or the home directory. The
+  # first two would hand a session another issue's worktree or the source
+  # repository the post-run integrity check assumes it cannot write.
+  #
+  # This widens the boundary Sandbox ownership decision (PMR-85) declined to
+  # loosen. Grant a directory that holds nothing but caches; anything reachable
+  # from it is reachable by every session, on either backend.
+  # cache_root: ~/.symphony/cache
   # The one bound on the number of *runs*. max_turns bounds the turns inside a
   # run and max_retry_backoff_ms bounds the delay between runs; neither stops an
   # issue that fails the same way every time -- a corrupted worktree, a

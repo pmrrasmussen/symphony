@@ -565,3 +565,46 @@ func terminalEvents(events []domain.Event) []domain.Event {
 	}
 	return out
 }
+
+// The tool cache grant reaches sandbox.filesystem.allowWrite, and an empty
+// CacheRoot leaves the boundary exactly as it was. The scoped Edit/Write rules
+// are derived from the same roots, so granting the cache to Bash without
+// granting it to those two tools is not a reachable state.
+func TestWriteRootsIncludeCacheRoot(t *testing.T) {
+	base := domain.AgentRequest{Workspace: "/tmp/ws", GitMetadataRoots: []string{"/tmp/src/.git/objects"}}
+
+	without := rootsOf(t, base)
+	for _, root := range without {
+		if root == "/tmp/cache" {
+			t.Fatalf("an unset CacheRoot granted %q; roots=%v", root, without)
+		}
+	}
+
+	withCache := base
+	withCache.CacheRoot = "/tmp/cache"
+	roots := rootsOf(t, withCache)
+	if len(roots) != len(without)+1 {
+		t.Fatalf("CacheRoot changed the root count by %d, want 1; got %v", len(roots)-len(without), roots)
+	}
+	var found bool
+	for _, root := range roots {
+		if root == "/tmp/cache" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("allowWrite roots %v do not grant the cache root", roots)
+	}
+	if roots[0] != "/tmp/ws" {
+		t.Fatalf("workspace must stay the first root, got %v", roots)
+	}
+}
+
+// A cache root equal to the workspace must not be granted twice; the dedupe
+// that protects GitMetadataRoots has to cover this grant as well.
+func TestWriteRootsDeduplicateCacheRoot(t *testing.T) {
+	roots := rootsOf(t, domain.AgentRequest{Workspace: "/tmp/ws", CacheRoot: "/tmp/ws"})
+	if len(roots) != 1 {
+		t.Fatalf("roots=%v, want the workspace exactly once", roots)
+	}
+}

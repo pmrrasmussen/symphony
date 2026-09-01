@@ -2,6 +2,7 @@ package coordinator
 
 import (
 	"context"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -237,8 +238,20 @@ func (c *Coordinator) launch(parent context.Context, i domain.Issue, attempt int
 			c.finishFailure(parent, i, attempt, "capability_prepare", err)
 			return
 		}
+		// The grant is only usable if the directory exists: the sandbox opens
+		// this one path, not its parent, so a session cannot create it itself.
+		// Creating it here rather than at load keeps it correct after an
+		// operator removes it from under a running daemon, and a failure is not
+		// fatal -- it costs the cache, not the dispatch.
+		cacheRoot := s.Agent.CacheRoot
+		if cacheRoot != "" {
+			if err := os.MkdirAll(cacheRoot, 0o755); err != nil {
+				c.log.Warn("agent cache root unavailable", "issue_id", i.ID, "error", err)
+				cacheRoot = ""
+			}
+		}
 		c.log.Debug("agent launch requested", "issue_id", i.ID, "issue_identifier", i.Identifier, "attempt", attempt, "agent_backend", launch.Backend)
-		session, events, err := c.agent.Start(ctx, domain.AgentRequest{Issue: i, Backend: launch.Backend, Model: launch.Model, Workspace: ws.Path, GitMetadataRoots: ws.GitMetadataRoots, Prompt: prompt, Command: launch.Command, ApprovalPolicy: launch.ApprovalPolicy, ThreadSandbox: launch.ThreadSandbox, TurnSandboxPolicy: launch.TurnSandboxPolicy, TurnTimeout: launch.TurnTimeout, ReadTimeout: launch.ReadTimeout, StartTimeout: launch.StartTimeout, Capabilities: capabilities})
+		session, events, err := c.agent.Start(ctx, domain.AgentRequest{Issue: i, Backend: launch.Backend, Model: launch.Model, Workspace: ws.Path, GitMetadataRoots: ws.GitMetadataRoots, CacheRoot: cacheRoot, Prompt: prompt, Command: launch.Command, ApprovalPolicy: launch.ApprovalPolicy, ThreadSandbox: launch.ThreadSandbox, TurnSandboxPolicy: launch.TurnSandboxPolicy, TurnTimeout: launch.TurnTimeout, ReadTimeout: launch.ReadTimeout, StartTimeout: launch.StartTimeout, Capabilities: capabilities})
 		if err != nil {
 			c.afterRunBeforeFailure(ws, i)
 			c.unreserve(i.ID, reservation)
