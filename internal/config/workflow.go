@@ -142,7 +142,7 @@ func decode(raw map[string]any, base, path, logRoot string, sources *sourceSnaps
 	if err != nil {
 		return Settings{}, err
 	}
-	agent, err := decodeAgent(raw)
+	agent, err := decodeAgent(raw, base, sources)
 	if err != nil {
 		return Settings{}, err
 	}
@@ -259,7 +259,54 @@ func validateSettings(s Settings) (Settings, error) {
 			return s, fmt.Errorf("invalid configuration: workspace.source_root is not a directory: %s", s.Workspace.SourceRoot)
 		}
 	}
+	if err := validateCacheRoot(s); err != nil {
+		return s, err
+	}
 	return s, nil
+}
+
+// validateCacheRoot rejects a cache root that overlaps the two directories the
+// write boundary exists to protect. Containment is checked in both directions
+// and against both roots, because either direction defeats it: a cache root
+// above workspace.root would grant every other issue's worktree, and one above
+// or inside workspace.source_root would let a session write the repository the
+// post-run integrity check assumes it cannot (PMR-161).
+//
+// The filesystem root and the operator's home directory are named separately.
+// Both would otherwise pass the containment checks whenever the workspace lives
+// outside them, and neither is a cache.
+func validateCacheRoot(s Settings) error {
+	root := s.Agent.CacheRoot
+	if root == "" {
+		return nil
+	}
+	if !filepath.IsAbs(root) {
+		return fmt.Errorf("invalid configuration: agent.cache_root must be an absolute path: %s", root)
+	}
+	if parent := filepath.Dir(root); parent == root {
+		return fmt.Errorf("invalid configuration: agent.cache_root must not be the filesystem root: %s", root)
+	}
+	if home, err := os.UserHomeDir(); err == nil && filepath.Clean(home) == root {
+		return fmt.Errorf("invalid configuration: agent.cache_root must not be the home directory: %s", root)
+	}
+	for _, other := range []struct{ field, path string }{
+		{"workspace.root", s.Workspace.Root},
+		{"workspace.source_root", s.Workspace.SourceRoot},
+	} {
+		if other.path == "" {
+			continue
+		}
+		if pathOverlaps(root, other.path) {
+			return fmt.Errorf("invalid configuration: agent.cache_root must not overlap %s: %s", other.field, root)
+		}
+	}
+	return nil
+}
+
+// pathOverlaps reports whether either path is the other or contains it.
+func pathOverlaps(a, b string) bool {
+	a, b = filepath.Clean(a), filepath.Clean(b)
+	return a == b || strings.HasPrefix(a, b+string(filepath.Separator)) || strings.HasPrefix(b, a+string(filepath.Separator))
 }
 
 func decodePolling(raw map[string]any) (Polling, error) {

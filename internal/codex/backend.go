@@ -356,7 +356,7 @@ func start(ctx context.Context, r domain.AgentRequest, environment []string, cap
 // refs, the primary index, other worktrees) stays outside the grant, so an
 // agent cannot mutate source branches (PMR-65).
 func localCommitSandbox(r domain.AgentRequest) any {
-	grants := uniquePaths(r.GitMetadataRoots)
+	grants := uniquePaths(append(cacheGrant(r), r.GitMetadataRoots...))
 	if len(grants) == 0 || r.ThreadSandbox != "workspace-write" {
 		return r.TurnSandboxPolicy
 	}
@@ -1083,4 +1083,14 @@ func (c *client) emitTokenUsage(raw json.RawMessage) {
 		return
 	}
 	c.emit(domain.Event{Kind: domain.EventUsage, At: time.Now(), Usage: usage})
+}
+
+// cacheGrant is the tool cache root as a writable-roots entry, or nothing when
+// none is configured. It is separate from GitMetadataRoots so the two grants
+// stay independently readable at the one place they are combined.
+func cacheGrant(r domain.AgentRequest) []string {
+	if cache := strings.TrimSpace(r.CacheRoot); cache != "" {
+		return []string{cache}
+	}
+	return nil
 }

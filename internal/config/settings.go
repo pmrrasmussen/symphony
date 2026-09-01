@@ -161,6 +161,20 @@ type Agent struct {
 	// validated against agentBackends, so an unknown value fails the whole
 	// candidate rather than silently falling back to a default.
 	Backend string
+	// CacheRoot is one host-owned directory outside the worktree that a session
+	// may write, for tools that keep a package cache under $HOME and cannot be
+	// told to do otherwise per-invocation. Empty, the default, grants nothing
+	// and leaves the write boundary exactly as it was.
+	//
+	// It is deliberately one purpose-named directory rather than a general list
+	// of extra write roots: the boundary this widens is the one PMR-85 declined
+	// to loosen, and a single grant whose meaning is stated is far harder to
+	// misuse than an open path list. decode rejects any value that overlaps
+	// workspace.root or workspace.source_root in either direction, so it can
+	// reach neither another issue's worktree nor the source repository.
+	//
+	// docs/architecture.md's "The tool cache grant" states what it costs.
+	CacheRoot string
 }
 
 // AgentLaunch is the backend-neutral launch contract the scheduler applies to

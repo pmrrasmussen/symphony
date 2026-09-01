@@ -2230,3 +2230,39 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{}}'
 		t.Fatal("the host credential filter removed unrelated variables")
 	}
 }
+
+// The tool cache grant reaches the Codex workspace-write policy too, so the
+// same workflow field means the same thing on either backend. An unset
+// CacheRoot must leave writableRoots exactly as it was.
+func TestLocalCommitSandboxGrantsCacheRoot(t *testing.T) {
+	objects, cache := "/tmp/src/.git/objects", "/tmp/cache"
+	base := domain.AgentRequest{GitMetadataRoots: []string{objects}, ThreadSandbox: "workspace-write"}
+
+	without, ok := localCommitSandbox(base).(map[string]any)
+	if !ok {
+		t.Fatalf("policy=%T, want a workspaceWrite map", localCommitSandbox(base))
+	}
+	if roots, _ := without["writableRoots"].([]string); len(roots) != 1 || roots[0] != objects {
+		t.Fatalf("writableRoots=%v, want only the git object store when no cache is configured", without["writableRoots"])
+	}
+
+	withCache := base
+	withCache.CacheRoot = cache
+	granted, ok := localCommitSandbox(withCache).(map[string]any)
+	if !ok {
+		t.Fatalf("policy=%T, want a workspaceWrite map", localCommitSandbox(withCache))
+	}
+	roots, _ := granted["writableRoots"].([]string)
+	var found bool
+	for _, root := range roots {
+		if root == cache {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("writableRoots=%v, want the cache root granted", roots)
+	}
+	if len(roots) != 2 {
+		t.Fatalf("writableRoots=%v, want exactly the object store and the cache root", roots)
+	}
+}

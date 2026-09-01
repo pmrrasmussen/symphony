@@ -235,8 +235,13 @@ type AgentRequest struct {
 	// SourceIntegrityError). docs/architecture.md's "Workspace isolation and
 	// the sandbox boundary" states the accepted exposure, why prevention was
 	// not built, and the containment requirement that stands while it does.
-	Workspace                     string
-	GitMetadataRoots              []string
+	Workspace        string
+	GitMetadataRoots []string
+	// CacheRoot is the one host-owned directory outside the worktree a session
+	// may write, carrying config.Agent.CacheRoot to whichever backend runs this
+	// request. Empty grants nothing. Like GitMetadataRoots it is a request, and
+	// the backend is what enforces it.
+	CacheRoot                     string
 	Prompt, Command               string
 	ApprovalPolicy, ThreadSandbox string
 	TurnSandboxPolicy             any

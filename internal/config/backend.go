@@ -28,7 +28,7 @@ func AgentBackends() []string { return append([]string(nil), agentBackends...) }
 // enum. It is used regardless of which backend is selected: only the launch
 // contract for the selected backend (Codex or Claude) is validated as
 // complete, in decode's cross-section validation.
-func decodeAgent(raw map[string]any) (Agent, error) {
+func decodeAgent(raw map[string]any, base string, sources *sourceSnapshot) (Agent, error) {
 	agent, err := object(raw, "agent")
 	if err != nil {
 		return Agent{}, err
@@ -60,7 +60,11 @@ func decodeAgent(raw map[string]any) (Agent, error) {
 	if !contains(agentBackends, backend) {
 		return Agent{}, fmt.Errorf("invalid configuration: agent.backend must be one of %s, got %q", strings.Join(agentBackends, ", "), backend)
 	}
-	return Agent{Backend: backend, MaxConcurrent: maxConcurrent, MaxTurns: maxTurns, MaxAttempts: maxAttempts, MaxRetryBackoff: maxRetryBackoff, ByState: byState}, nil
+	cacheRoot, err := agentCacheRoot(agent, base, sources)
+	if err != nil {
+		return Agent{}, err
+	}
+	return Agent{Backend: backend, MaxConcurrent: maxConcurrent, MaxTurns: maxTurns, MaxAttempts: maxAttempts, MaxRetryBackoff: maxRetryBackoff, ByState: byState, CacheRoot: cacheRoot}, nil
 }
 
 // AgentLaunch resolves the launch contract for the configured backend. The
@@ -314,4 +318,30 @@ func decodeCodex(raw map[string]any) (Codex, error) {
 		TurnSandboxPolicy: turnSandboxPolicy, TurnTimeout: turnTimeout, ReadTimeout: readTimeout,
 		StartTimeout: startTimeout, StallTimeout: stallTimeout,
 	}, nil
+}
+
+// agentCacheRoot parses agent.cache_root. Absent or empty yields "", which
+// grants nothing; the field's own error messages are spelled out here rather
+// than reusing optionalPathValue because that helper reports every failure
+// under a "workspace." prefix.
+func agentCacheRoot(agent map[string]any, base string, sources *sourceSnapshot) (string, error) {
+	value, exists := agent["cache_root"]
+	if !exists || value == nil {
+		return "", nil
+	}
+	text, ok := value.(string)
+	if !ok {
+		return "", errors.New("invalid configuration: agent.cache_root must be a path string")
+	}
+	if strings.TrimSpace(text) == "" {
+		return "", nil
+	}
+	expanded, err := sources.expand(text, "agent.cache_root")
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(expanded) == "" {
+		return "", errors.New("invalid configuration: agent.cache_root environment reference is unresolved")
+	}
+	return normalizePath(expanded, base), nil
 }

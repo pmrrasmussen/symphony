@@ -172,6 +172,10 @@ func writeRoots(r domain.AgentRequest) ([]string, error) {
 	}
 	seen := map[string]bool{workspace: true}
 	roots := []string{workspace}
+	if cache := strings.TrimSpace(r.CacheRoot); cache != "" && !seen[cache] {
+		seen[cache] = true
+		roots = append(roots, cache)
+	}
 	for _, root := range r.GitMetadataRoots {
 		root = strings.TrimSpace(root)
 		if root == "" || seen[root] {
